@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Klay Workspace Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg0:#121314; --bg1:#1c1e20; --bg2:#242729; --bg3:#2d3134; --bg4:#383d41;
+  --line:#0b0c0d; --line2:#2a2e31; --hi:rgba(255,255,255,.06);
+  --fg:#d8dadd; --fg2:#9ba0a6; --fg3:#676d74;
+  --acc:#e3834f; --acc-fg:#1b120c; --acc-dim:rgba(227,131,79,.24); --acc-line:rgba(227,131,79,.7);
+  --canvas:#0e0f10;
+  --font:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --trayw:262px;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg0:#121314}}
+:root[data-theme="dark"]{--bg0:#121314}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg0);color:var(--fg);font:12px/1.35 var(--font);overflow:hidden;
+  user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+svg{display:block}
+img{display:block}
+
+/* ---------- app frame: menubar / top shelf / work / status ---------- */
+#app{display:grid;grid-template-rows:26px 58px minmax(0,1fr) 20px;height:100vh;min-width:320px}
+
+#mbar{display:flex;align-items:center;gap:0;padding:0 6px;background:var(--bg2);border-bottom:1px solid var(--line);overflow:hidden}
+.logo{display:flex;align-items:center;gap:6px;margin-right:12px;font-weight:600;font-size:12.5px}
+.logo i{width:16px;height:16px;background:var(--acc);color:var(--acc-fg);display:grid;place-items:center;font:600 11px var(--mono);font-style:normal;border-radius:2px}
+#mnames{display:flex;flex:1;overflow:hidden}
+.mn{height:20px;padding:0 7px;border:0;background:transparent;cursor:default;border-radius:2px;color:var(--fg);white-space:nowrap;font-size:11.5px}
+.mn:hover{background:var(--bg3)} .mn.on{background:var(--acc);color:var(--acc-fg)}
+.mn.docked{color:var(--fg2)}
+.mn.docked::after{content:"";display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--acc);margin-left:5px;vertical-align:1px}
+.doc{color:var(--fg3);font-size:11px;white-space:nowrap;margin-left:8px}
+
+#shelf{display:flex;align-items:center;gap:6px;padding:0 8px;background:var(--bg1);border-bottom:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);overflow:hidden}
+#shelf .grp{display:flex;align-items:center;gap:3px;padding-right:8px;border-right:1px solid var(--line);margin-right:2px;height:58px}
+#shelf .grp.col{flex-direction:column;align-items:stretch;justify-content:center;gap:3px;min-width:170px}
+#shelf .grp:last-child{border-right:0}
+#shelf .zs{margin:0;flex:1}
+#shelf .seg{margin:0}
+#shelf .seg .sb{padding:0 9px}
+.mode{width:46px;height:46px;padding:0;background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);border-radius:3px;cursor:default;color:var(--fg2);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}
+.mode span{font-size:10px;font-weight:500}
+.mode:hover{background:var(--bg4);color:var(--fg)} .mode.on{background:var(--acc);color:var(--acc-fg);box-shadow:none}
+.mode.dis{opacity:.4;pointer-events:none}
+.sp{flex:1}
+/* ZBrush-style shelf slider: label + value on a dark field, thin value line underneath */
+.zs.line{height:20px;background:var(--bg2);box-shadow:none}
+.zs.line .zf{top:auto;bottom:0;height:3px;background:var(--acc);border:0}
+.zs.line .zl,.zs.line .zv{line-height:16px}
+.zs.line .zv{color:var(--fg)}
+.btn.on{background:var(--acc-dim);border-color:var(--acc-line);color:var(--fg)}
+
+/* ---------- work area: tray | div | center(top tray / shelves+canvas / bottom tray) | div | tray ---------- */
+#work{display:grid;grid-template-columns:auto auto minmax(160px,1fr) auto auto;min-height:0;position:relative}
+#center{display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0;min-width:0}
+#mid{display:grid;grid-template-columns:auto minmax(120px,1fr) auto;min-height:0}
+/* pin regions to their tracks: hidden trays must not shift auto-placement */
+#tray-left{grid-column:1} .div[data-tray=left]{grid-column:2} #center{grid-column:3} .div[data-tray=right]{grid-column:4} #tray-right{grid-column:5}
+#tray-top{grid-row:1} #mid{grid-row:2} #tray-bottom{grid-row:3}
+#shelf-left{grid-column:1} #canvas{grid-column:2} #shelf-right{grid-column:3}
+.shelf-v{display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px 4px;background:var(--bg1);overflow-y:auto;overflow-x:hidden;scrollbar-width:none;touch-action:none}
+.shelf-v::-webkit-scrollbar{display:none}
+#shelf-left{border-right:1px solid var(--line);width:100px}
+#shelf-right{border-left:1px solid var(--line);width:54px}
+.thumb{width:86px;background:transparent;border:0;padding:0;cursor:default;display:flex;flex-direction:column;align-items:center;gap:2px;color:var(--fg2);font-size:10px;margin-bottom:3px;flex:none}
+.thumb:hover{color:var(--fg)}
+.thumb .im{width:84px;height:84px;border:1px solid var(--line);border-radius:3px;background:var(--bg2);box-shadow:inset 0 1px 0 var(--hi);overflow:hidden;display:grid;place-items:center;color:var(--fg3)}
+.thumb .im img{width:100%;height:100%}
+.thumb.on .im{border-color:var(--acc-line);box-shadow:0 0 0 1px var(--acc-dim)}
+.thumb.dim b{color:var(--fg3)}
+.thumb b{font-weight:500;color:var(--fg);max-width:86px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10.5px}
+/* colour picker */
+.cp{display:flex;gap:3px;width:86px;height:72px;margin-top:4px;flex:none}
+.cp-sv{flex:1;position:relative;border:1px solid var(--line);border-radius:2px;cursor:crosshair;touch-action:none}
+.cp-sv i{position:absolute;width:9px;height:9px;border:1.5px solid #fff;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 1px rgba(0,0,0,.6);pointer-events:none}
+.cp-h{width:12px;position:relative;border:1px solid var(--line);border-radius:2px;cursor:ns-resize;touch-action:none;
+  background:linear-gradient(to bottom,#f00 0%,#ff0 17%,#0f0 33%,#0ff 50%,#00f 67%,#f0f 83%,#f00 100%)}
+.cp-h i{position:absolute;left:-2px;right:-2px;height:4px;border:1px solid #fff;transform:translateY(-50%);box-shadow:0 0 0 1px rgba(0,0,0,.6);pointer-events:none}
+.cp-row{display:flex;align-items:center;gap:5px;width:86px;margin-top:4px;flex:none}
+.cp-sw{position:relative;width:40px;height:32px;background:transparent;border:0;padding:0;cursor:default}
+.cp-sw i{position:absolute;width:24px;height:22px;border:1px solid var(--line);box-shadow:0 0 0 1px var(--bg4)}
+.cp-sw i:first-child{left:0;top:0;z-index:2} .cp-sw i:nth-child(2){right:0;bottom:0}
+.cp-sw span{position:absolute;right:-2px;top:-3px;color:var(--fg2);background:var(--bg1);border-radius:50%;padding:1px}
+.cp-hex{font:10px var(--mono);color:var(--fg2)}
+.btn.alt{width:86px;margin-top:4px;flex:none;background:var(--acc);color:var(--acc-fg);border-color:transparent;font-weight:500}
+/* right-shelf navigation buttons: icon over label */
+.nav{width:46px;height:40px;background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);border-radius:3px;cursor:default;color:var(--fg2);padding:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex:none}
+.nav span{font-size:9.5px;font-weight:500}
+.nav:hover{background:var(--bg4);color:var(--fg)} .nav.on{background:var(--acc-dim);border-color:var(--acc-line);color:var(--fg)}
+.nav.dis{opacity:.4;pointer-events:none}
+.navsep{height:1px;width:36px;background:var(--line);box-shadow:0 1px 0 var(--hi);margin:3px 0;flex:none}
+
+/* trays */
+.tray{background:var(--bg1);touch-action:none;scrollbar-width:thin;scrollbar-color:var(--bg4) transparent;position:relative;overscroll-behavior:contain}
+.tray.v{width:var(--trayw);overflow-y:auto;overflow-x:hidden}
+.tray.h{display:flex;align-items:flex-start;overflow-x:auto;overflow-y:hidden;max-height:min(280px,42vh);border-bottom:1px solid var(--line)}
+#tray-bottom{border-bottom:0;border-top:1px solid var(--line)}
+.tray.closed,.tray.h:empty{display:none}
+.tray.v:empty::after{content:"Drop a palette here, or dock one from its ◉ button";position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:20px;color:var(--fg3);font-size:11px}
+.tray.h .pal{flex:0 0 auto;width:max-content;min-width:220px;max-width:min(560px,60vw);border-right:1px solid var(--line);border-bottom:0;align-self:stretch}
+.tray.h .pal.open .pb{max-height:calc(min(280px,42vh) - 25px);overflow-y:auto;scrollbar-width:thin}
+.tray.h .open .pb{display:flex;flex-wrap:wrap;gap:0 10px;align-items:flex-start;align-content:flex-start;padding:0 6px 6px}
+.tray.h .pb>.sec{width:230px;flex:none}
+.div{width:7px;background:var(--bg2);border-left:1px solid var(--line);border-right:1px solid var(--line);cursor:pointer;display:grid;place-items:center;color:var(--fg3)}
+.div:hover{background:var(--bg3);color:var(--acc)}
+.div svg{width:5px;height:9px}
+body.focus .tray,body.focus .div,body.focus .shelf-v,body.focus #shelf{display:none}
+
+/* ---------- palette ---------- */
+.pal{border-bottom:1px solid var(--line)}
+.pal.ghosted{opacity:.35}
+.ph{display:flex;align-items:center;height:26px;padding:0 6px 0 3px;gap:4px;background:var(--bg2);box-shadow:inset 0 1px 0 var(--hi);cursor:default}
+.ph:hover{background:var(--bg3)}
+.dk{width:18px;height:18px;border:0;background:transparent;padding:0;display:grid;place-items:center;color:var(--fg3);cursor:grab;border-radius:50%;flex:none}
+.dk:hover{color:var(--acc);background:var(--bg4)}
+.dk.on{color:var(--acc)}
+.caret{width:12px;height:12px;display:grid;place-items:center;color:var(--fg2);flex:none}
+.caret svg{transition:transform .12s}
+.open>.ph .caret svg,.sec.open>.sh .caret svg{transform:rotate(90deg)}
+.pt{flex:1;font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.01em}
+.pb{display:none;background:var(--bg1)}
+.open .pb{display:block}
+.pal.floating{border:1px solid var(--line);box-shadow:0 14px 40px rgba(0,0,0,.65),inset 0 1px 0 var(--hi);border-radius:3px;overflow:hidden}
+.pal.floating .ph{cursor:default}
+.pal.floating .pb{display:block}
+
+/* sub-palette (section) */
+.sec{border-bottom:1px solid var(--line2)}
+.sec:last-child{border-bottom:0}
+.sh{display:flex;align-items:center;height:22px;padding:0 6px 0 8px;gap:4px;background:var(--bg2);color:var(--fg);cursor:default;font-weight:500;font-size:11.5px;border-top:1px solid var(--line)}
+.sh:hover{background:var(--bg3)}
+.sh .tag{margin-left:auto}
+.sc{display:none;padding:5px 7px 7px}
+.sec.open>.sc{display:block}
+
+/* ---------- widgets ---------- */
+.row{display:flex;align-items:center;gap:4px;min-height:22px;margin:1px 0}
+.lbl{color:var(--fg2);flex:1;white-space:nowrap}
+.zs{position:relative;height:20px;margin:2px 0;background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);cursor:ew-resize;overflow:hidden;border-radius:2px;touch-action:none}
+.zs .zf{position:absolute;top:0;bottom:0;left:0;background:var(--acc-dim);border-right:1px solid var(--acc-line)}
+.zs .zl,.zs .zv{position:absolute;top:0;line-height:18px;pointer-events:none}
+.zs .zl{left:6px;color:var(--fg)}
+.zs .zv{right:6px;font-family:var(--mono);font-size:11px;color:var(--fg2)}
+.zs:hover .zv{color:var(--fg)}
+.dis{opacity:.42;pointer-events:none}
+.seg{display:flex;margin:2px 0;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.seg .sb{flex:1;height:20px;background:var(--bg3);border:0;border-right:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);cursor:default;padding:0 7px;white-space:nowrap}
+.seg .sb:last-child{border-right:0}
+.seg .sb:hover{background:var(--bg4)}
+.seg .sb.on{background:var(--acc);color:var(--acc-fg);box-shadow:none;font-weight:500}
+.seg.tall .sb{height:30px;padding:0 10px;font-weight:500}
+.btn{height:20px;padding:0 9px;background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);border-radius:2px;cursor:default;white-space:nowrap}
+.btn:hover{background:var(--bg4)} .btn:active{background:var(--bg2);box-shadow:none}
+.btn.acc{background:var(--acc);color:var(--acc-fg);font-weight:500;box-shadow:none}
+.btn.full{width:100%;margin:2px 0}
+.btns{display:flex;gap:3px;margin:2px 0}
+.btns .btn{flex:1}
+.chk{display:flex;align-items:center;gap:7px;height:22px;cursor:default;color:var(--fg);background:none;border:0;padding:0 4px 0 0;border-radius:2px;flex:1}
+.chk:hover{background:var(--bg2)}
+.chk i{width:12px;height:12px;border:1px solid var(--line);background:var(--bg3);box-shadow:inset 0 1px 0 var(--hi);border-radius:2px;display:grid;place-items:center;flex:none}
+.chk.on i{background:var(--acc);border-color:var(--acc)}
+.chk.on i svg{display:block} .chk i svg{display:none}
+.chk .k{margin-left:auto;color:var(--fg3);font-family:var(--mono);font-size:10px}
+.tag{display:inline-block;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);border:1px solid var(--line2);padding:1px 5px;border-radius:2px;font-weight:400}
+.note{color:var(--fg3);font-size:11px;margin:3px 0 1px}
+.kvs{display:grid;grid-template-columns:auto 1fr;gap:1px 10px;margin:2px 0}
+.kvs span{color:var(--fg2)} .kvs b{font-weight:400;font-family:var(--mono);font-size:11px;text-align:right;color:var(--fg)}
+.field{display:flex;align-items:center;height:20px;background:var(--bg0);border:1px solid var(--line);padding:0 6px;font-family:var(--mono);font-size:11px;color:var(--fg);margin:2px 0;border-radius:2px}
+.field.ph2{color:var(--fg3)}
+.bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:4px;margin:2px 0}
+.bt{position:relative;background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);border-radius:3px;padding:3px 3px 4px;cursor:default;color:var(--fg2);display:flex;flex-direction:column;align-items:center;gap:3px}
+.bt:hover{background:var(--bg4);color:var(--fg)}
+.bt.on{background:var(--acc-dim);border-color:var(--acc-line);color:var(--fg)}
+.bt img{width:100%;aspect-ratio:1;border-radius:2px;border:1px solid var(--line)}
+.bt .k{position:absolute;top:5px;right:6px;font:10px var(--mono);color:#fff;text-shadow:0 1px 2px #000}
+.bt span{font-size:11px}
+.sws{display:flex;gap:6px;margin:3px 0;flex-wrap:wrap}
+.sw{width:44px;height:44px;border-radius:3px;border:1px solid var(--line);padding:2px;background:var(--bg2);cursor:default;position:relative}
+.sw img{width:100%;height:100%}
+.sw.on{border-color:var(--acc-line);background:var(--acc-dim)} .sw:hover{background:var(--bg4)} .sw.on:hover{background:var(--acc-dim)}
+#pop .bgrid{grid-template-columns:repeat(5,92px)}
+#pop .bt img{background:var(--bg2)}
+.bt img{background:var(--bg2)}
+.thumb .im img{background:var(--bg2)}
+.list{margin:2px 0;border:1px solid var(--line);background:var(--bg0);border-radius:2px;max-height:150px;overflow-y:auto;scrollbar-width:thin}
+.list div{display:flex;height:20px;align-items:center;padding:0 7px;gap:8px;border-bottom:1px solid var(--line2)}
+.list div:last-child{border-bottom:0}
+.list div b{font-weight:400;color:var(--fg)} .list div span{color:var(--fg3);margin-left:auto;font-family:var(--mono);font-size:10.5px}
+.list div.cur{background:var(--acc-dim)} .list div.red b{color:var(--fg3)}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:2px 0;align-items:center}
+.keys kbd{font:10.5px var(--mono);background:var(--bg3);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi);padding:1px 5px;border-radius:2px;color:var(--fg);justify-self:start}
+.keys span{color:var(--fg2)}
+.plist div{display:flex;align-items:center;height:22px;gap:6px;border-bottom:1px solid var(--line2);cursor:default;padding:0 2px}
+.plist div:hover{background:var(--bg2)}
+.plist div:last-child{border-bottom:0}
+.plist .tag{margin-left:auto}
+.plist .tag.acc{color:var(--acc);border-color:var(--acc-line)}
+
+/* ---------- canvas ---------- */
+#canvas{position:relative;background:var(--canvas);overflow:hidden;min-width:0}
+.floor{position:absolute;left:-60%;right:-60%;top:56%;height:140%;
+  background-image:linear-gradient(rgba(255,255,255,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.07) 1px,transparent 1px);
+  background-size:44px 44px;transform:perspective(700px) rotateX(72deg);transform-origin:top center;
+  -webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 15%,transparent 60%);mask-image:radial-gradient(ellipse at 50% 0%,#000 15%,transparent 60%)}
+.sphere{position:absolute;left:50%;top:50%;width:min(62vmin,540px);aspect-ratio:1;transform:translate(-50%,-54%);border-radius:50%;
+  background:radial-gradient(circle at 37% 32%,#f3e1d1 0%,#dfc1a8 30%,#b9937a 62%,#6d4f3f 88%,#3b2b23 100%);
+  box-shadow:0 40px 80px rgba(0,0,0,.6),inset -30px -40px 80px rgba(0,0,0,.25)}
+.sphere::after{content:"";position:absolute;left:44%;top:42%;width:24%;height:26%;border-radius:50%;
+  background:radial-gradient(circle at 40% 40%,rgba(255,255,255,.35),rgba(160,110,80,.25) 60%,transparent 70%);filter:blur(6px)}
+.docframe{position:absolute;inset:16px;border:1px solid rgba(255,255,255,.13);pointer-events:none}
+.hud{position:absolute;display:flex;align-items:center;gap:4px;pointer-events:none}
+.hud *{pointer-events:auto}
+.hud.tl{left:8px;top:8px} .hud.bl{left:10px;bottom:8px;color:var(--fg3);font-size:11px} .hud.bl b{color:var(--fg2);font-weight:500}
+.hud.tr{right:10px;top:10px}
+.crumb{display:flex;align-items:center;gap:6px;color:var(--fg3);font-size:11px}
+.crumb .btn{height:18px;padding:0 6px;font-size:11px;background:rgba(45,49,52,.8)}
+.gizmo{width:60px;height:60px;color:var(--fg2);font:10px var(--mono)}
+.cursor{position:absolute;left:46%;top:38%;width:72px;height:72px;border:1px solid var(--acc);border-radius:50%;transform:translate(-50%,-50%);opacity:.9;pointer-events:none}
+.cursor::after{content:"";position:absolute;left:50%;top:50%;width:3px;height:3px;background:var(--acc);transform:translate(-50%,-50%);border-radius:50%}
+#focus-hint{position:absolute;right:10px;top:10px;color:var(--fg3);font-size:11px;display:none}
+body.focus #focus-hint{display:block}
+body.focus .hud.tr{display:none}
+
+/* drop zones, drag ghost, insert marker */
+.zone{position:absolute;display:none;background:var(--acc-dim);border:1px dashed var(--acc-line);opacity:.5;z-index:5}
+body.dragging .zone{display:block}
+.zone.hot{opacity:1;background:rgba(227,131,79,.35)}
+.zone.top{left:0;right:0;top:0;height:56px} .zone.bottom{left:0;right:0;bottom:0;height:56px}
+.zone.left{left:0;top:0;bottom:0;width:56px} .zone.right{right:0;top:0;bottom:0;width:56px}
+.zone label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--acc);pointer-events:none;white-space:nowrap}
+.zone.left label,.zone.right label{writing-mode:vertical-rl}
+#ghost{position:fixed;z-index:50;pointer-events:none;display:none;padding:0 10px 0 6px;height:24px;line-height:24px;background:var(--bg3);border:1px solid var(--acc-line);box-shadow:0 6px 18px rgba(0,0,0,.6);font-weight:500;border-radius:2px}
+#ins{position:fixed;z-index:40;background:var(--acc);display:none;pointer-events:none;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+body.dragging,body.dragging *{cursor:grabbing!important}
+
+/* floating palette (menu dropdown) + popover */
+#drop{position:fixed;z-index:55;display:none;width:330px;max-height:70vh;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--bg4) transparent;touch-action:none;overscroll-behavior:contain}
+#pop{position:fixed;z-index:60;min-width:150px;background:var(--bg2);border:1px solid var(--line);box-shadow:inset 0 1px 0 var(--hi),0 10px 30px rgba(0,0,0,.6);border-radius:3px;padding:3px;display:none}
+#pop .it{display:flex;align-items:center;gap:8px;height:22px;padding:0 8px 0 6px;border-radius:2px;cursor:default;white-space:nowrap}
+#pop .it:hover{background:var(--acc);color:var(--acc-fg)}
+#pop .it i{width:12px;height:12px;display:grid;place-items:center;flex:none;font-style:normal;font-size:10px}
+#pop .it kbd{margin-left:auto;font:10px var(--mono);color:var(--fg3)}
+#pop .it:hover kbd{color:var(--acc-fg)}
+#pop .sep{height:1px;background:var(--line);margin:3px 0;box-shadow:0 1px 0 var(--hi)}
+#pop .hd{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);padding:4px 6px 2px}
+#pop .bgrid{padding:3px}
+#pop .sws{padding:4px 6px}
+
+#status{display:flex;align-items:center;gap:14px;padding:0 10px;background:var(--bg2);border-top:1px solid var(--line);color:var(--fg2);font-size:11px;white-space:nowrap;overflow:hidden}
+#status .dot{width:7px;height:7px;border-radius:50%;background:#7fbf5f;margin-right:6px;display:inline-block;vertical-align:-1px}
+#status .m{font-family:var(--mono)}
+#status .hint{flex:1;text-align:right;color:var(--fg3);overflow:hidden;text-overflow:ellipsis}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="mbar">
+    <div class="logo"><i>k</i>klay</div>
+    <nav id="mnames"></nav>
+    <span class="doc">Untitled · Sphere · 240 002 v</span>
+  </div>
+
+  <div id="shelf">
+    <div class="grp" id="shelf-modes"></div>
+    <div class="grp col" id="shelf-paint"></div>
+    <div class="grp col" id="shelf-z"></div>
+    <div class="grp col" id="shelf-size"></div>
+    <span class="sp"></span>
+    <div class="grp"><button class="btn" data-act="undo">Undo</button><button class="btn dis" data-act="redo">Redo</button></div>
+  </div>
+
+  <div id="work">
+    <div id="tray-left" class="tray v scroller" data-side="left"></div>
+    <div class="div" data-tray="left" title="Toggle left tray"></div>
+    <div id="center">
+      <div id="tray-top" class="tray h scroller" data-side="top"></div>
+      <div id="mid">
+        <div id="shelf-left" class="shelf-v"></div>
+        <div id="canvas">
+          <div class="floor"></div>
+          <div class="docframe"></div>
+          <div class="sphere"></div>
+          <div class="cursor"></div>
+          <div class="hud tl"><div class="crumb"><button class="btn" data-toggle="persp" id="crumb-persp">Perspective</button><span>/</span><span>Sphere</span></div></div>
+          <div class="hud tr"><svg class="gizmo" viewBox="0 0 60 60" aria-hidden="true"><g stroke="currentColor" stroke-width="1.2" fill="none"><line x1="30" y1="34" x2="30" y2="10"/><line x1="30" y1="34" x2="50" y2="44"/><line x1="30" y1="34" x2="12" y2="46"/></g><text x="27" y="8" fill="#9ba0a6">Y</text><text x="52" y="50" fill="#e3834f">X</text><text x="4" y="52" fill="#7aa9d6">Z</text></svg></div>
+          <div class="hud bl">Brush <b id="hud-brush">Draw</b> · r <b id="hud-r">0.25</b> · s <b id="hud-s">0.50</b></div>
+          <div id="focus-hint">Tab or Esc restores the interface</div>
+          <div class="zone top" data-zone="top"><label>Dock top</label></div>
+          <div class="zone bottom" data-zone="bottom"><label>Dock bottom</label></div>
+          <div class="zone left" data-zone="left"><label>Dock left</label></div>
+          <div class="zone right" data-zone="right"><label>Dock right</label></div>
+        </div>
+        <div id="shelf-right" class="shelf-v"></div>
+      </div>
+      <div id="tray-bottom" class="tray h scroller" data-side="bottom"></div>
+    </div>
+    <div class="div" data-tray="right" title="Toggle right tray"></div>
+    <div id="tray-right" class="tray v scroller" data-side="right"></div>
+  </div>
+
+  <div id="status">
+    <span><span class="dot"></span><span id="st-msg">Ready</span></span>
+    <span class="m">240 002 vertices · 480 000 triangles · 59 chunks</span>
+    <span class="hint">Click a menu name to open its palette · ◉ docks it to a tray · drag empty tray space to scroll · Tab hides the interface</span>
+    <span class="m">5.9 ms · 170 fps</span>
+  </div>
+</div>
+
+<div id="drop" class="scroller"></div>
+<div id="pop"></div>
+<div id="ghost"></div>
+<div id="ins"></div>
+
+<script>
+/* ============================================================
+   Icons
+   ============================================================ */
+const ICON = {
+  caret:  '<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 0l4 4-4 4z" fill="currentColor"/></svg>',
+  dock:   '<svg width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.6" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="6" cy="6" r="1.8" fill="currentColor"/></svg>',
+  check:  '<svg width="9" height="9" viewBox="0 0 9 9" fill="none" stroke="#1b120c" stroke-width="1.6"><path d="M1.5 4.8l2 2 4-4.3"/></svg>',
+  stroke: '<svg width="34" height="34" viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 24c6-14 10 6 16-6s6 8 8 2"/></svg>',
+  alpha:  '<svg width="34" height="34" viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="5" y="5" width="24" height="24" rx="2"/><path d="M5 29L29 5" stroke-dasharray="2 3"/></svg>',
+  divL:   '<svg viewBox="0 0 5 9"><path d="M5 0L0 4.5 5 9z" fill="currentColor"/></svg>',
+  divR:   '<svg viewBox="0 0 5 9"><path d="M0 0l5 4.5L0 9z" fill="currentColor"/></svg>',
+  texture:'<svg width="34" height="34" viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="5" y="5" width="24" height="24" rx="2"/><path d="M5 13h24M5 21h24M13 5v24M21 5v24" opacity=".6"/></svg>',
+  // shelf / nav icons (18px, stroke)
+  sculpt: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 14c3 0 4-7 7-7s4 7 7 7"/><path d="M9 7V3"/></svg>',
+  move:   '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 2v14M2 9h14M6.5 4.5L9 2l2.5 2.5M6.5 13.5L9 16l2.5-2.5M4.5 6.5L2 9l2.5 2.5M13.5 6.5L16 9l-2.5 2.5"/></svg>',
+  scale:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="9" height="9"/><path d="M8 2h8v8M16 2l-6 6"/></svg>',
+  rotate: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 9a6 6 0 1 1-2-4.5"/><path d="M13.5 1.5v3.5H10"/></svg>',
+  frame:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6V2h4M12 2h4v4M16 12v4h-4M6 16H2v-4"/><circle cx="9" cy="9" r="3"/></svg>',
+  persp:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 3h8l3 12H2z"/><path d="M6.5 3L5 15M11.5 3L13 15"/></svg>',
+  floor:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 14l4-9h6l4 9z"/><path d="M4 9.5h10M3 12h12M9 5v9"/></svg>',
+  sym:    '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 2v14" stroke-dasharray="2 2"/><path d="M7 5L3 9l4 4M11 5l4 4-4 4"/></svg>',
+  local:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="9" r="6"/><circle cx="9" cy="9" r="1.5" fill="currentColor"/></svg>',
+  transp: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="9" height="9"/><rect x="7" y="7" width="9" height="9" stroke-dasharray="2 2"/></svg>',
+  ghost:  '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 16V8a5 5 0 0 1 10 0v8l-2.5-2-2.5 2-2.5-2z"/></svg>',
+  solo:   '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="9" r="4"/><circle cx="3.5" cy="4" r="1.2" opacity=".4"/><circle cx="14.5" cy="14" r="1.2" opacity=".4"/></svg>',
+  detail: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12c2-4 4-4 6 0s4 4 6 0"/><path d="M2 7c2-2 4-2 6 0s4 2 6 0" opacity=".5"/></svg>',
+  hide:   '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 9s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5z"/><path d="M3 15L15 3"/></svg>',
+  swap:   '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M1 3h6M5 1l2 2-2 2M9 7H3M5 5L3 7l2 2"/></svg>',
+};
+
+/* ============================================================
+   Live values (what the engine would own)
+   ============================================================ */
+const V = {
+  tool:'sculpt', brush:'draw', radius:0.25, strength:0.5, mode:'add', falloff:0.5,
+  spacing:0.12, stabilizer:0, pressure:true,
+  segments:200, material:'clay', symx:false, symy:false, symz:false, radial:false, radialCount:8,
+  grid:true, detail:false, fov:45, persp:true, exportName:'klay_export.obj', maskMode:'paint', strokeType:'free', xform:'move',
+  trayw:262, uiscale:1, bfm:false, topo:false,
+  paint:'m', rgbi:1, dynamic:true,
+  color:[22, 0.55, 0.88], color2:[0, 0, 1],   // HSV primary / secondary
+};
+const BRUSHES = [['draw','Draw','1'],['smooth','Smooth','2'],['grab','Grab','3'],['flatten','Flatten','4'],['inflate','Inflate','5']];
+// id, name, base colour (linear-ish rgb 0..1), specular strength
+const MATERIALS = [
+  ['clay','Warm clay',[0.84,0.66,0.54],0.35],
+  ['steel','Steel',[0.70,0.74,0.78],0.9],
+  ['terracotta','Terracotta',[0.78,0.42,0.27],0.3],
+  ['olive','Olive',[0.64,0.62,0.42],0.25],
+];
+const NC = 'Not connected';
+
+/* ============================================================
+   Previews: a sphere rendered in the current material with one
+   stroke of the brush on it (kind 'none' = plain sphere, used
+   for material thumbnails). Draw and Inflate flip in Subtract.
+   ============================================================ */
+const PREV = {};
+function spherePreview(kind, matId, sub) {
+  const flips = kind === 'draw' || kind === 'inflate';
+  const key = `${kind}:${matId}${sub && flips ? ':sub' : ''}`;
+  if (PREV[key]) return PREV[key];
+  const mat = MATERIALS.find(m => m[0] === matId), base = mat[2], specK = mat[3];
+  const n = 96, R = 0.86, c = document.createElement('canvas'); c.width = c.height = n;
+  const g = c.getContext('2d'), img = g.createImageData(n, n), D = new Float32Array(n * n);
+  // stroke path across the front of the sphere, in [-1,1] coords
+  const path = []; for (let i = 0; i <= 40; i++) { const t = i / 40; path.push([-0.46 + 0.92 * t, 0.26 - 0.5 * t + 0.14 * Math.sin(t * Math.PI)]); }
+  // lumpy surface for Smooth / Flatten: three octaves of crossed sines
+  const noise = (x, y) => 0.55 * (Math.sin(x * 9.1 + 1.3) * Math.sin(y * 8.7 + .4) + .6 * Math.sin(x * 17 + y * 13 + 2) * Math.sin(y * 15 - x * 7) + .4 * Math.sin((x + y) * 23) * Math.sin((x - y) * 19));
+  const sgn = sub && flips ? -1 : 1;
+  // displacement field (along the view axis, foreshortened at the rim)
+  for (let py = 0; py < n; py++) for (let px = 0; px < n; px++) {
+    const x = (px + 0.5) / n * 2 - 1, y = (py + 0.5) / n * 2 - 1, r2 = x * x + y * y;
+    if (r2 >= R * R || kind === 'none') continue;
+    const nz = Math.sqrt(R * R - r2) / R;
+    let d = 9; for (const p of path) { const dd = Math.hypot(x - p[0], y - p[1]); if (dd < d) d = dd; }
+    const rr = kind === 'inflate' ? 0.34 : 0.21;
+    let f = Math.max(0, 1 - d / rr); f = f * f * (3 - 2 * f);
+    let h = 0;
+    if (kind === 'draw') h = f * 0.16 * sgn;
+    else if (kind === 'inflate') h = Math.pow(f, 0.7) * 0.2 * sgn;
+    else if (kind === 'smooth') h = noise(x, y) * 0.11 * (1 - f * 0.97);
+    else if (kind === 'flatten') h = noise(x, y) * 0.11 * (1 - f) - f * 0.03;
+    else if (kind === 'grab') { const dx = x - 0.02, dy = y + 0.02, a = dx > 0 ? 0.5 : 0.24; h = 0.22 * Math.exp(-1.4 * (dx * dx / (a * a) + dy * dy / (0.26 * 0.26))); }
+    D[py * n + px] = h * nz;
+  }
+  const Lt = [-0.42, -0.5, 0.76], ll = Math.hypot(...Lt); Lt.forEach((v, i) => Lt[i] = v / ll);
+  const hx = Lt[0], hy = Lt[1], hz = Lt[2] + 1, hl = Math.hypot(hx, hy, hz);
+  const at = (x, y) => D[Math.min(n - 1, Math.max(0, y)) * n + Math.min(n - 1, Math.max(0, x))];
+  for (let py = 0; py < n; py++) for (let px = 0; px < n; px++) {
+    const x = (px + 0.5) / n * 2 - 1, y = (py + 0.5) / n * 2 - 1, r = Math.hypot(x, y);
+    const o = (py * n + px) * 4;
+    const edge = (R - r) * n / 2 + 0.5;                  // pixels inside the rim
+    if (edge <= 0) { img.data[o + 3] = 0; continue; }
+    const rc = Math.min(r, R - 0.001), z = Math.sqrt(R * R - rc * rc);
+    // analytic sphere normal + gradient of the displacement
+    const gx = (at(px + 1, py) - at(px - 1, py)) * n * 0.5, gy = (at(px, py + 1) - at(px, py - 1)) * n * 0.5;
+    let nx = x / R - gx * 0.5, ny = y / R - gy * 0.5, nz = z / R; const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+    const diff = Math.max(0, nx * Lt[0] + ny * Lt[1] + nz * Lt[2]);
+    const spec = Math.pow(Math.max(0, (nx * hx + ny * hy + nz * hz) / hl), 36) * specK;
+    const fill = 0.16 + 0.1 * Math.max(0, -ny);           // soft fill light from below
+    for (let k = 0; k < 3; k++) img.data[o + k] = Math.min(255, 255 * (base[k] * (fill + 0.9 * diff) + spec));
+    img.data[o + 3] = Math.round(255 * Math.min(1, edge));
+  }
+  g.putImageData(img, 0, 0);
+  return PREV[key] = c.toDataURL();
+}
+const prev = kind => spherePreview(kind, V.material, V.mode === 'sub');
+const matPrev = id => spherePreview('none', id, false);
+
+/* ---- colour helpers (HSV picker) ---- */
+function hsv2rgb(h, s, v) { const f = (k, n = (k + h / 60) % 6) => v - v * s * Math.max(0, Math.min(n, 4 - n, 1)); return [f(5), f(3), f(1)]; }
+const hex = ([r, g, b]) => '#' + [r, g, b].map(c => Math.round(c * 255).toString(16).padStart(2, '0')).join('');
+const colorHex = c => hex(hsv2rgb(c[0], c[1], c[2]));
+
+/* ============================================================
+   Widget helpers (return HTML strings)
+   ============================================================ */
+const fmt = (v, step) => step >= 1 ? String(Math.round(v)) : v.toFixed(step < 0.1 ? 2 : 1);
+let curPal = null; // palette id while rendering its body (section keys)
+const W = {
+  slider: (key, label, min, max, step, o = {}) => {
+    const v = V[key], pct = ((v - min) / (max - min) * 100).toFixed(2);
+    return `<div class="zs ctl${o.dis ? ' dis' : ''}${o.line ? ' line' : ''}" data-key="${key}" data-min="${min}" data-max="${max}" data-step="${step}" data-suffix="${o.suffix || ''}">
+      <div class="zf" style="width:${pct}%"></div><span class="zl">${label}</span><span class="zv">${fmt(v, step)}${o.suffix || ''}</span></div>`;
+  },
+  seg: (key, opts, o = {}) => `<div class="seg ctl${o.tall ? ' tall' : ''}${o.dis ? ' dis' : ''}">${opts.map(([val, lab]) =>
+    `<button class="sb${V[key] === val ? ' on' : ''}" data-set="${key}:${val}">${lab}</button>`).join('')}</div>`,
+  chk: (key, label, o = {}) => `<button class="chk ctl${V[key] ? ' on' : ''}${o.dis ? ' dis' : ''}" data-toggle="${key}"><i>${ICON.check}</i>${label}${o.k ? `<span class="k">${o.k}</span>` : ''}</button>`,
+  btn: (label, act, o = {}) => `<button class="btn ctl${o.full ? ' full' : ''}${o.acc ? ' acc' : ''}${o.dis ? ' dis' : ''}" data-act="${act}">${label}</button>`,
+  btns: (...b) => `<div class="btns">${b.join('')}</div>`,
+  note: t => `<div class="note">${t}</div>`,
+  kvs: pairs => `<div class="kvs">${pairs.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('')}</div>`,
+  field: (v, o = {}) => `<div class="field ctl${o.ph ? ' ph2' : ''}">${v}</div>`,
+  brushGrid: () => `<div class="bgrid">${BRUSHES.map(([id, name, k]) =>
+    `<button class="bt ctl${V.brush === id ? ' on' : ''}" data-set="brush:${id}"><img src="${prev(id)}" alt=""><span class="k">${k}</span><span>${name}</span></button>`).join('')}</div>`,
+  swatches: () => `<div class="sws">${MATERIALS.map(([id, name]) =>
+    `<button class="sw ctl${V.material === id ? ' on' : ''}" data-set="material:${id}" title="${name}" aria-label="${name}"><img src="${matPrev(id)}" alt=""></button>`).join('')}</div>`,
+  /* HSV colour picker: saturation/value square + hue strip */
+  picker: () => {
+    const [h, s, v] = V.color;
+    return `<div class="cp"><div class="cp-sv ctl" style="background:linear-gradient(to top,#000,rgba(0,0,0,0)),linear-gradient(to right,#fff,hsl(${h} 100% 50%))"><i style="left:${s * 100}%;top:${(1 - v) * 100}%"></i></div><div class="cp-h ctl"><i style="top:${h / 360 * 100}%"></i></div></div>`;
+  },
+  /* sub-palette: collapsible section. key = palette/section, state in L.sec */
+  sec: (sid, title, html, o = {}) => {
+    const key = curPal + '/' + sid, open = L.sec[key] ?? (o.open !== false);
+    return `<div class="sec${open ? ' open' : ''}" data-sec="${key}"><div class="sh"><span class="caret">${ICON.caret}</span>${title}${o.tag ? `<span class="tag">${o.tag}</span>` : ''}</div><div class="sc${o.dis ? ' dis' : ''}">${html}</div></div>`;
+  },
+};
+
+/* ============================================================
+   Palette registry. Every palette is in the menu bar; `dock`
+   is where it starts docked (null = menu only). Adding a
+   palette = one entry here.
+   ============================================================ */
+const PALETTES = [
+  { id:'alpha', title:'Alpha', dock:null, body: () =>
+      W.sec('alpha', 'Alpha', W.note('No alpha selected.') + W.btn('Load alpha…', 'noop', {full:true}), {tag:NC, dis:true}) },
+
+  { id:'brush', title:'Brush', dock:'left', body: () =>
+      W.sec('brushes', 'Brushes', W.brushGrid() + W.note('Ctrl inverts · Shift smooths · 1–5 selects')) +
+      W.sec('mods', 'Modifiers',
+        W.slider('radius', 'Radius', 0.02, 1, 0.01) + W.slider('strength', 'Strength', 0, 1, 0.01) +
+        W.seg('mode', [['add','Add'],['sub','Subtract']]) +
+        W.slider('falloff', 'Falloff', 0, 1, 0.01, {dis:true})) +
+      W.sec('auto', 'Auto masking', W.chk('bfm', 'Backface mask') + W.chk('topo', 'Topological'), {tag:NC, dis:true, open:false}) },
+
+  { id:'document', title:'Document', dock:null, body: () =>
+      W.sec('doc', 'Document', W.kvs([['Name','Untitled'],['Object','Sphere'],['Source','procedural']]) + W.btns(W.btn('New', 'noop'), W.btn('Open…', 'noop'), W.btn('Save', 'noop'))) +
+      W.sec('export', 'Export', W.field(V.exportName) + W.btn('Export OBJ', 'export', {full:true}) + W.note('Writes positions and triangles; normals are recomputed on import.')) +
+      W.sec('import', 'Import', W.btn('Import OBJ…', 'noop', {full:true}), {tag:NC, dis:true, open:false}) },
+
+  { id:'edit', title:'Edit', dock:'right', body: () =>
+      W.sec('undo', 'Undo', W.btns(W.btn('Undo', 'undo'), W.btn('Redo', 'redo', {dis:true})) + W.kvs([['Snapshots','71 MB'],['Steps','4 / 5']])) +
+      W.sec('history', 'History', `<div class="list">
+        <div><b>Rebuild sphere</b><span>200</span></div><div><b>Draw stroke</b><span>12 k</span></div>
+        <div><b>Grab stroke</b><span>41 k</span></div><div class="cur"><b>Smooth stroke</b><span>9 k</span></div>
+        <div class="red"><b>Inflate stroke</b><span>redo</span></div></div>`) },
+
+  { id:'masking', title:'Masking', dock:null, body: () =>
+      W.sec('mask', 'Mask', W.seg('maskMode', [['paint','Paint'],['rect','Rect'],['lasso','Lasso']]) +
+        W.btns(W.btn('Invert', 'noop'), W.btn('Clear', 'noop'), W.btn('Blur', 'noop')), {tag:NC, dis:true}) },
+
+  { id:'material', title:'Material', dock:'right', body: () =>
+      W.sec('mats', 'Materials', W.swatches() + W.note(MATERIALS.find(m => m[0] === V.material)[1])) +
+      W.sec('shade', 'Shading', W.chk('detail', 'Surface detail shading') + W.chk('grid', 'Floor grid')) },
+
+  { id:'mesh', title:'Mesh', dock:'right', body: () =>
+      W.sec('info', 'Mesh', W.kvs([['Object','Sphere'],['Vertices','240 002'],['Triangles','480 000'],['Bounds','2.0 × 2.0 × 2.0']])) +
+      W.sec('rebuild', 'Rebuild', W.slider('segments', 'Segments', 50, 1500, 1) +
+        W.note(`≈ ${(V.segments * V.segments * 6 + 2).toLocaleString('fr').replace(/ /g, ' ')} vertices after rebuild`) +
+        W.btn('Rebuild sphere', 'rebuild', {full:true})) +
+      W.sec('chunks', 'Chunks', W.kvs([['Chunks','59'],['Target size','4 096 v'],['Dirty','0'],['Build','0.4 s']]), {open:false}) },
+
+  { id:'performance', title:'Performance', dock:'bottom', body: () =>
+      W.sec('frame', 'Frame', W.kvs([['Frame','5.9 ms · 170 fps'],['Dab','0.00 ms · 2 941 661 v'],['Upload / submit','0.01 / 5.70 ms']])) +
+      W.sec('gpu', 'GPU', W.kvs([['Device','RTX 5060 (Vulkan)'],['Upload','0 chunks · 0.0 MB'],['Normals','0 chunks']])) },
+
+  { id:'prefs', title:'Preferences', dock:null, body: () =>
+      W.sec('ui', 'Interface', W.slider('trayw', 'Tray width', 200, 420, 1, {suffix:' px'}) + W.slider('uiscale', 'UI scale', 0.8, 2, 0.1, {dis:true})) +
+      W.sec('keys', 'Shortcuts', `<div class="keys">
+        <kbd>LMB drag</kbd><span>sculpt</span><kbd>Ctrl</kbd><span>invert brush</span><kbd>Shift</kbd><span>smooth</span>
+        <kbd>RMB / MMB</kbd><span>orbit</span><kbd>Shift + RMB</kbd><span>pan</span><kbd>Scroll</kbd><span>zoom · Ctrl: radius</span>
+        <kbd>[ ]</kbd><span>brush radius</span><kbd>1 – 5</kbd><span>brushes</span><kbd>F</kbd><span>frame mesh</span><kbd>Tab</kbd><span>hide interface</span></div>`) },
+
+  { id:'stroke', title:'Stroke', dock:null, body: () =>
+      W.sec('type', 'Stroke type', W.seg('strokeType', [['free','Freehand'],['dots','Dots'],['drag','Drag rect']]), {tag:NC, dis:true}) +
+      W.sec('mods', 'Modifiers', W.slider('spacing', 'Spacing', 0, 1, 0.01) + W.slider('stabilizer', 'Stabilizer', 0, 1, 0.01) + W.chk('pressure', 'Pen pressure → strength'), {tag:NC, dis:true}) },
+
+  { id:'symmetry', title:'Symmetry', dock:'left', body: () =>
+      W.sec('axes', 'Axes', `<div class="row">${W.chk('symx', 'X')}${W.chk('symy', 'Y')}${W.chk('symz', 'Z')}</div>` + W.chk('radial', 'Radial') + W.slider('radialCount', 'Radial count', 2, 24, 1), {tag:NC, dis:true}) },
+
+  { id:'transform', title:'Transform', dock:null, body: () =>
+      W.sec('xf', 'Transform', W.seg('xform', [['move','Move'],['rotate','Rotate'],['scale','Scale']]) + W.btn('Reset transform', 'noop', {full:true}), {tag:NC, dis:true}) },
+
+  { id:'view', title:'View', dock:null, body: () =>
+      W.sec('cam', 'Camera', W.chk('persp', 'Perspective') + W.slider('fov', 'Field of view', 20, 90, 1, {suffix:'°'}) + W.btn('Frame mesh', 'frame', {full:true})) +
+      W.sec('disp', 'Display', W.chk('grid', 'Floor grid') + W.chk('detail', 'Surface detail shading')) +
+      W.sec('views', 'Views', W.btns(W.btn('Front', 'noop'), W.btn('Side', 'noop'), W.btn('Top', 'noop'), W.btn('Iso', 'noop'))) },
+
+  { id:'workspace', title:'Workspace', dock:null, body: () =>
+      W.sec('layout', 'Layout', W.btns(W.btn('Reset', 'reset'), W.btn('Collapse all', 'collapse'), W.btn('Expand all', 'expand')) + W.btn('Hide interface (Tab)', 'focus', {full:true})) +
+      W.sec('trays', 'Trays', `<div class="row">${['left','right'].map(s => `<button class="chk ctl${L.tray[s] ? ' on' : ''}" data-traytoggle="${s}"><i>${ICON.check}</i>${s[0].toUpperCase() + s.slice(1)} tray</button>`).join('')}</div>`) +
+      W.sec('docked', 'Palettes', `<div class="plist">${PALETTES.map(p => { const s = sideOf(p.id); return `<div data-pm="${p.id}">${ICON.dock}${p.title}<span class="tag${s !== 'menu' ? ' acc' : ''}">${s}</span></div>`; }).join('')}</div>` + W.note('Click a palette to choose its tray.')) },
+];
+const byId = Object.fromEntries(PALETTES.map(p => [p.id, p]));
+PALETTES.sort((a, b) => a.title.localeCompare(b.title));
+
+/* ============================================================
+   Layout state
+   ============================================================ */
+const SIDES = ['top', 'left', 'right', 'bottom'];
+const STORE = 'klay.mockup.layout.v2';
+let L;
+function defaultLayout() {
+  const l = { top:[], left:[], right:[], bottom:[], open:{}, sec:{}, tray:{left:true, right:true} };
+  for (const p of PALETTES) { if (p.dock) l[p.dock].push(p.id); l.open[p.id] = p.id !== 'performance'; }
+  return l;
+}
+function load() {
+  try {
+    const s = JSON.parse(localStorage.getItem(STORE));
+    if (s && SIDES.every(k => Array.isArray(s[k])) && s.open && s.tray) {
+      const seen = new Set();
+      for (const k of SIDES) s[k] = s[k].filter(id => byId[id] && !seen.has(id) && seen.add(id));
+      for (const p of PALETTES) if (!(p.id in s.open)) s.open[p.id] = true;
+      s.sec = s.sec || {};
+      if (s.trayw) V.trayw = s.trayw;
+      return s;
+    }
+  } catch (e) {}
+  return defaultLayout();
+}
+function save() { try { L.trayw = V.trayw; localStorage.setItem(STORE, JSON.stringify(L)); } catch (e) {} }
+function sideOf(id) { return SIDES.find(s => L[s].includes(id)) || 'menu'; }
+function movePalette(id, side, index) {
+  const from = sideOf(id);
+  if (from !== 'menu') { const fi = L[from].indexOf(id); L[from].splice(fi, 1); if (from === side && index != null && fi < index) index--; }
+  if (side !== 'menu') {
+    if (index == null || index > L[side].length) index = L[side].length;
+    L[side].splice(index, 0, id);
+    if (L.tray[side] === false) L.tray[side] = true;
+  }
+  closeDrop(); save(); render();
+  flash(side === 'menu' ? `${byId[id].title} undocked` : `${byId[id].title} → ${side} tray`);
+}
+
+/* ============================================================
+   Rendering
+   ============================================================ */
+const $ = s => document.querySelector(s);
+const trays = Object.fromEntries(SIDES.map(s => [s, document.getElementById('tray-' + s)]));
+const drop = $('#drop'), pop = $('#pop'), ghost = $('#ghost'), ins = $('#ins'), work = $('#work');
+let dropId = null;
+
+function paletteHTML(id, floating) {
+  const p = byId[id], open = floating || L.open[id];
+  curPal = id;
+  const html = `<section class="pal${open ? ' open' : ''}${floating ? ' floating' : ''}" data-id="${id}">
+    <header class="ph">
+      <button class="dk ctl" data-pm="${id}" title="Dock / undock — drag to a tray" aria-label="Dock ${p.title}">${ICON.dock}</button>
+      ${floating ? '' : `<span class="caret">${ICON.caret}</span>`}
+      <span class="pt">${p.title}</span>
+      ${floating && sideOf(id) !== 'menu' ? `<span class="tag">${sideOf(id)} tray</span>` : ''}
+    </header>
+    <div class="pb">${p.body()}</div>
+  </section>`;
+  curPal = null;
+  return html;
+}
+function render() {
+  document.documentElement.style.setProperty('--trayw', V.trayw + 'px');
+  for (const s of SIDES) {
+    const t = trays[s], st = t.scrollTop, sl = t.scrollLeft;
+    t.innerHTML = L[s].map(id => paletteHTML(id, false)).join('');
+    t.classList.toggle('closed', (s === 'left' || s === 'right') && !L.tray[s]);
+    t.scrollTop = st; t.scrollLeft = sl;
+  }
+  document.querySelectorAll('.div').forEach(d => { const s = d.dataset.tray, open = L.tray[s]; d.innerHTML = (s === 'left') === open ? ICON.divL : ICON.divR; });
+  $('#mnames').innerHTML = PALETTES.map(p => `<button class="mn${dropId === p.id ? ' on' : ''}${sideOf(p.id) !== 'menu' ? ' docked' : ''}" data-mname="${p.id}">${p.title}</button>`).join('');
+  if (dropId) { const st = drop.scrollTop; drop.innerHTML = paletteHTML(dropId, true); drop.scrollTop = st; }
+
+  // top shelf (ZBrush: mode buttons · paint · Zadd/Zsub · intensity/size sliders)
+  const mode = (id, label, on, dis) => `<button class="mode ctl${on ? ' on' : ''}${dis ? ' dis' : ''}" data-set="tool:${id}">${ICON[id]}<span>${label}</span></button>`;
+  $('#shelf-modes').innerHTML = mode('sculpt', 'Sculpt', V.tool === 'sculpt') + mode('move', 'Move', false, true) + mode('scale', 'Scale', false, true) + mode('rotate', 'Rotate', false, true);
+  $('#shelf-paint').innerHTML = W.seg('paint', [['mrgb','Mrgb'],['rgb','Rgb'],['m','M']], {dis:true}) + W.slider('rgbi', 'Rgb Intensity', 0, 1, 0.01, {line:true, dis:true});
+  $('#shelf-z').innerHTML = `<div class="row" style="margin:0;gap:3px">${W.seg('mode', [['add','Zadd'],['sub','Zsub']])}<button class="btn dis" style="height:20px">Zcut</button></div>` + W.slider('strength', 'Z Intensity', 0, 1, 0.01, {line:true});
+  $('#shelf-size').innerHTML = W.slider('falloff', 'Focal Shift', 0, 1, 0.01, {line:true, dis:true}) + `<div class="row" style="margin:0;gap:3px">${W.slider('radius', 'Draw Size', 0.02, 1, 0.01, {line:true})}<button class="btn ctl${V.dynamic ? ' on' : ''}" data-toggle="dynamic" title="Radius scales with zoom" style="height:20px;font-size:10px">Dyn</button></div>`;
+
+  // left shelf (ZBrush: brush · stroke · alpha · texture · material · colour)
+  const mat = MATERIALS.find(m => m[0] === V.material), br = BRUSHES.find(b => b[0] === V.brush);
+  const c1 = colorHex(V.color), c2 = colorHex(V.color2);
+  $('#shelf-left').innerHTML =
+    `<button class="thumb on ctl" data-pick="brush" title="Brush"><span class="im"><img src="${prev(V.brush)}" alt=""></span><b>${br[1]}</b></button>` +
+    `<button class="thumb ctl" data-act="noop" title="Stroke"><span class="im">${ICON.stroke}</span><b>Freehand</b></button>` +
+    `<button class="thumb ctl dim" data-act="noop" title="Alpha"><span class="im">${ICON.alpha}</span><b>Alpha Off</b></button>` +
+    `<button class="thumb ctl dim" data-act="noop" title="Texture"><span class="im">${ICON.texture}</span><b>Texture Off</b></button>` +
+    `<button class="thumb ctl" data-pick="material" title="Material"><span class="im"><img src="${matPrev(V.material)}" alt=""></span><b>${mat[1]}</b></button>` +
+    W.picker() +
+    `<div class="cp-row"><button class="cp-sw ctl" data-act="swapcolor" title="Switch colours"><i style="background:${c1}"></i><i style="background:${c2}"></i><span>${ICON.swap}</span></button><span class="cp-hex">${c1}</span></div>` +
+    `<button class="btn alt ctl dis" title="Alternate colour">Alternate</button>`;
+
+  // right shelf (ZBrush: navigation / display toggles)
+  const nav = (icon, label, attr, on, dis, title) => `<button class="nav ctl${on ? ' on' : ''}${dis ? ' dis' : ''}" ${attr} title="${title || label}">${ICON[icon]}<span>${label}</span></button>`;
+  $('#shelf-right').innerHTML =
+    nav('frame', 'Frame', 'data-act="frame"', false, false, 'Frame mesh (F)') +
+    nav('persp', 'Persp', 'data-toggle="persp"', V.persp) +
+    nav('floor', 'Floor', 'data-toggle="grid"', V.grid) +
+    nav('sym', 'Sym', 'data-toggle="symx"', V.symx, true) +
+    `<div class="navsep"></div>` +
+    nav('local', 'Local', '', false, true) + nav('transp', 'Transp', '', false, true) + nav('ghost', 'Ghost', '', false, true) + nav('solo', 'Solo', '', false, true) +
+    `<div class="navsep"></div>` +
+    nav('detail', 'Detail', 'data-toggle="detail"', V.detail) +
+    nav('hide', 'Hide', 'data-act="focus"', false, false, 'Hide interface (Tab)');
+
+  // canvas hud
+  $('#hud-brush').textContent = br[1];
+  $('#hud-r').textContent = V.radius.toFixed(2); $('#hud-s').textContent = V.strength.toFixed(2);
+  $('.floor').style.display = V.grid ? '' : 'none';
+  $('#crumb-persp').textContent = V.persp ? 'Perspective' : 'Orthographic';
+  const sz = 40 + V.radius * 180; const c = $('.cursor'); c.style.width = c.style.height = sz + 'px';
+}
+
+/* ============================================================
+   Menu dropdown palette, popovers
+   ============================================================ */
+function openDrop(id, anchor) {
+  if (dropId === id) { closeDrop(); render(); return; }
+  closePop();
+  dropId = id;
+  drop.style.display = 'block'; drop.innerHTML = paletteHTML(id, true);
+  const r = anchor.getBoundingClientRect(); let x = r.left;
+  if (x + drop.offsetWidth > innerWidth - 6) x = innerWidth - 6 - drop.offsetWidth;
+  drop.style.left = x + 'px'; drop.style.top = (r.bottom + 2) + 'px';
+  drop.style.maxHeight = (innerHeight - r.bottom - 30) + 'px';
+  render();
+}
+function closeDrop() { if (!dropId) return; dropId = null; drop.style.display = 'none'; drop.innerHTML = ''; }
+
+function showPop(anchor, html, o = {}) {
+  pop.innerHTML = html; pop.style.display = 'block';
+  const r = anchor.getBoundingClientRect(), pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let x = o.right ? r.right + 4 : r.left, y = o.right ? r.top : r.bottom + 3;
+  if (x + pw > innerWidth - 6) x = Math.max(6, (o.right ? r.left - pw - 4 : r.right - pw));
+  if (y + ph > innerHeight - 6) y = Math.max(6, innerHeight - 6 - ph);
+  pop.style.left = x + 'px'; pop.style.top = y + 'px';
+  document.querySelectorAll('.dk.on').forEach(el => el.classList.remove('on'));
+  if (anchor.classList.contains('dk')) anchor.classList.add('on');
+}
+function closePop() { pop.style.display = 'none'; document.querySelectorAll('.dk.on').forEach(el => el.classList.remove('on')); }
+const it = (label, act, k, mark) => `<div class="it" data-act="${act}"><i>${mark || ''}</i>${label}${k ? `<kbd>${k}</kbd>` : ''}</div>`;
+function openDockMenu(anchor, id) {
+  const cur = sideOf(id);
+  showPop(anchor, `<div class="hd">${byId[id].title}</div>` +
+    SIDES.map(s => it(`${s[0].toUpperCase() + s.slice(1)} tray`, `dock:${id}:${s}`, '', cur === s ? '●' : '')).join('') +
+    `<div class="sep"></div>` + it('Menu only (undock)', `dock:${id}:menu`, '', cur === 'menu' ? '●' : '') +
+    (cur !== 'menu' ? it(L.open[id] ? 'Collapse' : 'Expand', `toggle:${id}`) : ''));
+}
+function openPicker(anchor, what) {
+  if (what === 'brush') showPop(anchor, `<div class="hd">Brush · 1–5</div>` + W.brushGrid() +
+    `<div class="btns dis" style="padding:3px 3px 0">${W.btn('Load Brush', 'noop')}${W.btn('Save As', 'noop')}${W.btn('Clone', 'noop')}${W.btn('Reset All', 'noop')}</div>`, {right:true});
+  else showPop(anchor, `<div class="hd">Material</div>` + W.swatches(), {right:true});
+}
+
+/* ============================================================
+   Actions, clicks, keys
+   ============================================================ */
+const stmsg = $('#st-msg'); let flashT, suppressClick = false;
+function flash(msg) { stmsg.textContent = msg; clearTimeout(flashT); flashT = setTimeout(() => stmsg.textContent = 'Ready', 1800); }
+function setFocus(on) { document.body.classList.toggle('focus', on); closeDrop(); closePop(); flash(on ? 'Interface hidden' : 'Interface restored'); }
+function doAction(a) {
+  const msgs = { undo:'Undo: Smooth stroke', redo:'Redo: Inflate stroke', frame:'Framed mesh', rebuild:`Rebuilt sphere · ${V.segments} segments`, export:`Wrote ${V.exportName}`, noop:'Not connected' };
+  if (a === 'focus') return setFocus(!document.body.classList.contains('focus'));
+  if (a === 'reset') { L = defaultLayout(); V.trayw = 262; save(); render(); return flash('Layout reset'); }
+  if (a === 'collapse' || a === 'expand') { for (const p of PALETTES) L.open[p.id] = a === 'expand'; for (const k in L.sec) L.sec[k] = a === 'expand'; save(); render(); return; }
+  if (a.startsWith('dock:')) { const [, id, side] = a.split(':'); return movePalette(id, side); }
+  if (a.startsWith('toggle:')) { const id = a.slice(7); L.open[id] = !L.open[id]; save(); render(); return; }
+  if (a === 'swapcolor') { [V.color, V.color2] = [V.color2, V.color]; render(); return; }
+  flash(msgs[a] || a);
+}
+
+document.addEventListener('click', e => {
+  if (suppressClick) { suppressClick = false; e.stopPropagation(); e.preventDefault(); return; }
+  const t = e.target;
+  const inPop = t.closest('#pop');
+  const mn = t.closest('[data-mname]'); if (mn) { closePop(); openDrop(mn.dataset.mname, mn); return; }
+  const pm = t.closest('[data-pm]'); if (pm) { openDockMenu(pm, pm.dataset.pm); return; }
+  const pk = t.closest('[data-pick]'); if (pk) { openPicker(pk, pk.dataset.pick); return; }
+  const dv = t.closest('[data-tray]'); if (dv) { L.tray[dv.dataset.tray] = !L.tray[dv.dataset.tray]; save(); render(); return; }
+  const tt = t.closest('[data-traytoggle]'); if (tt) { L.tray[tt.dataset.traytoggle] = !L.tray[tt.dataset.traytoggle]; save(); render(); return; }
+  const sh = t.closest('.sh'); if (sh) { const k = sh.parentElement.dataset.sec; L.sec[k] = !sh.parentElement.classList.contains('open'); save(); render(); return; }
+  const ph = t.closest('.ph');
+  if (ph && !ph.closest('.floating')) { const id = ph.parentElement.dataset.id; L.open[id] = !L.open[id]; save(); render(); return; }
+  const set = t.closest('[data-set]');
+  if (set) { const [k, v] = set.dataset.set.split(':'); V[k] = v; render(); if (inPop && k === 'brush') openPicker($('[data-pick=brush]'), 'brush'); else if (inPop) closePop(); return; }
+  const tg = t.closest('[data-toggle]'); if (tg) { V[tg.dataset.toggle] = !V[tg.dataset.toggle]; render(); return; }
+  const act = t.closest('[data-act]'); if (act) { if (inPop) closePop(); doAction(act.dataset.act); return; }
+  if (!inPop) closePop();
+  if (!t.closest('#drop') && !t.closest('#mbar')) { closeDrop(); render(); }
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Tab') { e.preventDefault(); setFocus(!document.body.classList.contains('focus')); }
+  if (e.key === 'Escape') { if (dropId || pop.style.display === 'block') { closeDrop(); closePop(); render(); } else setFocus(false); }
+  const n = parseInt(e.key); if (n >= 1 && n <= 5 && !e.ctrlKey) { V.brush = BRUSHES[n - 1][0]; render(); }
+  if (e.key === '[') { V.radius = Math.max(0.02, +(V.radius - 0.02).toFixed(2)); render(); }
+  if (e.key === ']') { V.radius = Math.min(1, +(V.radius + 0.02).toFixed(2)); render(); }
+  if (e.key === 'f' || e.key === 'F') flash('Framed mesh');
+});
+
+/* ============================================================
+   Pointer: sliders, pen-drag scrolling, palette dragging
+   ============================================================ */
+document.addEventListener('pointerdown', e => {
+  if (e.button !== 0 && e.pointerType === 'mouse') return;
+  const t = e.target;
+  const zs = t.closest('.zs'); if (zs) return sliderDrag(e, zs);
+  const cp = t.closest('.cp-sv,.cp-h'); if (cp) return colorDrag(e, cp);
+  const dk = t.closest('.dk'); if (dk) return paletteDrag(e, dk.closest('.pal').dataset.id);
+  if (t.closest('.ctl,#pop,.sh')) return;
+  const sc = t.closest('.scroller,.shelf-v'); if (sc) scrollDrag(e, sc);
+});
+
+function sliderDrag(e, zs) {
+  e.preventDefault(); e.stopPropagation();
+  const key = zs.dataset.key, min = +zs.dataset.min, max = +zs.dataset.max, step = +zs.dataset.step, suf = zs.dataset.suffix;
+  const apply = ev => {
+    const r = zs.getBoundingClientRect();
+    const f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+    let v = min + f * (max - min); v = Math.round(v / step) * step; V[key] = +v.toFixed(4);
+    // live update every slider bound to this key (shelf + palettes) without a full render
+    document.querySelectorAll(`.zs[data-key="${key}"]`).forEach(el => {
+      el.querySelector('.zf').style.width = ((V[key] - min) / (max - min) * 100) + '%';
+      el.querySelector('.zv').textContent = fmt(V[key], step) + suf;
+    });
+    if (key === 'radius') { $('#hud-r').textContent = V.radius.toFixed(2); const sz = 40 + V.radius * 180; const c = $('.cursor'); c.style.width = c.style.height = sz + 'px'; }
+    if (key === 'strength') $('#hud-s').textContent = V.strength.toFixed(2);
+    if (key === 'trayw') document.documentElement.style.setProperty('--trayw', V.trayw + 'px');
+  };
+  apply(e);
+  try { zs.setPointerCapture(e.pointerId); } catch (err) {}
+  const mv = ev => apply(ev);
+  const up = () => { zs.removeEventListener('pointermove', mv); zs.removeEventListener('pointerup', up); zs.removeEventListener('pointercancel', up); save(); render(); };
+  zs.addEventListener('pointermove', mv); zs.addEventListener('pointerup', up); zs.addEventListener('pointercancel', up);
+}
+
+/* colour picker: drag in the square (saturation/value) or the strip (hue) */
+function colorDrag(e, el) {
+  e.preventDefault(); e.stopPropagation();
+  const isHue = el.classList.contains('cp-h');
+  const apply = ev => {
+    const r = el.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)), fy = Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height));
+    if (isHue) V.color[0] = fy * 360; else { V.color[1] = fx; V.color[2] = 1 - fy; }
+    const [h, s, v] = V.color, sv = $('.cp-sv'), hs = $('.cp-h i'), m = sv.querySelector('i');
+    sv.style.background = `linear-gradient(to top,#000,rgba(0,0,0,0)),linear-gradient(to right,#fff,hsl(${h} 100% 50%))`;
+    m.style.left = s * 100 + '%'; m.style.top = (1 - v) * 100 + '%'; hs.style.top = h / 360 * 100 + '%';
+    $('.cp-sw i').style.background = colorHex(V.color); $('.cp-hex').textContent = colorHex(V.color);
+  };
+  apply(e);
+  try { el.setPointerCapture(e.pointerId); } catch (err) {}
+  const mv = ev => apply(ev);
+  const up = () => { el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up); };
+  el.addEventListener('pointermove', mv); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+}
+
+/* drag anywhere on tray / palette background (pen, touch or mouse) to scroll */
+function scrollDrag(e, el) {
+  const sx = e.clientX, sy = e.clientY, st = el.scrollTop, sl = el.scrollLeft;
+  const horizontal = el.classList.contains('h');
+  let moved = false, lastY = sy, lastT = performance.now(), vel = 0;
+  try { el.setPointerCapture(e.pointerId); } catch (err) {}
+  const mv = ev => {
+    const dx = ev.clientX - sx, dy = ev.clientY - sy;
+    if (!moved && Math.hypot(dx, dy) < 4) return;
+    moved = true;
+    if (horizontal) el.scrollLeft = sl - dx; else el.scrollTop = st - dy;
+    const now = performance.now(); vel = (ev.clientY - lastY) / Math.max(1, now - lastT); lastY = ev.clientY; lastT = now;
+  };
+  const up = () => {
+    el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up);
+    if (!moved) return;
+    suppressClick = true; setTimeout(() => suppressClick = false, 0);
+    if (!horizontal && Math.abs(vel) > 0.3) { let v = vel * 16; const tick = () => { el.scrollTop -= v; v *= 0.9; if (Math.abs(v) > 0.5) requestAnimationFrame(tick); }; requestAnimationFrame(tick); }
+  };
+  el.addEventListener('pointermove', mv); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+}
+
+/* drag a palette by its ◉ onto a canvas edge or between palettes in a tray */
+function paletteDrag(e, id) {
+  e.preventDefault();
+  const sx = e.clientX, sy = e.clientY;
+  let active = false, target = null, palEl = null;
+  const mv = ev => {
+    if (!active) {
+      if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 5) return;
+      active = true; document.body.classList.add('dragging'); closePop();
+      palEl = work.querySelector(`.pal[data-id="${id}"]`); if (palEl) palEl.classList.add('ghosted');
+      ghost.textContent = byId[id].title; ghost.style.display = 'block';
+    }
+    ghost.style.left = (ev.clientX + 10) + 'px'; ghost.style.top = (ev.clientY - 12) + 'px';
+    target = hitTest(ev.clientX, ev.clientY);
+    document.querySelectorAll('.zone.hot').forEach(z => z.classList.remove('hot'));
+    ins.style.display = 'none';
+    if (!target) return;
+    if (target.zone) target.zone.classList.add('hot');
+    else if (target.mark) { Object.assign(ins.style, target.mark); ins.style.display = 'block'; }
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up);
+    if (!active) return;
+    document.body.classList.remove('dragging'); ghost.style.display = 'none'; ins.style.display = 'none';
+    document.querySelectorAll('.zone.hot').forEach(z => z.classList.remove('hot'));
+    if (palEl) palEl.classList.remove('ghosted');
+    suppressClick = true; setTimeout(() => suppressClick = false, 0);
+    if (target) movePalette(id, target.side, target.index);
+  };
+  window.addEventListener('pointermove', mv); window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+}
+function hitTest(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  const zone = el.closest('.zone'); if (zone) return { side: zone.dataset.zone, index: null, zone };
+  const tray = el.closest('.tray'); if (!tray) return null;
+  const side = tray.dataset.side, horizontal = tray.classList.contains('h');
+  const pals = [...tray.querySelectorAll('.pal')];
+  let index = pals.length;
+  for (let i = 0; i < pals.length; i++) { const r = pals[i].getBoundingClientRect(); if ((horizontal ? x : y) < (horizontal ? r.left + r.width / 2 : r.top + r.height / 2)) { index = i; break; } }
+  const dr = tray.getBoundingClientRect(), last = pals[pals.length - 1];
+  const mark = horizontal
+    ? { left: ((index < pals.length ? pals[index].getBoundingClientRect().left : (last ? last.getBoundingClientRect().right : dr.left)) - 1) + 'px', top: dr.top + 'px', width: '2px', height: dr.height + 'px' }
+    : { left: dr.left + 'px', top: ((index < pals.length ? pals[index].getBoundingClientRect().top : (last ? last.getBoundingClientRect().bottom : dr.top)) - 1) + 'px', width: dr.width + 'px', height: '2px' };
+  return { side, index, mark };
+}
+
+/* ---- go ---- */
+L = load();
+render();
+// #open=<palette> and #pick=brush|material open those on load (handy for screenshots)
+const hp = new URLSearchParams(location.hash.slice(1));
+if (hp.get('open') && byId[hp.get('open')]) openDrop(hp.get('open'), $(`[data-mname="${hp.get('open')}"]`));
+if (hp.get('mat')) { V.material = hp.get('mat'); render(); }
+if (hp.get('pick')) openPicker($(`[data-pick="${hp.get('pick')}"]`), hp.get('pick'));
+</script>
+</body>
+</html>

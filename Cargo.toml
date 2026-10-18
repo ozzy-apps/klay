@@ -1,0 +1,27 @@
+[package]
+name = "klay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", features = ["winit", "x11", "wayland"] }
+egui-winit = "0.37"
+wgpu = "30.0"
+winit = "0.30"
+glam = { version = "0.34", features = ["bytemuck"] }
+rayon = "1.12"
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "1.0"
+env_logger = "0.11"
+log = "0.4"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+debug = 1
