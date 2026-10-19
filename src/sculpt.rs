@@ -2,6 +2,7 @@
 //! through `Selection`-based bulk operations.
 
 use crate::mesh::{SculptMesh, Selection};
+use crate::multires::{ChunkData, Level, Multires};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -54,9 +55,14 @@ impl Default for Brush {
     }
 }
 
-/// One undo step: the owned vertex positions of every chunk a stroke modified.
-pub struct UndoStep {
-    pub chunks: Vec<(u32, Vec<Vec3>)>,
+/// One undo step.
+pub enum UndoStep {
+    /// A stroke at `level`: the chunk data it replaced (positions at level 0, offsets
+    /// above it, see [`Multires::finish_stroke`]).
+    Stroke { level: usize, chunks: ChunkData },
+    /// A subdivision level was added. In the undo list the level is live (`None`); the
+    /// redo entry keeps the removed level so redo can put it back without recomputing it.
+    Divide(Option<Box<Level>>),
 }
 
 pub struct History {
@@ -90,16 +96,16 @@ impl History {
         }
     }
 
-    pub fn undo(&mut self, mesh: &mut SculptMesh) {
+    pub fn undo(&mut self, doc: &mut Multires) {
         if let Some(step) = self.undo.pop() {
-            let inverse = apply_step(mesh, step);
+            let inverse = apply_step(doc, step);
             self.redo.push(inverse);
         }
     }
 
-    pub fn redo(&mut self, mesh: &mut SculptMesh) {
+    pub fn redo(&mut self, doc: &mut Multires) {
         if let Some(step) = self.redo.pop() {
-            let inverse = apply_step(mesh, step);
+            let inverse = apply_step(doc, step);
             self.undo.push(inverse);
         }
     }
@@ -114,19 +120,27 @@ impl History {
         self.undo
             .iter()
             .chain(self.redo.iter())
-            .map(|s| s.chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>())
+            .map(|s| match s {
+                UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
+                UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
+            })
             .sum()
     }
 }
 
-/// Restore chunk positions from a step and return the inverse step.
-fn apply_step(mesh: &mut SculptMesh, mut step: UndoStep) -> UndoStep {
-    step.chunks.sort_unstable_by_key(|(c, _)| *c);
-    let chunk_ids: Vec<u32> = step.chunks.iter().map(|(c, _)| *c).collect();
-    let inverse = mesh.snapshot_chunks(&chunk_ids);
-    mesh.restore_chunks(&step.chunks);
-    mesh.finish_edit(&chunk_ids);
-    UndoStep { chunks: inverse }
+/// Apply a step and return its inverse.
+fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
+    match step {
+        UndoStep::Stroke { level, chunks } => UndoStep::Stroke {
+            level,
+            chunks: doc.restore(level, chunks),
+        },
+        UndoStep::Divide(None) => UndoStep::Divide(doc.pop_level().map(Box::new)),
+        UndoStep::Divide(Some(level)) => {
+            doc.push_level(*level);
+            UndoStep::Divide(None)
+        }
+    }
 }
 
 struct GrabState {
@@ -390,9 +404,9 @@ impl Stroke {
         mesh.finish_edit(&g.chunks);
     }
 
-    /// Finish the stroke and produce its undo step, if anything changed. A GPU grab is
-    /// applied to the CPU mesh here, once.
-    pub fn end(mut self, mesh: &mut SculptMesh) -> Option<UndoStep> {
+    /// Finish the stroke and return the positions it replaced, per chunk, if anything
+    /// changed. A GPU grab is applied to the CPU mesh here, once.
+    pub fn end(mut self, mesh: &mut SculptMesh) -> Option<ChunkData> {
         if let Some(g) = self.grab.take() {
             if g.gpu && g.delta != Vec3::ZERO {
                 let delta = g.delta;
@@ -400,13 +414,7 @@ impl Stroke {
                 mesh.finish_edit(&g.chunks);
             }
         }
-        if self.snapshots.is_empty() {
-            None
-        } else {
-            Some(UndoStep {
-                chunks: self.snapshots,
-            })
-        }
+        if self.snapshots.is_empty() { None } else { Some(self.snapshots) }
     }
 }
 

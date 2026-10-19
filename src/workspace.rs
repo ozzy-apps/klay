@@ -336,6 +336,16 @@ pub struct Model<'a> {
     pub vertices: usize,
     pub triangles: usize,
     pub chunks: usize,
+    /// Active subdivision level.
+    pub level: usize,
+    /// Vertex count of every level, lowest first.
+    pub levels: &'a [usize],
+    /// Vertices the next Divide would produce.
+    pub next_level_vertices: usize,
+    /// Divide is refused above this many vertices.
+    pub vertex_budget: &'a mut usize,
+    /// Memory held by all levels.
+    pub levels_bytes: usize,
     pub fps: f32,
     pub frame_ms: f32,
     pub stroke_ms: f32,
@@ -353,6 +363,10 @@ pub struct Actions {
     pub export: bool,
     pub undo: bool,
     pub redo: bool,
+    /// Add a subdivision level (ZBrush: Divide).
+    pub divide: bool,
+    /// Show this subdivision level (ZBrush: SDiv).
+    pub level: Option<usize>,
     pub frame: bool,
     pub zoom: f32,
     pub view: Option<(f32, f32)>,
@@ -1848,6 +1862,59 @@ impl Workspace {
                     ui,
                     h,
                     id,
+                    "geometry",
+                    "Geometry",
+                    None,
+                    true,
+                    true,
+                    &mut |_, ui| {
+                        let top = m.levels.len().saturating_sub(1);
+                        let fits = m.next_level_vertices <= *m.vertex_budget;
+                        if ui
+                            .add_enabled_ui(fits, |ui| full_button(ui, "Divide"))
+                            .inner
+                            .on_hover_text(format!(
+                                "Ctrl + D · next level ≈ {} vertices",
+                                crate::fmt_count(m.next_level_vertices)
+                            ))
+                            .on_disabled_hover_text(format!(
+                                "Next level ({} vertices) is over the budget",
+                                crate::fmt_count(m.next_level_vertices)
+                            ))
+                            .clicked()
+                        {
+                            a.divide = true;
+                        }
+                        let mut level = m.level as f32;
+                        ui.add_enabled_ui(top > 0, |ui| {
+                            if zslider(ui, "SDiv", &mut level, 0.0..=top.max(1) as f32, false, false, 0) {
+                                let l = level.round() as usize;
+                                if l != m.level {
+                                    a.level = Some(l);
+                                }
+                            }
+                        });
+                        kv(ui, "Level", &format!("{} of {}", m.level, top));
+                        kv(
+                            ui,
+                            "Vertices at level",
+                            &crate::fmt_count(m.levels.get(m.level).copied().unwrap_or(0)),
+                        );
+                        kv(ui, "Next level", &crate::fmt_count(m.next_level_vertices));
+                        let mut budget = *m.vertex_budget as f32 / 1e6;
+                        if zslider(ui, "Vertex budget (M)", &mut budget, 1.0..=120.0, true, false, 0) {
+                            *m.vertex_budget = (budget.round() * 1e6) as usize;
+                        }
+                        if top > 0 {
+                            kv(ui, "Levels in memory", &format!("{} MB", m.levels_bytes / 1_000_000));
+                        }
+                        note(ui, "D / Shift + D: higher / lower level");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
                     "rebuild",
                     "Rebuild",
                     None,
@@ -1970,6 +2037,8 @@ impl Workspace {
                             ("1 – 5", "brushes"),
                             ("Q W E R", "draw / move / scale / rotate"),
                             ("X", "symmetry"),
+                            ("Ctrl + D", "divide (add a subdivision level)"),
+                            ("D / Shift + D", "higher / lower subdivision level"),
                             ("F / Home", "frame mesh / reset view"),
                             ("P / Shift + P", "perspective / floor grid"),
                             ("Tab", "hide interface"),
@@ -3391,6 +3460,7 @@ mod tests {
     ) -> egui::FullOutput {
         let mut brush = Brush::default();
         let mut segments = 200;
+        let mut budget = 20_000_000usize;
         let mut path = String::from("test.obj");
         ctx.run_ui(
             egui::RawInput {
@@ -3413,6 +3483,11 @@ mod tests {
                         vertices: 240002,
                         triangles: 480000,
                         chunks: 128,
+                        level: 0,
+                        levels: &[240002],
+                        next_level_vertices: 960002,
+                        vertex_budget: &mut budget,
+                        levels_bytes: 0,
                         fps: 60.0,
                         frame_ms: 16.7,
                         stroke_ms: 0.0,

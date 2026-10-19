@@ -45,6 +45,7 @@ struct GpuGrab {
     _buffers: [wgpu::Buffer; 3],
 }
 
+/// GPU copy of one subdivision level.
 struct MeshBuffers {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
@@ -53,6 +54,10 @@ struct MeshBuffers {
     normal_bind_group: wgpu::BindGroup,
     index_count: u32,
     vertex_count: u32,
+    /// Per-chunk flags for the normal recompute pass.
+    dirty_flags: Vec<u32>,
+    // Kept alive for the bind group.
+    _normal_params: wgpu::Buffer,
 }
 
 pub struct Gfx {
@@ -67,14 +72,14 @@ pub struct Gfx {
     bind_group: wgpu::BindGroup,
     normal_pipeline: wgpu::ComputePipeline,
     normal_bgl: wgpu::BindGroupLayout,
-    normal_params: wgpu::Buffer,
     grab_pipeline: wgpu::ComputePipeline,
     grab_bgl: wgpu::BindGroupLayout,
     grab_params: wgpu::Buffer,
     grab: Option<GpuGrab>,
-    mesh: Option<MeshBuffers>,
-    /// Per-chunk flags for the normal recompute pass.
-    dirty_flags: Vec<u32>,
+    /// One entry per subdivision level, uploaded the first time the level is shown so
+    /// stepping between levels is a pointer swap.
+    levels: Vec<Option<MeshBuffers>>,
+    active: usize,
     needs_normals: bool,
     pub egui_renderer: egui_wgpu::Renderer,
     pub adapter_name: String,
@@ -319,13 +324,6 @@ impl Gfx {
             compilation_options: Default::default(),
             cache: None,
         });
-        let normal_params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("normal params"),
-            size: std::mem::size_of::<NormalParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // --- Grab compute pipeline ------------------------------------------------------
         let grab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grab"),
@@ -392,13 +390,12 @@ impl Gfx {
             bind_group,
             normal_pipeline,
             normal_bgl,
-            normal_params,
             grab_pipeline,
             grab_bgl,
             grab_params,
             grab: None,
-            mesh: None,
-            dirty_flags: Vec::new(),
+            levels: Vec::new(),
+            active: 0,
             needs_normals: false,
             egui_renderer,
             adapter_name,
@@ -418,8 +415,35 @@ impl Gfx {
         self.depth_view = create_depth(&self.device, width, height);
     }
 
-    /// Replace the GPU mesh with a full upload. Normals are computed on the GPU on the next frame.
-    pub fn upload_mesh(&mut self, mesh: &mut SculptMesh) {
+    /// Forget every uploaded level (the document was replaced).
+    pub fn clear_levels(&mut self) {
+        self.levels.clear();
+        self.active = 0;
+        self.grab = None;
+    }
+
+    /// Drop the GPU copies of levels at or above `count` (a level was removed).
+    pub fn truncate_levels(&mut self, count: usize) {
+        self.levels.truncate(count);
+        self.active = self.active.min(count.saturating_sub(1));
+    }
+
+    /// Display `level`, uploading it on first sight. Positions changed since the level was
+    /// last shown are re-uploaded by the next `upload_dirty`.
+    pub fn show_level(&mut self, mesh: &mut SculptMesh, level: usize) {
+        if self.levels.get(level).is_some_and(Option::is_some) {
+            self.active = level;
+        } else {
+            self.upload_level(mesh, level);
+        }
+    }
+
+    fn active_buffers(&self) -> Option<&MeshBuffers> {
+        self.levels.get(self.active).and_then(Option::as_ref)
+    }
+
+    /// Upload a level in full and display it. Normals are computed on the GPU on the next frame.
+    pub fn upload_level(&mut self, mesh: &mut SculptMesh, level: usize) {
         use wgpu::BufferUsages as U;
         let init = |label: &str, data: &[u8], usage: U| {
             self.device
@@ -462,13 +486,13 @@ impl Gfx {
             usage: U::STORAGE | U::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(
-            &self.normal_params,
-            0,
+        let normal_params = init(
+            "normal params",
             bytemuck::bytes_of(&NormalParams {
                 vertex_count: mesh.vertex_count() as u32,
                 _pad: [0; 3],
             }),
+            U::UNIFORM,
         );
         let normal_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("normals bg"),
@@ -504,11 +528,14 @@ impl Gfx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: self.normal_params.as_entire_binding(),
+                    resource: normal_params.as_entire_binding(),
                 },
             ],
         });
-        self.mesh = Some(MeshBuffers {
+        if self.levels.len() <= level {
+            self.levels.resize_with(level + 1, || None);
+        }
+        self.levels[level] = Some(MeshBuffers {
             positions,
             normals,
             indices,
@@ -516,8 +543,10 @@ impl Gfx {
             normal_bind_group,
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertex_count() as u32,
+            dirty_flags: vec![0; mesh.chunks.len()],
+            _normal_params: normal_params,
         });
-        self.dirty_flags = vec![0; mesh.chunks.len()];
+        self.active = level;
         for ch in &mut mesh.chunks {
             ch.dirty_pos = false;
             ch.dirty_nrm = true;
@@ -526,7 +555,9 @@ impl Gfx {
 
     /// Start a grab on the GPU: upload the selection, its original positions and weights once.
     pub fn begin_gpu_grab(&mut self, setup: crate::sculpt::GpuGrabSetup<'_>, flags: Vec<u32>) {
-        let Some(m) = &self.mesh else { return };
+        let Some(m) = self.active_buffers() else {
+            return;
+        };
         use wgpu::BufferUsages as U;
         let init = |label: &str, data: &[u8]| {
             self.device
@@ -592,13 +623,16 @@ impl Gfx {
     /// Re-upload positions of chunks whose vertices moved (runs of consecutive dirty chunks
     /// are merged into one copy each) and flag chunks whose normals must be recomputed.
     pub fn upload_dirty(&mut self, mesh: &mut SculptMesh) {
-        let Some(buffers) = &self.mesh else { return };
+        let Some(buffers) = self.levels.get_mut(self.active).and_then(Option::as_mut) else {
+            return;
+        };
+        debug_assert_eq!(buffers.dirty_flags.len(), mesh.chunks.len());
         let mut count = 0;
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut normal_chunks = 0;
         for (i, ch) in mesh.chunks.iter_mut().enumerate() {
             let nrm = std::mem::take(&mut ch.dirty_nrm);
-            self.dirty_flags[i] = nrm as u32;
+            buffers.dirty_flags[i] = nrm as u32;
             normal_chunks += nrm as usize;
             if !ch.dirty_pos {
                 continue;
@@ -657,7 +691,7 @@ impl Gfx {
         }
         if let Some(g) = &self.grab {
             if g.pending.is_some() {
-                for (f, &gf) in self.dirty_flags.iter_mut().zip(&g.flags) {
+                for (f, &gf) in buffers.dirty_flags.iter_mut().zip(&g.flags) {
                     *f |= gf;
                 }
                 normal_chunks = g.flags.iter().filter(|&&f| f != 0).count();
@@ -667,7 +701,7 @@ impl Gfx {
             self.queue.write_buffer(
                 &buffers.chunk_dirty,
                 0,
-                bytemuck::cast_slice(&self.dirty_flags),
+                bytemuck::cast_slice(&buffers.dirty_flags),
             );
         }
         self.needs_normals = normal_chunks > 0;
@@ -727,8 +761,8 @@ impl Gfx {
         }
 
         // Normal recompute for dirty chunks.
-        if let (Some(m), true) = (&self.mesh, self.needs_normals) {
-            self.needs_normals = false;
+        let needs_normals = std::mem::take(&mut self.needs_normals);
+        if let (Some(m), true) = (self.active_buffers(), needs_normals) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("normals"),
                 timestamp_writes: None,
@@ -777,7 +811,7 @@ impl Gfx {
             pass.set_pipeline(&self.background_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
-            if let Some(m) = &self.mesh {
+            if let Some(m) = self.active_buffers() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, m.positions.slice(..));

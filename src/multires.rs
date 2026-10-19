@@ -1,0 +1,932 @@
+//! Multiresolution subdivision levels, ZBrush style.
+//!
+//! Level 0 is the base mesh. Every level above it is the Loop subdivision of the level below
+//! (1:4 per triangle) plus a per-vertex offset: `P[k] = smooth(P[k-1]) + D[k]`. Sculpting at
+//! the active level edits its positions; the offsets of that level are refreshed for the
+//! touched chunks when the stroke ends. Levels above the active one are synced lazily: edits
+//! mark their chunks stale, and stepping up re-smooths the dependent child chunks and
+//! re-applies their offsets, one level at a time. Edits never flow downwards.
+//!
+//! Subdivision keeps chunk locality: each parent chunk's children (its vertices plus the
+//! midpoints of the edges it owns) are split spatially into child chunks, and every array of
+//! the child mesh is produced in parallel over chunks.
+
+use crate::mesh::{CHUNK_TARGET, Chunk, SculptMesh, partition_ids, split_ranges};
+use glam::Vec3;
+use rayon::prelude::*;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+const NONE: u32 = u32::MAX;
+
+/// How a child vertex is smoothed from its parent level. `[p, NONE, _, _]` is the even
+/// vertex above parent vertex `p` (its ring comes from the parent's adjacency); `[a, b, c, d]`
+/// is the odd vertex on parent edge `a-b` with opposite vertices `c` and `d` (`d == NONE` on a
+/// boundary edge).
+type Stencil = [u32; 4];
+
+/// Chunk positions saved for undo: at level 0 these are positions, above it offsets.
+pub type ChunkData = Vec<(u32, Vec<Vec3>)>;
+
+/// Connection from a level to the one below it.
+pub struct Link {
+    /// Per child vertex.
+    stencil: Vec<Stencil>,
+    /// Parent chunk -> child chunks with at least one vertex whose stencil reads it.
+    dependants: Vec<Vec<u32>>,
+}
+
+pub struct Level {
+    pub mesh: SculptMesh,
+    /// `None` for the base level.
+    link: Option<Link>,
+    /// Per chunk: offsets of the owned vertices from their smoothed positions. Empty while
+    /// nothing was ever sculpted in that chunk at this level (all zero).
+    offsets: Vec<Vec<Vec3>>,
+    /// Chunks whose positions changed since the level above was last synced.
+    stale: Vec<bool>,
+}
+
+impl Level {
+    fn base(mesh: SculptMesh) -> Self {
+        let n = mesh.chunks.len();
+        Self {
+            mesh,
+            link: None,
+            offsets: vec![Vec::new(); n],
+            stale: vec![false; n],
+        }
+    }
+
+    /// Approximate memory in bytes.
+    pub fn bytes(&self) -> usize {
+        let m = &self.mesh;
+        let mesh = m.positions.len() * 16
+            + m.indices.len() * 4
+            + (m.adj_verts.len() + m.vt_tris.len() + m.adj_offsets.len() + m.vt_offsets.len()) * 4;
+        let link = self.link.as_ref().map_or(0, |l| l.stencil.len() * 16);
+        let offsets: usize = self.offsets.iter().map(|o| o.len() * 12).sum();
+        mesh + link + offsets
+    }
+}
+
+/// Loop's weight for the ring of an even vertex of valence `n`.
+fn loop_beta(n: usize) -> f32 {
+    static TABLE: LazyLock<[f32; 64]> = LazyLock::new(|| std::array::from_fn(loop_beta_exact));
+    if n < 64 { TABLE[n] } else { loop_beta_exact(n) }
+}
+
+fn loop_beta_exact(n: usize) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
+    let t = 0.375 + 0.25 * (std::f32::consts::TAU / n as f32).cos();
+    (0.625 - t * t) / n as f32
+}
+
+/// Smoothed position of a child vertex from its parent level.
+#[inline]
+fn smooth(parent: &SculptMesh, s: Stencil) -> Vec3 {
+    let p = &parent.positions;
+    if s[1] == NONE {
+        let v = s[0] as usize;
+        let nb = parent.neighbors(s[0]);
+        let n = nb.len();
+        if n == 0 {
+            return p[v];
+        }
+        let beta = loop_beta(n);
+        let mut sum = Vec3::ZERO;
+        for &w in nb {
+            sum += p[w as usize];
+        }
+        p[v] * (1.0 - n as f32 * beta) + sum * beta
+    } else if s[3] == NONE {
+        (p[s[0] as usize] + p[s[1] as usize]) * 0.5
+    } else {
+        (p[s[0] as usize] + p[s[1] as usize]) * 0.375
+            + (p[s[2] as usize] + p[s[3] as usize]) * 0.125
+    }
+}
+
+/// Parent chunks a child vertex's stencil reads.
+fn stencil_chunks(parent: &SculptMesh, s: Stencil, out: &mut Vec<u32>) {
+    if s[1] == NONE {
+        out.push(parent.vert_chunk[s[0] as usize]);
+        for &w in parent.neighbors(s[0]) {
+            out.push(parent.vert_chunk[w as usize]);
+        }
+    } else {
+        for &v in &s {
+            if v != NONE {
+                out.push(parent.vert_chunk[v as usize]);
+            }
+        }
+    }
+}
+
+/// Triangles of `parent` that contain edge `a-b`, as `(triangle, corner of a, corner of b,
+/// opposite vertex)`, at most two of them, in the order of `a`'s incidence list.
+fn edge_tris(
+    parent: &SculptMesh,
+    a: u32,
+    b: u32,
+) -> impl Iterator<Item = (u32, u32, u32, u32)> + '_ {
+    parent
+        .incident(a)
+        .iter()
+        .filter_map(move |&t| {
+            let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+            let ia = tri.iter().position(|&x| x == a)? as u32;
+            let ib = tri.iter().position(|&x| x == b)? as u32;
+            let o = *tri.iter().find(|&&x| x != a && x != b)?;
+            Some((t, ia, ib, o))
+        })
+        .take(2)
+}
+
+/// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
+pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
+    let v_count = parent.vertex_count();
+    let pc = &parent.chunks;
+
+    // 1. Edge numbering: edge `v-w` with `v < w` belongs to `v`, and v's edges follow those of
+    // all lower vertices. Since vertices are sorted by chunk, each chunk owns an edge range.
+    let mut edge_base = vec![0u32; v_count + 1];
+    edge_base[1..]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(v, e)| {
+            *e = parent
+                .neighbors(v as u32)
+                .iter()
+                .filter(|&&w| w > v as u32)
+                .count() as u32;
+        });
+    for v in 0..v_count {
+        edge_base[v + 1] += edge_base[v];
+    }
+    let e_count = edge_base[v_count] as usize;
+    let n_count = v_count + e_count;
+    let edge_id = |a: u32, b: u32| -> u32 {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let k = parent
+            .neighbors(lo)
+            .iter()
+            .filter(|&&w| w > lo)
+            .position(|&w| w == hi)
+            .expect("edge of a known neighbour");
+        edge_base[lo as usize] + k as u32
+    };
+    // Natural ids: even vertex `v` is `v`, odd vertex of edge `e` is `v_count + e`.
+    let odd_nat = |a: u32, b: u32| (v_count as u32) + edge_id(a, b);
+
+    // 2. Odd stencils in edge order, filled per parent chunk.
+    let mut odd = vec![[NONE; 4]; e_count];
+    {
+        let ranges = pc.iter().map(|ch| {
+            (
+                edge_base[ch.vert_start as usize] as usize,
+                edge_base[ch.vert_end as usize] as usize,
+            )
+        });
+        split_ranges(&mut odd, ranges)
+            .into_par_iter()
+            .zip(pc.par_iter())
+            .for_each(|(slice, ch)| {
+                let mut k = 0;
+                for v in ch.vert_start..ch.vert_end {
+                    for &w in parent.neighbors(v) {
+                        if w <= v {
+                            continue;
+                        }
+                        let mut s = [v, w, NONE, NONE];
+                        for (i, (_, _, _, o)) in edge_tris(parent, v, w).enumerate() {
+                            s[2 + i] = o;
+                        }
+                        slice[k] = s;
+                        k += 1;
+                    }
+                }
+            });
+    }
+
+    // 3. Smoothed positions in natural order.
+    let mut pos_nat = vec![Vec3::ZERO; n_count];
+    {
+        let (even, odd_pos) = pos_nat.split_at_mut(v_count);
+        even.par_iter_mut()
+            .enumerate()
+            .for_each(|(v, p)| *p = smooth(parent, [v as u32, NONE, 0, 0]));
+        odd_pos
+            .par_iter_mut()
+            .zip(odd.par_iter())
+            .for_each(|(p, s)| *p = smooth(parent, *s));
+    }
+
+    // 4. Child chunks: each parent chunk's vertices and the midpoints of the edges it owns,
+    // split spatially into groups of at most CHUNK_TARGET.
+    let per_parent: Vec<Vec<Vec<u32>>> = pc
+        .par_iter()
+        .map(|ch| {
+            let (s, e) = ch.range();
+            let (es, ee) = (edge_base[s] as usize, edge_base[e] as usize);
+            let mut ids: Vec<u32> = (s as u32..e as u32).collect();
+            ids.extend((v_count + es) as u32..(v_count + ee) as u32);
+            partition_ids(ids, &pos_nat)
+        })
+        .collect();
+    let mut groups: Vec<Vec<u32>> = Vec::with_capacity(pc.len() * 4);
+    for g in per_parent {
+        groups.extend(g);
+    }
+    let c_count = groups.len();
+    let mut chunk_start = Vec::with_capacity(c_count + 1);
+    chunk_start.push(0u32);
+    for g in &groups {
+        chunk_start.push(chunk_start.last().unwrap() + g.len() as u32);
+    }
+    debug_assert_eq!(*chunk_start.last().unwrap() as usize, n_count);
+    let ranges = || {
+        chunk_start
+            .windows(2)
+            .map(|w| (w[0] as usize, w[1] as usize))
+    };
+
+    // 5. Natural -> final ids. Every natural id is in exactly one group, so the parallel
+    // scatter never writes a slot twice.
+    let remap: Vec<AtomicU32> = (0..n_count).map(|_| AtomicU32::new(0)).collect();
+    groups
+        .par_iter()
+        .zip(chunk_start.par_iter())
+        .for_each(|(g, &start)| {
+            for (i, &nat) in g.iter().enumerate() {
+                remap[nat as usize].store(start + i as u32, Relaxed);
+            }
+        });
+    let rm = |nat: u32| remap[nat as usize].load(Relaxed);
+
+    // 6. Per-vertex arrays in final order, and the CSR counts.
+    let mut positions = vec![Vec3::ZERO; n_count];
+    let mut vert_chunk = vec![0u32; n_count];
+    let mut stencil = vec![[0u32; 4]; n_count];
+    let mut adj_offsets = vec![0u32; n_count + 1];
+    let mut vt_offsets = vec![0u32; n_count + 1];
+    {
+        let shifted = || ranges().map(|(s, e)| (s + 1, e + 1));
+        split_ranges(&mut positions, ranges())
+            .into_par_iter()
+            .zip(split_ranges(&mut vert_chunk, ranges()))
+            .zip(split_ranges(&mut stencil, ranges()))
+            .zip(split_ranges(&mut adj_offsets, shifted()))
+            .zip(split_ranges(&mut vt_offsets, shifted()))
+            .zip(groups.par_iter())
+            .enumerate()
+            .for_each(|(ci, (((((p, vc), st), ac), tc), g))| {
+                for (i, &nat) in g.iter().enumerate() {
+                    p[i] = pos_nat[nat as usize];
+                    vc[i] = ci as u32;
+                    let s = if (nat as usize) < v_count {
+                        [nat, NONE, 0, 0]
+                    } else {
+                        odd[nat as usize - v_count]
+                    };
+                    st[i] = s;
+                    if s[1] == NONE {
+                        ac[i] = parent.neighbors(s[0]).len() as u32;
+                        tc[i] = parent.incident(s[0]).len() as u32;
+                    } else {
+                        let opp = (s[2] != NONE) as u32 + (s[3] != NONE) as u32;
+                        ac[i] = 2 + 2 * opp;
+                        tc[i] = 3 * opp;
+                    }
+                }
+            });
+    }
+    drop(pos_nat);
+    drop(odd);
+    for i in 0..n_count {
+        adj_offsets[i + 1] += adj_offsets[i];
+        vt_offsets[i + 1] += vt_offsets[i];
+    }
+
+    // 7. Adjacency and incidence lists, filled per chunk. Child triangle `4t + k` is the
+    // corner of parent triangle `t` at its k-th vertex (k < 3) or its centre (k == 3).
+    let mut adj_verts = vec![0u32; adj_offsets[n_count] as usize];
+    let mut vt_tris = vec![0u32; vt_offsets[n_count] as usize];
+    {
+        let adj_ranges = ranges().map(|(s, e)| (adj_offsets[s] as usize, adj_offsets[e] as usize));
+        let vt_ranges = ranges().map(|(s, e)| (vt_offsets[s] as usize, vt_offsets[e] as usize));
+        split_ranges(&mut adj_verts, adj_ranges)
+            .into_par_iter()
+            .zip(split_ranges(&mut vt_tris, vt_ranges))
+            .zip(ranges().collect::<Vec<_>>().into_par_iter())
+            .for_each(|((adj, vt), (s, e))| {
+                let (a0, t0) = (adj_offsets[s] as usize, vt_offsets[s] as usize);
+                for j in s..e {
+                    let st = stencil[j];
+                    let adj =
+                        &mut adj[adj_offsets[j] as usize - a0..adj_offsets[j + 1] as usize - a0];
+                    let vt = &mut vt[vt_offsets[j] as usize - t0..vt_offsets[j + 1] as usize - t0];
+                    if st[1] == NONE {
+                        let p = st[0];
+                        for (k, &w) in parent.neighbors(p).iter().enumerate() {
+                            adj[k] = rm(odd_nat(p, w));
+                        }
+                        for (k, &t) in parent.incident(p).iter().enumerate() {
+                            let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                            let corner = tri.iter().position(|&x| x == p).unwrap() as u32;
+                            vt[k] = 4 * t + corner;
+                        }
+                    } else {
+                        let [a, b, c, d] = st;
+                        adj[0] = rm(a);
+                        adj[1] = rm(b);
+                        let mut k = 2;
+                        for o in [c, d] {
+                            if o != NONE {
+                                adj[k] = rm(odd_nat(a, o));
+                                adj[k + 1] = rm(odd_nat(b, o));
+                                k += 2;
+                            }
+                        }
+                        for (k, (t, ia, ib, _)) in edge_tris(parent, a, b).enumerate() {
+                            vt[3 * k] = 4 * t + ia;
+                            vt[3 * k + 1] = 4 * t + ib;
+                            vt[3 * k + 2] = 4 * t + 3;
+                        }
+                    }
+                    adj.sort_unstable();
+                }
+            });
+    }
+
+    // 8. Triangles, four per parent triangle, same winding.
+    let mut indices = vec![0u32; parent.indices.len() * 4];
+    indices
+        .par_chunks_mut(12)
+        .zip(parent.indices.par_chunks(3))
+        .for_each(|(out, tri)| {
+            let [a, b, c] = [tri[0], tri[1], tri[2]];
+            let (ab, bc, ca) = (rm(odd_nat(a, b)), rm(odd_nat(b, c)), rm(odd_nat(c, a)));
+            let (a, b, c) = (rm(a), rm(b), rm(c));
+            out.copy_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
+        });
+
+    // 9. Each chunk lists the triangles whose first vertex it owns: the corner triangles of
+    // its even vertices and the centre triangles whose first edge its odd vertices split.
+    let tris: Vec<Vec<u32>> = ranges()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(s, e)| {
+            let mut out = Vec::with_capacity((e - s) * 2);
+            for st in &stencil[s..e] {
+                if st[1] == NONE {
+                    let p = st[0];
+                    for &t in parent.incident(p) {
+                        let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                        let corner = tri.iter().position(|&x| x == p).unwrap() as u32;
+                        out.push(4 * t + corner);
+                    }
+                } else {
+                    for (t, ia, ib, _) in edge_tris(parent, st[0], st[1]) {
+                        if ia + ib == 1 {
+                            out.push(4 * t + 3);
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+    let chunks: Vec<Chunk> = ranges()
+        .zip(tris)
+        .map(|((s, e), tris)| Chunk::new(s as u32, e as u32, tris))
+        .collect();
+
+    // 10. Which child chunks read which parent chunks.
+    let deps: Vec<Vec<u32>> = ranges()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(s, e)| {
+            let mut out = Vec::new();
+            for st in &stencil[s..e] {
+                stencil_chunks(parent, *st, &mut out);
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+    let mut dependants = vec![Vec::new(); pc.len()];
+    for (child, d) in deps.iter().enumerate() {
+        for &p in d {
+            dependants[p as usize].push(child as u32);
+        }
+    }
+
+    let mesh = SculptMesh::assemble(
+        positions,
+        indices,
+        chunks,
+        vert_chunk,
+        adj_offsets,
+        adj_verts,
+        vt_offsets,
+        vt_tris,
+    );
+    debug_assert!(
+        mesh.chunks
+            .iter()
+            .all(|c| (c.vert_end - c.vert_start) as usize <= CHUNK_TARGET)
+    );
+    (
+        mesh,
+        Link {
+            stencil,
+            dependants,
+        },
+    )
+}
+
+/// The level stack.
+pub struct Multires {
+    levels: Vec<Level>,
+    active: usize,
+    /// Divide is refused when the next level would have more vertices than this.
+    pub budget: usize,
+}
+
+impl Multires {
+    pub fn new(mesh: SculptMesh, budget: usize) -> Self {
+        Self {
+            levels: vec![Level::base(mesh)],
+            active: 0,
+            budget,
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn count(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub fn top(&self) -> usize {
+        self.levels.len() - 1
+    }
+
+    /// The mesh being displayed and sculpted.
+    pub fn mesh(&self) -> &SculptMesh {
+        &self.levels[self.active].mesh
+    }
+
+    pub fn mesh_mut(&mut self) -> &mut SculptMesh {
+        &mut self.levels[self.active].mesh
+    }
+
+    #[cfg(test)]
+    pub fn level_mesh(&self, level: usize) -> &SculptMesh {
+        &self.levels[level].mesh
+    }
+
+    /// Vertex count per level, lowest first.
+    pub fn vertex_counts(&self) -> Vec<usize> {
+        self.levels.iter().map(|l| l.mesh.vertex_count()).collect()
+    }
+
+    /// Vertices the level above the top one would have.
+    pub fn next_vertex_count(&self) -> usize {
+        let m = &self.levels[self.top()].mesh;
+        m.vertex_count() + m.edge_count()
+    }
+
+    pub fn can_divide(&self) -> bool {
+        self.next_vertex_count() <= self.budget
+    }
+
+    /// Approximate memory of all levels, in bytes.
+    pub fn bytes(&self) -> usize {
+        self.levels.iter().map(Level::bytes).sum()
+    }
+
+    /// Subdivide the top level and make the new level active. Returns false when the
+    /// budget would be exceeded.
+    pub fn divide(&mut self) -> bool {
+        if !self.can_divide() {
+            return false;
+        }
+        let top = self.top();
+        self.sync_to(top);
+        let (mesh, link) = subdivide(&self.levels[top].mesh);
+        let n = mesh.chunks.len();
+        self.levels.push(Level {
+            mesh,
+            link: Some(link),
+            offsets: vec![Vec::new(); n],
+            stale: vec![false; n],
+        });
+        self.levels[top].stale.iter_mut().for_each(|s| *s = false);
+        self.active = top + 1;
+        true
+    }
+
+    /// Change the displayed level, syncing upwards as needed. Returns the number of chunks
+    /// that were re-smoothed on the way up.
+    pub fn set_active(&mut self, level: usize) -> usize {
+        let level = level.min(self.top());
+        let synced = if level > self.active {
+            self.sync_to(level)
+        } else {
+            0
+        };
+        self.active = level;
+        synced
+    }
+
+    /// Bring every level up to `level` in line with the edits below it. Returns the number
+    /// of chunks re-smoothed.
+    pub fn sync_to(&mut self, level: usize) -> usize {
+        (0..level.min(self.top())).map(|l| self.sync_level(l)).sum()
+    }
+
+    /// Make level `l + 1` consistent with the stale chunks of level `l`. Returns the number
+    /// of child chunks recomputed.
+    fn sync_level(&mut self, l: usize) -> usize {
+        let (lower, upper) = self.levels.split_at_mut(l + 1);
+        let parent = &mut lower[l];
+        let child = &mut upper[0];
+        let stale: Vec<u32> = parent
+            .stale
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| i as u32)
+            .collect();
+        if stale.is_empty() {
+            return 0;
+        }
+        let link = child
+            .link
+            .as_ref()
+            .expect("level above the base has a link");
+        let mut targets: Vec<u32> = stale
+            .iter()
+            .flat_map(|&c| link.dependants[c as usize].iter().copied())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let pm = &parent.mesh;
+        let Level { mesh, offsets, .. } = child;
+        let SculptMesh {
+            positions, chunks, ..
+        } = mesh;
+        split_ranges(
+            positions,
+            targets.iter().map(|&t| chunks[t as usize].range()),
+        )
+        .into_par_iter()
+        .zip(targets.par_iter())
+        .for_each(|(slice, &t)| {
+            let s = chunks[t as usize].vert_start as usize;
+            let off = &offsets[t as usize];
+            for (i, p) in slice.iter_mut().enumerate() {
+                let base = smooth(pm, link.stencil[s + i]);
+                *p = if off.is_empty() { base } else { base + off[i] };
+            }
+        });
+        mesh.finish_edit(&targets);
+        for &c in &stale {
+            parent.stale[c as usize] = false;
+        }
+        for &t in &targets {
+            child.stale[t as usize] = true;
+        }
+        targets.len()
+    }
+
+    /// Record a finished stroke at `level`: `snapshot` holds the positions of the touched
+    /// chunks before the stroke. Refreshes the level's offsets for those chunks and marks
+    /// them stale for the level above. Returns the chunk data an undo needs (positions at
+    /// level 0, offsets above it).
+    pub fn finish_stroke(&mut self, level: usize, mut snapshot: ChunkData) -> ChunkData {
+        if level == 0 {
+            for (c, _) in &snapshot {
+                self.levels[0].stale[*c as usize] = true;
+            }
+            return snapshot;
+        }
+        let (lower, upper) = self.levels.split_at_mut(level);
+        let parent = &lower[level - 1].mesh;
+        let lvl = &mut upper[0];
+        let link = lvl.link.as_ref().unwrap();
+        let mesh = &lvl.mesh;
+        // One smoothing pass per touched chunk gives both the old offsets (for undo) and the
+        // new ones.
+        let new: Vec<(u32, Vec<Vec3>)> = snapshot
+            .par_iter_mut()
+            .map(|(c, saved)| {
+                let (s, e) = mesh.chunks[*c as usize].range();
+                let mut now = Vec::with_capacity(e - s);
+                for i in 0..e - s {
+                    let base = smooth(parent, link.stencil[s + i]);
+                    saved[i] -= base;
+                    now.push(mesh.positions[s + i] - base);
+                }
+                (*c, now)
+            })
+            .collect();
+        for (c, off) in new {
+            lvl.offsets[c as usize] = off;
+            lvl.stale[c as usize] = true;
+        }
+        snapshot
+    }
+
+    /// Restore chunk data saved by [`finish_stroke`](Self::finish_stroke) or a previous
+    /// restore, and return the data that undoes this restore. The displayed level is kept
+    /// in sync.
+    pub fn restore(&mut self, level: usize, mut saved: ChunkData) -> ChunkData {
+        saved.sort_unstable_by_key(|(c, _)| *c);
+        let ids: Vec<u32> = saved.iter().map(|(c, _)| *c).collect();
+        let inverse = if level == 0 {
+            let mesh = &mut self.levels[0].mesh;
+            let inverse = mesh.snapshot_chunks(&ids);
+            mesh.restore_chunks(&saved);
+            mesh.finish_edit(&ids);
+            inverse
+        } else {
+            // Offsets only mean something against a parent the level is in sync with.
+            self.sync_to(level);
+            let (lower, upper) = self.levels.split_at_mut(level);
+            let parent = &lower[level - 1].mesh;
+            let lvl = &mut upper[0];
+            let link = lvl.link.as_ref().unwrap();
+            let mut inverse = Vec::with_capacity(saved.len());
+            for (c, data) in saved {
+                let n = data.len();
+                let old = std::mem::replace(&mut lvl.offsets[c as usize], data);
+                inverse.push((
+                    c,
+                    if old.is_empty() {
+                        vec![Vec3::ZERO; n]
+                    } else {
+                        old
+                    },
+                ));
+            }
+            let Level { mesh, offsets, .. } = lvl;
+            let SculptMesh {
+                positions, chunks, ..
+            } = mesh;
+            split_ranges(positions, ids.iter().map(|&c| chunks[c as usize].range()))
+                .into_par_iter()
+                .zip(ids.par_iter())
+                .for_each(|(slice, &c)| {
+                    let s = chunks[c as usize].vert_start as usize;
+                    let off = &offsets[c as usize];
+                    for (i, p) in slice.iter_mut().enumerate() {
+                        *p = smooth(parent, link.stencil[s + i]) + off[i];
+                    }
+                });
+            mesh.finish_edit(&ids);
+            inverse
+        };
+        for &c in &ids {
+            self.levels[level].stale[c as usize] = true;
+        }
+        if self.active > level {
+            self.sync_to(self.active);
+        }
+        inverse
+    }
+
+    /// Remove the top level (undo of a divide). The base level stays.
+    pub fn pop_level(&mut self) -> Option<Level> {
+        if self.levels.len() <= 1 {
+            return None;
+        }
+        let level = self.levels.pop();
+        self.active = self.active.min(self.top());
+        level
+    }
+
+    /// Put back a level removed by [`pop_level`](Self::pop_level) (redo of a divide) and show it.
+    pub fn push_level(&mut self, level: Level) {
+        self.levels.push(level);
+        let top = self.top();
+        self.set_active(top);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::cube_sphere;
+    use std::collections::HashSet;
+
+    fn sphere(segments: u32) -> SculptMesh {
+        let (p, i) = cube_sphere(segments, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    fn check_tables(m: &SculptMesh) {
+        let n = m.vertex_count();
+        // Adjacency and incidence rebuilt by brute force from the triangle list.
+        let mut adj: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        let mut vt: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        for (t, tri) in m.indices.chunks_exact(3).enumerate() {
+            for k in 0..3 {
+                vt[tri[k] as usize].insert(t as u32);
+                adj[tri[k] as usize].insert(tri[(k + 1) % 3]);
+                adj[tri[k] as usize].insert(tri[(k + 2) % 3]);
+            }
+        }
+        for v in 0..n as u32 {
+            let got: HashSet<u32> = m.neighbors(v).iter().copied().collect();
+            assert_eq!(got, adj[v as usize], "adjacency of {v}");
+            assert!(
+                m.neighbors(v).windows(2).all(|w| w[0] < w[1]),
+                "adjacency sorted"
+            );
+            let got: HashSet<u32> = m.incident(v).iter().copied().collect();
+            assert_eq!(got, vt[v as usize], "incidence of {v}");
+        }
+        // Every triangle is listed by exactly one chunk, the one owning its first vertex.
+        let mut seen = vec![0u32; m.triangle_count()];
+        for (ci, ch) in m.chunks.iter().enumerate() {
+            for &t in &ch.tris {
+                seen[t as usize] += 1;
+                assert_eq!(m.vert_chunk[m.indices[3 * t as usize] as usize], ci as u32);
+            }
+            for v in ch.vert_start..ch.vert_end {
+                assert_eq!(m.vert_chunk[v as usize], ci as u32);
+            }
+            assert!((ch.vert_end - ch.vert_start) as usize <= CHUNK_TARGET);
+        }
+        assert!(seen.iter().all(|&s| s == 1), "triangle listed once");
+    }
+
+    #[test]
+    fn subdivision_is_one_to_four_and_consistent() {
+        let base = sphere(12);
+        let (child, link) = subdivide(&base);
+        assert_eq!(
+            child.vertex_count(),
+            base.vertex_count() + base.edge_count()
+        );
+        assert_eq!(child.triangle_count(), 4 * base.triangle_count());
+        // Closed surface: Euler characteristic 2 at both levels.
+        let euler = |m: &SculptMesh| {
+            m.vertex_count() as i64 - m.edge_count() as i64 + m.triangle_count() as i64
+        };
+        assert_eq!(euler(&base), 2);
+        assert_eq!(euler(&child), 2);
+        check_tables(&child);
+        assert_eq!(link.stencil.len(), child.vertex_count());
+        assert_eq!(link.dependants.len(), base.chunks.len());
+        // Loop subdivision of a unit sphere stays close to it and shrinks slightly.
+        let r: Vec<f32> = child.positions.iter().map(|p| p.length()).collect();
+        let mean = r.iter().sum::<f32>() / r.len() as f32;
+        assert!(mean < 1.0 && mean > 0.98, "mean radius {mean}");
+        assert!(r.iter().all(|&x| x > 0.97 && x <= 1.0001));
+        // Outward winding kept: every triangle's normal points away from the origin.
+        for tri in child.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                child.positions[tri[0] as usize],
+                child.positions[tri[1] as usize],
+                child.positions[tri[2] as usize],
+            );
+            assert!((b - a).cross(c - a).dot(a) > 0.0);
+        }
+    }
+
+    #[test]
+    fn second_level_nests_in_chunks() {
+        let base = sphere(40);
+        let (l1, _) = subdivide(&base);
+        check_tables(&l1);
+        let (l2, _) = subdivide(&l1);
+        assert_eq!(l2.vertex_count(), l1.vertex_count() + l1.edge_count());
+        check_tables(&l2);
+        // Same surface, same bounds.
+        let (b0, b2) = (base.bounds(), l2.bounds());
+        assert!((b0.max - b2.max).length() < 0.02 && (b0.min - b2.min).length() < 0.02);
+    }
+
+    #[test]
+    fn divide_respects_budget() {
+        let mut mr = Multires::new(sphere(8), 2000);
+        let next = mr.next_vertex_count();
+        assert!(next > 1000 && next < 2000);
+        assert!(mr.divide());
+        assert_eq!(mr.count(), 2);
+        assert_eq!(mr.active(), 1);
+        assert!(!mr.can_divide());
+        assert!(!mr.divide());
+        assert_eq!(mr.count(), 2);
+    }
+
+    /// Move the vertex nearest `p` at the active level by `delta` through the stroke path.
+    fn nudge(mr: &mut Multires, p: Vec3, delta: Vec3) -> ChunkData {
+        let level = mr.active();
+        let mesh = mr.mesh_mut();
+        let v = (0..mesh.vertex_count() as u32)
+            .min_by(|&a, &b| {
+                (mesh.positions[a as usize] - p)
+                    .length_squared()
+                    .total_cmp(&(mesh.positions[b as usize] - p).length_squared())
+            })
+            .unwrap();
+        let c = mesh.vert_chunk[v as usize];
+        let snapshot = mesh.snapshot_chunks(&[c]);
+        mesh.positions[v as usize] += delta;
+        mesh.finish_edit(&[c]);
+        mr.finish_stroke(level, snapshot)
+    }
+
+    #[test]
+    fn lower_level_edits_propagate_and_detail_survives() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        assert!(mr.divide());
+        assert!(mr.divide());
+        let top0 = mr.mesh().positions.clone();
+        // Detail at the top level.
+        let d = Vec3::new(0.0, 0.0, 0.3);
+        nudge(&mut mr, Vec3::Z, d);
+        let top1 = mr.mesh().positions.clone();
+        let moved = top1.iter().zip(&top0).filter(|(a, b)| a != b).count();
+        assert_eq!(moved, 1);
+        // Edit the base in the same area and come back up.
+        mr.set_active(0);
+        assert_eq!(mr.active(), 0);
+        let base_before = mr.mesh().positions.clone();
+        nudge(&mut mr, Vec3::Z, Vec3::new(0.0, 0.0, 0.5));
+        mr.set_active(2);
+        let top2 = &mr.mesh().positions;
+        // The base edit reached the top: the region near +Z moved outwards...
+        let near: Vec<usize> = (0..top2.len()).filter(|&i| top0[i].z > 0.9).collect();
+        assert!(!near.is_empty());
+        assert!(near.iter().any(|&i| top2[i].z > top1[i].z + 0.01));
+        // ...the far side did not...
+        assert!(
+            (0..top2.len())
+                .filter(|&i| top0[i].z < 0.0)
+                .all(|i| top2[i] == top1[i])
+        );
+        // ...and the detail offset is still exactly on top of the smoothed surface.
+        let lvl2 = &mr.levels[2];
+        let link = lvl2.link.as_ref().unwrap();
+        let vd = (0..top1.len()).find(|&i| top1[i] != top0[i]).unwrap();
+        let smooth_now = smooth(&mr.levels[1].mesh, link.stencil[vd]);
+        let c = lvl2.mesh.vert_chunk[vd] as usize;
+        let i = vd - lvl2.mesh.chunks[c].vert_start as usize;
+        assert!((lvl2.offsets[c][i] - d).length() < 1e-5);
+        assert!((top2[vd] - (smooth_now + d)).length() < 1e-5);
+        // Stepping down shows the lower level untouched by the top-level detail.
+        mr.set_active(0);
+        let base_now = &mr.mesh().positions;
+        let changed = base_now
+            .iter()
+            .zip(&base_before)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn undo_works_at_every_level() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        let base0 = mr.mesh().positions.clone();
+        let undo_a = nudge(&mut mr, Vec3::X, Vec3::X * 0.2);
+        assert!(mr.divide());
+        let l1_after_a = mr.mesh().positions.clone();
+        let undo_b = nudge(&mut mr, Vec3::X, Vec3::X * 0.1);
+        assert_ne!(mr.mesh().positions, l1_after_a);
+        // Undo the level-1 stroke: offsets return to zero, so the level is the plain
+        // subdivision of the (still edited) base.
+        let redo_b = mr.restore(1, undo_b);
+        assert_eq!(mr.mesh().positions, l1_after_a);
+        // Undo the level-0 stroke while level 1 is displayed: the display follows.
+        let redo_a = mr.restore(0, undo_a);
+        assert_eq!(mr.level_mesh(0).positions, base0);
+        let (fresh, _) = subdivide(mr.level_mesh(0));
+        assert_eq!(mr.mesh().positions, fresh.positions);
+        // Redo both.
+        mr.restore(0, redo_a);
+        assert_eq!(mr.mesh().positions, l1_after_a);
+        mr.restore(1, redo_b);
+        assert_ne!(mr.mesh().positions, l1_after_a);
+        // Undo / redo of the divide itself.
+        let saved = mr.pop_level().unwrap();
+        assert_eq!(mr.count(), 1);
+        assert_eq!(mr.active(), 0);
+        let n = saved.mesh.vertex_count();
+        mr.push_level(saved);
+        assert_eq!(mr.count(), 2);
+        assert_eq!(mr.active(), 1);
+        assert_eq!(mr.mesh().vertex_count(), n);
+    }
+}

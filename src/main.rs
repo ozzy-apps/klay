@@ -1,5 +1,6 @@
 mod camera;
 mod mesh;
+mod multires;
 mod render;
 mod sculpt;
 mod workspace;
@@ -7,8 +8,9 @@ mod workspace;
 use camera::Camera;
 use glam::{Vec2, Vec3};
 use mesh::{SculptMesh, cube_sphere};
+use multires::Multires;
 use render::{Gfx, Uniforms};
-use sculpt::{Brush, BrushKind, History, Stroke};
+use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
 use workspace::{Mode, QuickPopup};
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,7 +77,8 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
 
-    mesh: SculptMesh,
+    /// The subdivision level stack; the active level is what is shown and sculpted.
+    doc: Multires,
     camera: Camera,
     brush: Brush,
     history: History,
@@ -102,6 +105,12 @@ struct App {
     pending_export: bool,
     pending_undo: bool,
     pending_redo: bool,
+    pending_divide: bool,
+    pending_level: Option<usize>,
+    /// Frames left in `--frames` mode (plain frame timing at the active level) and the
+    /// accumulated frame time.
+    measure: Option<(u32, f32)>,
+    quit: bool,
 
     // Stats.
     build_ms: f32,
@@ -123,7 +132,7 @@ struct App {
 }
 
 impl App {
-    fn new(segments: u32, demo: bool) -> Self {
+    fn new(segments: u32, demo: bool, budget: usize) -> Self {
         let t = Instant::now();
         let (p, i) = cube_sphere(segments, 1.0);
         let mesh = SculptMesh::from_raw(p, i);
@@ -133,7 +142,7 @@ impl App {
             gfx: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            mesh,
+            doc: Multires::new(mesh, budget),
             camera: Camera::new(),
             brush: Brush::default(),
             history: History::new(32),
@@ -155,6 +164,10 @@ impl App {
             pending_export: false,
             pending_undo: false,
             pending_redo: false,
+            pending_divide: false,
+            pending_level: None,
+            measure: None,
+            quit: false,
             build_ms,
             last_frame: Instant::now(),
             frame_ms: 0.0,
@@ -170,6 +183,66 @@ impl App {
             stress_upload: 0.0,
             stress_render: 0.0,
         }
+    }
+
+    fn mesh(&self) -> &SculptMesh {
+        self.doc.mesh()
+    }
+
+    /// Add a subdivision level above the top one and show it (ZBrush: Ctrl + D).
+    fn divide(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        if !self.doc.can_divide() {
+            self.workspace.notify(format!(
+                "Next level would have {} vertices, over the budget of {}",
+                fmt_count(self.doc.next_vertex_count()),
+                fmt_count(self.doc.budget)
+            ));
+            return;
+        }
+        let t = Instant::now();
+        self.doc.divide();
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.history.push(UndoStep::Divide(None));
+        self.show_active_level();
+        self.status = format!(
+            "Level {}: {} vertices, divided in {:.0} ms",
+            self.doc.active(),
+            fmt_count(self.mesh().vertex_count()),
+            ms
+        );
+        log::info!("{}", self.status);
+    }
+
+    /// Show another subdivision level (ZBrush: D up, Shift + D down).
+    fn set_level(&mut self, level: usize) {
+        if self.stroke.is_some() || level == self.doc.active() || level > self.doc.top() {
+            return;
+        }
+        let t = Instant::now();
+        self.doc.set_active(level);
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.show_active_level();
+        self.status = format!(
+            "Level {} of {}: {} vertices ({:.1} ms)",
+            self.doc.active(),
+            self.doc.top(),
+            fmt_count(self.mesh().vertex_count()),
+            ms
+        );
+        log::info!("{}", self.status);
+    }
+
+    /// Point the renderer at the active level after it changed.
+    fn show_active_level(&mut self) {
+        let level = self.doc.active();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.truncate_levels(self.doc.count());
+            gfx.show_level(self.doc.mesh_mut(), level);
+        }
+        self.update_hover();
     }
 
     /// Scripted strokes through the real input path: used by `--demo` and `--bench`.
@@ -299,17 +372,17 @@ impl App {
         };
         if stroke.grabbing() {
             stroke.dab(
-                &mut self.mesh,
+                self.doc.mesh_mut(),
                 &self.stroke_brush,
                 Vec3::ZERO,
                 Vec3::Y,
                 fwd,
                 ray,
             );
-        } else if let Some(hit) = self.mesh.raycast(ray.0, ray.1) {
+        } else if let Some(hit) = self.doc.mesh().raycast(ray.0, ray.1) {
             self.hover = Some(hit.point);
             stroke.dab(
-                &mut self.mesh,
+                self.doc.mesh_mut(),
                 &self.stroke_brush,
                 hit.point,
                 hit.normal,
@@ -321,7 +394,7 @@ impl App {
         if let (Some(stroke), Some(gfx)) = (self.stroke.as_mut(), self.gfx.as_mut()) {
             if !gfx.gpu_grab_active() {
                 if let Some(setup) = stroke.gpu_grab_setup() {
-                    let flags = self.mesh.normal_flags(setup.chunks);
+                    let flags = self.doc.mesh().normal_flags(setup.chunks);
                     gfx.begin_gpu_grab(setup, flags);
                 }
             }
@@ -341,8 +414,10 @@ impl App {
             self.apply_stroke();
         }
         if let Some(stroke) = self.stroke.take() {
-            if let Some(step) = stroke.end(&mut self.mesh) {
-                self.history.push(step);
+            let level = self.doc.active();
+            if let Some(snapshot) = stroke.end(self.doc.mesh_mut()) {
+                let chunks = self.doc.finish_stroke(level, snapshot);
+                self.history.push(UndoStep::Stroke { level, chunks });
             }
         }
         if let Some(gfx) = self.gfx.as_mut() {
@@ -352,7 +427,7 @@ impl App {
 
     fn update_hover(&mut self) {
         let (o, d) = self.cursor_ray();
-        self.hover = self.mesh.raycast(o, d).map(|h| h.point);
+        self.hover = self.mesh().raycast(o, d).map(|h| h.point);
         log::trace!(
             "hover {:?} cursor={:?} canvas={:?} yaw={} pitch={} roll={} o={o:?} d={d:?}",
             self.hover, self.cursor, self.canvas_rect, self.camera.yaw, self.camera.pitch, self.camera.roll
@@ -360,7 +435,7 @@ impl App {
     }
 
     fn frame_camera(&mut self) {
-        let b = self.mesh.bounds();
+        let b = self.mesh().bounds();
         self.camera.target = (b.min + b.max) * 0.5;
         self.camera.distance = (b.max - b.min).length() * 1.1;
     }
@@ -427,16 +502,17 @@ impl App {
     fn rebuild(&mut self) {
         let t = Instant::now();
         let (p, i) = cube_sphere(self.segments, 1.0);
-        self.mesh = SculptMesh::from_raw(p, i);
+        self.doc = Multires::new(SculptMesh::from_raw(p, i), self.doc.budget);
         self.build_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.history.clear();
         self.stroke = None;
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.upload_mesh(&mut self.mesh);
+            gfx.clear_levels();
+            gfx.upload_level(self.doc.mesh_mut(), 0);
         }
         self.status = format!(
             "Built {} vertices in {:.0} ms",
-            fmt_count(self.mesh.vertex_count()),
+            fmt_count(self.mesh().vertex_count()),
             self.build_ms
         );
     }
@@ -450,6 +526,10 @@ impl App {
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
             KeyCode::KeyY if ctrl => self.pending_redo = true,
+            // ZBrush: Ctrl + D divides, D and Shift + D step through the levels.
+            KeyCode::KeyD if ctrl => self.pending_divide = true,
+            KeyCode::KeyD if shift => self.pending_level = Some(self.doc.active().saturating_sub(1)),
+            KeyCode::KeyD => self.pending_level = Some(self.doc.active() + 1),
             KeyCode::BracketLeft => self.brush.radius = (self.brush.radius * 0.8).max(0.01),
             KeyCode::BracketRight => self.brush.radius = (self.brush.radius * 1.25).min(2.0),
             KeyCode::KeyF => self.frame_camera(),
@@ -475,6 +555,14 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        let levels = self.doc.vertex_counts();
+        let (vertices, triangles, chunks) = {
+            let m = self.mesh();
+            (m.vertex_count(), m.triangle_count(), m.chunks.len())
+        };
+        let level = self.doc.active();
+        let next_level_vertices = self.doc.next_vertex_count();
+        let levels_bytes = self.doc.bytes();
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -485,9 +573,14 @@ impl App {
                 can_undo: self.history.can_undo(),
                 can_redo: self.history.can_redo(),
                 history_bytes: self.history.bytes(),
-                vertices: self.mesh.vertex_count(),
-                triangles: self.mesh.triangle_count(),
-                chunks: self.mesh.chunks.len(),
+                vertices,
+                triangles,
+                chunks,
+                level,
+                levels: &levels,
+                next_level_vertices,
+                vertex_budget: &mut self.doc.budget,
+                levels_bytes,
                 fps: self.fps,
                 frame_ms: self.frame_ms,
                 stroke_ms: self.stroke_ms,
@@ -508,6 +601,10 @@ impl App {
         self.pending_export |= actions.export;
         self.pending_undo |= actions.undo;
         self.pending_redo |= actions.redo;
+        self.pending_divide |= actions.divide;
+        if actions.level.is_some() {
+            self.pending_level = actions.level;
+        }
         if actions.frame {
             self.frame_camera();
         }
@@ -554,16 +651,29 @@ impl App {
         }
         if self.pending_undo {
             self.pending_undo = false;
-            self.history.undo(&mut self.mesh);
+            if self.stroke.is_none() {
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+            }
         }
         if self.pending_redo {
             self.pending_redo = false;
-            self.history.redo(&mut self.mesh);
+            if self.stroke.is_none() {
+                self.history.redo(&mut self.doc);
+                self.show_active_level();
+            }
+        }
+        if self.pending_divide {
+            self.pending_divide = false;
+            self.divide();
+        }
+        if let Some(level) = self.pending_level.take() {
+            self.set_level(level);
         }
         if self.pending_export {
             self.pending_export = false;
             let t = Instant::now();
-            self.status = match self.mesh.export_obj(&self.export_path) {
+            self.status = match self.mesh().export_obj(&self.export_path) {
                 Ok(()) => format!(
                     "Exported {} in {:.1} s",
                     self.export_path,
@@ -612,6 +722,25 @@ impl App {
             self.stroke_pending = false;
             self.apply_stroke();
         }
+        if let Some((left, acc)) = self.measure {
+            const TOTAL: u32 = 240;
+            // Skip the first frames: they include the upload and the first normal pass.
+            let acc = if left <= TOTAL { acc + dt * 1000.0 } else { acc };
+            if left == 0 {
+                log::info!(
+                    "frames: avg {:.2} ms over {TOTAL} frames at level {} ({} vertices), last upload {:.2} ms, submit {:.2} ms",
+                    acc / TOTAL as f32,
+                    self.doc.active(),
+                    fmt_count(self.mesh().vertex_count()),
+                    self.upload_ms,
+                    self.render_ms
+                );
+                self.measure = None;
+                self.quit = true;
+            } else {
+                self.measure = Some((left - 1, acc));
+            }
+        }
 
         let vp = self.viewport();
         self.camera.aspect = vp.x / vp.y;
@@ -655,7 +784,7 @@ impl App {
         };
         let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
-        gfx.upload_dirty(&mut self.mesh);
+        gfx.upload_dirty(self.doc.mesh_mut());
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
         let t = Instant::now();
         gfx.render(&uniforms, &jobs, full.textures_delta, full.pixels_per_point);
@@ -684,7 +813,8 @@ impl ApplicationHandler for App {
         );
         workspace::theme(&self.egui_ctx);
         let mut gfx = Gfx::new(window.clone(), self.vsync);
-        gfx.upload_mesh(&mut self.mesh);
+        let level = self.doc.active();
+        gfx.upload_level(self.doc.mesh_mut(), level);
         let max_tex = gfx.device.limits().max_texture_dimension_2d as usize;
         let state = egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -699,7 +829,7 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.status = format!(
             "Built {} vertices in {:.0} ms",
-            fmt_count(self.mesh.vertex_count()),
+            fmt_count(self.mesh().vertex_count()),
             self.build_ms
         );
         if self.demo {
@@ -779,7 +909,7 @@ impl ApplicationHandler for App {
                                 // brush, Ctrl = masking); on empty canvas it rotates, with
                                 // Alt it moves, and releasing Alt turns it into a zoom.
                                 let (o, d) = self.cursor_ray();
-                                let hit = self.mesh.raycast(o, d);
+                                let hit = self.mesh().raycast(o, d);
                                 log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
                                 if hit.is_none() {
                                     self.begin_nav(MouseButton::Left);
@@ -863,7 +993,11 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.quit {
+            event_loop.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -897,22 +1031,25 @@ fn line(a: Vec2, b: Vec2, n: usize) -> Vec<Vec2> {
         .collect()
 }
 
-/// Headless benchmark: build, scripted strokes, undo/redo, export.
-fn bench(segments: u32) {
-    let mut app = App::new(segments, false);
+/// Headless benchmark: build, optional subdivision, scripted strokes, undo/redo, export.
+fn bench(segments: u32, divide: u32, budget: usize) {
+    let mut app = App::new(segments, false, budget);
     println!(
         "mesh: {} vertices, {} triangles, {} chunks, built in {:.0} ms",
-        fmt_count(app.mesh.vertex_count()),
-        fmt_count(app.mesh.triangle_count()),
-        app.mesh.chunks.len(),
+        fmt_count(app.mesh().vertex_count()),
+        fmt_count(app.mesh().triangle_count()),
+        app.mesh().chunks.len(),
         app.build_ms
     );
-    let adj_mb = (app.mesh.adj_verts.len() + app.mesh.vt_tris.len()) as f32 * 4.0 / 1e6;
-    let geo_mb =
-        app.mesh.vertex_count() as f32 * 16.0 / 1e6 + app.mesh.indices.len() as f32 * 4.0 / 1e6;
+    let adj_mb = (app.mesh().adj_verts.len() + app.mesh().vt_tris.len()) as f32 * 4.0 / 1e6;
+    let geo_mb = app.mesh().vertex_count() as f32 * 16.0 / 1e6
+        + app.mesh().indices.len() as f32 * 4.0 / 1e6;
     println!("memory: geometry {geo_mb:.0} MB, adjacency {adj_mb:.0} MB");
+    if divide > 0 {
+        bench_multires(&mut app, divide);
+    }
     let t = Instant::now();
-    let hit = app.mesh.raycast(app.camera.eye(), app.camera.forward());
+    let hit = app.mesh().raycast(app.camera.eye(), app.camera.forward());
     println!(
         "raycast: {:.3} ms, hit = {}",
         t.elapsed().as_secs_f32() * 1000.0,
@@ -925,22 +1062,26 @@ fn bench(segments: u32) {
         );
     }
     // Micro-profile of the giant grab's building blocks.
-    if let Some(hit) = app.mesh.raycast(app.camera.eye(), app.camera.forward()) {
+    if let Some(hit) = app.mesh().raycast(app.camera.eye(), app.camera.forward()) {
         let t = Instant::now();
-        let sel = app.mesh.select_sphere(hit.point, 1.2);
+        let sel = app.mesh().select_sphere(hit.point, 1.2);
         println!(
             "select_sphere r=1.2: {} verts in {:.2} ms",
             fmt_count(sel.len()),
             t.elapsed().as_secs_f32() * 1000.0
         );
         let chunks = sel.chunks();
-        let orig = sel.par_map(|_, v| app.mesh.positions[v as usize]);
+        let orig = {
+            let mesh = app.mesh();
+            sel.par_map(|_, v| mesh.positions[v as usize])
+        };
         let w: Vec<f32> = sel.dist.iter().map(|&d| sculpt::falloff(d, 1.2)).collect();
         let n = 20;
         let t = Instant::now();
         for k in 0..n {
             let delta = Vec3::new(0.001 * k as f32, 0.0, 0.0);
-            app.mesh
+            app.doc
+                .mesh_mut()
                 .scatter_positions_with(&sel, |i, _| orig[i] + delta * w[i]);
         }
         println!(
@@ -949,7 +1090,7 @@ fn bench(segments: u32) {
         );
         let t = Instant::now();
         for _ in 0..n {
-            app.mesh.finish_edit(&chunks);
+            app.doc.mesh_mut().finish_edit(&chunks);
         }
         println!(
             "finish_edit ({} chunks): {:.2} ms",
@@ -958,7 +1099,7 @@ fn bench(segments: u32) {
         );
     }
     let t = Instant::now();
-    let normals = app.mesh.compute_all_normals();
+    let normals = app.mesh().compute_all_normals();
     println!(
         "CPU normals for all {} vertices (export path only): {:.0} ms",
         fmt_count(normals.len()),
@@ -966,10 +1107,10 @@ fn bench(segments: u32) {
     );
     let t = Instant::now();
     for _ in 0..3 {
-        app.history.undo(&mut app.mesh);
+        app.history.undo(&mut app.doc);
     }
     for _ in 0..3 {
-        app.history.redo(&mut app.mesh);
+        app.history.redo(&mut app.doc);
     }
     println!(
         "3 undo + 3 redo: {:.1} ms, history {:.1} MB",
@@ -978,29 +1119,126 @@ fn bench(segments: u32) {
     );
 }
 
+/// Multires part of the benchmark: divide `times`, then a Draw stroke at the base level
+/// and the cost of stepping back up through the levels it made stale.
+fn bench_multires(app: &mut App, times: u32) {
+    for _ in 0..times {
+        if !app.doc.can_divide() {
+            println!(
+                "divide: next level ({} vertices) is over the budget of {}",
+                fmt_count(app.doc.next_vertex_count()),
+                fmt_count(app.doc.budget)
+            );
+            break;
+        }
+        let t = Instant::now();
+        app.doc.divide();
+        app.history.push(UndoStep::Divide(None));
+        println!(
+            "divide to level {}: {} vertices, {} chunks in {:.0} ms",
+            app.doc.active(),
+            fmt_count(app.mesh().vertex_count()),
+            app.mesh().chunks.len(),
+            t.elapsed().as_secs_f32() * 1000.0
+        );
+    }
+    let top = app.doc.top();
+    if top == 0 {
+        return;
+    }
+    println!(
+        "levels: {} MB for {} levels",
+        app.doc.bytes() / 1_000_000,
+        app.doc.count()
+    );
+    // Draw at the base with every level above it present.
+    app.doc.set_active(0);
+    let vp = app.viewport();
+    let c = app.canvas_origin() + vp * 0.5;
+    let r = vp.y * 0.33;
+    app.brush = Brush {
+        kind: BrushKind::Draw,
+        radius: 0.18,
+        strength: 0.8,
+    };
+    let t = Instant::now();
+    for (i, p) in arc(0.2, 1.4, 0.55, 60).iter().enumerate() {
+        app.cursor = c + *p * r;
+        if i == 0 {
+            app.begin_stroke();
+        } else {
+            app.apply_stroke();
+        }
+    }
+    let (dabs, count) = app.stroke.as_ref().map(|s| (s.dabs, s.last_count)).unwrap_or((0, 0));
+    let ms = t.elapsed().as_secs_f32() * 1000.0;
+    app.end_stroke();
+    println!(
+        "draw at level 0 with {top} levels above: {dabs} dabs over {count} verts, {ms:.1} ms, {:.2} ms/dab",
+        ms / dabs.max(1) as f32
+    );
+    for level in 1..=top {
+        let t = Instant::now();
+        let touched = app.doc.set_active(level);
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        println!(
+            "step up to level {level}: {touched} of {} chunks re-smoothed in {ms:.1} ms",
+            app.mesh().chunks.len()
+        );
+    }
+    let t = Instant::now();
+    app.history.undo(&mut app.doc);
+    println!("undo the base stroke from level {top}: {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+    let t = Instant::now();
+    app.history.redo(&mut app.doc);
+    println!("redo it: {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+    app.brush = Brush::default();
+}
+
+/// Default vertex budget for subdivision: two divides of the default sphere fit.
+const DEFAULT_BUDGET: usize = 20_000_000;
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| -> Option<&String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
+    };
+    let divide: u32 = flag("--divide").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let budget: usize = flag("--budget").and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_BUDGET);
     if let Some(i) = args.iter().position(|a| a == "--bench") {
         let segments = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(400);
-        bench(segments);
+        bench(segments, divide, budget);
         return;
     }
     let demo = args.iter().any(|a| a == "--demo");
     let stress = args.iter().any(|a| a == "--stress");
+    let frames = args.iter().any(|a| a == "--frames");
     let vsync = !args.iter().any(|a| a == "--novsync");
-    let segments = args
-        .iter()
-        .position(|a| a == "--segments")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(400);
+    let segments = flag("--segments").and_then(|s| s.parse().ok()).unwrap_or(400);
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(segments, demo);
+    let mut app = App::new(segments, demo, budget);
     app.vsync = vsync;
+    for _ in 0..divide {
+        let t = Instant::now();
+        if !app.doc.divide() {
+            log::warn!("--divide: vertex budget reached at level {}", app.doc.top());
+            break;
+        }
+        app.history.push(UndoStep::Divide(None));
+        log::info!(
+            "divided to level {}: {} vertices in {:.0} ms",
+            app.doc.active(),
+            fmt_count(app.mesh().vertex_count()),
+            t.elapsed().as_secs_f32() * 1000.0
+        );
+    }
     if stress {
         app.stress = Some((240, 0.0, 0.0));
+    }
+    if frames {
+        app.measure = Some((240 + 30, 0.0));
     }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {e}");

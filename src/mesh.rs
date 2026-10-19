@@ -68,6 +68,20 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub(crate) fn new(vert_start: u32, vert_end: u32, tris: Vec<u32>) -> Self {
+        Self {
+            vert_start,
+            vert_end,
+            tris,
+            aabb: Aabb::empty(),
+            dirty_pos: true,
+            dirty_nrm: true,
+            neighbors: Vec::new(),
+            external: Vec::new(),
+            stamp: 0,
+        }
+    }
+
     pub fn range(&self) -> (usize, usize) {
         (self.vert_start as usize, self.vert_end as usize)
     }
@@ -185,6 +199,17 @@ impl SculptMesh {
         &self.adj_verts[a as usize..b as usize]
     }
 
+    /// Triangles incident to `v`.
+    pub fn incident(&self, v: u32) -> &[u32] {
+        let (a, b) = (self.vt_offsets[v as usize], self.vt_offsets[v as usize + 1]);
+        &self.vt_tris[a as usize..b as usize]
+    }
+
+    /// Number of edges (each counted once).
+    pub fn edge_count(&self) -> usize {
+        self.adj_verts.len() / 2
+    }
+
     /// Build a chunked mesh from raw positions and triangle indices.
     pub fn from_raw(positions: Vec<Vec3>, indices: Vec<u32>) -> Self {
         let n = positions.len();
@@ -204,17 +229,7 @@ impl SculptMesh {
                 new_positions.push(positions[old as usize]);
                 vert_chunk.push(ci as u32);
             }
-            chunks.push(Chunk {
-                vert_start: start,
-                vert_end: new_positions.len() as u32,
-                tris: Vec::new(),
-                aabb: Aabb::empty(),
-                dirty_pos: true,
-                dirty_nrm: true,
-                neighbors: Vec::new(),
-                external: Vec::new(),
-                stamp: 0,
-            });
+            chunks.push(Chunk::new(start, new_positions.len() as u32, Vec::new()));
         }
         let positions = new_positions;
         let indices: Vec<u32> = indices.into_par_iter().map(|i| remap[i as usize]).collect();
@@ -282,6 +297,24 @@ impl SculptMesh {
         }
         drop(blocks);
 
+        Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+    }
+
+    /// Build a mesh from arrays that are already in chunk order: positions and `vert_chunk`
+    /// sorted so every chunk owns a contiguous range, each chunk listing the triangles whose
+    /// first vertex it owns, and both CSR tables complete. Chunk neighbours, borrowed
+    /// vertices and bounds are derived here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        positions: Vec<Vec3>,
+        indices: Vec<u32>,
+        chunks: Vec<Chunk>,
+        vert_chunk: Vec<u32>,
+        adj_offsets: Vec<u32>,
+        adj_verts: Vec<u32>,
+        vt_offsets: Vec<u32>,
+        vt_tris: Vec<u32>,
+    ) -> Self {
         let mut mesh = Self {
             positions,
             indices,
@@ -294,7 +327,7 @@ impl SculptMesh {
             stamp_id: 0,
         };
 
-        // 6. Chunk neighbours and external vertices (referenced by our triangles, owned elsewhere).
+        // Chunk neighbours and external vertices (referenced by our triangles, owned elsewhere).
         let info: Vec<(Vec<u32>, Vec<u32>)> = mesh
             .chunks
             .par_iter()
@@ -329,7 +362,7 @@ impl SculptMesh {
             ch.neighbors = nbs;
         }
 
-        // 7. Chunk bounds.
+        // Chunk bounds.
         let Self { chunks, positions, .. } = &mut mesh;
         chunks.par_iter_mut().for_each(|ch| ch.aabb = chunk_bounds(ch, positions));
         mesh
@@ -635,7 +668,10 @@ fn chunk_bounds(ch: &Chunk, positions: &[Vec3]) -> Aabb {
 }
 
 /// Split a slice into disjoint mutable sub-slices for ascending, non-overlapping ranges.
-fn split_ranges<'a, T>(data: &'a mut [T], ranges: impl Iterator<Item = (usize, usize)>) -> Vec<&'a mut [T]> {
+pub(crate) fn split_ranges<'a, T>(
+    data: &'a mut [T],
+    ranges: impl Iterator<Item = (usize, usize)>,
+) -> Vec<&'a mut [T]> {
     let mut out = Vec::new();
     let mut rest = data;
     let mut consumed = 0;
@@ -674,11 +710,19 @@ fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     if t > 1e-6 { Some(t) } else { None }
 }
 
-/// Recursive median split of vertex ids along the longest axis of their bounds.
+/// Recursive median split of all vertices along the longest axis of their bounds.
 fn partition_vertices(positions: &[Vec3]) -> Vec<Vec<u32>> {
-    let all: Vec<u32> = (0..positions.len() as u32).collect();
+    partition_ids((0..positions.len() as u32).collect(), positions)
+}
+
+/// Recursive median split of `ids` (indices into `positions`) into groups of at most
+/// [`CHUNK_TARGET`] vertices. An empty input gives no groups.
+pub(crate) fn partition_ids(ids: Vec<u32>, positions: &[Vec3]) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
-    let mut stack = vec![all];
+    if ids.is_empty() {
+        return out;
+    }
+    let mut stack = vec![ids];
     while let Some(mut ids) = stack.pop() {
         if ids.len() <= CHUNK_TARGET {
             out.push(ids);

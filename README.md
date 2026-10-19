@@ -11,7 +11,13 @@ cargo run --release -- --segments 1200    # 8.6M vertices
 cargo run --release -- --demo             # apply scripted strokes on startup
 cargo run --release -- --bench 1500       # headless CPU benchmark at 13.5M vertices
 cargo run --release -- --segments 1500 --stress --novsync   # per-frame cost of a huge grab
+cargo run --release -- --divide 2                           # start two subdivision levels up (15.4M vertices)
+cargo run --release -- --bench 400 --divide 2               # divide timings, base-level stroke, step-up cost
+cargo run --release -- --divide 2 --novsync --frames        # average frame time at the top level, then exit
 ```
+
+`--budget N` caps the vertex count a Divide may reach (default 20 000 000); the Geometry section
+of the Mesh palette has the same slider.
 
 ## Workspace
 
@@ -37,7 +43,8 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
   Older `v1` layout files are ignored and replaced.
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
-presets, mesh rebuild, undo/redo, OBJ export and live statistics are connected to the engine.
+presets, mesh rebuild, subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
+vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
 Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
 
@@ -81,6 +88,8 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
 | `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode (only Draw sculpts so far) |
 | `X` | Symmetry across X |
+| Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
+| `D` / Shift + `D` | Higher / lower subdivision level |
 | `F` | Frame the mesh |
 | `P` / Shift + `P` | Perspective toggle / floor grid |
 | `Home` | Reset the view angle and frame |
@@ -100,10 +109,21 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   chunk the first time a stroke touches it. Grab runs on the GPU (`grab.wgsl`): the
   selection, original positions and weights go up once, each frame sends one delta, and
   the CPU applies the final result when the stroke ends.
-- `render.rs`: positions, packed normals and indices live on the GPU. Normals are never
-  stored on the CPU: a compute pass (`normals.wgsl`) recomputes them for flagged chunks each
-  frame. Dirty position ranges are re-uploaded as merged contiguous runs. egui is drawn in a
-  second pass.
+- `multires.rs`: ZBrush-style subdivision levels. Divide Loop-subdivides the top level 1:4,
+  keeping chunk locality (each parent chunk's vertices and edge midpoints are split spatially
+  into its child chunks) and building every table of the new mesh in parallel over chunks.
+  A level above the base is `smooth(parent) + offset` per vertex; offsets are stored per
+  chunk and only for chunks that were sculpted at that level. Sculpting edits the active
+  level; its offsets are refreshed for the touched chunks when the stroke ends. Levels above
+  are synced lazily: edited chunks are marked stale, and stepping up re-smooths only the
+  dependent child chunks and re-applies their offsets, one level at a time. Edits at the top
+  level touch nothing else. Undo stores positions at level 0 and offsets above it, so it
+  works at any level, and the displayed level follows; Divide itself is undoable.
+- `render.rs`: positions, packed normals and indices live on the GPU, one set per
+  subdivision level that has been shown, so stepping between levels is a pointer swap.
+  Normals are never stored on the CPU: a compute pass (`normals.wgsl`) recomputes them for
+  flagged chunks each frame. Dirty position ranges are re-uploaded as merged contiguous runs.
+  egui is drawn in a second pass.
 
 ## Numbers (RTX 5060, 16 cores, release build)
 
@@ -112,6 +132,19 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | 960k vertices | 0.4 s | 0.1 ms/frame | 0.4 ms CPU + GPU |
 | 8.6M vertices | 4.4 s | 0.3 ms/frame | 6 ms/frame |
 | 13.5M vertices | 6.5 s | 0.5 ms/frame | 8 ms/frame |
+
+### Subdivision levels (400-segment sphere, `--bench 400 --divide 2`)
+
+| Step | Result |
+| --- | --- |
+| Divide 960k → 3.84M vertices | 240 ms |
+| Divide 3.84M → 15.4M vertices | 940 ms |
+| Draw dab at level 0 with two levels above (7.7k vertices under the brush) | 0.7 ms/dab, same as without levels: upper levels are synced when you step up |
+| Step up to level 1 after that stroke | 75 of 1 024 chunks re-smoothed, 0.6 ms |
+| Step up to level 2 | 368 of 4 096 chunks re-smoothed, 3 ms |
+| Undo / redo that base stroke while level 2 is shown | 4 ms each |
+| Frame at level 0 / 1 / 2 (`--novsync --frames`) | 0.65 / 0.95 / 3.7 ms |
+| Memory for the three levels | 2.2 GB |
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of
