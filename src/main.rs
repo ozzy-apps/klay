@@ -235,12 +235,29 @@ impl App {
         log::info!("{}", self.status);
     }
 
-    /// Point the renderer at the active level after it changed.
+    /// Point the renderer at the active level after it changed. If the level does not fit
+    /// in GPU memory, the highest level below it that does is shown instead.
     fn show_active_level(&mut self) {
-        let level = self.doc.active();
+        let wanted = self.doc.active();
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.truncate_levels(self.doc.count());
-            gfx.show_level(self.doc.mesh_mut(), level);
+            if !gfx.show_level(self.doc.mesh_mut(), wanted) {
+                let mut level = wanted;
+                while level > 0 {
+                    level -= 1;
+                    self.doc.set_active(level);
+                    if gfx.show_level(self.doc.mesh_mut(), level) {
+                        break;
+                    }
+                }
+                let msg = format!(
+                    "Level {wanted} ({} vertices) does not fit in GPU memory · showing level {}",
+                    fmt_count(self.doc.vertex_counts()[wanted]),
+                    self.doc.active()
+                );
+                log::warn!("{msg}");
+                self.workspace.notify(msg);
+            }
         }
         self.update_hover();
     }
@@ -508,8 +525,8 @@ impl App {
         self.stroke = None;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
-            gfx.upload_level(self.doc.mesh_mut(), 0);
         }
+        self.show_active_level();
         self.status = format!(
             "Built {} vertices in {:.0} ms",
             fmt_count(self.mesh().vertex_count()),
@@ -563,6 +580,7 @@ impl App {
         let level = self.doc.active();
         let next_level_vertices = self.doc.next_vertex_count();
         let levels_bytes = self.doc.bytes();
+        let gpu_level_bytes = self.gfx.as_ref().map_or(0, Gfx::level_bytes);
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -581,6 +599,7 @@ impl App {
                 next_level_vertices,
                 vertex_budget: &mut self.doc.budget,
                 levels_bytes,
+                gpu_level_bytes,
                 fps: self.fps,
                 frame_ms: self.frame_ms,
                 stroke_ms: self.stroke_ms,
@@ -812,9 +831,7 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         workspace::theme(&self.egui_ctx);
-        let mut gfx = Gfx::new(window.clone(), self.vsync);
-        let level = self.doc.active();
-        gfx.upload_level(self.doc.mesh_mut(), level);
+        let gfx = Gfx::new(window.clone(), self.vsync);
         let max_tex = gfx.device.limits().max_texture_dimension_2d as usize;
         let state = egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -827,6 +844,7 @@ impl ApplicationHandler for App {
         self.egui_state = Some(state);
         self.gfx = Some(gfx);
         self.window = Some(window);
+        self.show_active_level();
         self.status = format!(
             "Built {} vertices in {:.0} ms",
             fmt_count(self.mesh().vertex_count()),
@@ -1195,8 +1213,9 @@ fn bench_multires(app: &mut App, times: u32) {
     app.brush = Brush::default();
 }
 
-/// Default vertex budget for subdivision: two divides of the default sphere fit.
-const DEFAULT_BUDGET: usize = 20_000_000;
+/// Default vertex budget for subdivision: three divides of the default sphere fit (61M
+/// vertices: about 8 GB of RAM and 4.4 GB of GPU memory for that level).
+const DEFAULT_BUDGET: usize = 64_000_000;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();

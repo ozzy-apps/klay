@@ -346,6 +346,8 @@ pub struct Model<'a> {
     pub vertex_budget: &'a mut usize,
     /// Memory held by all levels.
     pub levels_bytes: usize,
+    /// GPU memory held by the levels that are shown or cached.
+    pub gpu_level_bytes: u64,
     pub fps: f32,
     pub frame_ms: f32,
     pub stroke_ms: f32,
@@ -1984,6 +1986,7 @@ impl Workspace {
                 self.sec(ui, h, id, "gpu", "GPU", None, true, true, &mut |_, ui| {
                     kv(ui, "Device", m.adapter);
                     kv(ui, "Chunks", &crate::fmt_count(m.chunks));
+                    kv(ui, "Levels on GPU", &format!("{} MB", m.gpu_level_bytes / 1_000_000));
                 });
             }
             PaletteId::Preferences => {
@@ -3488,6 +3491,7 @@ mod tests {
                         next_level_vertices: 960002,
                         vertex_budget: &mut budget,
                         levels_bytes: 0,
+                        gpu_level_bytes: 0,
                         fps: 60.0,
                         frame_ms: 16.7,
                         stroke_ms: 0.0,

@@ -16,8 +16,9 @@ cargo run --release -- --bench 400 --divide 2               # divide timings, ba
 cargo run --release -- --divide 2 --novsync --frames        # average frame time at the top level, then exit
 ```
 
-`--budget N` caps the vertex count a Divide may reach (default 20 000 000); the Geometry section
-of the Mesh palette has the same slider.
+`--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
+default sphere); the Geometry section of the Mesh palette has the same slider. Each level costs
+about 150 bytes per vertex of RAM and 72 bytes per vertex of GPU memory while it is shown.
 
 ## Workspace
 
@@ -121,6 +122,9 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   works at any level, and the displayed level follows; Divide itself is undoable.
 - `render.rs`: positions, packed normals and indices live on the GPU, one set per
   subdivision level that has been shown, so stepping between levels is a pointer swap.
+  Levels that are not shown keep their copies up to 1 GB in total; beyond that the largest
+  are dropped and re-uploaded on the next visit, and a level that still does not fit is
+  refused with a notice while the previous level stays up.
   Normals are never stored on the CPU: a compute pass (`normals.wgsl`) recomputes them for
   flagged chunks each frame. Dirty position ranges are re-uploaded as merged contiguous runs.
   egui is drawn in a second pass.
@@ -139,9 +143,11 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | --- | --- |
 | Divide 960k → 3.84M vertices | 240 ms |
 | Divide 3.84M → 15.4M vertices | 940 ms |
+| Divide 15.4M → 61.4M vertices | 4.0 s, 9.1 GB RAM for the four levels, 4.4 GB of GPU memory to show it |
 | Draw dab at level 0 with two levels above (7.7k vertices under the brush) | 0.7 ms/dab, same as without levels: upper levels are synced when you step up |
 | Step up to level 1 after that stroke | 75 of 1 024 chunks re-smoothed, 0.6 ms |
 | Step up to level 2 | 368 of 4 096 chunks re-smoothed, 3 ms |
+| Step up to level 3 | 1 619 of 16 384 chunks re-smoothed, 14 ms |
 | Undo / redo that base stroke while level 2 is shown | 4 ms each |
 | Frame at level 0 / 1 / 2 (`--novsync --frames`) | 0.65 / 0.95 / 3.7 ms |
 | Memory for the three levels | 2.2 GB |

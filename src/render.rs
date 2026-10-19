@@ -56,9 +56,21 @@ struct MeshBuffers {
     vertex_count: u32,
     /// Per-chunk flags for the normal recompute pass.
     dirty_flags: Vec<u32>,
+    /// GPU memory held by this level.
+    bytes: u64,
     // Kept alive for the bind group.
     _normal_params: wgpu::Buffer,
 }
+
+/// Levels that are not shown keep their GPU copies while they total at most this much;
+/// beyond it the largest ones are dropped and re-uploaded on their next visit. A
+/// 61M-vertex level alone is 4.4 GB, so this is what lets it fit next to the lower levels
+/// on an 8 GB card.
+const GPU_CACHE_BYTES: u64 = 1 << 30;
+
+/// Uploads are flushed to the GPU in pieces of this size so the staging memory in flight
+/// stays bounded.
+const UPLOAD_PIECE: usize = 256 << 20;
 
 pub struct Gfx {
     surface: wgpu::Surface<'static>,
@@ -429,12 +441,15 @@ impl Gfx {
     }
 
     /// Display `level`, uploading it on first sight. Positions changed since the level was
-    /// last shown are re-uploaded by the next `upload_dirty`.
-    pub fn show_level(&mut self, mesh: &mut SculptMesh, level: usize) {
+    /// last shown are re-uploaded by the next `upload_dirty`. Returns false when the level
+    /// does not fit in GPU memory; the previously shown level stays up.
+    pub fn show_level(&mut self, mesh: &mut SculptMesh, level: usize) -> bool {
         if self.levels.get(level).is_some_and(Option::is_some) {
             self.active = level;
+            self.trim_cache();
+            true
         } else {
-            self.upload_level(mesh, level);
+            self.upload_level(mesh, level)
         }
     }
 
@@ -442,41 +457,123 @@ impl Gfx {
         self.levels.get(self.active).and_then(Option::as_ref)
     }
 
-    /// Upload a level in full and display it. Normals are computed on the GPU on the next frame.
-    pub fn upload_level(&mut self, mesh: &mut SculptMesh, level: usize) {
+    /// GPU memory held by the levels, shown or cached.
+    pub fn level_bytes(&self) -> u64 {
+        self.levels.iter().flatten().map(|m| m.bytes).sum()
+    }
+
+    /// Drop cached copies of levels that are not shown, largest first, until they fit
+    /// `GPU_CACHE_BYTES`.
+    fn trim_cache(&mut self) {
+        loop {
+            let cached = self
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| *i != self.active && l.is_some());
+            let total: u64 = cached.clone().map(|(_, l)| l.as_ref().unwrap().bytes).sum();
+            if total <= GPU_CACHE_BYTES {
+                return;
+            }
+            let Some((victim, _)) = cached.max_by_key(|(_, l)| l.as_ref().unwrap().bytes) else {
+                return;
+            };
+            log::info!("gpu: dropping the cached copy of level {victim}");
+            self.levels[victim] = None;
+        }
+    }
+
+    /// Drop every cached level except the shown one and wait for the memory to be released.
+    fn evict_cached(&mut self) {
+        for (i, l) in self.levels.iter_mut().enumerate() {
+            if i != self.active {
+                *l = None;
+            }
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// Create a buffer and fill it in pieces, flushing between them so the staging memory
+    /// in flight stays bounded.
+    fn upload(&self, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: data.len().max(4) as u64,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (i, piece) in data.chunks(UPLOAD_PIECE).enumerate() {
+            self.queue
+                .write_buffer(&buffer, (i * UPLOAD_PIECE) as u64, piece);
+            if piece.len() == UPLOAD_PIECE {
+                self.queue.submit(std::iter::empty());
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            }
+        }
+        buffer
+    }
+
+    /// Upload a level in full and display it. Normals are computed on the GPU on the next
+    /// frame. When the level does not fit, every cached level is dropped and the upload is
+    /// tried once more; if it still fails the level is not shown and false is returned.
+    pub fn upload_level(&mut self, mesh: &mut SculptMesh, level: usize) -> bool {
+        let previous = self.active;
+        if self.levels.len() <= level {
+            self.levels.resize_with(level + 1, || None);
+        }
+        self.levels[level] = None;
+        self.active = level;
+        self.trim_cache();
+        for attempt in 0..2 {
+            match self.create_level(mesh) {
+                Some(buffers) => {
+                    log::info!(
+                        "gpu: level {level} uploaded, {} MB",
+                        buffers.bytes / 1_000_000
+                    );
+                    self.levels[level] = Some(buffers);
+                    for ch in &mut mesh.chunks {
+                        ch.dirty_pos = false;
+                        ch.dirty_nrm = true;
+                    }
+                    return true;
+                }
+                None if attempt == 0 => self.evict_cached(),
+                None => {}
+            }
+        }
+        self.active = previous;
+        false
+    }
+
+    /// Buffers for a level, or `None` when the GPU is out of memory.
+    fn create_level(&self, mesh: &SculptMesh) -> Option<MeshBuffers> {
         use wgpu::BufferUsages as U;
-        let init = |label: &str, data: &[u8], usage: U| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents: data,
-                    usage,
-                })
-        };
-        let positions = init(
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let positions = self.upload(
             "positions",
             bytemuck::cast_slice(&mesh.positions),
-            U::VERTEX | U::STORAGE | U::COPY_DST,
+            U::VERTEX | U::STORAGE,
         );
-        let indices = init(
+        let indices = self.upload(
             "indices",
             bytemuck::cast_slice(&mesh.indices),
             U::INDEX | U::STORAGE,
         );
-        let vt_offsets = init(
+        let vt_offsets = self.upload(
             "vt_offsets",
             bytemuck::cast_slice(&mesh.vt_offsets),
             U::STORAGE,
         );
-        let vt_tris = init("vt_tris", bytemuck::cast_slice(&mesh.vt_tris), U::STORAGE);
-        let vert_chunk = init(
+        let vt_tris = self.upload("vt_tris", bytemuck::cast_slice(&mesh.vt_tris), U::STORAGE);
+        let vert_chunk = self.upload(
             "vert_chunk",
             bytemuck::cast_slice(&mesh.vert_chunk),
             U::STORAGE,
         );
         let normals = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("normals"),
-            size: (mesh.vertex_count() * 4) as u64,
+            size: (mesh.vertex_count() * 4).max(4) as u64,
             usage: U::VERTEX | U::STORAGE,
             mapped_at_creation: false,
         });
@@ -486,14 +583,43 @@ impl Gfx {
             usage: U::STORAGE | U::COPY_DST,
             mapped_at_creation: false,
         });
-        let normal_params = init(
-            "normal params",
-            bytemuck::bytes_of(&NormalParams {
-                vertex_count: mesh.vertex_count() as u32,
-                _pad: [0; 3],
-            }),
-            U::UNIFORM,
-        );
+        let normal_params = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("normal params"),
+                contents: bytemuck::bytes_of(&NormalParams {
+                    vertex_count: mesh.vertex_count() as u32,
+                    _pad: [0; 3],
+                }),
+                usage: U::UNIFORM,
+            });
+        let bytes = [
+            &positions,
+            &indices,
+            &vt_offsets,
+            &vt_tris,
+            &vert_chunk,
+            &normals,
+            &chunk_dirty,
+        ]
+        .iter()
+        .map(|b| b.size())
+        .sum();
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            log::warn!("gpu: a level of {} MB did not fit: {e}", bytes / 1_000_000);
+            drop((
+                positions,
+                indices,
+                vt_offsets,
+                vt_tris,
+                vert_chunk,
+                normals,
+                chunk_dirty,
+                normal_params,
+            ));
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            return None;
+        }
         let normal_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("normals bg"),
             layout: &self.normal_bgl,
@@ -532,10 +658,7 @@ impl Gfx {
                 },
             ],
         });
-        if self.levels.len() <= level {
-            self.levels.resize_with(level + 1, || None);
-        }
-        self.levels[level] = Some(MeshBuffers {
+        Some(MeshBuffers {
             positions,
             normals,
             indices,
@@ -544,13 +667,9 @@ impl Gfx {
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertex_count() as u32,
             dirty_flags: vec![0; mesh.chunks.len()],
+            bytes,
             _normal_params: normal_params,
-        });
-        self.active = level;
-        for ch in &mut mesh.chunks {
-            ch.dirty_pos = false;
-            ch.dirty_nrm = true;
-        }
+        })
     }
 
     /// Start a grab on the GPU: upload the selection, its original positions and weights once.
