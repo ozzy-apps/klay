@@ -18,10 +18,48 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Nav {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavMode {
     Orbit,
     Pan,
+    Zoom,
+}
+
+/// A camera drag in progress. The mode is not stored: it is derived from the button and
+/// the current modifiers on every move, so modifiers can be changed mid-drag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NavDrag {
+    button: MouseButton,
+    /// Alt has been held at some point during a left-button drag. From then on the drag
+    /// pans while Alt is down and zooms once Alt is released (ZBrush: Alt + click,
+    /// release Alt, drag = zoom). Before Alt is ever used a left drag orbits.
+    alt_used: bool,
+}
+
+impl NavDrag {
+    fn mode(&self, m: ModifiersState) -> NavMode {
+        match self.button {
+            MouseButton::Left => {
+                if m.alt_key() {
+                    NavMode::Pan
+                } else if self.alt_used {
+                    NavMode::Zoom
+                } else {
+                    NavMode::Orbit
+                }
+            }
+            // Right/middle: orbit; Alt or Shift pans; Ctrl zooms.
+            _ => {
+                if m.control_key() {
+                    NavMode::Zoom
+                } else if m.alt_key() || m.shift_key() {
+                    NavMode::Pan
+                } else {
+                    NavMode::Orbit
+                }
+            }
+        }
+    }
 }
 
 struct App {
@@ -40,7 +78,7 @@ struct App {
     cursor: Vec2,
     last_cursor: Vec2,
     modifiers: ModifiersState,
-    nav: Option<Nav>,
+    nav: Option<NavDrag>,
     hover: Option<Vec3>,
 
     // UI state.
@@ -309,6 +347,40 @@ impl App {
         self.camera.distance = (b.max - b.min).length() * 1.1;
     }
 
+    /// Default view angle plus a frame: `Home`.
+    fn home_camera(&mut self) {
+        let fresh = Camera::new();
+        self.camera.yaw = fresh.yaw;
+        self.camera.pitch = fresh.pitch;
+        self.frame_camera();
+    }
+
+    fn begin_nav(&mut self, button: MouseButton) {
+        self.nav = Some(NavDrag {
+            button,
+            alt_used: self.modifiers.alt_key(),
+        });
+        // No brush ring while the camera moves.
+        self.hover = None;
+    }
+
+    fn end_nav(&mut self, button: MouseButton) {
+        if self.nav.map(|n| n.button) == Some(button) {
+            self.nav = None;
+            self.update_hover();
+        }
+    }
+
+    fn nav_move(&mut self, drag: NavDrag, delta: Vec2) {
+        let mode = drag.mode(self.modifiers);
+        log::trace!("nav {mode:?} {:?} dx={} dy={}", drag.button, delta.x, delta.y);
+        match mode {
+            NavMode::Orbit => self.camera.orbit(delta.x, delta.y),
+            NavMode::Pan => self.camera.pan(delta.x, delta.y, self.viewport().y),
+            NavMode::Zoom => self.camera.dolly(delta.x, delta.y),
+        }
+    }
+
     fn rebuild(&mut self) {
         let t = Instant::now();
         let (p, i) = cube_sphere(self.segments, 1.0);
@@ -337,6 +409,7 @@ impl App {
             KeyCode::BracketLeft => self.brush.radius = (self.brush.radius * 0.8).max(0.01),
             KeyCode::BracketRight => self.brush.radius = (self.brush.radius * 1.25).min(2.0),
             KeyCode::KeyF => self.frame_camera(),
+            KeyCode::Home => self.home_camera(),
             KeyCode::Digit1 => self.brush.kind = BrushKind::Draw,
             KeyCode::Digit2 => self.brush.kind = BrushKind::Smooth,
             KeyCode::Digit3 => self.brush.kind = BrushKind::Grab,
@@ -593,27 +666,31 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                // Pressing Alt during a left drag arms the pan/zoom pair for the rest of it.
+                if let Some(drag) = self.nav.as_mut() {
+                    if drag.button == MouseButton::Left && self.modifiers.alt_key() {
+                        drag.alt_used = true;
+                    }
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = self.cursor;
                 self.cursor = Vec2::new(position.x as f32, position.y as f32);
                 let delta = self.cursor - self.last_cursor;
-                match self.nav {
-                    Some(Nav::Orbit) => self.camera.orbit(delta.x, delta.y),
-                    Some(Nav::Pan) => self.camera.pan(delta.x, delta.y, self.viewport().y),
-                    None => {
-                        if self.stroke.is_some() {
-                            if self.stroke_brush.kind == BrushKind::Grab {
-                                self.stroke_pending = true;
-                            } else {
-                                self.apply_stroke();
-                            }
-                        } else if !over_ui {
-                            self.update_hover();
-                        } else {
-                            self.hover = None;
-                        }
+                if let Some(drag) = self.nav {
+                    self.nav_move(drag, delta);
+                } else if self.stroke.is_some() {
+                    if self.stroke_brush.kind == BrushKind::Grab {
+                        self.stroke_pending = true;
+                    } else {
+                        self.apply_stroke();
                     }
+                } else if !over_ui {
+                    self.update_hover();
+                } else {
+                    self.hover = None;
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -621,32 +698,31 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => {
                         if pressed {
-                            if !consumed && !over_ui && self.nav.is_none() {
-                                if self.modifiers.alt_key() {
-                                    self.nav = Some(Nav::Orbit);
+                            if !consumed && !over_ui && self.nav.is_none() && self.stroke.is_none()
+                            {
+                                // Alt + left drag navigates anywhere (Ctrl inverts the brush,
+                                // so Alt is free over the model). A plain click on empty
+                                // canvas orbits, like ZBrush; on the model it sculpts.
+                                let (o, d) = self.cursor_ray();
+                                if self.modifiers.alt_key() || self.mesh.raycast(o, d).is_none()
+                                {
+                                    self.begin_nav(MouseButton::Left);
                                 } else {
                                     self.begin_stroke();
                                 }
                             }
                         } else {
                             self.end_stroke();
-                            if self.nav == Some(Nav::Orbit) && self.modifiers.alt_key() {
-                                self.nav = None;
-                            }
+                            self.end_nav(MouseButton::Left);
                         }
                     }
                     MouseButton::Right | MouseButton::Middle => {
                         if pressed {
-                            if !over_ui && self.stroke.is_none() {
-                                self.nav = Some(if self.modifiers.shift_key() {
-                                    Nav::Pan
-                                } else {
-                                    Nav::Orbit
-                                });
+                            if !over_ui && self.stroke.is_none() && self.nav.is_none() {
+                                self.begin_nav(button);
                             }
                         } else {
-                            self.nav = None;
-                            self.update_hover();
+                            self.end_nav(button);
                         }
                     }
                     _ => {}
@@ -661,8 +737,12 @@ impl ApplicationHandler for App {
                     if self.modifiers.control_key() {
                         self.brush.radius = (self.brush.radius * (1.0 + y * 0.1)).clamp(0.01, 2.0);
                     } else {
-                        self.camera.zoom(y);
-                        self.update_hover();
+                        // Zoom towards the point under the cursor so it stays put.
+                        let (_, dir) = self.cursor_ray();
+                        self.camera.zoom_towards(y, dir);
+                        if self.nav.is_none() {
+                            self.update_hover();
+                        }
                     }
                 }
             }
@@ -820,5 +900,47 @@ fn main() {
     }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {e}");
+    }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+
+    #[test]
+    fn alt_click_release_alt_zooms() {
+        // ZBrush: Alt + click starts a pan, releasing Alt turns the same drag into a zoom,
+        // pressing Alt again goes back to panning.
+        let drag = NavDrag {
+            button: MouseButton::Left,
+            alt_used: true,
+        };
+        assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
+        assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Zoom);
+        assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
+    }
+
+    #[test]
+    fn plain_canvas_drag_orbits_until_alt_is_used() {
+        let mut drag = NavDrag {
+            button: MouseButton::Left,
+            alt_used: false,
+        };
+        assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Orbit);
+        drag.alt_used = true; // Alt pressed mid-drag
+        assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
+        assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Zoom);
+    }
+
+    #[test]
+    fn right_button_modifiers() {
+        let drag = NavDrag {
+            button: MouseButton::Right,
+            alt_used: false,
+        };
+        assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Orbit);
+        assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
+        assert_eq!(drag.mode(ModifiersState::SHIFT), NavMode::Pan);
+        assert_eq!(drag.mode(ModifiersState::CONTROL), NavMode::Zoom);
     }
 }

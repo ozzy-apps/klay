@@ -100,6 +100,28 @@ impl Camera {
         self.distance = (self.distance * (1.0 - scroll * 0.1)).clamp(0.05, 50.0);
     }
 
+    /// Zoom like [`zoom`](Self::zoom) but keep the point under the cursor fixed on screen:
+    /// the target slides towards where `ray_dir` crosses the plane through the target.
+    pub fn zoom_towards(&mut self, scroll: f32, ray_dir: Vec3) {
+        let old = self.distance;
+        self.zoom(scroll);
+        let k = self.distance / old;
+        let fwd = self.forward();
+        let denom = ray_dir.dot(fwd);
+        if denom > 1e-4 {
+            // Eye uses the old distance: recompute it from the target and the old value.
+            let eye = self.target - fwd * old;
+            let under_cursor = eye + ray_dir * (old / denom);
+            self.target += (under_cursor - self.target) * (1.0 - k);
+        }
+    }
+
+    /// Drag zoom: dragging down or right moves the eye closer.
+    pub fn dolly(&mut self, dx: f32, dy: f32) {
+        let factor = (-(dx + dy) * 0.005).exp();
+        self.distance = (self.distance * factor).clamp(0.05, 50.0);
+    }
+
     /// World-space ray through a pixel position. `x`, `y` in pixels, origin top-left.
     pub fn ray(&self, x: f32, y: f32, width: f32, height: f32) -> (Vec3, Vec3) {
         let ndc_x = (x / width.max(1.0)) * 2.0 - 1.0;
@@ -114,5 +136,45 @@ impl Camera {
     pub fn pixel_size_at(&self, world_pos: Vec3, viewport_h: f32) -> f32 {
         let d = (world_pos - self.eye()).dot(self.forward()).max(self.near);
         2.0 * d * (self.fov_y * 0.5).tan() / viewport_h.max(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pixel position of a world point, origin top-left.
+    fn project(cam: &Camera, p: Vec3, w: f32, h: f32) -> (f32, f32) {
+        let clip = cam.view_proj() * p.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        ((ndc.x + 1.0) * 0.5 * w, (1.0 - ndc.y) * 0.5 * h)
+    }
+
+    #[test]
+    fn zoom_towards_keeps_point_under_cursor() {
+        let mut cam = Camera::new();
+        cam.aspect = 1.6;
+        let (w, h) = (1600.0, 1000.0);
+        let (x, y) = (1200.0, 300.0);
+        // The point under the cursor on the target plane.
+        let (o, d) = cam.ray(x, y, w, h);
+        let fwd = cam.forward();
+        let p = o + d * ((cam.target - o).dot(fwd) / d.dot(fwd));
+        for scroll in [3.0, -2.0, 1.0] {
+            let (_, d) = cam.ray(x, y, w, h);
+            cam.zoom_towards(scroll, d);
+            let (px, py) = project(&cam, p, w, h);
+            assert!((px - x).abs() < 0.05 && (py - y).abs() < 0.05, "{px} {py}");
+        }
+    }
+
+    #[test]
+    fn dolly_down_moves_closer() {
+        let mut cam = Camera::new();
+        let d0 = cam.distance;
+        cam.dolly(0.0, 40.0);
+        assert!(cam.distance < d0);
+        cam.dolly(-80.0, 0.0);
+        assert!(cam.distance > d0);
     }
 }

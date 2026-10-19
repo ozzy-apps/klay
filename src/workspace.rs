@@ -1751,15 +1751,16 @@ impl Workspace {
                     true,
                     &mut |_, ui| {
                         for (key, what) in [
-                            ("LMB drag", "sculpt"),
+                            ("LMB drag", "sculpt · on canvas: orbit"),
                             ("Ctrl", "invert brush"),
                             ("Shift", "smooth"),
-                            ("RMB / MMB", "orbit"),
-                            ("Shift + RMB", "pan"),
-                            ("Scroll", "zoom · Ctrl: radius"),
+                            ("Alt + LMB", "pan"),
+                            ("Alt + LMB, release Alt", "zoom"),
+                            ("RMB / MMB", "orbit · Alt: pan · Ctrl: zoom"),
+                            ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
-                            ("F", "frame mesh"),
+                            ("F / Home", "frame mesh / reset view"),
                             ("Tab", "hide interface"),
                         ] {
                             kv(ui, key, what);
