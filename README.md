@@ -18,7 +18,7 @@ cargo run --release -- --divide 2 --novsync --frames        # average frame time
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
 default sphere); the Geometry section of the Mesh palette has the same slider. Each level costs
-about 150 bytes per vertex of RAM and 72 bytes per vertex of GPU memory while it is shown.
+about 140 bytes per vertex of RAM and 52 bytes per vertex of GPU memory while it is shown.
 
 ## Workspace
 
@@ -101,9 +101,11 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 
 - `mesh.rs`: vertices are structure-of-arrays and physically sorted into spatial chunks of
   about 4096 vertices (recursive median split). Each chunk owns a contiguous vertex range,
-  a triangle list, an AABB, the list of neighbouring chunks and the few vertices it borrows
-  from them. CSR adjacency tables give vertex neighbours and incident triangles. Every heavy
-  pass (selection, position writes, bounds) runs in parallel over chunks with rayon.
+  a contiguous range of the index buffer (the triangles whose first vertex it owns, those
+  reaching into another chunk first), an AABB, the list of neighbouring chunks and the few
+  vertices it borrows from them. CSR adjacency tables give vertex neighbours and incident
+  triangles. Every heavy pass (selection, position writes, bounds) runs in parallel over
+  chunks with rayon.
 - `sculpt.rs`: a stroke gathers vertices under the brush by testing chunk bounds first,
   computes new positions in one parallel pass and scatters them in a second, then marks the
   touched chunks and their neighbours dirty. Undo snapshots the owned positions of each
@@ -120,14 +122,18 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   dependent child chunks and re-applies their offsets, one level at a time. Edits at the top
   level touch nothing else. Undo stores positions at level 0 and offsets above it, so it
   works at any level, and the displayed level follows; Divide itself is undoable.
-- `render.rs`: positions, packed normals and indices live on the GPU, one set per
-  subdivision level that has been shown, so stepping between levels is a pointer swap.
-  Levels that are not shown keep their copies up to 1 GB in total; beyond that the largest
-  are dropped and re-uploaded on the next visit, and a level that still does not fit is
-  refused with a notice while the previous level stays up.
-  Normals are never stored on the CPU: a compute pass (`normals.wgsl`) recomputes them for
-  flagged chunks each frame. Dirty position ranges are re-uploaded as merged contiguous runs.
-  egui is drawn in a second pass.
+- `render.rs`: positions, packed normals, indices and fixed-point normal accumulators live
+  on the GPU (52 bytes per vertex), one set per subdivision level that has been shown, so
+  stepping between levels is a pointer swap. Levels that are not shown keep their copies up
+  to 1 GB in total; beyond that the largest are dropped and re-uploaded on the next visit,
+  and a level that still does not fit is refused with a notice while the previous level
+  stays up. Normals are never stored on the CPU, and the GPU holds no vertex-to-triangle
+  table: `normals.wgsl` runs three dispatches over the flagged chunks and their neighbours.
+  One workgroup per flagged chunk walks the chunk's triangle range and sums face normals for
+  its own vertices in workgroup memory; one per listed chunk walks only its border triangles
+  and adds, atomically, to the vertices they touch in other flagged chunks; a third turns the
+  sums into packed unit normals. Dirty position ranges are re-uploaded as merged contiguous
+  runs. egui is drawn in a second pass.
 
 ## Numbers (RTX 5060, 16 cores, release build)
 
@@ -141,16 +147,18 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 
 | Step | Result |
 | --- | --- |
-| Divide 960k → 3.84M vertices | 240 ms |
-| Divide 3.84M → 15.4M vertices | 940 ms |
-| Divide 15.4M → 61.4M vertices | 4.0 s, 9.1 GB RAM for the four levels, 4.4 GB of GPU memory to show it |
+| Divide 960k → 3.84M vertices | 260 ms |
+| Divide 3.84M → 15.4M vertices | 1.03 s |
+| Divide 15.4M → 61.4M vertices | 4.2 s, 9 GB RAM for the four levels, 3.2 GB of GPU memory to show it (was 4.4 GB with the vertex-to-triangle tables on the GPU) |
 | Draw dab at level 0 with two levels above (7.7k vertices under the brush) | 0.7 ms/dab, same as without levels: upper levels are synced when you step up |
 | Step up to level 1 after that stroke | 75 of 1 024 chunks re-smoothed, 0.6 ms |
 | Step up to level 2 | 368 of 4 096 chunks re-smoothed, 3 ms |
 | Step up to level 3 | 1 619 of 16 384 chunks re-smoothed, 14 ms |
 | Undo / redo that base stroke while level 2 is shown | 4 ms each |
-| Frame at level 0 / 1 / 2 (`--novsync --frames`) | 0.65 / 0.95 / 3.7 ms |
+| Frame at level 0 / 1 / 2 / 3 (`--novsync --frames`) | 0.7 / 1.1 / 4.0 / 14.4 ms |
+| GPU memory at level 2 / 3 while shown | 0.8 / 3.2 GB (52 bytes per vertex) |
 | Memory for the three levels | 2.2 GB |
+| Grab of a third of a 13.5M-vertex mesh (`--segments 1500 --stress --novsync`), with the normal passes each frame | 8.9 ms/frame (9.3 ms before the accumulate passes) |
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of

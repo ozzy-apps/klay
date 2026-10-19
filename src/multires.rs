@@ -11,7 +11,7 @@
 //! midpoints of the edges it owns) are split spatially into child chunks, and every array of
 //! the child mesh is produced in parallel over chunks.
 
-use crate::mesh::{CHUNK_TARGET, Chunk, SculptMesh, partition_ids, split_ranges};
+use crate::mesh::{CHUNK_TARGET, Chunk, SculptMesh, crosses_chunk, partition_ids, split_ranges};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::sync::LazyLock;
@@ -143,6 +143,14 @@ fn edge_tris(
             Some((t, ia, ib, o))
         })
         .take(2)
+}
+
+/// Triangles of `parent` whose first edge is `a-b` (`a < b`), in the order of `a`'s
+/// incidence list: the parent triangles whose centre child the odd vertex of `a-b` owns.
+fn centre_tris(parent: &SculptMesh, a: u32, b: u32) -> impl Iterator<Item = u32> + '_ {
+    edge_tris(parent, a, b)
+        .filter(|&(_, ia, ib, _)| ia + ib == 1)
+        .map(|(t, _, _, _)| t)
 }
 
 /// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
@@ -310,8 +318,117 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
         vt_offsets[i + 1] += vt_offsets[i];
     }
 
-    // 7. Adjacency and incidence lists, filled per chunk. Child triangle `4t + k` is the
-    // corner of parent triangle `t` at its k-th vertex (k < 3) or its centre (k == 3).
+    // 7. The triangles each chunk owns, by natural child id. Child triangle `4t + k` is the
+    // corner of parent triangle `t` at its k-th vertex (k < 3) or its centre (k == 3); its
+    // first vertex is the even vertex above that corner, or the odd vertex on the
+    // triangle's first edge, so a chunk owns the children whose first vertex it holds. The
+    // lists are sorted so a chunk's range of the index buffer keeps the parent's triangle
+    // order, which the vertex cache rewards (owner order costs 17% of frame time).
+    let owned: Vec<Vec<u32>> = ranges()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(s, e)| {
+            let mut out = Vec::with_capacity((e - s) * 2);
+            for st in &stencil[s..e] {
+                if st[1] == NONE {
+                    let p = st[0];
+                    for &t in parent.incident(p) {
+                        let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                        let corner = tri.iter().position(|&x| x == p).unwrap() as u32;
+                        out.push(4 * t + corner);
+                    }
+                } else {
+                    for t in centre_tris(parent, st[0], st[1]) {
+                        out.push(4 * t + 3);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out
+        })
+        .collect();
+    let mut chunk_tri = Vec::with_capacity(c_count + 1);
+    chunk_tri.push(0u32);
+    for o in &owned {
+        chunk_tri.push(chunk_tri.last().unwrap() + o.len() as u32);
+    }
+    let t_count = parent.indices.len() / 3 * 4;
+    debug_assert_eq!(*chunk_tri.last().unwrap() as usize, t_count);
+
+    // 8. Triangles, four per parent triangle with the parent's winding, each chunk's range
+    // in the order of its owned list except that the triangles reaching into another chunk
+    // go first (the renderer walks only those for neighbouring chunks). The final id of
+    // every natural child id goes into `tri_remap`; each child is owned by one chunk, so
+    // the parallel scatter never writes a slot twice.
+    let tri_remap: Vec<AtomicU32> = (0..t_count)
+        .into_par_iter()
+        .map(|_| AtomicU32::new(0))
+        .collect();
+    let mut indices = vec![0u32; 3 * t_count];
+    let borders: Vec<u32> = {
+        let tri_ranges = chunk_tri
+            .windows(2)
+            .map(|w| (3 * w[0] as usize, 3 * w[1] as usize));
+        split_ranges(&mut indices, tri_ranges)
+            .into_par_iter()
+            .zip(owned.par_iter())
+            .zip(ranges().collect::<Vec<_>>().into_par_iter())
+            .zip(chunk_tri.par_iter())
+            .map(|(((out, o), (s, e)), &start)| {
+                // The children of one parent triangle share its remapped corners and edge
+                // midpoints, and are consecutive in the sorted list when one chunk owns
+                // several of them.
+                let mut last_t = NONE;
+                let mut v = [0u32; 6]; // a, b, c, ab, bc, ca
+                let mut tris: Vec<[u32; 3]> = Vec::with_capacity(o.len());
+                let mut crosses: Vec<bool> = Vec::with_capacity(o.len());
+                for &nat in o {
+                    let (t, k) = (nat / 4, nat % 4);
+                    if t != last_t {
+                        let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                        v = [
+                            rm(tri[0]),
+                            rm(tri[1]),
+                            rm(tri[2]),
+                            rm(odd_nat(tri[0], tri[1])),
+                            rm(odd_nat(tri[1], tri[2])),
+                            rm(odd_nat(tri[2], tri[0])),
+                        ];
+                        last_t = t;
+                    }
+                    let child = match k {
+                        0 => [v[0], v[3], v[5]],
+                        1 => [v[1], v[4], v[3]],
+                        2 => [v[2], v[5], v[4]],
+                        _ => [v[3], v[4], v[5]],
+                    };
+                    crosses.push(crosses_chunk(&child, s as u32, e as u32));
+                    tris.push(child);
+                }
+                // Border triangles first, then the rest, each part in list order.
+                let mut n = 0u32;
+                let mut n_border = 0u32;
+                for pass in [true, false] {
+                    for (i, &nat) in o.iter().enumerate() {
+                        if crosses[i] == pass {
+                            let at = 3 * n as usize;
+                            out[at..at + 3].copy_from_slice(&tris[i]);
+                            tri_remap[nat as usize].store(start + n, Relaxed);
+                            n += 1;
+                        }
+                    }
+                    if pass {
+                        n_border = n;
+                    }
+                }
+                n_border
+            })
+            .collect()
+    };
+    drop(owned);
+    let tm = |nat: u32| tri_remap[nat as usize].load(Relaxed);
+
+    // 9. Adjacency and incidence lists, filled per chunk.
     let mut adj_verts = vec![0u32; adj_offsets[n_count] as usize];
     let mut vt_tris = vec![0u32; vt_offsets[n_count] as usize];
     {
@@ -336,7 +453,7 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
                         for (k, &t) in parent.incident(p).iter().enumerate() {
                             let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
                             let corner = tri.iter().position(|&x| x == p).unwrap() as u32;
-                            vt[k] = 4 * t + corner;
+                            vt[k] = tm(4 * t + corner);
                         }
                     } else {
                         let [a, b, c, d] = st;
@@ -351,9 +468,9 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
                             }
                         }
                         for (k, (t, ia, ib, _)) in edge_tris(parent, a, b).enumerate() {
-                            vt[3 * k] = 4 * t + ia;
-                            vt[3 * k + 1] = 4 * t + ib;
-                            vt[3 * k + 2] = 4 * t + 3;
+                            vt[3 * k] = tm(4 * t + ia);
+                            vt[3 * k + 1] = tm(4 * t + ib);
+                            vt[3 * k + 2] = tm(4 * t + 3);
                         }
                     }
                     adj.sort_unstable();
@@ -361,50 +478,16 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
             });
     }
 
-    // 8. Triangles, four per parent triangle, same winding.
-    let mut indices = vec![0u32; parent.indices.len() * 4];
-    indices
-        .par_chunks_mut(12)
-        .zip(parent.indices.par_chunks(3))
-        .for_each(|(out, tri)| {
-            let [a, b, c] = [tri[0], tri[1], tri[2]];
-            let (ab, bc, ca) = (rm(odd_nat(a, b)), rm(odd_nat(b, c)), rm(odd_nat(c, a)));
-            let (a, b, c) = (rm(a), rm(b), rm(c));
-            out.copy_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
-        });
+    drop(tri_remap);
 
-    // 9. Each chunk lists the triangles whose first vertex it owns: the corner triangles of
-    // its even vertices and the centre triangles whose first edge its odd vertices split.
-    let tris: Vec<Vec<u32>> = ranges()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|(s, e)| {
-            let mut out = Vec::with_capacity((e - s) * 2);
-            for st in &stencil[s..e] {
-                if st[1] == NONE {
-                    let p = st[0];
-                    for &t in parent.incident(p) {
-                        let tri = &parent.indices[3 * t as usize..3 * t as usize + 3];
-                        let corner = tri.iter().position(|&x| x == p).unwrap() as u32;
-                        out.push(4 * t + corner);
-                    }
-                } else {
-                    for (t, ia, ib, _) in edge_tris(parent, st[0], st[1]) {
-                        if ia + ib == 1 {
-                            out.push(4 * t + 3);
-                        }
-                    }
-                }
-            }
-            out
-        })
-        .collect();
+    // 10. Chunks: vertex range and the triangle range its vertices own.
     let chunks: Vec<Chunk> = ranges()
-        .zip(tris)
-        .map(|((s, e), tris)| Chunk::new(s as u32, e as u32, tris))
+        .zip(chunk_tri.windows(2))
+        .zip(&borders)
+        .map(|(((s, e), w), &b)| Chunk::new(s as u32, e as u32, w[0], w[0] + b, w[1]))
         .collect();
 
-    // 10. Which child chunks read which parent chunks.
+    // 11. Which child chunks read which parent chunks.
     let deps: Vec<Vec<u32>> = ranges()
         .collect::<Vec<_>>()
         .into_par_iter()
@@ -754,19 +837,25 @@ mod tests {
             let got: HashSet<u32> = m.incident(v).iter().copied().collect();
             assert_eq!(got, vt[v as usize], "incidence of {v}");
         }
-        // Every triangle is listed by exactly one chunk, the one owning its first vertex.
-        let mut seen = vec![0u32; m.triangle_count()];
+        // Chunk triangle ranges tile the index buffer in order, each holds exactly the
+        // triangles whose first vertex the chunk owns, and the ones reaching into another
+        // chunk come first.
+        let mut next = 0;
         for (ci, ch) in m.chunks.iter().enumerate() {
-            for &t in &ch.tris {
-                seen[t as usize] += 1;
-                assert_eq!(m.vert_chunk[m.indices[3 * t as usize] as usize], ci as u32);
+            assert_eq!(ch.tri_start, next, "triangle ranges are contiguous");
+            next = ch.tri_end;
+            for t in ch.tris() {
+                let tri = &m.indices[3 * t as usize..3 * t as usize + 3];
+                assert_eq!(m.vert_chunk[tri[0] as usize], ci as u32);
+                let crosses = tri.iter().any(|&v| m.vert_chunk[v as usize] != ci as u32);
+                assert_eq!(crosses, t < ch.tri_border, "border triangles first");
             }
             for v in ch.vert_start..ch.vert_end {
                 assert_eq!(m.vert_chunk[v as usize], ci as u32);
             }
             assert!((ch.vert_end - ch.vert_start) as usize <= CHUNK_TARGET);
         }
-        assert!(seen.iter().all(|&s| s == 1), "triangle listed once");
+        assert_eq!(next as usize, m.triangle_count(), "every triangle is in a range");
     }
 
     #[test]

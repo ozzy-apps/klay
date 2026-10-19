@@ -1214,7 +1214,7 @@ fn bench_multires(app: &mut App, times: u32) {
 }
 
 /// Default vertex budget for subdivision: three divides of the default sphere fit (61M
-/// vertices: about 8 GB of RAM and 4.4 GB of GPU memory for that level).
+/// vertices: about 8 GB of RAM and 3.2 GB of GPU memory for that level).
 const DEFAULT_BUDGET: usize = 64_000_000;
 
 fn main() {

@@ -1,10 +1,11 @@
 //! Chunked triangle mesh for sculpting.
 //!
 //! Vertices are stored structure-of-arrays and are physically sorted by chunk, so every
-//! chunk owns a contiguous vertex range. All heavy operations (selection, position writes,
-//! bounds) run in parallel over chunks, and a brush stroke only touches the chunks under it
-//! plus their immediate neighbours. Normals are not stored on the CPU: the GPU recomputes
-//! them for dirty chunks each frame, and brushes evaluate them on demand.
+//! chunk owns a contiguous vertex range, and the index buffer is grouped the same way, so
+//! every chunk also owns a contiguous triangle range. All heavy operations (selection,
+//! position writes, bounds) run in parallel over chunks, and a brush stroke only touches the
+//! chunks under it plus their immediate neighbours. Normals are not stored on the CPU: the
+//! GPU recomputes them for dirty chunks each frame, and brushes evaluate them on demand.
 
 use glam::Vec3;
 use rayon::prelude::*;
@@ -52,9 +53,14 @@ pub struct Chunk {
     /// Owned vertex range `[vert_start, vert_end)`.
     pub vert_start: u32,
     pub vert_end: u32,
-    /// Triangle ids whose first vertex is owned by this chunk.
-    pub tris: Vec<u32>,
-    /// Bounds of every vertex referenced by `tris`.
+    /// Owned triangle range `[tri_start, tri_end)`: the triangles whose first vertex this
+    /// chunk owns. The index buffer is grouped by chunk, so they are contiguous, and within
+    /// the range the triangles that touch a vertex of another chunk come first, ending at
+    /// `tri_border`.
+    pub tri_start: u32,
+    pub tri_border: u32,
+    pub tri_end: u32,
+    /// Bounds of every vertex referenced by the owned triangles.
     pub aabb: Aabb,
     /// Positions changed: re-upload the owned range.
     pub dirty_pos: bool,
@@ -68,11 +74,13 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub(crate) fn new(vert_start: u32, vert_end: u32, tris: Vec<u32>) -> Self {
+    pub(crate) fn new(vert_start: u32, vert_end: u32, tri_start: u32, tri_border: u32, tri_end: u32) -> Self {
         Self {
             vert_start,
             vert_end,
-            tris,
+            tri_start,
+            tri_border,
+            tri_end,
             aabb: Aabb::empty(),
             dirty_pos: true,
             dirty_nrm: true,
@@ -84,6 +92,16 @@ impl Chunk {
 
     pub fn range(&self) -> (usize, usize) {
         (self.vert_start as usize, self.vert_end as usize)
+    }
+
+    /// Ids of the owned triangles.
+    pub fn tris(&self) -> std::ops::Range<u32> {
+        self.tri_start..self.tri_end
+    }
+
+    /// Ids of the owned triangles that have a vertex in another chunk.
+    pub fn border_tris(&self) -> std::ops::Range<u32> {
+        self.tri_start..self.tri_border
     }
 }
 
@@ -229,16 +247,13 @@ impl SculptMesh {
                 new_positions.push(positions[old as usize]);
                 vert_chunk.push(ci as u32);
             }
-            chunks.push(Chunk::new(start, new_positions.len() as u32, Vec::new()));
+            chunks.push(Chunk::new(start, new_positions.len() as u32, 0, 0, 0));
         }
         let positions = new_positions;
         let indices: Vec<u32> = indices.into_par_iter().map(|i| remap[i as usize]).collect();
 
-        // 3. Assign triangles to chunks.
-        for t in 0..indices.len() / 3 {
-            let c = vert_chunk[indices[3 * t] as usize];
-            chunks[c as usize].tris.push(t as u32);
-        }
+        // 3. Group the triangles by the chunk owning their first vertex, border ones first.
+        let indices = group_triangles(indices, &mut chunks);
 
         // 4. Vertex -> triangle CSR.
         let mut vt_offsets = vec![0u32; n + 1];
@@ -301,8 +316,9 @@ impl SculptMesh {
     }
 
     /// Build a mesh from arrays that are already in chunk order: positions and `vert_chunk`
-    /// sorted so every chunk owns a contiguous range, each chunk listing the triangles whose
-    /// first vertex it owns, and both CSR tables complete. Chunk neighbours, borrowed
+    /// sorted so every chunk owns a contiguous range, the index buffer grouped so each chunk
+    /// owns the contiguous range of triangles whose first vertex it owns (those touching
+    /// another chunk first), and both CSR tables complete. Chunk neighbours, borrowed
     /// vertices and bounds are derived here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn assemble(
@@ -345,7 +361,7 @@ impl SculptMesh {
                 nbs.sort_unstable();
                 nbs.dedup();
                 let mut external = Vec::new();
-                for &t in &ch.tris {
+                for t in ch.border_tris() {
                     for &v in &mesh.indices[3 * t as usize..3 * t as usize + 3] {
                         if v < ch.vert_start || v >= ch.vert_end {
                             external.push(v);
@@ -586,7 +602,7 @@ impl SculptMesh {
                     break;
                 }
             }
-            for &t in &self.chunks[ci].tris {
+            for t in self.chunks[ci].tris() {
                 let i = 3 * t as usize;
                 let a = self.positions[self.indices[i] as usize];
                 let b = self.positions[self.indices[i + 1] as usize];
@@ -651,6 +667,47 @@ fn vertex_normal(positions: &[Vec3], indices: &[u32], vt_offsets: &[u32], vt_tri
         n += (b - a).cross(c - a);
     }
     n.normalize_or(Vec3::Y)
+}
+
+/// Whether triangle `tri` has a vertex outside `[vert_start, vert_end)`.
+pub(crate) fn crosses_chunk(tri: &[u32], vert_start: u32, vert_end: u32) -> bool {
+    tri.iter().any(|&v| v < vert_start || v >= vert_end)
+}
+
+/// Reorder `indices` so the triangles whose first vertex lies in chunk `c` form one
+/// contiguous range with the ones that cross into another chunk first, keeping the input
+/// order within each part, and record the ranges in `chunks[c]`.
+fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk]) -> Vec<u32> {
+    // Chunk and border flag per triangle, then counting sort by (chunk, !border).
+    let owner: Vec<(u32, bool)> = indices
+        .par_chunks_exact(3)
+        .map(|tri| {
+            let c = chunks.partition_point(|ch| ch.vert_end <= tri[0]) as u32;
+            let ch = &chunks[c as usize];
+            (c, crosses_chunk(tri, ch.vert_start, ch.vert_end))
+        })
+        .collect();
+    let mut start = vec![0u32; 2 * chunks.len() + 1];
+    for &(c, border) in &owner {
+        start[2 * c as usize + !border as usize + 1] += 1;
+    }
+    for i in 0..2 * chunks.len() {
+        start[i + 1] += start[i];
+    }
+    let mut fill = start.clone();
+    let mut out = vec![0u32; indices.len()];
+    for (tri, &(c, border)) in indices.chunks_exact(3).zip(&owner) {
+        let slot = &mut fill[2 * c as usize + !border as usize];
+        let at = 3 * *slot as usize;
+        out[at..at + 3].copy_from_slice(tri);
+        *slot += 1;
+    }
+    for (c, ch) in chunks.iter_mut().enumerate() {
+        ch.tri_start = start[2 * c];
+        ch.tri_border = start[2 * c + 1];
+        ch.tri_end = start[2 * c + 2];
+    }
+    out
 }
 
 /// Bounds of a chunk's triangles: its own contiguous vertex range plus the few vertices it

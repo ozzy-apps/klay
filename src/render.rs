@@ -20,12 +20,23 @@ pub struct Uniforms {
     pub display: [f32; 4],
 }
 
+/// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
+/// normals, since the chunk counts follow the work list.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct NormalParams {
-    vertex_count: u32,
+    scale: f32,
+    cap: f32,
+    chunk_count: u32,
+    flagged: u32,
+    listed: u32,
     _pad: [u32; 3],
 }
+
+/// Fixed point for the normal accumulators: a face of typical size contributes about 2^18
+/// per axis; one face is capped at 2^24 so the sum of up to 128 faces cannot overflow.
+const NORMAL_TYPICAL: f32 = (1u32 << 18) as f32;
+const NORMAL_CAP: f32 = (1u32 << 24) as f32;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -45,26 +56,35 @@ struct GpuGrab {
     _buffers: [wgpu::Buffer; 3],
 }
 
-/// GPU copy of one subdivision level.
+/// GPU copy of one subdivision level: 52 bytes per vertex (positions 12, packed normals 4,
+/// indices 24, normal accumulators 12) plus a few words per chunk.
 struct MeshBuffers {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
     indices: wgpu::Buffer,
-    chunk_dirty: wgpu::Buffer,
+    /// Per-chunk flags for the normal passes (1 = recompute).
+    chunk_flag: wgpu::Buffer,
+    /// Chunk ids the normal passes visit: flagged chunks first, then their edge neighbours.
+    work: wgpu::Buffer,
+    normal_params: wgpu::Buffer,
     normal_bind_group: wgpu::BindGroup,
     index_count: u32,
-    vertex_count: u32,
-    /// Per-chunk flags for the normal recompute pass.
+    /// Fixed-point scale of the normal accumulators for this level.
+    normal_scale: f32,
+    /// CPU side of `chunk_flag`.
     dirty_flags: Vec<u32>,
+    /// Flagged and listed chunks of the next normal passes.
+    flagged: u32,
+    listed: u32,
     /// GPU memory held by this level.
     bytes: u64,
     // Kept alive for the bind group.
-    _normal_params: wgpu::Buffer,
+    _tables: [wgpu::Buffer; 4],
 }
 
 /// Levels that are not shown keep their GPU copies while they total at most this much;
 /// beyond it the largest ones are dropped and re-uploaded on their next visit. A
-/// 61M-vertex level alone is 4.4 GB, so this is what lets it fit next to the lower levels
+/// 61M-vertex level alone is 3.2 GB, so this is what lets it fit next to the lower levels
 /// on an 8 GB card.
 const GPU_CACHE_BYTES: u64 = 1 << 30;
 
@@ -82,7 +102,9 @@ pub struct Gfx {
     background_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    normal_pipeline: wgpu::ComputePipeline,
+    normal_own: wgpu::ComputePipeline,
+    normal_border: wgpu::ComputePipeline,
+    normal_normalize: wgpu::ComputePipeline,
     normal_bgl: wgpu::BindGroupLayout,
     grab_pipeline: wgpu::ComputePipeline,
     grab_bgl: wgpu::BindGroupLayout,
@@ -310,9 +332,11 @@ impl Gfx {
                 storage(3, true),
                 storage(4, true),
                 storage(5, true),
-                storage(6, false),
+                storage(6, true),
+                storage(7, false),
+                storage(8, false),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7,
+                    binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -328,14 +352,19 @@ impl Gfx {
             bind_group_layouts: &[Some(&normal_bgl)],
             immediate_size: 0,
         });
-        let normal_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("normals pipeline"),
-            layout: Some(&normal_layout),
-            module: &normal_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let normal_pass = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&normal_layout),
+                module: &normal_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let normal_own = normal_pass("normals own", "cs_own");
+        let normal_border = normal_pass("normals border", "cs_border");
+        let normal_normalize = normal_pass("normals normalize", "cs_normalize");
         // --- Grab compute pipeline ------------------------------------------------------
         let grab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grab"),
@@ -400,7 +429,9 @@ impl Gfx {
             uniform_buf,
             background_pipeline,
             bind_group,
-            normal_pipeline,
+            normal_own,
+            normal_border,
+            normal_normalize,
             normal_bgl,
             grab_pipeline,
             grab_bgl,
@@ -528,8 +559,9 @@ impl Gfx {
             match self.create_level(mesh) {
                 Some(buffers) => {
                     log::info!(
-                        "gpu: level {level} uploaded, {} MB",
-                        buffers.bytes / 1_000_000
+                        "gpu: level {level} uploaded, {} MB ({} bytes per vertex)",
+                        buffers.bytes / 1_000_000,
+                        buffers.bytes / mesh.vertex_count().max(1) as u64
                     );
                     self.levels[level] = Some(buffers);
                     for ch in &mut mesh.chunks {
@@ -560,47 +592,47 @@ impl Gfx {
             bytemuck::cast_slice(&mesh.indices),
             U::INDEX | U::STORAGE,
         );
-        let vt_offsets = self.upload(
-            "vt_offsets",
-            bytemuck::cast_slice(&mesh.vt_offsets),
-            U::STORAGE,
+        let chunk_count = mesh.chunks.len();
+        let mut chunk_verts = Vec::with_capacity(chunk_count + 1);
+        let mut chunk_tris = Vec::with_capacity(chunk_count + 1);
+        let mut chunk_border = Vec::with_capacity(chunk_count);
+        for ch in &mesh.chunks {
+            chunk_verts.push(ch.vert_start);
+            chunk_tris.push(ch.tri_start);
+            chunk_border.push(ch.tri_border);
+        }
+        chunk_verts.push(mesh.vertex_count() as u32);
+        chunk_tris.push(mesh.triangle_count() as u32);
+        let chunk_verts = self.upload("chunk_verts", bytemuck::cast_slice(&chunk_verts), U::STORAGE);
+        let chunk_tris = self.upload("chunk_tris", bytemuck::cast_slice(&chunk_tris), U::STORAGE);
+        let chunk_border = self.upload("chunk_border", bytemuck::cast_slice(&chunk_border), U::STORAGE);
+        let plain = |label: &str, size: usize, usage: U| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(4) as u64,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let normals = plain("normals", mesh.vertex_count() * 4, U::VERTEX | U::STORAGE);
+        let acc = plain("normal accumulators", mesh.vertex_count() * 12, U::STORAGE);
+        let chunk_flag = plain("chunk_flag", chunk_count * 4, U::STORAGE | U::COPY_DST);
+        let work = plain("normal work list", chunk_count * 4, U::STORAGE | U::COPY_DST);
+        let normal_params = plain(
+            "normal params",
+            std::mem::size_of::<NormalParams>(),
+            U::UNIFORM | U::COPY_DST,
         );
-        let vt_tris = self.upload("vt_tris", bytemuck::cast_slice(&mesh.vt_tris), U::STORAGE);
-        let vert_chunk = self.upload(
-            "vert_chunk",
-            bytemuck::cast_slice(&mesh.vert_chunk),
-            U::STORAGE,
-        );
-        let normals = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("normals"),
-            size: (mesh.vertex_count() * 4).max(4) as u64,
-            usage: U::VERTEX | U::STORAGE,
-            mapped_at_creation: false,
-        });
-        let chunk_dirty = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk_dirty"),
-            size: (mesh.chunks.len().max(1) * 4) as u64,
-            usage: U::STORAGE | U::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let normal_params = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("normal params"),
-                contents: bytemuck::bytes_of(&NormalParams {
-                    vertex_count: mesh.vertex_count() as u32,
-                    _pad: [0; 3],
-                }),
-                usage: U::UNIFORM,
-            });
         let bytes = [
             &positions,
             &indices,
-            &vt_offsets,
-            &vt_tris,
-            &vert_chunk,
+            &chunk_verts,
+            &chunk_tris,
+            &chunk_border,
             &normals,
-            &chunk_dirty,
+            &acc,
+            &chunk_flag,
+            &work,
         ]
         .iter()
         .map(|b| b.size())
@@ -610,11 +642,13 @@ impl Gfx {
             drop((
                 positions,
                 indices,
-                vt_offsets,
-                vt_tris,
-                vert_chunk,
+                chunk_verts,
+                chunk_tris,
+                chunk_border,
                 normals,
-                chunk_dirty,
+                acc,
+                chunk_flag,
+                work,
                 normal_params,
             ));
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -634,26 +668,34 @@ impl Gfx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: vt_offsets.as_entire_binding(),
+                    resource: chunk_verts.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: vt_tris.as_entire_binding(),
+                    resource: chunk_tris.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: vert_chunk.as_entire_binding(),
+                    resource: chunk_border.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: chunk_dirty.as_entire_binding(),
+                    resource: chunk_flag.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: normals.as_entire_binding(),
+                    resource: work.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
+                    resource: acc.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: normals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
                     resource: normal_params.as_entire_binding(),
                 },
             ],
@@ -662,13 +704,17 @@ impl Gfx {
             positions,
             normals,
             indices,
-            chunk_dirty,
+            chunk_flag,
+            work,
+            normal_params,
             normal_bind_group,
             index_count: mesh.indices.len() as u32,
-            vertex_count: mesh.vertex_count() as u32,
-            dirty_flags: vec![0; mesh.chunks.len()],
+            normal_scale: normal_scale(mesh),
+            dirty_flags: vec![0; chunk_count],
+            flagged: 0,
+            listed: 0,
             bytes,
-            _normal_params: normal_params,
+            _tables: [chunk_verts, chunk_tris, chunk_border, acc],
         })
     }
 
@@ -817,10 +863,42 @@ impl Gfx {
             }
         }
         if normal_chunks > 0 {
+            // Work list: the flagged chunks, then every chunk sharing an edge with one of
+            // them (their triangles touch flagged vertices).
+            let flags = &buffers.dirty_flags;
+            let mut work: Vec<u32> = (0..flags.len() as u32).filter(|&c| flags[c as usize] != 0).collect();
+            let flagged = work.len();
+            let mut listed = flags.clone();
+            for k in 0..flagged {
+                for &nb in &mesh.chunks[work[k] as usize].neighbors {
+                    if listed[nb as usize] == 0 {
+                        listed[nb as usize] = 1;
+                        work.push(nb);
+                    }
+                }
+            }
+            buffers.flagged = flagged as u32;
+            buffers.listed = work.len() as u32;
+            if flagged > 64 {
+                log::debug!(
+                    "normals work list: {flagged} flagged + {} neighbour chunks of {}",
+                    work.len() - flagged,
+                    flags.len()
+                );
+            }
+            self.queue.write_buffer(&buffers.chunk_flag, 0, bytemuck::cast_slice(flags));
+            self.queue.write_buffer(&buffers.work, 0, bytemuck::cast_slice(&work));
             self.queue.write_buffer(
-                &buffers.chunk_dirty,
+                &buffers.normal_params,
                 0,
-                bytemuck::cast_slice(&buffers.dirty_flags),
+                bytemuck::bytes_of(&NormalParams {
+                    scale: buffers.normal_scale,
+                    cap: NORMAL_CAP,
+                    chunk_count: flags.len() as u32,
+                    flagged: buffers.flagged,
+                    listed: buffers.listed,
+                    _pad: [0; 3],
+                }),
             );
         }
         self.needs_normals = normal_chunks > 0;
@@ -879,17 +957,22 @@ impl Gfx {
             }
         }
 
-        // Normal recompute for dirty chunks.
+        // Normal recompute for dirty chunks: own-vertex sums, cross-chunk sums, normalise.
         let needs_normals = std::mem::take(&mut self.needs_normals);
         if let (Some(m), true) = (self.active_buffers(), needs_normals) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("normals"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.normal_pipeline);
             pass.set_bind_group(0, &m.normal_bind_group, &[]);
-            let groups = m.vertex_count.div_ceil(256);
-            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+            for (pipeline, chunks) in [
+                (&self.normal_own, m.flagged),
+                (&self.normal_border, m.listed),
+                (&self.normal_normalize, m.flagged),
+            ] {
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(chunks.min(65535), chunks.div_ceil(65535), 1);
+            }
         }
 
         // Mesh pass.
@@ -987,6 +1070,25 @@ impl Gfx {
             self.egui_renderer.free_texture(&id);
         }
     }
+}
+
+/// Fixed-point scale of the normal accumulators for a level: a face of mean area lands at
+/// `NORMAL_TYPICAL`. The mean is taken from an even sample of the triangles.
+fn normal_scale(mesh: &SculptMesh) -> f32 {
+    let tris = mesh.triangle_count();
+    let step = (tris / 65536).max(1);
+    let mut sum = 0.0f64;
+    let mut n = 0usize;
+    for t in (0..tris).step_by(step) {
+        let i = &mesh.indices[3 * t..3 * t + 3];
+        let a = mesh.positions[i[0] as usize];
+        let b = mesh.positions[i[1] as usize];
+        let c = mesh.positions[i[2] as usize];
+        sum += (b - a).cross(c - a).length() as f64;
+        n += 1;
+    }
+    let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+    if mean > 0.0 { NORMAL_TYPICAL / mean as f32 } else { 1.0 }
 }
 
 fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
