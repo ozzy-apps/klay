@@ -25,6 +25,21 @@ pub fn perspective_rh(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     )
 }
 
+/// Orthographic projection with a 0..1 depth range, symmetric about the view axis.
+pub fn orthographic_rh(half_w: f32, half_h: f32, near: f32, far: f32) -> Mat4 {
+    let r = 1.0 / (near - far);
+    Mat4::from_cols(
+        Vec4::new(1.0 / half_w, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 1.0 / half_h, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, r, 0.0),
+        Vec4::new(0.0, 0.0, r * near, 1.0),
+    )
+}
+
+/// Pitch limit: exactly straight down / straight up. The up vector follows the orbit
+/// (see [`Camera::up`]), so the poles are not degenerate.
+pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2;
+
 /// Orbit camera around a target point.
 pub struct Camera {
     pub target: Vec3,
@@ -35,6 +50,9 @@ pub struct Camera {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+    /// Orthographic instead of perspective. The visible height at the target stays the
+    /// same when toggling, so the model does not jump.
+    pub ortho: bool,
 }
 
 impl Camera {
@@ -48,6 +66,7 @@ impl Camera {
             aspect: 1.0,
             near: 0.01,
             far: 100.0,
+            ortho: false,
         }
     }
 
@@ -65,19 +84,37 @@ impl Camera {
     }
 
     pub fn right(&self) -> Vec3 {
-        self.forward().cross(Vec3::Y).normalize()
+        self.forward().cross(self.up()).normalize()
     }
 
+    /// Screen-up in world space: the derivative of the eye direction with respect to
+    /// pitch. Equals +Y at pitch 0 and stays well defined at the poles, where a fixed
+    /// world up would make the view matrix degenerate.
     pub fn up(&self) -> Vec3 {
-        self.right().cross(self.forward()).normalize()
+        Vec3::new(
+            -self.pitch.sin() * self.yaw.sin(),
+            self.pitch.cos(),
+            -self.pitch.sin() * self.yaw.cos(),
+        )
     }
 
     pub fn view(&self) -> Mat4 {
-        look_at_rh(self.eye(), self.target, Vec3::Y)
+        look_at_rh(self.eye(), self.target, self.up())
+    }
+
+    /// Half of the visible height at the target plane.
+    pub fn half_height_at_target(&self) -> f32 {
+        self.distance * (self.fov_y * 0.5).tan()
     }
 
     pub fn proj(&self) -> Mat4 {
-        perspective_rh(self.fov_y, self.aspect.max(0.01), self.near, self.far)
+        let aspect = self.aspect.max(0.01);
+        if self.ortho {
+            let h = self.half_height_at_target();
+            orthographic_rh(h * aspect, h, self.near, self.far)
+        } else {
+            perspective_rh(self.fov_y, aspect, self.near, self.far)
+        }
     }
 
     pub fn view_proj(&self) -> Mat4 {
@@ -86,7 +123,15 @@ impl Camera {
 
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.008;
-        self.pitch = (self.pitch + dy * 0.008).clamp(-1.55, 1.55);
+        self.pitch = (self.pitch + dy * 0.008).clamp(-MAX_PITCH, MAX_PITCH);
+    }
+
+    /// Snap to the nearest axis view (ZBrush: Shift while rotating): yaw to a multiple
+    /// of 90°, pitch to front/side level, straight up or straight down.
+    pub fn snap_to_axis(&mut self) {
+        let q = std::f32::consts::FRAC_PI_2;
+        self.yaw = (self.yaw / q).round() * q;
+        self.pitch = (self.pitch / q).round().clamp(-1.0, 1.0) * q;
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, viewport_h: f32) {
@@ -101,17 +146,17 @@ impl Camera {
     }
 
     /// Zoom like [`zoom`](Self::zoom) but keep the point under the cursor fixed on screen:
-    /// the target slides towards where `ray_dir` crosses the plane through the target.
-    pub fn zoom_towards(&mut self, scroll: f32, ray_dir: Vec3) {
+    /// the target slides towards where the cursor `ray` crosses the plane through the
+    /// target. Works for both projections (in orthographic the ray origin carries the offset).
+    pub fn zoom_towards(&mut self, scroll: f32, ray: (Vec3, Vec3)) {
         let old = self.distance;
         self.zoom(scroll);
         let k = self.distance / old;
         let fwd = self.forward();
-        let denom = ray_dir.dot(fwd);
+        let (o, d) = ray;
+        let denom = d.dot(fwd);
         if denom > 1e-4 {
-            // Eye uses the old distance: recompute it from the target and the old value.
-            let eye = self.target - fwd * old;
-            let under_cursor = eye + ray_dir * (old / denom);
+            let under_cursor = o + d * ((self.target - o).dot(fwd) / denom);
             self.target += (under_cursor - self.target) * (1.0 - k);
         }
     }
@@ -134,6 +179,9 @@ impl Camera {
 
     /// Size of one pixel in world units at the given distance from the eye.
     pub fn pixel_size_at(&self, world_pos: Vec3, viewport_h: f32) -> f32 {
+        if self.ortho {
+            return 2.0 * self.half_height_at_target() / viewport_h.max(1.0);
+        }
         let d = (world_pos - self.eye()).dot(self.forward()).max(self.near);
         2.0 * d * (self.fov_y * 0.5).tan() / viewport_h.max(1.0)
     }
@@ -161,10 +209,67 @@ mod tests {
         let fwd = cam.forward();
         let p = o + d * ((cam.target - o).dot(fwd) / d.dot(fwd));
         for scroll in [3.0, -2.0, 1.0] {
-            let (_, d) = cam.ray(x, y, w, h);
-            cam.zoom_towards(scroll, d);
+            let ray = cam.ray(x, y, w, h);
+            cam.zoom_towards(scroll, ray);
             let (px, py) = project(&cam, p, w, h);
             assert!((px - x).abs() < 0.05 && (py - y).abs() < 0.05, "{px} {py}");
+        }
+    }
+
+    #[test]
+    fn ortho_zoom_towards_keeps_point_under_cursor() {
+        let mut cam = Camera::new();
+        cam.aspect = 1.6;
+        cam.ortho = true;
+        let (w, h) = (1600.0, 1000.0);
+        let (x, y) = (300.0, 800.0);
+        let (o, d) = cam.ray(x, y, w, h);
+        let fwd = cam.forward();
+        let p = o + d * ((cam.target - o).dot(fwd) / d.dot(fwd));
+        for scroll in [2.0, -3.0] {
+            let ray = cam.ray(x, y, w, h);
+            cam.zoom_towards(scroll, ray);
+            let (px, py) = project(&cam, p, w, h);
+            assert!((px - x).abs() < 0.05 && (py - y).abs() < 0.05, "{px} {py}");
+        }
+    }
+
+    #[test]
+    fn ortho_toggle_keeps_target_plane_scale() {
+        let mut cam = Camera::new();
+        cam.aspect = 1.6;
+        let (w, h) = (1600.0, 1000.0);
+        // A point on the target plane, off-centre.
+        let p = cam.target + cam.right() * 0.7 + cam.up() * 0.4;
+        let a = project(&cam, p, w, h);
+        cam.ortho = true;
+        let b = project(&cam, p, w, h);
+        assert!((a.0 - b.0).abs() < 0.05 && (a.1 - b.1).abs() < 0.05, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn snap_to_axis_rounds_to_quarter_turns() {
+        let q = std::f32::consts::FRAC_PI_2;
+        let mut cam = Camera::new();
+        cam.yaw = 0.6;
+        cam.pitch = 0.35;
+        cam.snap_to_axis();
+        assert!(cam.yaw.abs() < 1e-6 && cam.pitch.abs() < 1e-6);
+        cam.yaw = 1.0;
+        cam.pitch = 1.2;
+        cam.snap_to_axis();
+        assert!((cam.yaw - q).abs() < 1e-6 && (cam.pitch - q).abs() < 1e-6);
+    }
+
+    #[test]
+    fn view_is_finite_at_the_poles() {
+        for pitch in [MAX_PITCH, -MAX_PITCH] {
+            let mut cam = Camera::new();
+            cam.pitch = pitch;
+            let m = cam.view_proj();
+            assert!(m.to_cols_array().iter().all(|v| v.is_finite()));
+            let (o, d) = cam.ray(10.0, 10.0, 100.0, 100.0);
+            assert!(o.is_finite() && d.is_finite());
         }
     }
 

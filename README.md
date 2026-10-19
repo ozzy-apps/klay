@@ -64,18 +64,20 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Input | Action |
 | --- | --- |
 | Left drag on the model | Sculpt with the current brush |
-| Left drag on empty canvas | Orbit |
-| Ctrl + left drag | Inverted brush (carve) |
+| Alt + left drag on the model | Alternate brush (carve), like ZBrush's ZSub |
 | Shift + left drag | Smooth |
-| Alt + left drag | Pan (anywhere, also over the model) |
-| Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to pan) |
-| Right / middle drag | Orbit |
-| Alt or Shift + right / middle drag | Pan |
+| Ctrl + left drag | Reserved for masking (not connected yet) |
+| Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
+| Alt + left drag on empty canvas | Move |
+| Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to move) |
+| Right / middle drag | Rotate, anywhere (ZBrush right-click navigation) |
+| Alt + right / middle drag | Move |
 | Ctrl + right / middle drag | Zoom |
 | Scroll | Zoom towards the cursor (Ctrl + scroll: brush radius) |
 | `[` `]` | Brush radius |
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
 | `F` | Frame the mesh |
+| `P` / Shift + `P` | Perspective toggle / floor grid |
 | `Home` | Reset the view angle and frame |
 | `Tab` | Toggle canvas focus |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |

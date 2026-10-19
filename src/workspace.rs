@@ -342,6 +342,9 @@ pub struct Model<'a> {
     pub upload_ms: f32,
     pub render_ms: f32,
     pub adapter: &'a str,
+    /// World X, Y, Z axes in view space as (right, up, towards-camera) components, for
+    /// the axis gizmo.
+    pub axes: [[f32; 3]; 3],
 }
 
 #[derive(Default)]
@@ -371,6 +374,8 @@ pub struct Workspace {
     /// Surface detail shading (the shader's reserved toggle).
     pub wireframe: bool,
     pub grid: bool,
+    /// Perspective (true) or orthographic projection: `P`.
+    pub perspective: bool,
     pub color: Hsva,
     pub color2: Hsva,
     dynamic: bool,
@@ -405,6 +410,7 @@ impl Workspace {
             material: 0,
             wireframe: false,
             grid: true,
+            perspective: true,
             color: Hsva::new(0.06, 0.55, 0.88, 1.0),
             color2: Hsva::new(0.0, 0.0, 1.0, 1.0),
             dynamic: true,
@@ -914,10 +920,14 @@ impl Workspace {
                 {
                     a.frame = true;
                 }
-                big_button(ui, "persp", "Persp", size, true, false)
-                    .on_hover_text("Orthographic view is not connected yet");
+                if big_button(ui, "persp", "Persp", size, self.perspective, true)
+                    .on_hover_text("Perspective · P")
+                    .clicked()
+                {
+                    self.perspective = !self.perspective;
+                }
                 if big_button(ui, "floor", "Floor", size, self.grid, true)
-                    .on_hover_text("Floor grid")
+                    .on_hover_text("Floor grid · Shift + P")
                     .clicked()
                 {
                     self.grid = !self.grid;
@@ -1412,7 +1422,7 @@ impl Workspace {
                                 }
                             });
                         }
-                        note(ui, "Ctrl inverts · Shift smooths · 1–5 selects");
+                        note(ui, "Alt inverts · Shift smooths · 1–5 selects");
                     },
                 );
                 self.sec(
@@ -1751,16 +1761,16 @@ impl Workspace {
                     true,
                     &mut |_, ui| {
                         for (key, what) in [
-                            ("LMB drag", "sculpt · on canvas: orbit"),
-                            ("Ctrl", "invert brush"),
-                            ("Shift", "smooth"),
-                            ("Alt + LMB", "pan"),
-                            ("Alt + LMB, release Alt", "zoom"),
-                            ("RMB / MMB", "orbit · Alt: pan · Ctrl: zoom"),
+                            ("Drag model", "sculpt · Alt: alternate · Shift: smooth"),
+                            ("Drag canvas", "rotate · Shift: snap to axis"),
+                            ("Alt + drag canvas", "move"),
+                            ("Alt + click, release Alt", "zoom"),
+                            ("RMB / MMB", "rotate · Alt: move · Ctrl: zoom"),
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
                             ("F / Home", "frame mesh / reset view"),
+                            ("P / Shift + P", "perspective / floor grid"),
                             ("Tab", "hide interface"),
                         ] {
                             kv(ui, key, what);
@@ -1849,10 +1859,9 @@ impl Workspace {
                     None,
                     true,
                     true,
-                    &mut |_, ui| {
+                    &mut |ws, ui| {
+                        ui.checkbox(&mut ws.perspective, "Perspective");
                         ui.add_enabled_ui(false, |ui| {
-                            let mut persp = true;
-                            ui.checkbox(&mut persp, "Perspective");
                             let mut fov = 45.0;
                             zslider(ui, "Field of view", &mut fov, 20.0..=90.0, false, false, 0);
                         });
@@ -2078,16 +2087,21 @@ impl Workspace {
             .show(&ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    let projection = if self.perspective {
+                        "Perspective"
+                    } else {
+                        "Orthographic"
+                    };
                     let resp = ui.add(
-                        egui::Button::new(RichText::new("Perspective").size(11.0).color(FG2))
+                        egui::Button::new(RichText::new(projection).size(11.0).color(FG2))
                             .min_size(vec2(0.0, 18.0)),
                     );
                     egui::Popup::menu(&resp).frame(popup_frame()).show(|ui| {
                         for (label, yaw, pitch) in [
-                            ("Perspective", 0.6, 0.35),
+                            ("Default view", 0.6, 0.35),
                             ("Front", 0.0, 0.0),
                             ("Side", std::f32::consts::FRAC_PI_2, 0.0),
-                            ("Top", 0.0, 1.55),
+                            ("Top", 0.0, std::f32::consts::FRAC_PI_2),
                         ] {
                             if menu_item(ui, label, false).clicked() {
                                 a.view = Some((yaw, pitch));
@@ -2102,35 +2116,36 @@ impl Workspace {
                 .fixed_pos(pos2(canvas.right() - 76.0, canvas.top() + 10.0))
                 .show(&ctx, |ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(60.0, 60.0), Sense::hover());
-                    let center = r.center() + vec2(0.0, 4.0);
-                    for (label, offset, color, view) in [
-                        ("Y", vec2(0.0, -24.0), FG2, (0.0, 1.55)),
-                        (
-                            "X",
-                            vec2(20.0, 10.0),
-                            ACC,
-                            (std::f32::consts::FRAC_PI_2, 0.0),
-                        ),
-                        (
-                            "Z",
-                            vec2(-18.0, 12.0),
-                            Color32::from_rgb(122, 169, 214),
-                            (0.0, 0.0),
-                        ),
-                    ] {
+                    let center = r.center();
+                    // Project the world axes with the live camera; draw back-facing ones
+                    // first and dimmer.
+                    let mut axes = [
+                        ("X", ACC, m.axes[0], (std::f32::consts::FRAC_PI_2, 0.0)),
+                        ("Y", FG2, m.axes[1], (0.0, std::f32::consts::FRAC_PI_2)),
+                        ("Z", Color32::from_rgb(122, 169, 214), m.axes[2], (0.0, 0.0)),
+                    ];
+                    axes.sort_by(|a, b| a.2[2].total_cmp(&b.2[2]));
+                    for (label, color, [x, y, depth], view) in axes {
+                        let offset = vec2(x, -y) * 24.0;
                         let end = center + offset;
+                        let dim = if depth < 0.0 { 0.45 } else { 1.0 };
                         ui.painter()
-                            .line_segment([center, end], Stroke::new(1.2, FG2));
+                            .line_segment([center, end], Stroke::new(1.2, FG2.gamma_multiply(dim)));
+                        let label_pos = if offset.length() > 1.0 {
+                            end + offset.normalized() * 7.0
+                        } else {
+                            end
+                        };
                         ui.painter().text(
-                            end + offset.normalized() * 7.0,
+                            label_pos,
                             Align2::CENTER_CENTER,
                             label,
                             FontId::monospace(10.0),
-                            color,
+                            color.gamma_multiply(dim),
                         );
                         if ui
                             .interact(
-                                Rect::from_center_size(end, vec2(22.0, 22.0)),
+                                Rect::from_center_size(label_pos, vec2(22.0, 22.0)),
                                 Id::unique(("axis", label)),
                                 Sense::click(),
                             )
@@ -3199,6 +3214,7 @@ mod tests {
                         upload_ms: 0.0,
                         render_ms: 0.0,
                         adapter: "Test adapter",
+                        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                     },
                 );
             },
