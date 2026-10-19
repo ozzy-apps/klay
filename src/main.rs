@@ -9,6 +9,7 @@ use glam::{Vec2, Vec3};
 use mesh::{SculptMesh, cube_sphere};
 use render::{Gfx, Uniforms};
 use sculpt::{Brush, BrushKind, History, Stroke};
+use workspace::{Mode, QuickPopup};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -23,6 +24,7 @@ enum NavMode {
     Orbit,
     Pan,
     Zoom,
+    Roll,
 }
 
 /// A camera drag in progress. The mode is not stored: it is derived from the button and
@@ -34,6 +36,9 @@ struct NavDrag {
     /// pans while Alt is down and zooms once Alt is released (ZBrush: Alt + click,
     /// release Alt, drag = zoom). Before Alt is ever used a left drag orbits.
     alt_used: bool,
+    /// Shift was held when the left button went down: releasing Shift then turns the
+    /// drag into a roll about the view axis (ZBrush: Shift, click, release Shift, drag).
+    shift_at_press: bool,
 }
 
 impl NavDrag {
@@ -44,6 +49,8 @@ impl NavDrag {
                     NavMode::Pan
                 } else if self.alt_used {
                     NavMode::Zoom
+                } else if self.shift_at_press && !m.shift_key() {
+                    NavMode::Roll
                 } else {
                     NavMode::Orbit
                 }
@@ -77,6 +84,8 @@ struct App {
 
     cursor: Vec2,
     last_cursor: Vec2,
+    /// egui points per physical pixel, for placing popups at the cursor.
+    scale: f32,
     modifiers: ModifiersState,
     nav: Option<NavDrag>,
     hover: Option<Vec3>,
@@ -130,6 +139,7 @@ impl App {
             stroke_brush: Brush::default(),
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
+            scale: 1.0,
             modifiers: ModifiersState::empty(),
             nav: None,
             hover: None,
@@ -271,8 +281,9 @@ impl App {
         let gpu = self.gfx.is_some() && self.stroke_brush.kind == BrushKind::Grab;
         // Alt is ZBrush's alternate (ZSub) modifier.
         let invert = self.modifiers.alt_key() ^ self.workspace.subtract;
-        log::trace!("stroke {:?} invert={invert}", self.stroke_brush.kind);
-        self.stroke = Some(Stroke::begin(invert, gpu));
+        let symmetry = self.workspace.symmetry;
+        log::trace!("stroke {:?} invert={invert} symmetry={symmetry}", self.stroke_brush.kind);
+        self.stroke = Some(Stroke::begin(invert, gpu, symmetry));
         self.apply_stroke();
     }
 
@@ -339,6 +350,10 @@ impl App {
     fn update_hover(&mut self) {
         let (o, d) = self.cursor_ray();
         self.hover = self.mesh.raycast(o, d).map(|h| h.point);
+        log::trace!(
+            "hover {:?} cursor={:?} canvas={:?} yaw={} pitch={} roll={} o={o:?} d={d:?}",
+            self.hover, self.cursor, self.canvas_rect, self.camera.yaw, self.camera.pitch, self.camera.roll
+        );
     }
 
     fn frame_camera(&mut self) {
@@ -352,6 +367,7 @@ impl App {
         let fresh = Camera::new();
         self.camera.yaw = fresh.yaw;
         self.camera.pitch = fresh.pitch;
+        self.camera.roll = fresh.roll;
         self.frame_camera();
     }
 
@@ -359,6 +375,7 @@ impl App {
         self.nav = Some(NavDrag {
             button,
             alt_used: self.modifiers.alt_key(),
+            shift_at_press: self.modifiers.shift_key(),
         });
         // No brush ring while the camera moves.
         self.hover = None;
@@ -383,7 +400,24 @@ impl App {
             }
             NavMode::Pan => self.camera.pan(delta.x, delta.y, self.viewport().y),
             NavMode::Zoom => self.camera.dolly(delta.x, delta.y),
+            NavMode::Roll => {
+                // Follow the cursor's angle about the canvas centre.
+                let c = self.canvas_origin() + self.viewport() * 0.5;
+                let (a, b) = (self.last_cursor - c, self.cursor - c);
+                if a.length() > 8.0 && b.length() > 8.0 {
+                    let d = b.y.atan2(b.x) - a.y.atan2(a.x);
+                    let d = (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                        - std::f32::consts::PI;
+                    // Screen y points down: the scene follows the cursor around the centre.
+                    self.camera.roll_by(d);
+                }
+            }
         }
+    }
+
+    /// Logical (egui) position of the cursor.
+    fn cursor_pos(&self) -> egui::Pos2 {
+        egui::pos2(self.cursor.x / self.scale, self.cursor.y / self.scale)
     }
 
     fn rebuild(&mut self) {
@@ -407,6 +441,7 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         match key {
+            KeyCode::Escape if self.workspace.popup.is_some() => self.workspace.popup = None,
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
@@ -422,6 +457,15 @@ impl App {
             KeyCode::Digit3 => self.brush.kind = BrushKind::Grab,
             KeyCode::Digit4 => self.brush.kind = BrushKind::Flatten,
             KeyCode::Digit5 => self.brush.kind = BrushKind::Inflate,
+            KeyCode::KeyQ => self.workspace.mode = Mode::Draw,
+            KeyCode::KeyW => self.workspace.mode = Mode::Move,
+            KeyCode::KeyE => self.workspace.mode = Mode::Scale,
+            KeyCode::KeyR => self.workspace.mode = Mode::Rotate,
+            KeyCode::KeyX => self.workspace.symmetry = !self.workspace.symmetry,
+            KeyCode::KeyS => self.workspace.toggle_popup(QuickPopup::Size, self.cursor_pos()),
+            KeyCode::KeyU => self.workspace.toggle_popup(QuickPopup::Intensity, self.cursor_pos()),
+            KeyCode::KeyI => self.workspace.toggle_popup(QuickPopup::Rgb, self.cursor_pos()),
+            KeyCode::KeyO => self.workspace.toggle_popup(QuickPopup::Focal, self.cursor_pos()),
             _ => {}
         }
     }
@@ -493,6 +537,7 @@ impl App {
             state.handle_platform_output(&window, full.platform_output);
         }
         let scale = full.pixels_per_point;
+        self.scale = scale;
         let logical_canvas = self.workspace.canvas;
         self.canvas_rect =
             egui::Rect::from_min_max(logical_canvas.min * scale, logical_canvas.max * scale);
@@ -597,7 +642,12 @@ impl App {
                 self.canvas_rect.width(),
                 self.canvas_rect.height(),
             ],
-            display: [if self.workspace.grid { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            display: [
+                if self.workspace.grid { 1.0 } else { 0.0 },
+                if self.workspace.symmetry { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
         let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
@@ -714,16 +764,28 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => {
                         if pressed {
-                            if !consumed && !over_ui && self.nav.is_none() && self.stroke.is_none()
+                            if self.workspace.popup.is_some() {
+                                // The press that closes a hotkey popup does nothing else.
+                            } else if !consumed
+                                && !over_ui
+                                && self.nav.is_none()
+                                && self.stroke.is_none()
                             {
                                 // ZBrush: a left drag on the model sculpts (Alt = alternate
                                 // brush, Ctrl = masking); on empty canvas it rotates, with
                                 // Alt it moves, and releasing Alt turns it into a zoom.
                                 let (o, d) = self.cursor_ray();
-                                if self.mesh.raycast(o, d).is_none() {
+                                let hit = self.mesh.raycast(o, d);
+                                log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
+                                if hit.is_none() {
                                     self.begin_nav(MouseButton::Left);
                                 } else if self.modifiers.control_key() {
-                                    self.status = "Masking is not connected yet".to_string();
+                                    self.workspace.notify("Masking is not connected yet");
+                                } else if self.workspace.mode != Mode::Draw {
+                                    self.workspace.notify(format!(
+                                        "{} mode is not connected yet · Q returns to Draw",
+                                        self.workspace.mode.name()
+                                    ));
                                 } else {
                                     self.begin_stroke();
                                 }
@@ -931,6 +993,7 @@ mod nav_tests {
         let drag = NavDrag {
             button: MouseButton::Left,
             alt_used: true,
+            shift_at_press: false,
         };
         assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
         assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Zoom);
@@ -942,6 +1005,7 @@ mod nav_tests {
         let mut drag = NavDrag {
             button: MouseButton::Left,
             alt_used: false,
+            shift_at_press: false,
         };
         assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Orbit);
         drag.alt_used = true; // Alt pressed mid-drag
@@ -950,10 +1014,32 @@ mod nav_tests {
     }
 
     #[test]
+    fn shift_click_release_shift_rolls() {
+        // ZBrush: Shift held at the click snaps while held; releasing it turns the drag
+        // into a roll. Alt still wins for the pan/zoom pair.
+        let drag = NavDrag {
+            button: MouseButton::Left,
+            alt_used: false,
+            shift_at_press: true,
+        };
+        assert_eq!(drag.mode(ModifiersState::SHIFT), NavMode::Orbit);
+        assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Roll);
+        assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);
+        // Shift pressed only mid-drag never rolls.
+        let plain = NavDrag {
+            button: MouseButton::Left,
+            alt_used: false,
+            shift_at_press: false,
+        };
+        assert_eq!(plain.mode(ModifiersState::empty()), NavMode::Orbit);
+    }
+
+    #[test]
     fn right_button_modifiers() {
         let drag = NavDrag {
             button: MouseButton::Right,
             alt_used: false,
+            shift_at_press: false,
         };
         assert_eq!(drag.mode(ModifiersState::empty()), NavMode::Orbit);
         assert_eq!(drag.mode(ModifiersState::ALT), NavMode::Pan);

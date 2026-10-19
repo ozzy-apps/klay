@@ -98,11 +98,18 @@ pub struct Selection {
     pub verts: Vec<u32>,
     pub dist: Vec<f32>,
     pub groups: Vec<Group>,
+    /// +1 for vertices selected by the brush itself, -1 for those selected by its mirror
+    /// image. Empty when the selection has no mirror (every vertex is +1).
+    pub side: Vec<f32>,
 }
 
 impl Selection {
     pub fn len(&self) -> usize {
         self.verts.len()
+    }
+
+    pub fn side(&self, i: usize) -> f32 {
+        if self.side.is_empty() { 1.0 } else { self.side[i] }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -373,7 +380,66 @@ impl SculptMesh {
                     ds[i] = *d;
                 }
             });
-        Selection { verts, dist, groups }
+        Selection { verts, dist, groups, side: Vec::new() }
+    }
+
+    /// Vertices within `r` of `c` or of its mirror image across the X = 0 plane. Each
+    /// vertex is listed once, with the distance to the nearer centre and `side` telling
+    /// which one (see [`Selection::side`]), so the two sides never race on a vertex.
+    /// Kept separate from [`select_sphere`](Self::select_sphere) so the common path stays
+    /// as tight as it is.
+    pub fn select_sphere_mirror_x(&self, c: Vec3, r: f32) -> Selection {
+        let m = Vec3::new(-c.x, c.y, c.z);
+        let r2 = r * r;
+        let per_chunk: Vec<(u32, Vec<(u32, f32, f32)>)> = self
+            .chunks
+            .par_iter()
+            .enumerate()
+            .filter(|(_, ch)| ch.aabb.intersects_sphere(c, r) || ch.aabb.intersects_sphere(m, r))
+            .map(|(ci, ch)| {
+                let hits: Vec<(u32, f32, f32)> = (ch.vert_start..ch.vert_end)
+                    .filter_map(|v| {
+                        let p = self.positions[v as usize];
+                        let a = (p - c).length_squared();
+                        let b = (p - m).length_squared();
+                        let (d2, side) = if a <= b { (a, 1.0) } else { (b, -1.0) };
+                        if d2 <= r2 { Some((v, d2.sqrt(), side)) } else { None }
+                    })
+                    .collect();
+                (ci as u32, hits)
+            })
+            .filter(|(_, hits)| !hits.is_empty())
+            .collect();
+        let mut groups = Vec::with_capacity(per_chunk.len());
+        let mut total = 0u32;
+        for (chunk, hits) in &per_chunk {
+            groups.push(Group {
+                chunk: *chunk,
+                start: total,
+                end: total + hits.len() as u32,
+            });
+            total += hits.len() as u32;
+        }
+        let mut verts = vec![0u32; total as usize];
+        let mut dist = vec![0f32; total as usize];
+        let mut side = vec![0f32; total as usize];
+        let ranges = || groups.iter().map(|g| (g.start as usize, g.end as usize));
+        let vslices = split_ranges(&mut verts, ranges());
+        let dslices = split_ranges(&mut dist, ranges());
+        let sslices = split_ranges(&mut side, ranges());
+        vslices
+            .into_par_iter()
+            .zip(dslices.into_par_iter())
+            .zip(sslices.into_par_iter())
+            .zip(per_chunk.par_iter())
+            .for_each(|(((vs, ds), ss), (_, hits))| {
+                for (i, (v, d, s)) in hits.iter().enumerate() {
+                    vs[i] = *v;
+                    ds[i] = *d;
+                    ss[i] = *s;
+                }
+            });
+        Selection { verts, dist, groups, side }
     }
 
     /// Write new positions for a selection, in parallel per chunk.

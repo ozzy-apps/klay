@@ -85,7 +85,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Brush ring projected onto the surface.
     if (u.params.x > 0.5) {
-        let d = distance(in.world_pos, u.brush.xyz);
+        var d = distance(in.world_pos, u.brush.xyz);
+        // Symmetry: a second ring at the mirror image across X = 0.
+        if (u.display.y > 0.5) {
+            let mirrored = vec3<f32>(-u.brush.x, u.brush.y, u.brush.z);
+            d = min(d, distance(in.world_pos, mirrored));
+        }
         let r = u.brush.w;
         let px = u.params.z;
         let ring = smoothstep(px * 1.5, 0.0, abs(d - r));

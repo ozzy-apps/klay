@@ -70,12 +70,16 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
 | Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to move) |
+| Shift + click on empty canvas, release Shift, drag | Roll about the view axis |
 | Right / middle drag | Rotate, anywhere (ZBrush right-click navigation) |
 | Alt + right / middle drag | Move |
 | Ctrl + right / middle drag | Zoom |
 | Scroll | Zoom towards the cursor (Ctrl + scroll: brush radius) |
+| `S` / `U` | Draw-size / Z-intensity slider popup at the cursor (`I`, `O` are stubs) |
 | `[` `]` | Brush radius |
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
+| `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode (only Draw sculpts so far) |
+| `X` | Symmetry across X |
 | `F` | Frame the mesh |
 | `P` / Shift + `P` | Perspective toggle / floor grid |
 | `Home` | Reset the view angle and frame |

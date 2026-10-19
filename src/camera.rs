@@ -53,6 +53,8 @@ pub struct Camera {
     /// Orthographic instead of perspective. The visible height at the target stays the
     /// same when toggling, so the model does not jump.
     pub ortho: bool,
+    /// Rotation about the view axis, radians (ZBrush: Shift, click, release Shift, drag).
+    pub roll: f32,
 }
 
 impl Camera {
@@ -67,6 +69,7 @@ impl Camera {
             near: 0.01,
             far: 100.0,
             ortho: false,
+            roll: 0.0,
         }
     }
 
@@ -87,15 +90,30 @@ impl Camera {
         self.forward().cross(self.up()).normalize()
     }
 
-    /// Screen-up in world space: the derivative of the eye direction with respect to
-    /// pitch. Equals +Y at pitch 0 and stays well defined at the poles, where a fixed
-    /// world up would make the view matrix degenerate.
-    pub fn up(&self) -> Vec3 {
+    /// Screen-up in world space before roll: the derivative of the eye direction with
+    /// respect to pitch. Equals +Y at pitch 0 and stays well defined at the poles, where
+    /// a fixed world up would make the view matrix degenerate.
+    fn up_unrolled(&self) -> Vec3 {
         Vec3::new(
             -self.pitch.sin() * self.yaw.sin(),
             self.pitch.cos(),
             -self.pitch.sin() * self.yaw.cos(),
         )
+    }
+
+    /// Screen-up in world space, including roll.
+    pub fn up(&self) -> Vec3 {
+        let u = self.up_unrolled();
+        if self.roll == 0.0 {
+            return u;
+        }
+        let r = self.forward().cross(u);
+        u * self.roll.cos() + r * self.roll.sin()
+    }
+
+    /// Turn about the view axis. Positive rolls the scene counter-clockwise on screen.
+    pub fn roll_by(&mut self, angle: f32) {
+        self.roll = (self.roll - angle).rem_euclid(std::f32::consts::TAU);
     }
 
     pub fn view(&self) -> Mat4 {
@@ -132,6 +150,7 @@ impl Camera {
         let q = std::f32::consts::FRAC_PI_2;
         self.yaw = (self.yaw / q).round() * q;
         self.pitch = (self.pitch / q).round().clamp(-1.0, 1.0) * q;
+        self.roll = 0.0;
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, viewport_h: f32) {
@@ -262,6 +281,20 @@ mod tests {
     }
 
     #[test]
+    fn roll_turns_about_the_view_axis() {
+        let mut cam = Camera::new();
+        let fwd = cam.forward();
+        let up0 = cam.up();
+        cam.roll_by(std::f32::consts::FRAC_PI_2);
+        assert!((cam.forward() - fwd).length() < 1e-6);
+        assert!(cam.up().dot(up0).abs() < 1e-5, "up should be perpendicular after 90°");
+        assert!(cam.up().dot(fwd).abs() < 1e-5);
+        assert!(cam.right().dot(cam.up()).abs() < 1e-5);
+        cam.snap_to_axis();
+        assert_eq!(cam.roll, 0.0);
+    }
+
+    #[test]
     fn view_is_finite_at_the_poles() {
         for pitch in [MAX_PITCH, -MAX_PITCH] {
             let mut cam = Camera::new();
@@ -281,5 +314,37 @@ mod tests {
         assert!(cam.distance < d0);
         cam.dolly(-80.0, 0.0);
         assert!(cam.distance > d0);
+    }
+}
+
+#[cfg(test)]
+mod raycast_probe {
+    use super::*;
+    use crate::mesh::{SculptMesh, cube_sphere};
+
+    #[test]
+    fn front_view_rays_hit_the_sphere_everywhere_inside_its_outline() {
+        let (p, i) = cube_sphere(60, 1.0);
+        let mesh = SculptMesh::from_raw(p, i);
+        let (w, h) = (1020.0, 860.0);
+        for (yaw, pitch) in [(0.0, 0.0), (0.6, 0.35), (std::f32::consts::FRAC_PI_2, 0.0)] {
+            let mut cam = Camera::new();
+            cam.aspect = w / h;
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            let mut misses = Vec::new();
+            for (x, y) in [(295.0, 330.0), (510.0, 430.0), (330.0, 610.0), (700.0, 300.0), (400.0, 200.0)] {
+                let (o, d) = cam.ray(x, y, w, h);
+                // Analytic sphere test for the expectation.
+                let b = o.dot(d);
+                let c = o.length_squared() - 1.0;
+                let expect = b * b - c > 0.0 && -b > 0.0;
+                let got = mesh.raycast(o, d).is_some();
+                if expect != got {
+                    misses.push((x, y, expect, got, d));
+                }
+            }
+            assert!(misses.is_empty(), "yaw {yaw} pitch {pitch}: {misses:?}");
+        }
     }
 }

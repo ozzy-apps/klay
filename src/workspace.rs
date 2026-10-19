@@ -365,6 +365,46 @@ pub const MATERIALS: [(Color32, &str); 4] = [
     (Color32::from_rgb(184, 174, 152), "Polished bronze"),
 ];
 
+/// Top-shelf edit mode (ZBrush: Q / W / E / R). Only Draw sculpts today.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Draw,
+    Move,
+    Scale,
+    Rotate,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Draw => "Draw",
+            Self::Move => "Move",
+            Self::Scale => "Scale",
+            Self::Rotate => "Rotate",
+        }
+    }
+}
+
+/// Slider popup opened at the cursor by a hotkey (ZBrush: S / U / I / O).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuickPopup {
+    Size,
+    Intensity,
+    Rgb,
+    Focal,
+}
+
+impl QuickPopup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Size => "Draw Size",
+            Self::Intensity => "Z Intensity",
+            Self::Rgb => "Rgb Intensity",
+            Self::Focal => "Focal Shift",
+        }
+    }
+}
+
 pub struct Workspace {
     pub layout: DockLayout,
     pub canvas: Rect,
@@ -376,6 +416,11 @@ pub struct Workspace {
     pub grid: bool,
     /// Perspective (true) or orthographic projection: `P`.
     pub perspective: bool,
+    /// Mirror strokes across X: `X`.
+    pub symmetry: bool,
+    pub mode: Mode,
+    /// Open hotkey popup and the logical position it was opened at.
+    pub popup: Option<(QuickPopup, Pos2)>,
     pub color: Hsva,
     pub color2: Hsva,
     dynamic: bool,
@@ -386,6 +431,8 @@ pub struct Workspace {
     scroll_to: Option<PaletteId>,
     textures: HashMap<(usize, usize, bool), TextureHandle>,
     message: Option<(String, f64)>,
+    /// Text queued by the app for the status bar; shown on the next frame.
+    pending_notice: Option<String>,
     saved: String,
     persistence_path: PathBuf,
     pub persistence_error: Option<String>,
@@ -411,6 +458,9 @@ impl Workspace {
             wireframe: false,
             grid: true,
             perspective: true,
+            symmetry: false,
+            mode: Mode::Draw,
+            popup: None,
             color: Hsva::new(0.06, 0.55, 0.88, 1.0),
             color2: Hsva::new(0.0, 0.0, 1.0, 1.0),
             dynamic: true,
@@ -421,6 +471,7 @@ impl Workspace {
             scroll_to: None,
             textures: HashMap::new(),
             message: None,
+            pending_notice: None,
             saved,
             persistence_path,
             persistence_error: None,
@@ -429,6 +480,9 @@ impl Workspace {
 
     pub fn show(&mut self, ui: &mut Ui, m: &mut Model<'_>) -> Actions {
         let mut a = Actions::default();
+        if let Some(text) = self.pending_notice.take() {
+            self.flash(ui.ctx(), text);
+        }
         if !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
@@ -452,6 +506,7 @@ impl Workspace {
         }
         self.canvas = ui.available_rect_before_wrap();
         self.canvas_overlays(ui, m, &mut a);
+        self.quick_popup(ui, m);
         self.dropdown(ui, m, &mut a);
         self.drop_targets(ui);
         if let Some((id, place, before)) = self.pending_move.take() {
@@ -480,6 +535,61 @@ impl Workspace {
             self.saved = encoded;
         }
         a
+    }
+
+    /// Show `text` in the status bar for a moment (from outside a frame).
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.pending_notice = Some(text.into());
+    }
+
+    /// Open a hotkey popup at `pos`; the same key again closes it.
+    pub fn toggle_popup(&mut self, kind: QuickPopup, pos: Pos2) {
+        self.popup = match self.popup {
+            Some((open, _)) if open == kind => None,
+            _ => Some((kind, pos)),
+        };
+    }
+
+    fn quick_popup(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
+        let Some((kind, pos)) = self.popup else { return };
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.popup = None;
+            return;
+        }
+        let width = 200.0;
+        // Centre the 20 px slider on the cursor; the frame adds a 4 px margin.
+        let area = egui::Area::new(Id::unique("quick-popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos - vec2(width * 0.5 + 4.0, 14.0))
+            .show(&ctx, |ui| {
+                popup_frame().show(ui, |ui| {
+                    ui.set_width(width);
+                    match kind {
+                        QuickPopup::Size => {
+                            zslider(ui, kind.label(), &mut m.brush.radius, 0.01..=2.0, true, true, 2);
+                        }
+                        QuickPopup::Intensity => {
+                            zslider(ui, kind.label(), &mut m.brush.strength, 0.0..=1.0, false, true, 2);
+                        }
+                        QuickPopup::Rgb | QuickPopup::Focal => {
+                            ui.add_enabled_ui(false, |ui| {
+                                let mut v = if kind == QuickPopup::Rgb { 1.0 } else { 0.5 };
+                                zslider(ui, kind.label(), &mut v, 0.0..=1.0, false, true, 2);
+                            });
+                            note(ui, NC);
+                        }
+                    }
+                });
+            });
+        // A press anywhere outside closes it (the canvas swallows that press).
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.latest_pos().is_none_or(|p| !area.response.rect.contains(p))
+        });
+        if outside {
+            self.popup = None;
+        }
     }
 
     fn set_focus(&mut self, on: bool) {
@@ -686,12 +796,19 @@ impl Workspace {
                     .hline(rect.x_range(), rect.bottom() - 0.5, (1.0, LINE));
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
-                    // mode buttons
-                    big_button(ui, "sculpt", "Sculpt", vec2(46.0, 46.0), true, true);
-                    for (glyph, label) in
-                        [("move", "Move"), ("scale", "Scale"), ("rotate", "Rotate")]
-                    {
-                        big_button(ui, glyph, label, vec2(46.0, 46.0), false, false);
+                    // mode buttons (Q / W / E / R)
+                    for (glyph, label, mode, hint) in [
+                        ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
+                        ("move", "Move", Mode::Move, "Move · W · not connected"),
+                        ("scale", "Scale", Mode::Scale, "Scale · E · not connected"),
+                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · not connected"),
+                    ] {
+                        if big_button(ui, glyph, label, vec2(46.0, 46.0), self.mode == mode, true)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.mode = mode;
+                        }
                     }
                     shelf_separator(ui);
                     // paint (not connected)
@@ -932,7 +1049,12 @@ impl Workspace {
                 {
                     self.grid = !self.grid;
                 }
-                big_button(ui, "sym", "Sym", size, false, false).on_hover_text(NC);
+                if big_button(ui, "sym", "Sym", size, self.symmetry, true)
+                    .on_hover_text("Symmetry across X · X")
+                    .clicked()
+                {
+                    self.symmetry = !self.symmetry;
+                }
                 nav_separator(ui);
                 for (g, label) in [
                     ("local", "Local"),
@@ -1765,10 +1887,15 @@ impl Workspace {
                             ("Drag canvas", "rotate · Shift: snap to axis"),
                             ("Alt + drag canvas", "move"),
                             ("Alt + click, release Alt", "zoom"),
+                            ("Shift + click, release Shift", "roll"),
                             ("RMB / MMB", "rotate · Alt: move · Ctrl: zoom"),
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
+                            ("S / U", "draw size / Z intensity popup"),
+                            ("I / O", "Rgb intensity / focal shift"),
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
+                            ("Q W E R", "draw / move / scale / rotate"),
+                            ("X", "symmetry"),
                             ("F / Home", "frame mesh / reset view"),
                             ("P / Shift + P", "perspective / floor grid"),
                             ("Tab", "hide interface"),
@@ -1816,20 +1943,24 @@ impl Workspace {
                     id,
                     "axes",
                     "Axes",
-                    Some(NC),
+                    None,
                     true,
-                    false,
-                    &mut |_, ui| {
-                        let (mut x, mut y, mut z, mut radial, mut count) =
-                            (false, false, false, false, 8.0);
+                    true,
+                    &mut |ws, ui| {
+                        let (mut y, mut z, mut radial, mut count) = (false, false, false, 8.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 16.0;
-                            ui.checkbox(&mut x, "X");
-                            ui.checkbox(&mut y, "Y");
-                            ui.checkbox(&mut z, "Z");
+                            ui.checkbox(&mut ws.symmetry, "X").on_hover_text("X");
+                            ui.add_enabled_ui(false, |ui| {
+                                ui.checkbox(&mut y, "Y");
+                                ui.checkbox(&mut z, "Z");
+                            });
                         });
-                        ui.checkbox(&mut radial, "Radial");
-                        zslider(ui, "Radial count", &mut count, 2.0..=24.0, false, false, 0);
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.checkbox(&mut radial, "Radial");
+                            zslider(ui, "Radial count", &mut count, 2.0..=24.0, false, false, 0);
+                        });
+                        note(ui, "Y, Z and radial are not connected");
                     },
                 );
             }
