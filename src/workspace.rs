@@ -421,6 +421,9 @@ pub struct Workspace {
     pub mode: Mode,
     /// Open hotkey popup and the logical position it was opened at.
     pub popup: Option<(QuickPopup, Pos2)>,
+    /// ZBrush quick menu (Space held, or a right-click tap): where it opened and whether
+    /// it closes when Space is released rather than on a click elsewhere.
+    pub quick_menu: Option<(Pos2, bool)>,
     pub color: Hsva,
     pub color2: Hsva,
     dynamic: bool,
@@ -461,6 +464,7 @@ impl Workspace {
             symmetry: false,
             mode: Mode::Draw,
             popup: None,
+            quick_menu: None,
             color: Hsva::new(0.06, 0.55, 0.88, 1.0),
             color2: Hsva::new(0.0, 0.0, 1.0, 1.0),
             dynamic: true,
@@ -507,6 +511,7 @@ impl Workspace {
         self.canvas = ui.available_rect_before_wrap();
         self.canvas_overlays(ui, m, &mut a);
         self.quick_popup(ui, m);
+        self.quick_menu_ui(ui, m);
         self.dropdown(ui, m, &mut a);
         self.drop_targets(ui);
         if let Some((id, place, before)) = self.pending_move.take() {
@@ -540,6 +545,74 @@ impl Workspace {
     /// Show `text` in the status bar for a moment (from outside a frame).
     pub fn notify(&mut self, text: impl Into<String>) {
         self.pending_notice = Some(text.into());
+    }
+
+    /// Open the quick menu at `pos`. `held` = it belongs to a held Space key.
+    pub fn open_quick_menu(&mut self, pos: Pos2, held: bool) {
+        self.popup = None;
+        self.quick_menu = Some((pos, held));
+    }
+
+    /// The brush row, Zadd/Zsub, the two live sliders and the mode row, like ZBrush's
+    /// Space menu. Sliders start under the cursor so a small move adjusts them.
+    fn quick_menu_ui(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
+        let Some((pos, held)) = self.quick_menu else { return };
+        let ctx = ui.ctx().clone();
+        if !held && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.quick_menu = None;
+            return;
+        }
+        let width = 300.0;
+        let area = egui::Area::new(Id::unique("quick-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos - vec2(30.0, 20.0))
+            .show(&ctx, |ui| {
+                popup_frame().show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    let cols = BrushKind::ALL.len();
+                    let tile = (width - 4.0 * (cols as f32 - 1.0)) / cols as f32;
+                    ui.horizontal(|ui| {
+                        for (i, kind) in BrushKind::ALL.iter().enumerate() {
+                            let tex = self.texture(ui.ctx(), Some(*kind), self.subtract);
+                            if brush_tile(ui, tex, kind.name(), i + 1, m.brush.kind == *kind, tile)
+                                .clicked()
+                            {
+                                m.brush.kind = *kind;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.scope(|ui| {
+                            ui.set_width(96.0);
+                            if let Some(i) = seg(ui, &["Zadd", "Zsub"], self.subtract as usize, false) {
+                                self.subtract = i == 1;
+                            }
+                        });
+                        let modes = [Mode::Draw, Mode::Move, Mode::Scale, Mode::Rotate];
+                        let current = modes.iter().position(|x| *x == self.mode).unwrap_or(0);
+                        if let Some(i) = seg(ui, &["Draw", "Move", "Scale", "Rotate"], current, false) {
+                            self.mode = modes[i];
+                        }
+                    });
+                    zslider(ui, "Z Intensity", &mut m.brush.strength, 0.0..=1.0, false, true, 2);
+                    zslider(ui, "Draw Size", &mut m.brush.radius, 0.01..=2.0, true, true, 2);
+                    ui.add_enabled_ui(false, |ui| {
+                        let (mut rgb, mut focal) = (1.0, 0.5);
+                        zslider(ui, "Rgb Intensity", &mut rgb, 0.0..=1.0, false, true, 2);
+                        zslider(ui, "Focal Shift", &mut focal, 0.0..=1.0, false, true, 2);
+                    });
+                });
+            });
+        if !held {
+            let outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.latest_pos().is_none_or(|p| !area.response.rect.contains(p))
+            });
+            if outside {
+                self.quick_menu = None;
+            }
+        }
     }
 
     /// Open a hotkey popup at `pos`; the same key again closes it.
@@ -1890,6 +1963,7 @@ impl Workspace {
                             ("Shift + click, release Shift", "roll"),
                             ("RMB / MMB", "rotate · Alt: move · Ctrl: zoom"),
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
+                            ("Space (hold)", "quick menu · also: right-click tap"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
                             ("[ ]", "brush radius"),
@@ -3370,6 +3444,35 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("text {text:?} was not rendered"))
+    }
+
+    fn text_count(output: &egui::FullOutput, text: &str) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::Text(s) if s.galley.job.text == text))
+            .count()
+    }
+
+    #[test]
+    fn quick_menu_shows_while_open_and_closes_on_a_press_elsewhere() {
+        let (mut workspace, ctx) = test_workspace("quick-menu");
+        let size = vec2(1600.0, 1000.0);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        let shelf = text_count(&output, "Draw Size");
+        workspace.open_quick_menu(pos2(800.0, 500.0), false);
+        // A new egui area spends its first frame in an invisible sizing pass.
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&output, "Draw Size"), shelf + 1);
+        assert_eq!(text_count(&output, "Z Intensity"), shelf + 1);
+        // A press far from the menu closes it; a held (Space) menu ignores that.
+        frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), true)]);
+        frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), false)]);
+        assert!(workspace.quick_menu.is_none());
+        workspace.open_quick_menu(pos2(800.0, 500.0), true);
+        frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), true)]);
+        assert!(workspace.quick_menu.is_some());
     }
 
     /// Centre of the ◉ dock button of the first palette in the left tray.

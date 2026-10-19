@@ -75,6 +75,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Alt + right / middle drag | Move |
 | Ctrl + right / middle drag | Zoom |
 | Scroll | Zoom towards the cursor (Ctrl + scroll: brush radius) |
+| Space (hold) or right-click tap | Quick menu at the cursor: brushes, Zadd/Zsub, Z Intensity, Draw Size, modes |
 | `S` / `U` | Draw-size / Z-intensity slider popup at the cursor (`I`, `O` are stubs) |
 | `[` `]` | Brush radius |
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |

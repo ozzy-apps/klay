@@ -86,6 +86,8 @@ struct App {
     last_cursor: Vec2,
     /// egui points per physical pixel, for placing popups at the cursor.
     scale: f32,
+    /// Cursor at the start of the current camera drag, to tell a right-click tap apart.
+    nav_press: Vec2,
     modifiers: ModifiersState,
     nav: Option<NavDrag>,
     hover: Option<Vec3>,
@@ -140,6 +142,7 @@ impl App {
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             scale: 1.0,
+            nav_press: Vec2::ZERO,
             modifiers: ModifiersState::empty(),
             nav: None,
             hover: None,
@@ -377,6 +380,7 @@ impl App {
             alt_used: self.modifiers.alt_key(),
             shift_at_press: self.modifiers.shift_key(),
         });
+        self.nav_press = self.cursor;
         // No brush ring while the camera moves.
         self.hover = None;
     }
@@ -764,8 +768,8 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => {
                         if pressed {
-                            if self.workspace.popup.is_some() {
-                                // The press that closes a hotkey popup does nothing else.
+                            if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
+                                // The press that closes a popup or menu does nothing else.
                             } else if !consumed
                                 && !over_ui
                                 && self.nav.is_none()
@@ -797,11 +801,20 @@ impl ApplicationHandler for App {
                     }
                     MouseButton::Right | MouseButton::Middle => {
                         if pressed {
-                            if !over_ui && self.stroke.is_none() && self.nav.is_none() {
+                            if self.workspace.quick_menu.is_some() {
+                                // Closes the menu (handled by the workspace), nothing else.
+                            } else if !over_ui && self.stroke.is_none() && self.nav.is_none() {
                                 self.begin_nav(button);
                             }
                         } else {
+                            let tap = button == MouseButton::Right
+                                && self.nav.map(|n| n.button) == Some(button)
+                                && (self.cursor - self.nav_press).length() < 4.0;
                             self.end_nav(button);
+                            if tap {
+                                // ZBrush: a right-click without a drag opens the quick menu.
+                                self.workspace.open_quick_menu(self.cursor_pos(), false);
+                            }
                         }
                     }
                     _ => {}
@@ -826,9 +839,21 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && !self.egui_ctx.egui_wants_keyboard_input()
-                {
+                let typing = self.egui_ctx.egui_wants_keyboard_input();
+                if let PhysicalKey::Code(KeyCode::Space) = event.physical_key {
+                    // ZBrush quick menu: shown while Space is held.
+                    match event.state {
+                        ElementState::Pressed if !event.repeat && !typing => {
+                            self.workspace.open_quick_menu(self.cursor_pos(), true);
+                        }
+                        ElementState::Released => {
+                            if self.workspace.quick_menu.is_some_and(|(_, held)| held) {
+                                self.workspace.quick_menu = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if event.state == ElementState::Pressed && !typing {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         self.on_key(code);
                     }
