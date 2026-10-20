@@ -14,6 +14,8 @@ cargo run --release -- --segments 1500 --stress --novsync   # per-frame cost of 
 cargo run --release -- --divide 2                           # start two subdivision levels up (15.4M vertices)
 cargo run --release -- --bench 400 --divide 2               # divide timings, base-level stroke, step-up cost
 cargo run --release -- --divide 2 --novsync --frames        # average frame time at the top level, then exit
+cargo run --release -- --subtools 4                         # start with four sphere subtools in a row
+cargo run --release -- --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 ```
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
@@ -91,7 +93,8 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | `X` | Symmetry across X |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
-| `F` | Frame the mesh |
+| Alt + click another subtool | Select it (Alt + drag on the active one still carves) |
+| `F` | Frame the visible subtools |
 | `P` / Shift + `P` | Perspective toggle / floor grid |
 | `Home` | Reset the view angle and frame |
 | `Tab` | Toggle canvas focus |
@@ -122,6 +125,18 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   dependent child chunks and re-applies their offsets, one level at a time. Edits at the top
   level touch nothing else. Undo stores positions at level 0 and offsets above it, so it
   works at any level, and the displayed level follows; Divide itself is undoable.
+- `subtool.rs`: ZBrush-style SubTools. One subtool is active and holds its full level
+  stack. Every other one is parked and kept light: in RAM only a lossless packed form of its
+  stack (the base mesh in chunk order, one byte per vertex per upper level recording which
+  child chunk each vertex went to, and the offsets of chunks that were sculpted) plus its
+  undo list; on the GPU only a draw-only stand-in of at most 2M vertices, using the highest
+  level that fits with every vertex placed on the top level's surface and normals baked
+  once (40 bytes per vertex, no normal pass). Activating a parked subtool replays its
+  subdivisions from those labels, so vertex order and chunks come back identical and its
+  undo list stays valid. Alt + click picks a subtool with a one-pixel GPU id pass. The
+  SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
+  Delete and reordering; Deformation moves and sizes the active subtool exactly at every
+  level, undoably.
 - `render.rs`: positions, packed normals, indices and fixed-point normal accumulators live
   on the GPU (52 bytes per vertex), one set per subdivision level that has been shown, so
   stepping between levels is a pointer swap. Levels that are not shown keep their copies up
@@ -159,6 +174,19 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | GPU memory at level 2 / 3 while shown | 0.8 / 3.2 GB (52 bytes per vertex) |
 | Memory for the three levels | 2.2 GB |
 | Grab of a third of a 13.5M-vertex mesh (`--segments 1500 --stress --novsync`), with the normal passes each frame | 8.9 ms/frame (9.3 ms before the accumulate passes) |
+
+### SubTools (400-segment sphere, `--bench 400 --divide N` and `--selftest-subtools`)
+
+| Subtool | Active, in RAM | Parked, in RAM | Parked, on GPU | Park | Activate |
+| --- | --- | --- | --- | --- | --- |
+| 960k vertices, one level | 92 MB | 34 MB | 38 MB | 16 ms | 39 ms |
+| Two levels, 3.84M at the top | 526 MB | 38 MB | 38 MB | 49 ms | 0.19 s |
+| Three levels, 15.4M at the top | 2.26 GB | 53 MB | 38 MB | 0.19 s | 0.97 s |
+
+Parking bakes the stand-in and frees the stack (most of the time at three levels is giving
+2 GB back to the system). Activating replays the subdivisions from the stored labels, a
+little faster than dividing because there is no spatial split. Frame time at level 2 is
+unchanged by the natural-order chunks.
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of

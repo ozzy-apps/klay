@@ -63,6 +63,13 @@ pub enum UndoStep {
     /// A subdivision level was added. In the undo list the level is live (`None`); the
     /// redo entry keeps the removed level so redo can put it back without recomputing it.
     Divide(Option<Box<Level>>),
+    /// Every level was mapped by `p -> center + scale (p - center) + translate`
+    /// (Deformation: Offset, Size).
+    Transform {
+        center: Vec3,
+        scale: f32,
+        translate: Vec3,
+    },
 }
 
 pub struct History {
@@ -115,6 +122,13 @@ impl History {
         self.redo.clear();
     }
 
+    /// Drop the redo list, whose divide entries can hold whole levels. Used when a subtool
+    /// is parked so its history stays light; the undo list stays valid because a parked
+    /// stack comes back with the same chunks.
+    pub fn drop_redo(&mut self) {
+        self.redo.clear();
+    }
+
     /// Approximate memory held by history, in bytes.
     pub fn bytes(&self) -> usize {
         self.undo
@@ -123,6 +137,7 @@ impl History {
             .map(|s| match s {
                 UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
                 UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
+                UndoStep::Transform { .. } => 0,
             })
             .sum()
     }
@@ -139,6 +154,19 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
         UndoStep::Divide(Some(level)) => {
             doc.push_level(*level);
             UndoStep::Divide(None)
+        }
+        UndoStep::Transform {
+            center,
+            scale,
+            translate,
+        } => {
+            doc.transform(center, scale, translate);
+            // p = c + (p' - c - t) / s, written in the same form.
+            UndoStep::Transform {
+                center: center + translate,
+                scale: 1.0 / scale,
+                translate: -translate,
+            }
         }
     }
 }

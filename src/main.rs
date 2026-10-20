@@ -3,6 +3,7 @@ mod mesh;
 mod multires;
 mod render;
 mod sculpt;
+mod subtool;
 mod workspace;
 
 use camera::Camera;
@@ -10,8 +11,10 @@ use glam::{Vec2, Vec3};
 use mesh::{SculptMesh, cube_sphere};
 use multires::Multires;
 use render::{Gfx, Uniforms};
+use mesh::Aabb;
 use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
-use workspace::{Mode, QuickPopup};
+use subtool::{Deform, Parked, STAND_IN_VERTICES, SubTool};
+use workspace::{Mode, QuickPopup, SubToolRow};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -71,14 +74,33 @@ impl NavDrag {
     }
 }
 
+/// SubTool operations queued by the interface.
+#[derive(Clone, Copy, Debug)]
+enum SubToolOp {
+    Select(usize),
+    Append,
+    Duplicate,
+    Delete,
+    Deform(Deform, f32),
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
 
-    /// The subdivision level stack; the active level is what is shown and sculpted.
+    /// The level stack of the active subtool; its active level is shown and sculpted.
     doc: Multires,
+    /// Every subtool, the active one included (its stack is `doc`).
+    subtools: Vec<SubTool>,
+    active_tool: usize,
+    next_tool_id: u64,
+    /// `--subtools N`: spheres to append once the window exists.
+    initial_subtools: usize,
+    /// `--selftest-subtools`: frames left before picking and switching subtools through
+    /// the real GPU path, logging the results, then exiting.
+    selftest: Option<u32>,
     camera: Camera,
     brush: Brush,
     history: History,
@@ -107,6 +129,8 @@ struct App {
     pending_redo: bool,
     pending_divide: bool,
     pending_level: Option<usize>,
+    /// SubTool list operation from the interface, run outside the egui pass.
+    pending_subtool: Option<SubToolOp>,
     /// Frames left in `--frames` mode (plain frame timing at the active level) and the
     /// accumulated frame time.
     measure: Option<(u32, f32)>,
@@ -142,6 +166,17 @@ impl App {
             gfx: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
+            subtools: vec![SubTool {
+                id: 1,
+                name: "Sphere 1".to_string(),
+                visible: true,
+                bounds: mesh.bounds(),
+                parked: None,
+            }],
+            active_tool: 0,
+            next_tool_id: 2,
+            initial_subtools: 0,
+            selftest: None,
             doc: Multires::new(mesh, budget),
             camera: Camera::new(),
             brush: Brush::default(),
@@ -166,6 +201,7 @@ impl App {
             pending_redo: false,
             pending_divide: false,
             pending_level: None,
+            pending_subtool: None,
             measure: None,
             quit: false,
             build_ms,
@@ -187,6 +223,302 @@ impl App {
 
     fn mesh(&self) -> &SculptMesh {
         self.doc.mesh()
+    }
+
+    /// Stands in for `doc` between parking one subtool and activating another.
+    fn placeholder() -> Multires {
+        let (p, i) = cube_sphere(1, 1.0);
+        Multires::new(SculptMesh::from_raw(p, i), 0)
+    }
+
+    /// Park the active subtool: its stack is replaced by the packed form, its GPU levels are
+    /// freed and its stand-in uploaded. `doc` holds a placeholder until another subtool is
+    /// made active. Returns the time taken in ms.
+    fn park_active(&mut self) -> f32 {
+        let t = Instant::now();
+        let mut doc = std::mem::replace(&mut self.doc, Self::placeholder());
+        let stand_in = doc.stand_in(STAND_IN_VERTICES);
+        let packed = doc.pack();
+        let mut history = std::mem::replace(&mut self.history, History::new(32));
+        history.drop_redo();
+        let tool = &mut self.subtools[self.active_tool];
+        tool.bounds = stand_in.bounds;
+        let mut stand_in_vertices = stand_in.positions.len();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+            if !gfx.upload_stand_in(tool.id, &stand_in) {
+                stand_in_vertices = 0;
+            }
+        }
+        tool.parked = Some(Box::new(Parked {
+            packed,
+            history,
+            stand_in_vertices,
+        }));
+        t.elapsed().as_secs_f32() * 1000.0
+    }
+
+    /// Rebuild the stack of parked subtool `i` and make it the active one. Returns the time
+    /// taken in ms.
+    fn activate(&mut self, i: usize) -> f32 {
+        let t = Instant::now();
+        let tool = &mut self.subtools[i];
+        let Parked {
+            packed, history, ..
+        } = *tool.parked.take().expect("only a parked subtool can be activated");
+        tool.visible = true;
+        let id = tool.id;
+        self.doc = packed.unpack();
+        self.history = history;
+        self.active_tool = i;
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.drop_stand_in(id);
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        ms
+    }
+
+    /// Make subtool `i` the active one (SubTool list, or Alt + click on it).
+    fn select_subtool(&mut self, i: usize) {
+        if i == self.active_tool || i >= self.subtools.len() || self.stroke.is_some() {
+            return;
+        }
+        let park_ms = self.park_active();
+        let unpack_ms = self.activate(i);
+        self.status = format!(
+            "{}: {} vertices at level {} · parked the previous one in {:.0} ms, rebuilt this one in {:.0} ms",
+            self.subtools[i].name,
+            fmt_count(self.mesh().vertex_count()),
+            self.doc.active(),
+            park_ms,
+            unpack_ms
+        );
+        log::info!("{}", self.status);
+        self.workspace.notify(format!("Selected {}", self.subtools[i].name));
+    }
+
+    fn new_tool_id(&mut self) -> u64 {
+        let id = self.next_tool_id;
+        self.next_tool_id += 1;
+        id
+    }
+
+    /// Add a sphere subtool next to the visible model and make it active (ZBrush: Append).
+    fn append_sphere(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        let bounds = self.model_bounds();
+        let radius = 0.5;
+        let center = Vec3::new(
+            bounds.max.x + radius * 1.25,
+            (bounds.min.y + bounds.max.y) * 0.5,
+            (bounds.min.z + bounds.max.z) * 0.5,
+        );
+        let budget = self.doc.budget;
+        self.park_active();
+        let t = Instant::now();
+        let (p, i) = cube_sphere(self.segments, radius);
+        let p = p.into_iter().map(|q| q + center).collect();
+        self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
+        let id = self.new_tool_id();
+        self.subtools.push(SubTool {
+            id,
+            name: format!("Sphere {id}"),
+            visible: true,
+            bounds: self.doc.bounds(),
+            parked: None,
+        });
+        self.active_tool = self.subtools.len() - 1;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.status = format!(
+            "Appended Sphere {id}: {} vertices in {:.0} ms",
+            fmt_count(self.mesh().vertex_count()),
+            t.elapsed().as_secs_f32() * 1000.0
+        );
+    }
+
+    /// Insert a parked copy of the active subtool below it (ZBrush: Duplicate).
+    fn duplicate_subtool(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        let packed = self.doc.pack_copy();
+        let stand_in = self.doc.stand_in(STAND_IN_VERTICES);
+        let id = self.new_tool_id();
+        let mut stand_in_vertices = stand_in.positions.len();
+        if let Some(gfx) = self.gfx.as_mut() {
+            if !gfx.upload_stand_in(id, &stand_in) {
+                stand_in_vertices = 0;
+            }
+        }
+        let name = format!("{} copy", self.subtools[self.active_tool].name);
+        self.subtools.insert(
+            self.active_tool + 1,
+            SubTool {
+                id,
+                name: name.clone(),
+                visible: true,
+                bounds: stand_in.bounds,
+                parked: Some(Box::new(Parked {
+                    packed,
+                    history: History::new(32),
+                    stand_in_vertices,
+                })),
+            },
+        );
+        self.workspace.notify(format!("Duplicated as {name}"));
+    }
+
+    /// Delete the active subtool and activate the one below it, or above it when it was
+    /// the last (ZBrush: Delete). Not undoable.
+    fn delete_subtool(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        if self.subtools.len() < 2 {
+            self.workspace.notify("The last subtool cannot be deleted");
+            return;
+        }
+        let removed = self.subtools.remove(self.active_tool);
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.doc = Self::placeholder();
+        self.history = History::new(32);
+        let next = self.active_tool.min(self.subtools.len() - 1);
+        self.activate(next);
+        self.workspace.notify(format!("Deleted {}", removed.name));
+    }
+
+    /// Move the active subtool up (-1) or down (+1) in the list.
+    fn move_subtool(&mut self, by: i32) {
+        let i = self.active_tool;
+        let j = i as i64 + by as i64;
+        if j < 0 || j >= self.subtools.len() as i64 {
+            return;
+        }
+        self.subtools.swap(i, j as usize);
+        self.active_tool = j as usize;
+    }
+
+    /// Show or hide a parked subtool. The active one is always shown.
+    fn toggle_subtool(&mut self, i: usize) {
+        if i != self.active_tool {
+            if let Some(t) = self.subtools.get_mut(i) {
+                t.visible = !t.visible;
+            }
+        }
+    }
+
+    /// Offset or size the active subtool, undoably (ZBrush: Tool > Deformation).
+    fn deform(&mut self, kind: Deform, value: f32) {
+        if self.stroke.is_some() || value.abs() < 0.5 {
+            return;
+        }
+        let (center, scale, translate) = subtool::deform_map(kind, value, self.doc.bounds());
+        self.doc.transform(center, scale, translate);
+        // History entries hold what undoes them: the inverse map.
+        self.history.push(UndoStep::Transform {
+            center: center + translate,
+            scale: 1.0 / scale,
+            translate: -translate,
+        });
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.update_hover();
+        self.workspace
+            .notify(format!("{} {:+.0} applied", kind.label(), value));
+    }
+
+    /// Parked subtools that are drawn: `(gpu key, list index)`.
+    fn drawn_parked(&self) -> Vec<(u64, usize)> {
+        if self.workspace.solo {
+            return Vec::new();
+        }
+        self.subtools
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| *i != self.active_tool && t.visible)
+            .map(|(i, t)| (t.id, i))
+            .collect()
+    }
+
+    /// Bounds of what is drawn: the active subtool and the visible parked ones.
+    fn model_bounds(&self) -> Aabb {
+        self.drawn_parked()
+            .iter()
+            .fold(self.doc.bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds))
+    }
+
+    /// Pixel position of a world point on the canvas.
+    fn project(&self, p: Vec3) -> Vec2 {
+        let clip = self.camera.view_proj() * p.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        let vp = self.viewport();
+        self.canvas_origin() + Vec2::new((ndc.x + 1.0) * 0.5 * vp.x, (1.0 - ndc.y) * 0.5 * vp.y)
+    }
+
+    /// `--selftest-subtools`: pick every subtool at the centre of its bounds and the
+    /// background in a corner through the GPU id pass, then switch to a parked subtool the
+    /// way Alt + click does. Logs each check; returns whether all passed.
+    fn selftest_subtools(&mut self) -> bool {
+        let mut ok = true;
+        let saved = self.cursor;
+        for i in 0..self.subtools.len() {
+            let b = if i == self.active_tool { self.doc.bounds() } else { self.subtools[i].bounds };
+            self.cursor = self.project((b.min + b.max) * 0.5);
+            let got = self.pick_subtool();
+            let pass = got == Some(i);
+            ok &= pass;
+            log::info!("selftest: pick at the centre of {} -> {:?} ({})", self.subtools[i].name, got.map(|g| &self.subtools[g].name), if pass { "ok" } else { "FAIL" });
+        }
+        self.cursor = self.canvas_origin() + Vec2::splat(4.0);
+        let got = self.pick_subtool();
+        ok &= got.is_none();
+        log::info!("selftest: pick in the canvas corner -> {got:?} ({})", if got.is_none() { "ok" } else { "FAIL" });
+        let target = (self.active_tool + 1) % self.subtools.len();
+        let b = self.subtools[target].bounds;
+        self.cursor = self.project((b.min + b.max) * 0.5);
+        if let Some(i) = self.pick_subtool().filter(|&i| i != self.active_tool) {
+            self.select_subtool(i);
+        }
+        let pass = self.active_tool == target && self.subtools.iter().filter(|t| t.parked.is_none()).count() == 1;
+        ok &= pass;
+        log::info!("selftest: Alt + click path selected {} ({})", self.subtools[self.active_tool].name, if pass { "ok" } else { "FAIL" });
+        log::info!(
+            "selftest: active stack {} MB in RAM, parked {} MB in RAM, stand-ins {} MB on GPU, active levels {} MB on GPU",
+            self.doc.bytes() / 1_000_000,
+            self.subtools.iter().filter_map(|t| t.parked.as_ref()).map(|p| p.packed.bytes() + p.history.bytes()).sum::<usize>() / 1_000_000,
+            self.gfx.as_ref().map_or(0, Gfx::stand_in_bytes) / 1_000_000,
+            self.gfx.as_ref().map_or(0, Gfx::level_bytes) / 1_000_000,
+        );
+        self.cursor = saved;
+        log::info!("selftest: {}", if ok { "all passed" } else { "FAILED" });
+        ok
+    }
+
+    /// The subtool under the cursor, from the GPU id pass.
+    fn pick_subtool(&mut self) -> Option<usize> {
+        let parked: Vec<(u64, u32)> = self
+            .drawn_parked()
+            .into_iter()
+            .map(|(key, i)| (key, i as u32 + 1))
+            .collect();
+        let viewport = [
+            self.canvas_rect.min.x,
+            self.canvas_rect.min.y,
+            self.canvas_rect.width(),
+            self.canvas_rect.height(),
+        ];
+        let (x, y) = (self.cursor.x.max(0.0) as u32, self.cursor.y.max(0.0) as u32);
+        let active = self.active_tool as u32 + 1;
+        let id = self.gfx.as_mut()?.pick(x, y, viewport, active, &parked);
+        (id as usize).checked_sub(1)
     }
 
     /// Add a subdivision level above the top one and show it (ZBrush: Ctrl + D).
@@ -452,7 +784,7 @@ impl App {
     }
 
     fn frame_camera(&mut self) {
-        let b = self.mesh().bounds();
+        let b = self.model_bounds();
         self.camera.target = (b.min + b.max) * 0.5;
         self.camera.distance = (b.max - b.min).length() * 1.1;
     }
@@ -516,6 +848,7 @@ impl App {
         egui::pos2(self.cursor.x / self.scale, self.cursor.y / self.scale)
     }
 
+    /// Replace the active subtool's mesh with a fresh sphere of `segments`.
     fn rebuild(&mut self) {
         let t = Instant::now();
         let (p, i) = cube_sphere(self.segments, 1.0);
@@ -526,6 +859,7 @@ impl App {
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
         }
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
         self.show_active_level();
         self.status = format!(
             "Built {} vertices in {:.0} ms",
@@ -581,6 +915,35 @@ impl App {
         let next_level_vertices = self.doc.next_vertex_count();
         let levels_bytes = self.doc.bytes();
         let gpu_level_bytes = self.gfx.as_ref().map_or(0, Gfx::level_bytes);
+        let stand_in_bytes = self.gfx.as_ref().map_or(0, Gfx::stand_in_bytes);
+        let rows: Vec<SubToolRow> = self
+            .subtools
+            .iter()
+            .enumerate()
+            .map(|(i, t)| match &t.parked {
+                None => SubToolRow {
+                    name: t.name.clone(),
+                    visible: true,
+                    active: i == self.active_tool,
+                    vertices,
+                    level,
+                    top: self.doc.top(),
+                    bytes: levels_bytes,
+                    drawn: true,
+                },
+                Some(p) => SubToolRow {
+                    name: t.name.clone(),
+                    visible: t.visible,
+                    active: false,
+                    vertices: p.packed.counts()[p.packed.active()],
+                    level: p.packed.active(),
+                    top: p.packed.counts().len() - 1,
+                    bytes: p.packed.bytes() + p.history.bytes(),
+                    drawn: p.stand_in_vertices > 0 || self.gfx.is_none(),
+                },
+            })
+            .collect();
+        let parked_bytes = rows.iter().filter(|r| !r.active).map(|r| r.bytes).sum();
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -614,8 +977,32 @@ impl App {
                     let (r, u, f) = (self.camera.right(), self.camera.up(), self.camera.forward());
                     [Vec3::X, Vec3::Y, Vec3::Z].map(|v| [v.dot(r), v.dot(u), -v.dot(f)])
                 },
+                subtools: &rows,
+                parked_bytes,
+                stand_in_bytes,
             },
         );
+        if let Some(i) = actions.select_subtool {
+            self.pending_subtool = Some(SubToolOp::Select(i));
+        }
+        if let Some(i) = actions.toggle_subtool {
+            self.toggle_subtool(i);
+        }
+        if actions.append {
+            self.pending_subtool = Some(SubToolOp::Append);
+        }
+        if actions.duplicate {
+            self.pending_subtool = Some(SubToolOp::Duplicate);
+        }
+        if actions.delete {
+            self.pending_subtool = Some(SubToolOp::Delete);
+        }
+        if actions.move_subtool != 0 {
+            self.move_subtool(actions.move_subtool);
+        }
+        if let Some((kind, value)) = actions.deform {
+            self.pending_subtool = Some(SubToolOp::Deform(kind, value));
+        }
         self.pending_rebuild |= actions.rebuild;
         self.pending_export |= actions.export;
         self.pending_undo |= actions.undo;
@@ -689,6 +1076,14 @@ impl App {
         if let Some(level) = self.pending_level.take() {
             self.set_level(level);
         }
+        match self.pending_subtool.take() {
+            Some(SubToolOp::Select(i)) => self.select_subtool(i),
+            Some(SubToolOp::Append) => self.append_sphere(),
+            Some(SubToolOp::Duplicate) => self.duplicate_subtool(),
+            Some(SubToolOp::Delete) => self.delete_subtool(),
+            Some(SubToolOp::Deform(kind, value)) => self.deform(kind, value),
+            None => {}
+        }
         if self.pending_export {
             self.pending_export = false;
             let t = Instant::now();
@@ -740,6 +1135,15 @@ impl App {
         if self.stroke_pending {
             self.stroke_pending = false;
             self.apply_stroke();
+        }
+        if let Some(left) = self.selftest {
+            if left == 0 {
+                self.selftest = None;
+                self.selftest_subtools();
+                self.quit = true;
+            } else {
+                self.selftest = Some(left - 1);
+            }
         }
         if let Some((left, acc)) = self.measure {
             const TOTAL: u32 = 240;
@@ -801,12 +1205,13 @@ impl App {
                 0.0,
             ],
         };
+        let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut());
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
         let t = Instant::now();
-        gfx.render(&uniforms, &jobs, full.textures_delta, full.pixels_per_point);
+        gfx.render(&uniforms, &parked, &jobs, full.textures_delta, full.pixels_per_point);
         self.render_ms = t.elapsed().as_secs_f32() * 1000.0;
         if self.stress.is_some() {
             self.stress_upload += self.upload_ms;
@@ -854,6 +1259,13 @@ impl ApplicationHandler for App {
             for (name, ms, dabs, count) in self.scripted_strokes() {
                 log::info!("demo stroke {name}: {dabs} dabs over {count} verts in {ms:.1} ms");
             }
+        }
+        for _ in 0..std::mem::take(&mut self.initial_subtools) {
+            self.append_sphere();
+            log::info!("{}", self.status);
+        }
+        if self.subtools.len() > 1 {
+            self.frame_camera();
         }
     }
 
@@ -916,8 +1328,24 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => {
                         if pressed {
+                            let picked = if self.modifiers.alt_key()
+                                && self.subtools.len() > 1
+                                && !consumed
+                                && !over_ui
+                                && self.stroke.is_none()
+                                && self.nav.is_none()
+                                && self.workspace.popup.is_none()
+                                && self.workspace.quick_menu.is_none()
+                            {
+                                self.pick_subtool().filter(|&i| i != self.active_tool)
+                            } else {
+                                None
+                            };
                             if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
                                 // The press that closes a popup or menu does nothing else.
+                            } else if let Some(i) = picked {
+                                // ZBrush: Alt + click on another subtool selects it.
+                                self.select_subtool(i);
                             } else if !consumed
                                 && !over_ui
                                 && self.nav.is_none()
@@ -1066,6 +1494,7 @@ fn bench(segments: u32, divide: u32, budget: usize) {
     if divide > 0 {
         bench_multires(&mut app, divide);
     }
+    bench_subtool(&mut app);
     let t = Instant::now();
     let hit = app.mesh().raycast(app.camera.eye(), app.camera.forward());
     println!(
@@ -1213,6 +1642,38 @@ fn bench_multires(app: &mut App, times: u32) {
     app.brush = Brush::default();
 }
 
+/// Parking and re-activating the active subtool: memory before and after, and the times.
+fn bench_subtool(app: &mut App) {
+    let levels = app.doc.vertex_counts();
+    let stack = app.doc.bytes();
+    let t = Instant::now();
+    let stand_in = app.doc.stand_in(STAND_IN_VERTICES);
+    let stand_in_ms = t.elapsed().as_secs_f32() * 1000.0;
+    let stand_in_gpu = stand_in.positions.len() * 16 + stand_in.indices.len() * 4;
+    let t = Instant::now();
+    let doc = std::mem::replace(&mut app.doc, App::placeholder());
+    let packed = doc.pack();
+    let pack_ms = t.elapsed().as_secs_f32() * 1000.0;
+    let packed_bytes = packed.bytes();
+    let t = Instant::now();
+    app.doc = packed.unpack();
+    let unpack_ms = t.elapsed().as_secs_f32() * 1000.0;
+    println!(
+        "subtool: levels {:?}, active stack {} MB in RAM",
+        levels.iter().map(|&n| fmt_count(n)).collect::<Vec<_>>(),
+        stack / 1_000_000
+    );
+    println!(
+        "park: stand-in of {} vertices (level {}) in {stand_in_ms:.0} ms, {} MB on GPU; packed in {pack_ms:.1} ms to {} MB in RAM ({:.1}% of the stack)",
+        fmt_count(stand_in.positions.len()),
+        stand_in.level,
+        stand_in_gpu / 1_000_000,
+        packed_bytes / 1_000_000,
+        packed_bytes as f64 * 100.0 / stack as f64
+    );
+    println!("activate: stack rebuilt in {unpack_ms:.0} ms");
+}
+
 /// Default vertex budget for subdivision: three divides of the default sphere fit (61M
 /// vertices: about 8 GB of RAM and 3.2 GB of GPU memory for that level).
 const DEFAULT_BUDGET: usize = 64_000_000;
@@ -1235,6 +1696,7 @@ fn main() {
     let frames = args.iter().any(|a| a == "--frames");
     let vsync = !args.iter().any(|a| a == "--novsync");
     let segments = flag("--segments").and_then(|s| s.parse().ok()).unwrap_or(400);
+    let subtools: usize = flag("--subtools").and_then(|s| s.parse().ok()).unwrap_or(1);
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(segments, demo, budget);
@@ -1252,6 +1714,10 @@ fn main() {
             fmt_count(app.mesh().vertex_count()),
             t.elapsed().as_secs_f32() * 1000.0
         );
+    }
+    app.initial_subtools = subtools.saturating_sub(1);
+    if args.iter().any(|a| a == "--selftest-subtools") {
+        app.selftest = Some(20);
     }
     if stress {
         app.stress = Some((240, 0.0, 0.0));
@@ -1328,5 +1794,67 @@ mod nav_tests {
         // Shift is the rotation snap, not a pan.
         assert_eq!(drag.mode(ModifiersState::SHIFT), NavMode::Orbit);
         assert_eq!(drag.mode(ModifiersState::CONTROL), NavMode::Zoom);
+    }
+}
+
+#[cfg(test)]
+mod subtool_tests {
+    use super::*;
+
+    fn worst(a: &[Vec3], b: &[Vec3]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(p, q)| (*p - *q).length()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn subtools_park_light_and_come_back_with_their_history() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.segments = 16;
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        app.deform(Deform::OffsetX, -50.0);
+        let shown = app.doc.mesh().positions.clone();
+        let stack = app.doc.bytes();
+
+        app.append_sphere();
+        assert_eq!(app.subtools.len(), 2);
+        assert_eq!(app.active_tool, 1);
+        assert_eq!(app.doc.top(), 0, "the appended sphere starts undivided");
+        let parked = app.subtools[0].parked.as_ref().expect("first subtool is parked");
+        assert!(parked.packed.bytes() * 5 < stack, "parked {} vs stack {stack}", parked.packed.bytes());
+        // The new sphere sits to the right of the first one, not inside it.
+        assert!(app.doc.bounds().min.x > app.subtools[0].bounds.max.x);
+
+        app.select_subtool(0);
+        assert_eq!(app.active_tool, 0);
+        assert!(app.subtools[1].parked.is_some());
+        assert_eq!(app.doc.active(), 1, "the shown level comes back");
+        assert!(worst(&app.doc.mesh().positions, &shown) < 1e-5);
+
+        // The undo list came back with it: undo the offset, then the divide.
+        assert!(app.history.can_undo());
+        app.history.undo(&mut app.doc);
+        let centre = (app.doc.bounds().min + app.doc.bounds().max) * 0.5;
+        assert!(centre.length() < 1e-3, "offset undone, centre at {centre:?}");
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.top(), 0);
+
+        app.duplicate_subtool();
+        assert_eq!(app.subtools.len(), 3);
+        assert!(app.subtools[1].parked.is_some());
+        assert_eq!(app.subtools[1].name, "Sphere 1 copy");
+        app.delete_subtool();
+        assert_eq!(app.subtools.len(), 2);
+        assert_eq!(app.subtools[app.active_tool].name, "Sphere 1 copy");
+        assert!(app.subtools.iter().filter(|t| t.parked.is_none()).count() == 1);
+
+        app.move_subtool(1);
+        assert_eq!(app.active_tool, 1);
+        assert_eq!(app.subtools[1].name, "Sphere 1 copy");
+        app.toggle_subtool(0);
+        assert!(!app.subtools[0].visible);
+        assert!(app.drawn_parked().is_empty());
+        app.toggle_subtool(1);
+        assert!(app.subtools[1].visible, "the active subtool cannot be hidden");
     }
 }

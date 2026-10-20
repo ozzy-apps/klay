@@ -47,15 +47,41 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    // 1 for a parked subtool (drawn as instance 1), 0 for the active one.
+    @location(2) @interpolate(flat) parked: u32,
 };
 
 @vertex
-fn vs_main(@location(0) pos: vec3<f32>, @location(1) nrm: vec4<f32>) -> VsOut {
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) nrm: vec4<f32>,
+    @builtin(instance_index) instance: u32,
+) -> VsOut {
     var out: VsOut;
     out.clip = u.view_proj * vec4<f32>(pos, 1.0);
     out.world_pos = pos;
     out.normal = nrm.xyz;
+    out.parked = instance;
     return out;
+}
+
+struct PickOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) @interpolate(flat) id: u32,
+};
+
+// Id pass: the instance index carries the id of the subtool being drawn.
+@vertex
+fn vs_pick(@location(0) pos: vec3<f32>, @builtin(instance_index) instance: u32) -> PickOut {
+    var out: PickOut;
+    out.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    out.id = instance;
+    return out;
+}
+
+@fragment
+fn fs_pick(in: PickOut) -> @location(0) u32 {
+    return in.id;
 }
 
 @fragment
@@ -83,8 +109,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color *= 1.0 - slope * 0.35;
     }
 
+    // Parked subtools: a little darker, and never under the brush.
+    if (in.parked > 0u) {
+        color *= 0.78;
+    }
+
     // Brush ring projected onto the surface.
-    if (u.params.x > 0.5) {
+    if (u.params.x > 0.5 && in.parked == 0u) {
         var d = distance(in.world_pos, u.brush.xyz);
         // Symmetry: a second ring at the mirror image across X = 0.
         if (u.display.y > 0.5) {

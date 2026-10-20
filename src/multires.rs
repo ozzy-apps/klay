@@ -11,7 +11,10 @@
 //! midpoints of the edges it owns) are split spatially into child chunks, and every array of
 //! the child mesh is produced in parallel over chunks.
 
-use crate::mesh::{CHUNK_TARGET, Chunk, SculptMesh, crosses_chunk, partition_ids, split_ranges};
+use crate::mesh::{
+    Aabb, CHUNK_TARGET, Chunk, PackedNormal, SculptMesh, crosses_chunk, pack_normal, partition_ids,
+    split_ranges, vertex_normal,
+};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::sync::LazyLock;
@@ -34,6 +37,10 @@ pub struct Link {
     stencil: Vec<Stencil>,
     /// Parent chunk -> child chunks with at least one vertex whose stencil reads it.
     dependants: Vec<Vec<u32>>,
+    /// Which child chunk of its parent chunk each child vertex went to, in natural order per
+    /// parent chunk (see [`subdivide_with`]). One byte per vertex; it is what lets a parked
+    /// level be rebuilt with the same vertex order without keeping the level itself.
+    labels: Vec<u8>,
 }
 
 pub struct Level {
@@ -64,7 +71,7 @@ impl Level {
         let mesh = m.positions.len() * 16
             + m.indices.len() * 4
             + (m.adj_verts.len() + m.vt_tris.len() + m.adj_offsets.len() + m.vt_offsets.len()) * 4;
-        let link = self.link.as_ref().map_or(0, |l| l.stencil.len() * 16);
+        let link = self.link.as_ref().map_or(0, |l| l.stencil.len() * 17);
         let offsets: usize = self.offsets.iter().map(|o| o.len() * 12).sum();
         mesh + link + offsets
     }
@@ -155,6 +162,14 @@ fn centre_tris(parent: &SculptMesh, a: u32, b: u32) -> impl Iterator<Item = u32>
 
 /// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
 pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
+    subdivide_with(parent, None)
+}
+
+/// Loop subdivision of `parent`. With `replay`, the child chunks are formed from the given
+/// labels (from an earlier subdivision of the same topology) instead of a spatial split, so
+/// the result has exactly the vertex order and chunks of that earlier level, whatever the
+/// parent's positions are now.
+pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh, Link) {
     let v_count = parent.vertex_count();
     let pc = &parent.chunks;
 
@@ -233,17 +248,58 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
     }
 
     // 4. Child chunks: each parent chunk's vertices and the midpoints of the edges it owns,
-    // split spatially into groups of at most CHUNK_TARGET.
-    let per_parent: Vec<Vec<Vec<u32>>> = pc
-        .par_iter()
-        .map(|ch| {
-            let (s, e) = ch.range();
-            let (es, ee) = (edge_base[s] as usize, edge_base[e] as usize);
-            let mut ids: Vec<u32> = (s as u32..e as u32).collect();
-            ids.extend((v_count + es) as u32..(v_count + ee) as u32);
-            partition_ids(ids, &pos_nat)
-        })
-        .collect();
+    // split spatially into groups of at most CHUNK_TARGET, each group in natural order. The
+    // group of every child is kept as a one-byte label, laid out per parent chunk in natural
+    // order (parent chunk `c` starts at `vert_start + edge_base[vert_start]`), so a replay
+    // can rebuild the same groups from the topology alone.
+    let label_range = |ch: &Chunk| {
+        let (s, e) = ch.range();
+        let (es, ee) = (edge_base[s] as usize, edge_base[e] as usize);
+        (s + es, e + ee)
+    };
+    let children = |ch: &Chunk| {
+        let (s, e) = ch.range();
+        let (es, ee) = (edge_base[s] as usize, edge_base[e] as usize);
+        (s as u32..e as u32).chain((v_count + es) as u32..(v_count + ee) as u32)
+    };
+    let mut labels = vec![0u8; n_count];
+    let per_parent: Vec<Vec<Vec<u32>>> = match replay {
+        Some(given) => {
+            assert_eq!(given.len(), n_count, "labels belong to another topology");
+            labels.copy_from_slice(given);
+            pc.par_iter()
+                .map(|ch| {
+                    let (a, b) = label_range(ch);
+                    let lab = &given[a..b];
+                    let k = lab.iter().max().map_or(0, |&m| m as usize + 1);
+                    let mut groups = vec![Vec::new(); k];
+                    for (i, id) in children(ch).enumerate() {
+                        groups[lab[i] as usize].push(id);
+                    }
+                    groups
+                })
+                .collect()
+        }
+        None => split_ranges(&mut labels, pc.iter().map(label_range))
+            .into_par_iter()
+            .zip(pc.par_iter())
+            .map(|(lab, ch)| {
+                let mut groups = partition_ids(children(ch).collect(), &pos_nat);
+                assert!(groups.len() <= 256, "too many child chunks for a byte label");
+                let (s, e) = ch.range();
+                let es = edge_base[s] as usize;
+                for (gi, g) in groups.iter_mut().enumerate() {
+                    g.sort_unstable();
+                    for &id in g.iter() {
+                        let id = id as usize;
+                        let at = if id < v_count { id - s } else { (e - s) + (id - v_count - es) };
+                        lab[at] = gi as u8;
+                    }
+                }
+                groups
+            })
+            .collect(),
+    };
     let mut groups: Vec<Vec<u32>> = Vec::with_capacity(pc.len() * 4);
     for g in per_parent {
         groups.extend(g);
@@ -528,8 +584,112 @@ pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
         Link {
             stencil,
             dependants,
+            labels,
         },
     )
+}
+
+/// Lossless compact form of a level stack, kept for a parked subtool: the base mesh in chunk
+/// order, and for each level above it the labels that replay its subdivision plus the
+/// offsets of the chunks that were ever sculpted at that level. Adjacency, stencils and the
+/// positions of upper levels are not kept; [`unpack`](Self::unpack) rebuilds them.
+pub struct Packed {
+    positions: Vec<Vec3>,
+    indices: Vec<u32>,
+    ranges: Vec<[u32; 5]>,
+    levels: Vec<PackedLevel>,
+    active: usize,
+    budget: usize,
+    /// Vertex count per level, for display while parked.
+    counts: Vec<usize>,
+}
+
+struct PackedLevel {
+    labels: Vec<u8>,
+    offsets: Vec<Vec<Vec3>>,
+}
+
+impl Packed {
+    /// Memory held, in bytes.
+    pub fn bytes(&self) -> usize {
+        let levels: usize = self
+            .levels
+            .iter()
+            .map(|l| {
+                l.labels.len()
+                    + l.offsets.len() * std::mem::size_of::<Vec<Vec3>>()
+                    + l.offsets.iter().map(|o| o.len() * 12).sum::<usize>()
+            })
+            .sum();
+        self.positions.len() * 12 + self.indices.len() * 4 + self.ranges.len() * 20 + levels
+    }
+
+    /// Vertex count per level, lowest first.
+    pub fn counts(&self) -> &[usize] {
+        &self.counts
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    /// Rebuild the full level stack: the base mesh as it was, then every level by replaying
+    /// its subdivision and adding its offsets.
+    pub fn unpack(self) -> Multires {
+        let Packed {
+            positions,
+            indices,
+            ranges,
+            levels: packed,
+            active,
+            budget,
+            ..
+        } = self;
+        let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
+        for pl in packed {
+            let parent = &levels.last().unwrap().mesh;
+            let (mut mesh, link) = subdivide_with(parent, Some(&pl.labels));
+            let sculpted: Vec<u32> = (0..pl.offsets.len() as u32)
+                .filter(|&c| !pl.offsets[c as usize].is_empty())
+                .collect();
+            {
+                let SculptMesh {
+                    positions, chunks, ..
+                } = &mut mesh;
+                split_ranges(positions, sculpted.iter().map(|&c| chunks[c as usize].range()))
+                    .into_par_iter()
+                    .zip(sculpted.par_iter())
+                    .for_each(|(slice, &c)| {
+                        for (p, d) in slice.iter_mut().zip(&pl.offsets[c as usize]) {
+                            *p += *d;
+                        }
+                    });
+            }
+            mesh.finish_edit(&sculpted);
+            let n = mesh.chunks.len();
+            levels.push(Level {
+                mesh,
+                link: Some(link),
+                offsets: pl.offsets,
+                stale: vec![false; n],
+            });
+        }
+        Multires {
+            levels,
+            active,
+            budget,
+        }
+    }
+}
+
+/// Draw-only copy of a parked subtool for the GPU (see [`Multires::stand_in`]).
+pub struct StandIn {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<PackedNormal>,
+    pub indices: Vec<u32>,
+    /// The level whose topology it uses.
+    pub level: usize,
+    pub bounds: Aabb,
 }
 
 /// The level stack.
@@ -802,6 +962,133 @@ impl Multires {
         let top = self.top();
         self.set_active(top);
     }
+
+    /// Bounds of the displayed level.
+    pub fn bounds(&self) -> Aabb {
+        self.mesh().bounds()
+    }
+
+    /// The compact form of this stack (see [`Packed`]). Consumes the stack: this is what
+    /// frees the memory of a subtool that is parked.
+    pub fn pack(self) -> Packed {
+        let counts = self.vertex_counts();
+        let Multires {
+            levels,
+            active,
+            budget,
+        } = self;
+        let mut it = levels.into_iter();
+        let base = it.next().expect("a stack has a base level").mesh;
+        let ranges = base.chunk_ranges();
+        let SculptMesh {
+            positions, indices, ..
+        } = base;
+        let levels = it
+            .map(|l| PackedLevel {
+                labels: l.link.expect("level above the base has a link").labels,
+                offsets: l.offsets,
+            })
+            .collect();
+        Packed {
+            positions,
+            indices,
+            ranges,
+            levels,
+            active,
+            budget,
+            counts,
+        }
+    }
+
+    /// A compact copy, leaving this stack as it is (Duplicate).
+    pub fn pack_copy(&self) -> Packed {
+        let base = &self.levels[0].mesh;
+        Packed {
+            positions: base.positions.clone(),
+            indices: base.indices.clone(),
+            ranges: base.chunk_ranges(),
+            levels: self.levels[1..]
+                .iter()
+                .map(|l| PackedLevel {
+                    labels: l.link.as_ref().unwrap().labels.clone(),
+                    offsets: l.offsets.clone(),
+                })
+                .collect(),
+            active: self.active,
+            budget: self.budget,
+            counts: self.vertex_counts(),
+        }
+    }
+
+    /// A draw-only copy for when this subtool is parked: the topology of the highest level
+    /// with at most `max_vertices` vertices, each vertex placed where its chain of even
+    /// children lands on the top level, so the shape and large forms of the top level show.
+    /// Normals are baked from those positions. Brings every level in sync first.
+    pub fn stand_in(&mut self, max_vertices: usize) -> StandIn {
+        let top = self.top();
+        self.sync_to(top);
+        let level = (0..=top)
+            .rev()
+            .find(|&l| self.levels[l].mesh.vertex_count() <= max_vertices)
+            .unwrap_or(0);
+        let n = self.levels[level].mesh.vertex_count();
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        for l in level + 1..=top {
+            let link = self.levels[l].link.as_ref().unwrap();
+            let mut even = vec![0u32; self.levels[l - 1].mesh.vertex_count()];
+            for (child, st) in link.stencil.iter().enumerate() {
+                if st[1] == NONE {
+                    even[st[0] as usize] = child as u32;
+                }
+            }
+            ids.par_iter_mut().for_each(|v| *v = even[*v as usize]);
+        }
+        let top_positions = &self.levels[top].mesh.positions;
+        let positions: Vec<Vec3> = ids.par_iter().map(|&v| top_positions[v as usize]).collect();
+        drop(ids);
+        let m = &self.levels[level].mesh;
+        let normals = (0..n as u32)
+            .into_par_iter()
+            .map(|v| pack_normal(vertex_normal(&positions, &m.indices, &m.vt_offsets, &m.vt_tris, v)))
+            .collect();
+        let bounds = positions
+            .par_iter()
+            .fold(Aabb::empty, |mut b, &p| {
+                b.grow(p);
+                b
+            })
+            .reduce(Aabb::empty, |mut a, b| {
+                a.grow(b.min);
+                a.grow(b.max);
+                a
+            });
+        StandIn {
+            positions,
+            normals,
+            indices: m.indices.clone(),
+            level,
+            bounds,
+        }
+    }
+
+    /// Move and scale every level: `p -> c + s (p - c) + t`. Loop's weights sum to one, so
+    /// smoothing commutes with this map and the offsets only scale by `s`; the stack stays
+    /// exactly consistent, stale levels included.
+    pub fn transform(&mut self, c: Vec3, s: f32, t: Vec3) {
+        for lvl in &mut self.levels {
+            lvl.mesh
+                .positions
+                .par_iter_mut()
+                .for_each(|p| *p = c + (*p - c) * s + t);
+            if s != 1.0 {
+                lvl.offsets
+                    .par_iter_mut()
+                    .for_each(|o| o.iter_mut().for_each(|d| *d *= s));
+            }
+            let all: Vec<u32> = (0..lvl.mesh.chunks.len() as u32).collect();
+            lvl.mesh.finish_edit(&all);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -983,6 +1270,154 @@ mod tests {
             .filter(|(a, b)| a != b)
             .count();
         assert_eq!(changed, 1);
+    }
+
+    /// Every level of `b` matches `a`: same topology, chunks and tables, positions within
+    /// float noise, same offsets and labels.
+    fn assert_same_stack(a: &Multires, b: &Multires) {
+        assert_eq!(a.count(), b.count());
+        assert_eq!(a.active(), b.active());
+        for (la, lb) in a.levels.iter().zip(&b.levels) {
+            let (ma, mb) = (&la.mesh, &lb.mesh);
+            assert_eq!(ma.indices, mb.indices, "index buffer");
+            assert_eq!(ma.chunk_ranges(), mb.chunk_ranges(), "chunk ranges");
+            assert_eq!(ma.adj_offsets, mb.adj_offsets);
+            assert_eq!(ma.adj_verts, mb.adj_verts);
+            assert_eq!(ma.vt_tris, mb.vt_tris);
+            let worst = ma
+                .positions
+                .iter()
+                .zip(&mb.positions)
+                .map(|(p, q)| (*p - *q).length())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "positions differ by {worst}");
+            assert_eq!(la.offsets.len(), lb.offsets.len());
+            for (oa, ob) in la.offsets.iter().zip(&lb.offsets) {
+                assert_eq!(oa, ob, "offsets are carried over exactly");
+            }
+            match (&la.link, &lb.link) {
+                (Some(x), Some(y)) => {
+                    assert_eq!(x.labels, y.labels);
+                    assert_eq!(x.stencil, y.stencil);
+                    assert_eq!(x.dependants, y.dependants);
+                }
+                (None, None) => {}
+                _ => panic!("link mismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn pack_and_unpack_rebuild_the_exact_stack() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        nudge(&mut mr, Vec3::X, Vec3::X * 0.2);
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Y, Vec3::Y * 0.1);
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Z, Vec3::Z * 0.05);
+        // A base edit after dividing: the upper levels are now stale, and a re-divide would
+        // split chunks differently from the positions they were made from.
+        mr.set_active(0);
+        nudge(&mut mr, -Vec3::X, -Vec3::X * 0.3);
+        mr.set_active(1);
+        let mut reference = mr.pack_copy().unpack();
+        reference.sync_to(reference.top());
+        let packed = mr.pack();
+        assert!(packed.bytes() > 0);
+        let mut back = packed.unpack();
+        back.sync_to(back.top());
+        assert_eq!(back.active(), 1);
+        assert_same_stack(&reference, &back);
+        // And against a stack that was never packed.
+        let mut live = Multires::new(sphere(10), usize::MAX);
+        nudge(&mut live, Vec3::X, Vec3::X * 0.2);
+        assert!(live.divide());
+        nudge(&mut live, Vec3::Y, Vec3::Y * 0.1);
+        assert!(live.divide());
+        nudge(&mut live, Vec3::Z, Vec3::Z * 0.05);
+        live.set_active(0);
+        nudge(&mut live, -Vec3::X, -Vec3::X * 0.3);
+        live.set_active(1);
+        live.sync_to(live.top());
+        assert_same_stack(&live, &back);
+        for l in 0..back.count() {
+            check_tables(&back.levels[l].mesh);
+        }
+    }
+
+    #[test]
+    fn packed_form_is_much_smaller_than_the_stack() {
+        let mut mr = Multires::new(sphere(24), usize::MAX);
+        assert!(mr.divide());
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Z, Vec3::Z * 0.05);
+        let full = mr.bytes();
+        let packed = mr.pack().bytes();
+        assert!(packed * 10 < full, "packed {packed} vs full {full}");
+    }
+
+    #[test]
+    fn stand_in_samples_the_top_level() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        assert!(mr.divide());
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Z, Vec3::Z * 0.4);
+        let base_n = mr.levels[0].mesh.vertex_count();
+        let si = mr.stand_in(base_n);
+        assert_eq!(si.level, 0);
+        assert_eq!(si.positions.len(), base_n);
+        assert_eq!(si.indices, mr.levels[0].mesh.indices);
+        // Every stand-in vertex is a vertex of the top level.
+        let top: HashSet<[u32; 3]> = mr.levels[2]
+            .mesh
+            .positions
+            .iter()
+            .map(|p| p.to_array().map(f32::to_bits))
+            .collect();
+        assert!(si.positions.iter().all(|p| top.contains(&p.to_array().map(f32::to_bits))));
+        // A budget that fits the top level gives the top level itself.
+        let all = mr.stand_in(usize::MAX);
+        assert_eq!(all.level, 2);
+        assert_eq!(all.positions, mr.levels[2].mesh.positions);
+    }
+
+    #[test]
+    fn transform_keeps_the_stack_consistent() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Z, Vec3::Z * 0.2);
+        mr.set_active(0);
+        nudge(&mut mr, Vec3::X, Vec3::X * 0.2);
+        let (c, s, t) = (Vec3::new(0.1, 0.2, 0.3), 1.7, Vec3::new(-0.5, 0.25, 2.0));
+        let mut expect = mr.pack_copy().unpack();
+        expect.sync_to(1);
+        let want: Vec<Vec3> = expect.levels[1]
+            .mesh
+            .positions
+            .iter()
+            .map(|&p| c + (p - c) * s + t)
+            .collect();
+        mr.transform(c, s, t);
+        mr.set_active(1);
+        let worst = mr
+            .mesh()
+            .positions
+            .iter()
+            .zip(&want)
+            .map(|(p, q)| (*p - *q).length())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
+        // The exact inverse brings it back.
+        mr.transform(c + t, 1.0 / s, -t);
+        let back: Vec<Vec3> = expect.levels[1].mesh.positions.clone();
+        let worst = mr
+            .mesh()
+            .positions
+            .iter()
+            .zip(&back)
+            .map(|(p, q)| (*p - *q).length())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
     }
 
     #[test]

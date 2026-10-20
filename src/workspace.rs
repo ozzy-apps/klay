@@ -12,6 +12,7 @@
 //! helpers; the shell supplies docking, collapsing, scrolling and persistence.
 
 use crate::sculpt::{Brush, BrushKind};
+use crate::subtool::Deform;
 use egui::ecolor::Hsva;
 use egui::{
     Align, Align2, Color32, ColorImage, Context, CornerRadius, FontId, Frame, Id, Layout, Margin,
@@ -357,6 +358,27 @@ pub struct Model<'a> {
     /// World X, Y, Z axes in view space as (right, up, towards-camera) components, for
     /// the axis gizmo.
     pub axes: [[f32; 3]; 3],
+    /// Every subtool, in list order.
+    pub subtools: &'a [SubToolRow],
+    /// RAM held by parked subtools (packed stacks and their undo lists).
+    pub parked_bytes: usize,
+    /// GPU memory held by the stand-ins of parked subtools.
+    pub stand_in_bytes: u64,
+}
+
+/// One line of the SubTool list.
+pub struct SubToolRow {
+    pub name: String,
+    pub visible: bool,
+    pub active: bool,
+    /// Vertices at the level it is shown at.
+    pub vertices: usize,
+    pub level: usize,
+    pub top: usize,
+    /// RAM it holds: the full stack when active, the packed form when parked.
+    pub bytes: usize,
+    /// False for a parked subtool whose stand-in did not fit on the GPU.
+    pub drawn: bool,
 }
 
 #[derive(Default)]
@@ -372,6 +394,17 @@ pub struct Actions {
     pub frame: bool,
     pub zoom: f32,
     pub view: Option<(f32, f32)>,
+    /// SubTool list: make this one active.
+    pub select_subtool: Option<usize>,
+    /// SubTool list: flip the visibility of this one.
+    pub toggle_subtool: Option<usize>,
+    pub append: bool,
+    pub duplicate: bool,
+    pub delete: bool,
+    /// Move the active subtool up (-1) or down (+1) in the list.
+    pub move_subtool: i32,
+    /// A Deformation slider was released at this value.
+    pub deform: Option<(Deform, f32)>,
 }
 
 pub const MATERIALS: [(Color32, &str); 4] = [
@@ -434,6 +467,10 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Draw only the active subtool (ZBrush: Solo).
+    pub solo: bool,
+    /// Deformation slider being dragged, and its value.
+    deform_drag: Option<(Deform, f32)>,
     pub mode: Mode,
     /// Open hotkey popup and the logical position it was opened at.
     pub popup: Option<(QuickPopup, Pos2)>,
@@ -478,6 +515,8 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            solo: false,
+            deform_drag: None,
             mode: Mode::Draw,
             popup: None,
             quick_menu: None,
@@ -1145,13 +1184,14 @@ impl Workspace {
                     self.symmetry = !self.symmetry;
                 }
                 nav_separator(ui);
-                for (g, label) in [
-                    ("local", "Local"),
-                    ("transp", "Transp"),
-                    ("ghost", "Ghost"),
-                    ("solo", "Solo"),
-                ] {
+                for (g, label) in [("local", "Local"), ("transp", "Transp"), ("ghost", "Ghost")] {
                     big_button(ui, g, label, size, false, false).on_hover_text(NC);
+                }
+                if big_button(ui, "solo", "Solo", size, self.solo, true)
+                    .on_hover_text("Show only the active subtool")
+                    .clicked()
+                {
+                    self.solo = !self.solo;
                 }
                 nav_separator(ui);
                 if big_button(ui, "detail", "Detail", size, self.wireframe, true)
@@ -1854,8 +1894,111 @@ impl Workspace {
                 );
             }
             PaletteId::Mesh => {
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "subtool",
+                    "SubTool",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        for (i, row) in m.subtools.iter().enumerate() {
+                            let (pick, eye) = subtool_row(ui, i, row);
+                            if pick {
+                                a.select_subtool = Some(i);
+                            }
+                            if eye {
+                                a.toggle_subtool = Some(i);
+                            }
+                        }
+                        ui.add_space(2.0);
+                        let active = m.subtools.iter().position(|r| r.active).unwrap_or(0);
+                        let count = m.subtools.len();
+                        // Three fixed cells per row: a label wider than its cell is clipped
+                        // instead of widening the tray.
+                        let mut clicked = [false; 6];
+                        let labels = [
+                            ("Append", true, "Add a sphere subtool next to the model and select it"),
+                            ("Duplicate", true, "Copy the active subtool below it"),
+                            ("Delete", count > 1, "Delete the active subtool · not undoable"),
+                            ("Up", active > 0, "Move the active subtool up the list"),
+                            ("Down", active + 1 < count, "Move the active subtool down the list"),
+                            ("Solo", true, "Show only the active subtool"),
+                        ];
+                        for row in 0..2 {
+                            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                            let w = (r.width() - 6.0) / 3.0;
+                            for col in 0..3 {
+                                let k = row * 3 + col;
+                                let (label, on, hint) = labels[k];
+                                let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                                child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                                if !on {
+                                    child.disable();
+                                }
+                                let selected = k == 5 && ws.solo;
+                                clicked[k] = child
+                                    .put(
+                                        cell,
+                                        egui::Button::new(RichText::new(label).size(11.0))
+                                            .truncate()
+                                            .selected(selected),
+                                    )
+                                    .on_hover_text(hint)
+                                    .clicked();
+                            }
+                        }
+                        a.append |= clicked[0];
+                        a.duplicate |= clicked[1];
+                        a.delete |= clicked[2];
+                        if clicked[3] {
+                            a.move_subtool = -1;
+                        }
+                        if clicked[4] {
+                            a.move_subtool = 1;
+                        }
+                        if clicked[5] {
+                            ws.solo = !ws.solo;
+                        }
+                        kv(
+                            ui,
+                            "Active in RAM",
+                            &format!("{} MB", m.subtools.iter().find(|r| r.active).map_or(0, |r| r.bytes) / 1_000_000),
+                        );
+                        if m.subtools.len() > 1 {
+                            kv(ui, "Parked in RAM", &format!("{} MB", m.parked_bytes / 1_000_000));
+                            kv(ui, "Parked on GPU", &format!("{} MB", m.stand_in_bytes / 1_000_000));
+                        }
+                        note(ui, "Alt + click a subtool to select it");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "deformation",
+                    "Deformation",
+                    None,
+                    false,
+                    true,
+                    &mut |ws, ui| {
+                        for kind in Deform::ALL {
+                            if let Some(v) = spring_slider(ui, kind, &mut ws.deform_drag) {
+                                a.deform = Some((kind, v));
+                            }
+                        }
+                        note(ui, "Drag and release: applies to every level of the active subtool");
+                    },
+                );
                 self.sec(ui, h, id, "info", "Mesh", None, true, true, &mut |_, ui| {
-                    kv(ui, "Object", "Sphere");
+                    kv(
+                        ui,
+                        "Object",
+                        m.subtools.iter().find(|r| r.active).map_or("", |r| r.name.as_str()),
+                    );
                     kv(ui, "Vertices", &crate::fmt_count(m.vertices));
                     kv(ui, "Triangles", &crate::fmt_count(m.triangles));
                     kv(ui, "Chunks", &crate::fmt_count(m.chunks));
@@ -2034,6 +2177,7 @@ impl Workspace {
                             ("RMB / MMB", "rotate · Alt: move · Ctrl: zoom"),
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("Space (hold)", "quick menu · also: right-click tap"),
+                            ("Alt + click subtool", "select subtool"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
                             ("[ ]", "brush radius"),
@@ -3148,6 +3292,140 @@ fn kv(ui: &mut Ui, key: &str, value: &str) {
     });
 }
 
+/// A SubTool list line: name and size, highlighted when active, with an eye toggle on the
+/// right. Returns (row clicked, eye clicked).
+fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let eye_rect = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(22.0, 22.0));
+    let eye = ui.interact(eye_rect, Id::unique(("subtool-eye", index)), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(
+        r,
+        2,
+        if row.active {
+            ACC_DIM
+        } else if resp.hovered() {
+            BG4
+        } else {
+            BG3
+        },
+    );
+    p.rect_stroke(
+        r,
+        2,
+        Stroke::new(1.0, if row.active { ACC_LINE } else { LINE }),
+        StrokeKind::Inside,
+    );
+    let text = if row.visible || row.active { FG } else { FG3 };
+    p.text(
+        pos2(r.left() + 8.0, r.top() + 10.0),
+        Align2::LEFT_CENTER,
+        &row.name,
+        FontId::proportional(12.0),
+        text,
+    );
+    let detail = if !row.drawn {
+        "stand-in did not fit on the GPU".to_string()
+    } else if row.top > 0 {
+        format!(
+            "{} v · SDiv {} of {} · {} MB",
+            crate::fmt_count(row.vertices),
+            row.level,
+            row.top,
+            row.bytes / 1_000_000
+        )
+    } else {
+        format!("{} v · {} MB", crate::fmt_count(row.vertices), row.bytes / 1_000_000)
+    };
+    p.text(
+        pos2(r.left() + 8.0, r.bottom() - 9.0),
+        Align2::LEFT_CENTER,
+        detail,
+        FontId::monospace(10.0),
+        FG3,
+    );
+    // Eye: an outline with a pupil, crossed out when hidden.
+    let c = eye_rect.center();
+    let color = if row.active {
+        FG3
+    } else if eye.hovered() {
+        FG
+    } else {
+        FG2
+    };
+    let pts: Vec<Pos2> = (0..=16)
+        .map(|k| {
+            let t = k as f32 / 16.0 * std::f32::consts::TAU;
+            c + vec2(7.0 * t.cos(), 4.0 * t.sin())
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(1.2, color)));
+    p.circle_filled(c, 1.8, color);
+    if !row.visible && !row.active {
+        p.line_segment([c + vec2(-7.0, 6.0), c + vec2(7.0, -6.0)], Stroke::new(1.4, color));
+    }
+    let eye_clicked = eye.clicked() && !row.active;
+    let eye = eye.on_hover_text(if row.active {
+        "The active subtool is always shown"
+    } else if row.visible {
+        "Hide"
+    } else {
+        "Show"
+    });
+    (resp.clicked() && !eye.hovered(), eye_clicked)
+}
+
+/// ZBrush-style deformation slider: drag sets a value in -100..100 from the centre, release
+/// returns it and the slider springs back to 0.
+fn spring_slider(ui: &mut Ui, kind: Deform, drag: &mut Option<(Deform, f32)>) -> Option<f32> {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::drag());
+    let value_at = |p: Pos2| ((p.x - r.center().x) / (r.width() * 0.5) * 100.0).clamp(-100.0, 100.0);
+    let mut released = None;
+    if resp.drag_started() || resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            *drag = Some((kind, value_at(p).round()));
+        }
+    }
+    if resp.drag_stopped() {
+        if let Some((k, v)) = drag.take() {
+            if k == kind {
+                released = Some(v);
+            }
+        }
+    }
+    let value = match drag {
+        Some((k, v)) if *k == kind => *v,
+        _ => 0.0,
+    };
+    let p = ui.painter();
+    p.rect_filled(r, 2, if resp.hovered() || value != 0.0 { BG4 } else { BG3 });
+    let cx = r.center().x;
+    let x = cx + value / 100.0 * r.width() * 0.5;
+    if value != 0.0 {
+        p.rect_filled(
+            Rect::from_x_y_ranges(cx.min(x)..=cx.max(x), r.y_range()),
+            2,
+            ACC_DIM,
+        );
+    }
+    p.vline(cx, r.y_range().shrink(4.0), Stroke::new(1.0, LINE2));
+    p.text(
+        pos2(r.left() + 6.0, r.center().y),
+        Align2::LEFT_CENTER,
+        kind.label(),
+        FontId::proportional(11.5),
+        FG,
+    );
+    p.text(
+        pos2(r.right() - 6.0, r.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{value:+.0}"),
+        FontId::monospace(11.0),
+        if value != 0.0 { ACC } else { FG3 },
+    );
+    released
+}
+
 fn full_button(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add_sized([ui.available_width(), 20.0], egui::Button::new(label))
 }
@@ -3455,11 +3733,34 @@ mod tests {
         (workspace, ctx)
     }
 
+    fn row(name: &str, active: bool) -> SubToolRow {
+        SubToolRow {
+            name: name.to_string(),
+            visible: true,
+            active,
+            vertices: 240002,
+            level: 0,
+            top: 0,
+            bytes: 23_000_000,
+            drawn: true,
+        }
+    }
+
     fn frame(
         workspace: &mut Workspace,
         ctx: &egui::Context,
         size: Vec2,
         events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        frame_with(workspace, ctx, size, events, &[row("Sphere 1", true)])
+    }
+
+    fn frame_with(
+        workspace: &mut Workspace,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+        subtools: &[SubToolRow],
     ) -> egui::FullOutput {
         let mut brush = Brush::default();
         let mut segments = 200;
@@ -3499,6 +3800,9 @@ mod tests {
                         render_ms: 0.0,
                         adapter: "Test adapter",
                         axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                        subtools,
+                        parked_bytes: 0,
+                        stand_in_bytes: 0,
                     },
                 );
             },
@@ -3775,5 +4079,27 @@ mod tests {
         let add = sphere_image(Some(BrushKind::Draw), 0, false);
         let sub = sphere_image(Some(BrushKind::Draw), 0, true);
         assert_ne!(add.pixels, sub.pixels, "subtract must flip the stroke");
+    }
+
+    #[test]
+    fn subtool_section_never_widens_a_narrow_tray() {
+        let size = vec2(1600.0, 1000.0);
+        let three = [row("Sphere 1", false), row("Sphere 2", false), row("Sphere 3", true)];
+        // (Edit palette text, right shelf text) for a tray width and a SubTool list.
+        let place = |rows: &[SubToolRow], width: f32| {
+            let (mut workspace, ctx) = test_workspace("subtool-rows");
+            workspace.layout.tray_width = width;
+            frame_with(&mut workspace, &ctx, size, vec![], rows);
+            let out = frame_with(&mut workspace, &ctx, size, vec![], rows);
+            (text_position(&out, "Snapshots").x, text_position(&out, "Persp").x)
+        };
+        for width in [262.0, 200.0] {
+            assert_eq!(place(&[row("Sphere 1", true)], width), place(&three, width));
+        }
+        // Narrowing the tray by 62 px moves the tray text and the shelf by exactly 62 px:
+        // nothing in the tray asks for more room than the tray has.
+        let (wide, narrow) = (place(&three, 262.0), place(&three, 200.0));
+        assert!((narrow.0 - wide.0 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
+        assert!((narrow.1 - wide.1 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
     }
 }

@@ -255,9 +255,47 @@ impl SculptMesh {
         // 3. Group the triangles by the chunk owning their first vertex, border ones first.
         let indices = group_triangles(indices, &mut chunks);
 
+        let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
+        Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+    }
+
+    /// Owned ranges of every chunk: `[vert_start, vert_end, tri_start, tri_border, tri_end]`.
+    /// With the positions and the index buffer this is all [`from_chunked`](Self::from_chunked)
+    /// needs to rebuild the mesh exactly.
+    pub fn chunk_ranges(&self) -> Vec<[u32; 5]> {
+        self.chunks
+            .iter()
+            .map(|c| [c.vert_start, c.vert_end, c.tri_start, c.tri_border, c.tri_end])
+            .collect()
+    }
+
+    /// Rebuild a mesh from arrays that are already in chunk order (as kept by
+    /// [`chunk_ranges`](Self::chunk_ranges)), with the same vertex order, chunks and tables as
+    /// the mesh they came from. Unlike [`from_raw`](Self::from_raw) nothing is re-partitioned.
+    pub fn from_chunked(positions: Vec<Vec3>, indices: Vec<u32>, ranges: &[[u32; 5]]) -> Self {
+        let n = positions.len();
+        let mut vert_chunk = vec![0u32; n];
+        let chunks: Vec<Chunk> = ranges
+            .iter()
+            .enumerate()
+            .map(|(ci, r)| {
+                vert_chunk[r[0] as usize..r[1] as usize].fill(ci as u32);
+                Chunk::new(r[0], r[1], r[2], r[3], r[4])
+            })
+            .collect();
+        let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
+        Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+    }
+}
+
+/// Vertex -> vertex and vertex -> triangle CSR tables of an index buffer:
+/// `(adj_offsets, adj_verts, vt_offsets, vt_tris)`. Deterministic, so a mesh rebuilt from
+/// the same index buffer gets the same tables.
+fn build_csr(n: usize, indices: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+    {
         // 4. Vertex -> triangle CSR.
         let mut vt_offsets = vec![0u32; n + 1];
-        for &i in &indices {
+        for &i in indices {
             vt_offsets[i as usize + 1] += 1;
         }
         for i in 0..n {
@@ -311,9 +349,11 @@ impl SculptMesh {
             }
         }
         drop(blocks);
-
-        Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+        (adj_offsets, adj_verts, vt_offsets, vt_tris)
     }
+}
+
+impl SculptMesh {
 
     /// Build a mesh from arrays that are already in chunk order: positions and `vert_chunk`
     /// sorted so every chunk owns a contiguous range, the index buffer grouped so each chunk
@@ -656,7 +696,7 @@ impl SculptMesh {
 }
 
 /// Area-weighted vertex normal from the current positions.
-fn vertex_normal(positions: &[Vec3], indices: &[u32], vt_offsets: &[u32], vt_tris: &[u32], v: u32) -> Vec3 {
+pub(crate) fn vertex_normal(positions: &[Vec3], indices: &[u32], vt_offsets: &[u32], vt_tris: &[u32], v: u32) -> Vec3 {
     let mut n = Vec3::ZERO;
     let (ta, tb) = (vt_offsets[v as usize] as usize, vt_offsets[v as usize + 1] as usize);
     for &t in &vt_tris[ta..tb] {

@@ -2,7 +2,9 @@
 //! sculpt mesh, and the egui overlay.
 
 use crate::mesh::SculptMesh;
+use crate::multires::StandIn;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -82,6 +84,23 @@ struct MeshBuffers {
     _tables: [wgpu::Buffer; 4],
 }
 
+/// Draw-only GPU copy of a parked subtool: 40 bytes per vertex (positions 12, baked
+/// normals 4, indices 24), no normal pass, no chunk tables.
+struct StandInBuffers {
+    positions: wgpu::Buffer,
+    normals: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    bytes: u64,
+}
+
+/// Target of the id pass used to pick a subtool under the cursor.
+struct PickTarget {
+    view: wgpu::TextureView,
+    texture: wgpu::Texture,
+    size: (u32, u32),
+}
+
 /// Levels that are not shown keep their GPU copies while they total at most this much;
 /// beyond it the largest ones are dropped and re-uploaded on their next visit. A
 /// 61M-vertex level alone is 3.2 GB, so this is what lets it fit next to the lower levels
@@ -100,6 +119,11 @@ pub struct Gfx {
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     background_pipeline: wgpu::RenderPipeline,
+    pick_pipeline: wgpu::RenderPipeline,
+    pick_target: Option<PickTarget>,
+    pick_readback: wgpu::Buffer,
+    /// Parked subtools, by subtool id.
+    stand_ins: HashMap<u64, StandInBuffers>,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     normal_own: wgpu::ComputePipeline,
@@ -308,6 +332,52 @@ impl Gfx {
             cache: None,
         });
 
+        // Id pass for picking: positions only, writes the instance index as the id.
+        let pick_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pick pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_pick"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &pos_attr,
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_pick"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Uint,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let pick_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pick readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Normal compute pipeline ----------------------------------------------------
         let normal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("normals"),
@@ -428,6 +498,10 @@ impl Gfx {
             pipeline,
             uniform_buf,
             background_pipeline,
+            pick_pipeline,
+            pick_target: None,
+            pick_readback,
+            stand_ins: HashMap::new(),
             bind_group,
             normal_own,
             normal_border,
@@ -456,6 +530,150 @@ impl Gfx {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth(&self.device, width, height);
+    }
+
+    /// Upload the draw-only copy of a parked subtool. Returns false when it does not fit;
+    /// the subtool is then not drawn while parked.
+    pub fn upload_stand_in(&mut self, id: u64, s: &StandIn) -> bool {
+        use wgpu::BufferUsages as U;
+        self.stand_ins.remove(&id);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let positions = self.upload("stand-in positions", bytemuck::cast_slice(&s.positions), U::VERTEX);
+        let normals = self.upload("stand-in normals", bytemuck::cast_slice(&s.normals), U::VERTEX);
+        let indices = self.upload("stand-in indices", bytemuck::cast_slice(&s.indices), U::INDEX);
+        let bytes = positions.size() + normals.size() + indices.size();
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            log::warn!("gpu: a stand-in of {} MB did not fit: {e}", bytes / 1_000_000);
+            return false;
+        }
+        self.stand_ins.insert(
+            id,
+            StandInBuffers {
+                positions,
+                normals,
+                indices,
+                index_count: s.indices.len() as u32,
+                bytes,
+            },
+        );
+        true
+    }
+
+    pub fn drop_stand_in(&mut self, id: u64) {
+        self.stand_ins.remove(&id);
+    }
+
+    /// GPU memory held by the stand-ins of parked subtools.
+    pub fn stand_in_bytes(&self) -> u64 {
+        self.stand_ins.values().map(|s| s.bytes).sum()
+    }
+
+    /// Id of what is under pixel `(x, y)` of the last rendered frame: `active_id` for the
+    /// active subtool, the given id for a parked one, 0 for the background. One pixel is
+    /// rasterised, so this costs a draw call per subtool and a short wait.
+    pub fn pick(&mut self, x: u32, y: u32, viewport: [f32; 4], active_id: u32, parked: &[(u64, u32)]) -> u32 {
+        let (w, h) = (self.config.width, self.config.height);
+        if x >= w || y >= h {
+            return 0;
+        }
+        if self.pick_target.as_ref().is_none_or(|t| t.size != (w, h)) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("pick target"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.pick_target = Some(PickTarget {
+                view,
+                texture,
+                size: (w, h),
+            });
+        }
+        let target = self.pick_target.as_ref().unwrap();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pick") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pick"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            let [vx, vy, vw, vh] = viewport;
+            let vx = vx.clamp(0.0, (w - 1) as f32);
+            let vy = vy.clamp(0.0, (h - 1) as f32);
+            pass.set_viewport(vx, vy, vw.clamp(1.0, w as f32 - vx), vh.clamp(1.0, h as f32 - vy), 0.0, 1.0);
+            pass.set_scissor_rect(x, y, 1, 1);
+            pass.set_pipeline(&self.pick_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            if let Some(m) = self.levels.get(self.active).and_then(Option::as_ref) {
+                pass.set_vertex_buffer(0, m.positions.slice(..));
+                pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..m.index_count, 0, active_id..active_id + 1);
+            }
+            for &(key, id) in parked {
+                if let Some(s) = self.stand_ins.get(&key) {
+                    pass.set_vertex_buffer(0, s.positions.slice(..));
+                    pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..s.index_count, 0, id..id + 1);
+                }
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.pick_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.pick_readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let id = match self.pick_readback.get_mapped_range(..4) {
+            Ok(view) => u32::from_le_bytes([view[0], view[1], view[2], view[3]]),
+            Err(_) => 0,
+        };
+        self.pick_readback.unmap();
+        id
     }
 
     /// Forget every uploaded level (the document was replaced).
@@ -907,9 +1125,12 @@ impl Gfx {
         self.last_upload_chunks = count;
     }
 
+    /// Draw a frame: the active subtool, the stand-ins listed in `parked` (dimmed, no brush
+    /// ring), then the interface.
     pub fn render(
         &mut self,
         uniforms: &Uniforms,
+        parked: &[u64],
         paint_jobs: &[egui::ClippedPrimitive],
         mut textures_delta: egui::TexturesDelta,
         pixels_per_point: f32,
@@ -1020,6 +1241,16 @@ impl Gfx {
                 pass.set_vertex_buffer(1, m.normals.slice(..));
                 pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.index_count, 0, 0..1);
+            }
+            pass.set_pipeline(&self.pipeline);
+            for key in parked {
+                if let Some(s) = self.stand_ins.get(key) {
+                    pass.set_vertex_buffer(0, s.positions.slice(..));
+                    pass.set_vertex_buffer(1, s.normals.slice(..));
+                    pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    // Instance 1 marks a parked subtool for the shader.
+                    pass.draw_indexed(0..s.index_count, 0, 1..2);
+                }
             }
         }
 
