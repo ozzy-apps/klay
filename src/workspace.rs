@@ -24,6 +24,9 @@ use std::path::PathBuf;
 
 // ---------------------------------------------------------------- theme tokens
 pub const BACKGROUND: Color32 = Color32::from_rgb(14, 15, 16); // canvas
+/// Inset of the document frame drawn inside the canvas, in points. Like ZBrush, the margin
+/// between the frame and the canvas edge always navigates, even over the model.
+pub const FRAME_INSET: f32 = 16.0;
 const BG0: Color32 = Color32::from_rgb(18, 19, 20);
 const BG1: Color32 = Color32::from_rgb(28, 30, 32); // trays, palette bodies
 const BG2: Color32 = Color32::from_rgb(36, 39, 41); // menubar, headers, fields
@@ -2197,7 +2200,7 @@ impl Workspace {
                     &mut |_, ui| {
                         for (key, what) in [
                             ("Drag model", "sculpt · Alt: alternate · Shift: smooth"),
-                            ("Drag canvas", "rotate · Shift: snap to axis"),
+                            ("Drag canvas or border", "rotate · Shift: snap to axis"),
                             ("Alt + drag canvas", "move"),
                             ("Alt + click, release Alt", "zoom"),
                             ("Shift + click, release Shift", "roll"),
@@ -2529,7 +2532,7 @@ impl Workspace {
         let painter = ui.painter().with_clip_rect(canvas);
         // document frame
         painter.rect_stroke(
-            canvas.shrink(16.0),
+            canvas.shrink(FRAME_INSET),
             0,
             Stroke::new(1.0, Color32::from_white_alpha(28)),
             StrokeKind::Inside,

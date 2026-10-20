@@ -553,6 +553,16 @@ impl App {
         }
     }
 
+    /// The cursor is in the margin between the document frame and the canvas edge, where a
+    /// left drag always navigates (ZBrush: the border acts as empty canvas).
+    fn in_canvas_border(&self) -> bool {
+        if !self.canvas_rect.is_positive() {
+            return false;
+        }
+        let inner = self.canvas_rect.shrink(workspace::FRAME_INSET * self.scale);
+        !inner.contains(egui::pos2(self.cursor.x, self.cursor.y))
+    }
+
     /// Cursor in canvas pixels.
     fn canvas_cursor(&self) -> Vec2 {
         self.cursor - self.canvas_origin()
@@ -1564,7 +1574,7 @@ impl App {
             } else {
                 self.apply_stroke();
             }
-        } else if !over_ui {
+        } else if !over_ui && !self.in_canvas_border() {
             self.update_hover();
         } else {
             self.hover = None;
@@ -1574,7 +1584,9 @@ impl App {
     /// Left button pressed. `consumed`: egui took the event; `over_ui`: the cursor is off
     /// the canvas.
     fn left_press(&mut self, consumed: bool, over_ui: bool) {
+        let border = self.in_canvas_border();
         let picked = if self.modifiers.alt_key()
+            && !border
             && self.subtools.len() > 1
             && !consumed
             && !over_ui
@@ -1596,7 +1608,11 @@ impl App {
             // ZBrush: a left drag on the model sculpts (Alt = alternate brush, Ctrl =
             // masking), or in Move / Scale / Rotate mode draws and drives the Transpose
             // action line; on empty canvas it rotates, with Alt it moves, and releasing Alt
-            // turns it into a zoom.
+            // turns it into a zoom. The border outside the document frame is always canvas.
+            if border {
+                self.begin_nav(MouseButton::Left);
+                return;
+            }
             if self.workspace.mode != Mode::Draw
                 && !self.modifiers.control_key()
                 && self.begin_transpose()
@@ -2831,6 +2847,39 @@ mod transpose_tests {
         // Back in Draw mode the same drag sculpts.
         app.on_key(KeyCode::KeyQ);
         drag(&mut app, c, c + Vec2::new(30.0, 0.0));
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn the_canvas_border_navigates_even_over_the_model() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        // Zoomed in so far that the model fills the whole canvas.
+        app.camera.distance = 1.05;
+        let corner = Vec2::new(6.0, 6.0);
+        let (o, d) = app.camera.ray(corner.x, corner.y, 1600.0, 1000.0);
+        assert!(app.mesh().raycast(o, d).is_some(), "the model is under the border");
+        for key in [KeyCode::KeyQ, KeyCode::KeyW] {
+            app.on_key(key);
+            app.cursor_moved(corner, false);
+            assert!(app.hover.is_none(), "no brush ring in the border");
+            app.left_press(false, false);
+            assert!(app.nav.is_some() && app.stroke.is_none() && app.transpose.is_none());
+            // Alt + click, release Alt, drag: zoom back out.
+            app.modifiers = ModifiersState::ALT;
+            app.left_release();
+            app.left_press(false, false);
+            app.modifiers = ModifiersState::empty();
+            let before = app.camera.distance;
+            app.cursor_moved(corner - Vec2::new(0.0, 5.0), false);
+            assert!(app.camera.distance > before, "zoomed out");
+            app.left_release();
+            app.camera.distance = 1.05;
+        }
+        // Inside the frame the same press sculpts.
+        app.on_key(KeyCode::KeyQ);
+        drag(&mut app, Vec2::new(40.0, 40.0), Vec2::new(60.0, 40.0));
         assert!(app.history.can_undo());
     }
 }

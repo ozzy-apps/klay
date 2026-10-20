@@ -83,6 +83,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Ctrl + left drag | Reserved for masking (not connected yet) |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
+| Left drag in the border outside the canvas frame | Always navigates, even over the model, in every mode (as on empty canvas) |
 | Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to move) |
 | Shift + click on empty canvas, release Shift, drag | Roll about the view axis |
 | Right / middle drag | Rotate, anywhere (ZBrush right-click navigation) |
