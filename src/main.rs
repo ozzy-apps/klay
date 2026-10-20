@@ -1,4 +1,5 @@
 mod camera;
+mod mask;
 mod mesh;
 mod multires;
 mod project;
@@ -18,6 +19,7 @@ use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
 use std::path::Path;
 use subtool::{Deform, Parked, STAND_IN_VERTICES, SubTool};
 use transform::{ActionLine, Affine, Hit, Part, View};
+use mask::{MaskData, MaskOp};
 use workspace::{Mode, QuickPopup, SubToolRow};
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,6 +98,37 @@ enum SubToolOp {
     Deform(Deform, f32),
 }
 
+/// A left press with Ctrl that has not yet become a drag: on the model a drag paints the
+/// mask and a click blurs it; on the background a click inverts and a drag clears it.
+#[derive(Clone, Copy, Debug)]
+struct MaskPress {
+    at: Vec2,
+    /// Surface point under the press, when it was on the active subtool.
+    hit: Option<Vec3>,
+    /// Alt at the press: erase instead of paint, sharpen instead of blur.
+    alt: bool,
+    moved: bool,
+}
+
+/// State of `--selftest-mask`: masking through the same handlers the window events call,
+/// one input event per frame, then a masked Transpose move, a clear and undo of it all.
+#[derive(Default)]
+struct MaskTest {
+    phase: usize,
+    k: u32,
+    original: Vec<Vec3>,
+    before: Vec<Vec3>,
+    press: Vec2,
+    /// Frame times (ms): no mask, mask shown, dragging a masked move.
+    idle: Vec<f32>,
+    shaded: Vec<f32>,
+    drag: Vec<f32>,
+    dabs: Vec<f32>,
+    /// Named costs in ms, logged at the end.
+    costs: Vec<(&'static str, f32)>,
+    ok: bool,
+}
+
 /// State of `--selftest-transpose`: a scripted Move, Scale and Rotate through the same press /
 /// move / release handlers the window events call, one input event per frame, then three
 /// undos.
@@ -166,6 +199,8 @@ struct App {
     selftest_project: Option<u32>,
     /// `--selftest-transpose`: frame counter of the scripted move / scale / rotate / undo.
     selftest_transpose: Option<TransposeTest>,
+    /// `--selftest-mask`: the scripted masking session.
+    selftest_mask: Option<MaskTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// `--open PATH`: project to open once the window exists.
@@ -189,6 +224,8 @@ struct App {
     /// The Transpose action line, kept between drags (shown in Move / Scale / Rotate mode).
     action_line: Option<ActionLine>,
     transpose: Option<TransposeDrag>,
+    mask_press: Option<MaskPress>,
+    mask_stroke: Option<mask::MaskStroke>,
 
     // UI state.
     workspace: workspace::Workspace,
@@ -201,6 +238,8 @@ struct App {
     pending_undo: bool,
     pending_redo: bool,
     pending_divide: bool,
+    /// Whole-mask operation from a shortcut or the Masking palette.
+    pending_mask: Option<MaskOp>,
     pending_level: Option<usize>,
     /// SubTool list operation from the interface, run outside the egui pass.
     pending_subtool: Option<SubToolOp>,
@@ -252,6 +291,7 @@ impl App {
             selftest: None,
             selftest_project: None,
             selftest_transpose: None,
+            selftest_mask: None,
             project_path: "untitled.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
@@ -270,6 +310,8 @@ impl App {
             hover: None,
             action_line: None,
             transpose: None,
+            mask_press: None,
+            mask_stroke: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
             segments,
@@ -280,6 +322,7 @@ impl App {
             pending_undo: false,
             pending_redo: false,
             pending_divide: false,
+            pending_mask: None,
             pending_level: None,
             pending_subtool: None,
             measure: None,
@@ -308,7 +351,7 @@ impl App {
     /// A stroke or a Transpose drag is in progress: operations that replace or reshape the
     /// active stack wait for it to end.
     fn busy(&self) -> bool {
-        self.stroke.is_some() || self.transpose.is_some()
+        self.stroke.is_some() || self.transpose.is_some() || self.mask_press.is_some() || self.mask_stroke.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -516,6 +559,21 @@ impl App {
     /// taken in ms (the GPU copy of the shown level is re-uploaded by the next frame).
     fn apply_transform(&mut self, map: Affine) -> f32 {
         let t = Instant::now();
+        if self.doc.mesh().mask.iter().any(|&m| m > 0) {
+            // ZBrush: masked vertices stay; partly masked ones move part of the way.
+            let level = self.doc.active();
+            let mask = self.doc.mesh().mask.clone();
+            self.doc.transform_masked(&map, level, &mask);
+            self.history.push(UndoStep::MaskedTransform {
+                map: map.inverse(),
+                level,
+                mask,
+            });
+            self.subtools[self.active_tool].bounds = self.doc.bounds();
+            let ms = t.elapsed().as_secs_f32() * 1000.0;
+            self.update_hover();
+            return ms;
+        }
         self.transform_doc(&map, |app| app.doc.transform(&map));
         // History entries hold what undoes them: the inverse map.
         self.history.push(UndoStep::Transform(map.inverse()));
@@ -1069,6 +1127,11 @@ impl App {
                 if k == 90 {
                     t.ok = true;
                     t.original = self.doc.mesh().positions.clone();
+                    // Centre the active subtool, so the action line stays inside the frame
+                    // however many subtools there are.
+                    let b = self.doc.bounds();
+                    self.camera.target = (b.min + b.max) * 0.5;
+                    self.camera.distance = (b.max - b.min).length() * 1.6;
                     next(t);
                 }
             }
@@ -1076,7 +1139,9 @@ impl App {
             1 => {
                 let b = self.doc.bounds();
                 let centre = self.project((b.min + b.max) * 0.5);
-                let path = Vec2::new(0.2 * vp.y, 0.0);
+                // Short enough that the circles stay inside the document frame (the border
+                // around it always navigates) even with several subtools framed.
+                let path = Vec2::new(0.12 * vp.y, 0.0);
                 if k == 0 {
                     self.on_key(KeyCode::KeyW);
                     self.cursor_moved(centre, false);
@@ -1118,7 +1183,7 @@ impl App {
                     }
                     let f = k as f32 / DRAG as f32;
                     let to = match mode {
-                        Mode::Move => t.press + Vec2::new(0.15, -0.08) * vp.y * f,
+                        Mode::Move => t.press + Vec2::new(0.08, -0.06) * vp.y * f,
                         Mode::Scale => t.pivot + (t.press - t.pivot) * (1.0 + 0.5 * f),
                         _ => {
                             let r = t.press - t.pivot;
@@ -1149,7 +1214,7 @@ impl App {
                     let (detail, pass) = match mode {
                         Mode::Move => {
                             let got = self.project(shown.mid());
-                            let want = t.press + Vec2::new(0.15, -0.08) * vp.y;
+                            let want = t.press + Vec2::new(0.08, -0.06) * vp.y;
                             (format!("middle circle {:.2} px from the cursor", (got - want).length()), (got - want).length() < 0.5)
                         }
                         Mode::Scale => (format!("scale {:.4} (want 1.5)", map.scale), (map.scale - 1.5).abs() < 1e-3),
@@ -1207,6 +1272,195 @@ impl App {
                     return true;
                 }
             }
+        }
+        false
+    }
+
+    /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
+    fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
+        let vp = self.viewport();
+        let k = t.k;
+        t.k += 1;
+        let next = |t: &mut MaskTest| {
+            t.phase += 1;
+            t.k = 0;
+        };
+        let check = |t: &mut MaskTest, what: &str, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-mask: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let masked = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 127).count();
+        let centre = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+        // Inside the document frame but off the model.
+        let background = self.canvas_origin() + Vec2::splat(50.0 * self.scale);
+        // Press, then release on the same frame: a click.
+        let click = |app: &mut App, at: Vec2, m: ModifiersState| -> f32 {
+            app.modifiers = m;
+            app.cursor_moved(at, false);
+            let t0 = Instant::now();
+            app.left_press(false, false);
+            app.left_release();
+            app.modifiers = ModifiersState::empty();
+            t0.elapsed().as_secs_f32() * 1000.0
+        };
+        match t.phase {
+            0 => {
+                if k > 30 {
+                    t.idle.push(dt);
+                }
+                if k == 90 {
+                    t.ok = true;
+                    t.original = self.doc.mesh().positions.clone();
+                    self.on_key(KeyCode::KeyQ);
+                    next(t);
+                }
+            }
+            // Ctrl + drag on the model paints the mask.
+            1 => {
+                if k == 0 {
+                    t.press = centre;
+                    self.modifiers = ModifiersState::CONTROL;
+                    self.cursor_moved(centre, false);
+                    self.left_press(false, false);
+                } else if k <= 30 {
+                    self.cursor_moved(t.press + Vec2::new(0.25 * vp.y, 0.0) * (k as f32 / 30.0), false);
+                    if self.mask_stroke.is_some() {
+                        t.dabs.push(self.stroke_ms);
+                    }
+                } else {
+                    self.left_release();
+                    self.modifiers = ModifiersState::empty();
+                    let n = masked(self);
+                    check(t, &format!("Ctrl + drag masked {n} vertices"), n > 0 && self.history.can_undo());
+                    next(t);
+                }
+            }
+            // Frames with the mask shown.
+            2 => {
+                if k > 2 {
+                    t.shaded.push(dt);
+                }
+                if k == 60 {
+                    let gpu = self.gfx.as_ref().and_then(Gfx::read_mask).unwrap_or_default();
+                    let cpu = &self.doc.mesh().mask;
+                    check(t, "GPU mask matches the CPU", gpu.len() >= cpu.len() && gpu[..cpu.len()] == cpu[..]);
+                    next(t);
+                }
+            }
+            // Ctrl + click on the background inverts (twice), Ctrl + click on the model blurs.
+            3 => {
+                let n = masked(self);
+                let ms = click(self, background, ModifiersState::CONTROL);
+                t.costs.push(("invert (Ctrl + click background)", ms));
+                let total = self.doc.mesh().vertex_count();
+                check(t, "Ctrl + click on the background inverts", masked(self) == total - n);
+                click(self, background, ModifiersState::CONTROL);
+                let soft = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 10 && m < 245).count();
+                let s0 = soft(self);
+                let ms = click(self, centre, ModifiersState::CONTROL);
+                t.costs.push(("blur (Ctrl + click model)", ms));
+                check(t, "Ctrl + click on the model blurs", masked(self) > 0 && soft(self) > s0);
+                next(t);
+            }
+            // The mask follows a level change and comes back unchanged.
+            4 => {
+                let level = self.doc.active();
+                if level > 0 {
+                    let mask = self.doc.mesh().mask.clone();
+                    let t0 = Instant::now();
+                    self.set_level(level - 1);
+                    let down = t0.elapsed().as_secs_f32() * 1000.0;
+                    let t0 = Instant::now();
+                    self.set_level(level);
+                    let up = t0.elapsed().as_secs_f32() * 1000.0;
+                    t.costs.push(("level down with the mask", down));
+                    t.costs.push(("level up with the mask", up));
+                    // Blurred values do not survive the round trip exactly: even vertices do.
+                    let same = self.doc.mesh().mask.len() == mask.len();
+                    check(t, "the mask follows D / Shift + D", same && masked(self) > 0);
+                }
+                next(t);
+            }
+            // W: a line from the middle, then drag its middle circle up.
+            5 => {
+                if k == 0 {
+                    self.on_key(KeyCode::KeyW);
+                    self.cursor_moved(centre, false);
+                    self.left_press(false, false);
+                } else if k <= 5 {
+                    self.cursor_moved(centre + Vec2::new(0.2 * vp.y, 0.0) * (k as f32 / 5.0), false);
+                } else if k == 6 {
+                    self.left_release();
+                    t.before = self.doc.mesh().positions.clone();
+                    t.press = self.project(self.action_line.unwrap().mid());
+                    self.cursor_moved(t.press, false);
+                    self.left_press(false, false);
+                } else if k <= 66 {
+                    if k > 8 {
+                        t.drag.push(dt);
+                    }
+                    self.cursor_moved(t.press + Vec2::new(0.0, -0.15 * vp.y) * ((k - 6) as f32 / 60.0), false);
+                } else if k == 67 {
+                    let t0 = Instant::now();
+                    self.left_release();
+                    t.costs.push(("masked move release (CPU)", t0.elapsed().as_secs_f32() * 1000.0));
+                } else if k == 68 {
+                    t.costs.push(("masked move release frame", dt));
+                } else {
+                    let mesh = self.doc.mesh();
+                    let (mut held, mut moved) = (0.0f32, 0.0f32);
+                    for ((p, q), &m) in t.before.iter().zip(&mesh.positions).zip(&mesh.mask) {
+                        let d = (*p - *q).length();
+                        if m == 255 {
+                            held = held.max(d);
+                        } else if m == 0 {
+                            moved = moved.max(d);
+                        }
+                    }
+                    check(t, &format!("masked move: fully masked vertices moved {held:.1e}, free ones up to {moved:.3}"), held < 1e-4 && moved > 0.05);
+                    if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                        let err = gpu.iter().zip(&mesh.positions).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+                        check(t, &format!("GPU positions match the CPU after the masked move ({err:.1e})"), err < 1e-4);
+                    }
+                    next(t);
+                }
+            }
+            // Ctrl + drag on the background clears; then undo everything.
+            6 => {
+                if k == 0 {
+                    self.modifiers = ModifiersState::CONTROL;
+                    self.cursor_moved(background, false);
+                    self.left_press(false, false);
+                } else if k == 1 {
+                    self.cursor_moved(background + Vec2::new(40.0, 30.0), false);
+                } else if k == 2 {
+                    self.left_release();
+                    self.modifiers = ModifiersState::empty();
+                    check(t, "Ctrl + drag on the background clears", self.doc.mesh().mask.is_empty());
+                } else if k < 9 {
+                    // Clear, move, blur, invert, invert, stroke.
+                    self.pending_undo = true;
+                } else if k == 10 {
+                    let err = self.doc.mesh().positions.iter().zip(&t.original).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+                    check(t, &format!("six undos restore positions ({err:.1e}) and the empty mask"), err < 1e-4 && masked(self) == 0);
+                    let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+                    log::info!(
+                        "selftest-mask: level {} ({} vertices): frame {:.2} ms without a mask, {:.2} ms with it shown, {:.2} ms dragging a masked move; mask dab {:.2} ms avg",
+                        self.doc.active(),
+                        fmt_count(self.mesh().vertex_count()),
+                        avg(&t.idle),
+                        avg(&t.shaded),
+                        avg(&t.drag),
+                        avg(&t.dabs),
+                    );
+                    for (what, ms) in &t.costs {
+                        log::info!("selftest-mask: {what}: {ms:.1} ms");
+                    }
+                    log::info!("selftest-mask: {}", if t.ok { "all passed" } else { "FAILED" });
+                    return true;
+                }
+            }
+            _ => return true,
         }
         false
     }
@@ -1559,6 +1813,118 @@ impl App {
         }
     }
 
+    /// A whole-mask operation as one undo step (Masking palette, Ctrl + I / A / Shift + A,
+    /// Ctrl + click). Returns false when it changed nothing.
+    fn mask_op(&mut self, op: MaskOp) -> bool {
+        if self.busy() {
+            return false;
+        }
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let new = mask::apply(mesh, op);
+        let unchanged = new == mesh.mask
+            || (new.is_empty() && mesh.mask.iter().all(|&m| m == 0))
+            || (mesh.mask.is_empty() && new.iter().all(|&m| m == 0));
+        if unchanged {
+            return false;
+        }
+        let old = mask::replace(mesh, new);
+        self.history.push(UndoStep::Mask {
+            level,
+            data: MaskData::Whole(old),
+        });
+        true
+    }
+
+    /// Ctrl + left press (ZBrush masking): decided on the first move or on release.
+    fn begin_mask_press(&mut self, border: bool) {
+        if self.modifiers.shift_key() {
+            self.workspace.notify("Ctrl + Shift selection (hide) is not connected yet");
+            return;
+        }
+        let hit = if border {
+            None
+        } else {
+            let (o, d) = self.cursor_ray();
+            self.mesh().raycast(o, d).map(|h| h.point)
+        };
+        self.mask_press = Some(MaskPress {
+            at: self.cursor,
+            hit,
+            alt: self.modifiers.alt_key(),
+            moved: false,
+        });
+        self.hover = None;
+    }
+
+    /// One mask dab under the cursor.
+    fn mask_dab(&mut self) {
+        let t = Instant::now();
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d).map(|h| h.point) else {
+            return;
+        };
+        let brush = self.brush;
+        if let Some(stroke) = self.mask_stroke.as_mut() {
+            stroke.dab(self.doc.mesh_mut(), &brush, hit);
+        }
+        self.hover = Some(hit);
+        self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn mask_move(&mut self) {
+        if self.mask_stroke.is_some() {
+            self.mask_dab();
+            return;
+        }
+        let Some(press) = self.mask_press.as_mut() else {
+            return;
+        };
+        if press.moved || (self.cursor - press.at).length() < 4.0 {
+            return;
+        }
+        press.moved = true;
+        let press = *press;
+        let Some(hit) = press.hit else {
+            return; // a drag on the background clears the mask on release
+        };
+        if self.workspace.mode != Mode::Draw {
+            self.workspace.notify("Masking along the action line is not connected yet · Q to paint masks");
+            return;
+        }
+        // A drag on the model: paint from the press point on.
+        self.mask_press = None;
+        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry);
+        let brush = self.brush;
+        stroke.dab(self.doc.mesh_mut(), &brush, hit);
+        self.mask_stroke = Some(stroke);
+        self.mask_dab();
+    }
+
+    fn end_mask(&mut self) {
+        if let Some(stroke) = self.mask_stroke.take() {
+            if let Some(chunks) = stroke.end() {
+                self.history.push(UndoStep::Mask {
+                    level: self.doc.active(),
+                    data: MaskData::Chunks(chunks),
+                });
+            }
+        }
+        let Some(press) = self.mask_press.take() else {
+            return;
+        };
+        let op = match (press.hit.is_some(), press.moved, press.alt) {
+            (true, false, false) => Some(MaskOp::Blur),
+            (true, false, true) => Some(MaskOp::Sharpen),
+            (false, false, _) => Some(MaskOp::Invert),
+            (false, true, _) => Some(MaskOp::Clear),
+            (true, true, _) => None,
+        };
+        if let Some(op) = op {
+            self.mask_op(op);
+        }
+    }
+
     /// The cursor moved to `pos` (window pixels).
     fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
         self.last_cursor = self.cursor;
@@ -1568,6 +1934,8 @@ impl App {
             self.nav_move(drag, delta);
         } else if self.transpose.is_some() {
             self.transpose_move();
+        } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
+            self.mask_move();
         } else if self.stroke.is_some() {
             if self.stroke_brush.kind == BrushKind::Grab {
                 self.stroke_pending = true;
@@ -1586,6 +1954,7 @@ impl App {
     fn left_press(&mut self, consumed: bool, over_ui: bool) {
         let border = self.in_canvas_border();
         let picked = if self.modifiers.alt_key()
+            && !self.modifiers.control_key()
             && !border
             && self.subtools.len() > 1
             && !consumed
@@ -1609,6 +1978,11 @@ impl App {
             // masking), or in Move / Scale / Rotate mode draws and drives the Transpose
             // action line; on empty canvas it rotates, with Alt it moves, and releasing Alt
             // turns it into a zoom. The border outside the document frame is always canvas.
+            // Ctrl masks (see `begin_mask_press`).
+            if self.modifiers.control_key() {
+                self.begin_mask_press(border);
+                return;
+            }
             if border {
                 self.begin_nav(MouseButton::Left);
                 return;
@@ -1624,8 +1998,6 @@ impl App {
             log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
             if hit.is_none() {
                 self.begin_nav(MouseButton::Left);
-            } else if self.modifiers.control_key() {
-                self.workspace.notify("Masking is not connected yet");
             } else {
                 self.begin_stroke();
             }
@@ -1633,6 +2005,7 @@ impl App {
     }
 
     fn left_release(&mut self) {
+        self.end_mask();
         self.end_stroke();
         self.end_transpose();
         self.end_nav(MouseButton::Left);
@@ -1671,6 +2044,12 @@ impl App {
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
             KeyCode::KeyS if ctrl => self.pending_doc = Some(DocOp::Save),
             KeyCode::KeyO if ctrl => self.pending_doc = Some(DocOp::Open),
+            // ZBrush masking: Ctrl + I invert, Ctrl + A mask all, Ctrl + Shift + A clear,
+            // Ctrl + H view mask.
+            KeyCode::KeyI if ctrl => self.pending_mask = Some(MaskOp::Invert),
+            KeyCode::KeyA if ctrl && shift => self.pending_mask = Some(MaskOp::Clear),
+            KeyCode::KeyA if ctrl => self.pending_mask = Some(MaskOp::All),
+            KeyCode::KeyH if ctrl => self.workspace.show_mask = !self.workspace.show_mask,
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
             KeyCode::KeyY if ctrl => self.pending_redo = true,
@@ -1815,6 +2194,9 @@ impl App {
         self.pending_undo |= actions.undo;
         self.pending_redo |= actions.redo;
         self.pending_divide |= actions.divide;
+        if actions.mask.is_some() {
+            self.pending_mask = actions.mask;
+        }
         if actions.level.is_some() {
             self.pending_level = actions.level;
         }
@@ -1891,6 +2273,9 @@ impl App {
             self.pending_divide = false;
             self.divide();
         }
+        if let Some(op) = self.pending_mask.take() {
+            self.mask_op(op);
+        }
         if let Some(level) = self.pending_level.take() {
             self.set_level(level);
         }
@@ -1964,6 +2349,13 @@ impl App {
                 self.selftest_project = Some(left - 1);
             }
         }
+        if let Some(mut t) = self.selftest_mask.take() {
+            if self.selftest_mask_frame(&mut t, dt * 1000.0) {
+                self.quit = true;
+            } else {
+                self.selftest_mask = Some(t);
+            }
+        }
         if let Some(mut t) = self.selftest_transpose.take() {
             if self.selftest_transpose_frame(&mut t, dt * 1000.0) {
                 self.quit = true;
@@ -2017,6 +2409,8 @@ impl App {
         let light = (self.camera.right() * 0.6 + self.camera.up() * 0.8
             - self.camera.forward() * 0.9)
             .normalize();
+        let preview = self.preview_map();
+        let (preview_axis, preview_angle) = preview.rotation.to_axis_angle();
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
             inv_view_proj: self.camera.view_proj().inverse().to_cols_array_2d(),
@@ -2038,10 +2432,12 @@ impl App {
             display: [
                 if self.workspace.grid { 1.0 } else { 0.0 },
                 if self.workspace.symmetry { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+                if self.workspace.show_mask { 1.0 } else { 0.0 },
+                if self.doc.mesh().mask.is_empty() { 0.0 } else { 1.0 },
             ],
-            model: self.preview_map().matrix().to_cols_array_2d(),
+            xf_center: preview.center.extend(if preview.is_identity() { 0.0 } else { 1.0 }).to_array(),
+            xf_rotation: preview_axis.extend(preview_angle).to_array(),
+            xf_move: preview.translate.extend(preview.scale).to_array(),
         };
         let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
@@ -2503,6 +2899,9 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-subtools") {
         app.selftest = Some(20);
     }
+    if args.iter().any(|a| a == "--selftest-mask") {
+        app.selftest_mask = Some(MaskTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-transpose") {
         app.selftest_transpose = Some(TransposeTest::default());
     }
@@ -2881,5 +3280,118 @@ mod transpose_tests {
         app.on_key(KeyCode::KeyQ);
         drag(&mut app, Vec2::new(40.0, 40.0), Vec2::new(60.0, 40.0));
         assert!(app.history.can_undo());
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new(30, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app
+    }
+
+    fn drag(app: &mut App, from: Vec2, to: Vec2, m: ModifiersState) {
+        app.modifiers = m;
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for k in 1..=10 {
+            app.cursor_moved(from + (to - from) * (k as f32 / 10.0), false);
+        }
+        app.left_release();
+        app.modifiers = ModifiersState::empty();
+    }
+
+    fn masked(app: &App) -> usize {
+        app.doc.mesh().mask.iter().filter(|&&m| m > 127).count()
+    }
+
+    #[test]
+    fn ctrl_paints_erases_inverts_clears_and_blurs() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let background = Vec2::new(200.0, 200.0);
+        let ctrl = ModifiersState::CONTROL;
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ctrl);
+        let painted = masked(&app);
+        assert!(painted > 0 && painted < app.doc.mesh().vertex_count() / 2, "{painted}");
+        assert!(app.history.can_undo());
+        // Ctrl + click on the background inverts, again inverts back.
+        drag(&mut app, background, background, ctrl);
+        assert_eq!(masked(&app), app.doc.mesh().vertex_count() - painted);
+        drag(&mut app, background, background, ctrl);
+        assert_eq!(masked(&app), painted);
+        // Ctrl + click on the model blurs: the soft band widens.
+        let soft = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 10 && m < 245).count();
+        let s0 = soft(&app);
+        drag(&mut app, c, c, ctrl);
+        assert!(soft(&app) > s0);
+        // Ctrl + Alt + drag erases.
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ctrl | ModifiersState::ALT);
+        assert!(masked(&app) < painted / 2);
+        // Ctrl + drag on the background clears.
+        drag(&mut app, background, background + Vec2::new(60.0, 40.0), ctrl);
+        assert!(app.doc.mesh().mask.is_empty());
+        // Undo walks back through the five steps after the first stroke.
+        for _ in 0..5 {
+            app.history.undo(&mut app.doc);
+        }
+        assert_eq!(masked(&app), painted);
+        app.history.undo(&mut app.doc);
+        assert_eq!(masked(&app), 0);
+        // Shortcuts: Ctrl + A masks all, Ctrl + Shift + A clears.
+        assert!(app.mask_op(MaskOp::All));
+        assert_eq!(masked(&app), app.doc.mesh().vertex_count());
+        assert!(app.mask_op(MaskOp::Clear));
+        assert!(!app.mask_op(MaskOp::Clear), "clearing nothing is not an undo step");
+    }
+
+    #[test]
+    fn brushes_and_transpose_respect_the_mask() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        app.mask_op(MaskOp::All);
+        let before = app.doc.mesh().positions.clone();
+        // A Draw stroke on a fully masked model moves nothing.
+        drag(&mut app, c, c + Vec2::new(60.0, 0.0), ModifiersState::empty());
+        assert_eq!(app.doc.mesh().positions, before);
+        // Free the front, then move with Transpose: only the front moves.
+        app.brush.strength = 1.0;
+        drag(&mut app, c, c + Vec2::new(1.0, 5.0), ModifiersState::CONTROL | ModifiersState::ALT);
+        let front = app.doc.mesh().positions.iter().enumerate()
+            .max_by(|a, b| a.1.dot(app.camera.eye()).total_cmp(&b.1.dot(app.camera.eye()))).unwrap().0;
+        let back = app.doc.mesh().positions.iter().enumerate()
+            .min_by(|a, b| a.1.dot(app.camera.eye()).total_cmp(&b.1.dot(app.camera.eye()))).unwrap().0;
+        assert!(app.doc.mesh().mask[front] < 64 && app.doc.mesh().mask[back] == 255);
+        app.on_key(KeyCode::KeyW);
+        drag(&mut app, c, c + Vec2::new(200.0, 0.0), ModifiersState::empty());
+        let mid = app.project(app.action_line.unwrap().mid());
+        drag(&mut app, mid, mid + Vec2::new(0.0, -120.0), ModifiersState::empty());
+        let after = app.doc.mesh().positions.clone();
+        assert!((after[front] - before[front]).length() > 0.1, "the free front moved");
+        assert!((after[back] - before[back]).length() < 1e-5, "the masked back stayed");
+        // One undo step brings it back.
+        app.history.undo(&mut app.doc);
+        let worst = app.doc.mesh().positions.iter().zip(&before).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
+    }
+
+    #[test]
+    fn projects_keep_the_mask() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ModifiersState::CONTROL);
+        let mask = app.doc.mesh().mask.clone();
+        let path = std::env::temp_dir().join(format!("klay-mask-{}.klay", std::process::id()));
+        app.project_path = path.to_string_lossy().to_string();
+        app.save_project();
+        let mut other = App::new(4, false, 1000);
+        other.open_project(&app.project_path.clone());
+        assert!(other.status.starts_with("Opened"), "{}", other.status);
+        assert_eq!(other.doc.mesh().mask, mask);
+        let _ = std::fs::remove_file(&path);
     }
 }

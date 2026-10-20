@@ -8,13 +8,29 @@ struct Uniforms {
     // x = brush visible, y = surface detail, z = pixel size at brush, w = material
     params: vec4<f32>,
     viewport: vec4<f32>,
+    // x = floor grid, y = symmetry, z = show mask, w = the active subtool has a mask
     display: vec4<f32>,
-    // Live Transpose preview for the active subtool (identity otherwise); rotation and
-    // uniform scale only, so it also maps normals.
-    model: mat4x4<f32>,
+    // Live Transpose preview for the active subtool, each vertex moved as far as the mask
+    // lets it (transform.rs, Partial): centre; rotation axis and angle; translation and scale.
+    xf_center: vec4<f32>,
+    xf_rotation: vec4<f32>,
+    xf_move: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// Mask of the active subtool, one byte per vertex packed in words.
+@group(1) @binding(0) var<storage, read> mask: array<u32>;
+
+fn mask_at(v: u32) -> f32 {
+    return f32((mask[v >> 2u] >> ((v & 3u) * 8u)) & 255u) / 255.0;
+}
+
+// Rotate `v` by `angle` about the unit `axis` (Rodrigues).
+fn rotate(v: vec3<f32>, axis: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
+}
 
 @vertex
 fn vs_background(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -52,6 +68,7 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     // 1 for a parked subtool (drawn as instance 1), 0 for the active one.
     @location(2) @interpolate(flat) parked: u32,
+    @location(3) mask: f32,
 };
 
 @vertex
@@ -59,13 +76,27 @@ fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) nrm: vec4<f32>,
     @builtin(instance_index) instance: u32,
+    @builtin(vertex_index) vertex: u32,
 ) -> VsOut {
     var out: VsOut;
     var p = pos;
     var n = nrm.xyz;
+    out.mask = 0.0;
     if (instance == 0u) {
-        p = (u.model * vec4<f32>(pos, 1.0)).xyz;
-        n = (u.model * vec4<f32>(n, 0.0)).xyz;
+        // xf_center.w: a Transpose preview is on; display.w: the subtool has a mask.
+        let previewing = u.xf_center.w > 0.5;
+        var m = 0.0;
+        if (u.display.w > 0.5) {
+            m = mask_at(vertex);
+        }
+        out.mask = m;
+        if (previewing) {
+            let w = 1.0 - m;
+            let angle = u.xf_rotation.w * w;
+            let c = u.xf_center.xyz;
+            p = c + rotate(pos - c, u.xf_rotation.xyz, angle) * pow(u.xf_move.w, w) + u.xf_move.xyz * w;
+            n = rotate(n, u.xf_rotation.xyz, angle);
+        }
     }
     out.clip = u.view_proj * vec4<f32>(p, 1.0);
     out.world_pos = p;
@@ -121,6 +152,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Parked subtools: a little darker, and never under the brush.
     if (in.parked > 0u) {
         color *= 0.78;
+    }
+
+    // Mask (Ctrl): masked clay goes dark, as in ZBrush.
+    if (u.display.z > 0.5) {
+        color = mix(color, color * 0.18, in.mask * 0.9);
     }
 
     // Brush ring projected onto the surface.

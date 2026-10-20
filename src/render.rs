@@ -20,9 +20,14 @@ pub struct Uniforms {
     pub params: [f32; 4],
     pub viewport: [f32; 4],
     pub display: [f32; 4],
-    /// Map applied to the active subtool in the vertex shader: the live preview of a
-    /// Transpose move / scale / rotate (identity otherwise). Parked stand-ins ignore it.
-    pub model: [[f32; 4]; 4],
+    /// Map applied to the active subtool in the vertex shader, weighted per vertex by how
+    /// free it is of the mask: the live preview of a Transpose move / scale / rotate (see
+    /// `transform::Partial`). Centre (w: 1 while a preview is on); rotation axis and angle;
+    /// translation and scale.
+    /// Parked stand-ins ignore it.
+    pub xf_center: [f32; 4],
+    pub xf_rotation: [f32; 4],
+    pub xf_move: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -89,6 +94,9 @@ struct MeshBuffers {
     /// Flagged and listed chunks of the next normal passes.
     flagged: u32,
     listed: u32,
+    /// Mask, one byte per vertex (read by the vertex shader as packed words).
+    mask: wgpu::Buffer,
+    mask_bind_group: wgpu::BindGroup,
     /// GPU memory held by this level.
     bytes: u64,
     // Kept alive for the bind group.
@@ -137,6 +145,9 @@ pub struct Gfx {
     stand_ins: HashMap<u64, StandInBuffers>,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    mask_bgl: wgpu::BindGroupLayout,
+    /// Bound for stand-ins, which have no mask.
+    no_mask: wgpu::BindGroup,
     normal_own: wgpu::ComputePipeline,
     normal_border: wgpu::ComputePipeline,
     normal_normalize: wgpu::ComputePipeline,
@@ -250,9 +261,42 @@ impl Gfx {
             }],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mesh layout"),
+            label: Some("uniform layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
+        });
+        // The mesh pipeline also reads the mask in the vertex shader.
+        let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mask bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&mask_bgl)],
+            immediate_size: 0,
+        });
+        let no_mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("no mask"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let no_mask = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("no mask bg"),
+            layout: &mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: no_mask_buf.as_entire_binding(),
+            }],
         });
 
         let pos_attr = [wgpu::VertexAttribute {
@@ -268,7 +312,7 @@ impl Gfx {
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh pipeline"),
-            layout: Some(&layout),
+            layout: Some(&mesh_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -560,6 +604,8 @@ impl Gfx {
             pick_readback,
             stand_ins: HashMap::new(),
             bind_group,
+            mask_bgl,
+            no_mask,
             normal_own,
             normal_border,
             normal_normalize,
@@ -740,7 +786,17 @@ impl Gfx {
     /// Read the shown level's positions back from the GPU (self-tests).
     pub fn read_positions(&self) -> Option<Vec<glam::Vec3>> {
         let b = self.active_buffers()?;
-        let size = b.positions.size();
+        self.read_buffer(&b.positions)
+    }
+
+    /// Read the shown level's mask back from the GPU, padded to whole words (self-tests).
+    pub fn read_mask(&self) -> Option<Vec<u8>> {
+        let b = self.active_buffers()?;
+        self.read_buffer(&b.mask)
+    }
+
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> Option<Vec<T>> {
+        let size = buffer.size();
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("positions readback"),
             size,
@@ -750,7 +806,7 @@ impl Gfx {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
-        encoder.copy_buffer_to_buffer(&b.positions, 0, &readback, 0, size);
+        encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, size);
         self.queue.submit(std::iter::once(encoder.finish()));
         readback.map_async(wgpu::MapMode::Read, .., |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -875,6 +931,7 @@ impl Gfx {
                     for ch in &mut mesh.chunks {
                         ch.dirty_pos = false;
                         ch.dirty_nrm = true;
+                        ch.dirty_mask = false;
                     }
                     return true;
                 }
@@ -932,7 +989,17 @@ impl Gfx {
             std::mem::size_of::<NormalParams>(),
             U::UNIFORM | U::COPY_DST,
         );
+        // Padded to whole words; zero (nothing masked) unless the mesh has a mask.
+        let mask = if mesh.mask.is_empty() {
+            plain("mask", mesh.vertex_count().div_ceil(4) * 4, U::STORAGE | U::COPY_DST | U::COPY_SRC)
+        } else {
+            let mut padded = mesh.mask.clone();
+            padded.resize(mesh.vertex_count().div_ceil(4) * 4, 0);
+            // COPY_SRC: read back by `--selftest-mask`.
+            self.upload("mask", &padded, U::STORAGE | U::COPY_SRC)
+        };
         let bytes = [
+            &mask,
             &positions,
             &indices,
             &chunk_verts,
@@ -949,6 +1016,7 @@ impl Gfx {
         if let Some(e) = pollster::block_on(scope.pop()) {
             log::warn!("gpu: a level of {} MB did not fit: {e}", bytes / 1_000_000);
             drop((
+                mask,
                 positions,
                 indices,
                 chunk_verts,
@@ -1009,7 +1077,17 @@ impl Gfx {
                 },
             ],
         });
+        let mask_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask bg"),
+            layout: &self.mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mask.as_entire_binding(),
+            }],
+        });
         Some(MeshBuffers {
+            mask,
+            mask_bind_group,
             positions,
             normals,
             indices,
@@ -1196,6 +1274,28 @@ impl Gfx {
                 bytes as f32 / 1e6,
                 runs.len()
             );
+        }
+        // Mask: runs of chunks whose values changed, widened to whole words.
+        let mut mask_runs: Vec<(usize, usize)> = Vec::new();
+        for ch in mesh.chunks.iter_mut() {
+            if std::mem::take(&mut ch.dirty_mask) {
+                let (s, e) = ch.range();
+                let (s, e) = (s / 4 * 4, e.div_ceil(4) * 4);
+                match mask_runs.last_mut() {
+                    Some(last) if last.1 >= s => last.1 = last.1.max(e),
+                    _ => mask_runs.push((s, e)),
+                }
+            }
+        }
+        let n = mesh.vertex_count();
+        for (s, e) in mask_runs {
+            let mut data = vec![0u8; e - s];
+            if !mesh.mask.is_empty() {
+                let end = e.min(n);
+                data[..end - s].copy_from_slice(&mesh.mask[s..end]);
+            }
+            self.queue.write_buffer(&buffers.mask, s as u64, &data);
+            bytes += data.len();
         }
         if let Some(g) = &self.grab {
             if g.pending.is_some() {
@@ -1400,12 +1500,15 @@ impl Gfx {
             if let Some(m) = self.active_buffers() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, &m.mask_bind_group, &[]);
                 pass.set_vertex_buffer(0, m.positions.slice(..));
                 pass.set_vertex_buffer(1, m.normals.slice(..));
                 pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.index_count, 0, 0..1);
             }
             pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.no_mask, &[]);
             for key in parked {
                 if let Some(s) = self.stand_ins.get(key) {
                     pass.set_vertex_buffer(0, s.positions.slice(..));

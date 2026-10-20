@@ -67,6 +67,8 @@ pub struct Chunk {
     pub dirty_pos: bool,
     /// Some vertex normal in this chunk may have changed: GPU recompute.
     pub dirty_nrm: bool,
+    /// Mask values of the owned range changed: re-upload them.
+    pub dirty_mask: bool,
     /// Chunks that share at least one edge with this one.
     pub neighbors: Vec<u32>,
     /// Vertices referenced by `tris` but owned by another chunk.
@@ -85,6 +87,7 @@ impl Chunk {
             aabb: Aabb::empty(),
             dirty_pos: true,
             dirty_nrm: true,
+            dirty_mask: false,
             neighbors: Vec::new(),
             external: Vec::new(),
             stamp: 0,
@@ -181,6 +184,10 @@ pub struct SculptMesh {
     /// CSR adjacency: vertex -> incident triangles.
     pub vt_offsets: Vec<u32>,
     pub vt_tris: Vec<u32>,
+    /// Mask per vertex, 0 = free to edit, 255 = fully masked (ZBrush: Ctrl). Empty when
+    /// nothing is masked. Only the shown level of a stack carries it (see
+    /// [`crate::multires::Multires::set_active`]).
+    pub mask: Vec<u8>,
     stamp_id: u32,
 }
 
@@ -395,6 +402,7 @@ impl SculptMesh {
             adj_verts,
             vt_offsets,
             vt_tris,
+            mask: Vec::new(),
             stamp_id: 0,
         };
 

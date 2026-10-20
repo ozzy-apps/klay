@@ -20,7 +20,8 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-pub const VERSION: u32 = 1;
+/// 2: a mask per subtool (version 1 files still open, without masks).
+pub const VERSION: u32 = 2;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -185,7 +186,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
     let mut input = In::new(r, len);
     input.exact(MAGIC, "Klay project header")?;
     let version = input.u32()?;
-    if version != VERSION {
+    if version == 0 || version > VERSION {
         return Err(format!("project version {version} is not supported (this build reads {VERSION})"));
     }
     let count = input.u32()? as usize;
@@ -198,7 +199,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         let name: Vec<u8> = input.vec()?;
         let name = String::from_utf8(name).map_err(|_| "a subtool name is not valid text")?;
         let visible = input.u8()? != 0;
-        let packed = Packed::read_from(&mut input)?;
+        let packed = Packed::read_from(&mut input, version)?;
         tools.push(SavedTool {
             name,
             visible,

@@ -3,6 +3,7 @@
 
 use crate::mesh::{SculptMesh, Selection};
 use crate::multires::{ChunkData, Level, Multires};
+use crate::mask::MaskData;
 use crate::transform::Affine;
 use glam::Vec3;
 use rayon::prelude::*;
@@ -67,6 +68,15 @@ pub enum UndoStep {
     /// Every level was mapped by an [`Affine`] (Deformation: Offset, Size; Transpose Move,
     /// Scale, Rotate). Like every entry it holds what undoes it: the inverse map.
     Transform(Affine),
+    /// Every level was mapped by `map` weighted per vertex by how free each vertex is in
+    /// `mask`, the mask of `level` when the transform was made (Transpose with a mask).
+    MaskedTransform {
+        map: Affine,
+        level: usize,
+        mask: Vec<u8>,
+    },
+    /// The mask of `level` changed (Ctrl).
+    Mask { level: usize, data: MaskData },
 }
 
 pub struct History {
@@ -151,6 +161,8 @@ impl History {
                 UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
                 UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
                 UndoStep::Transform(_) => 0,
+                UndoStep::MaskedTransform { mask, .. } => mask.len(),
+                UndoStep::Mask { data, .. } => data.bytes(),
             })
             .sum()
     }
@@ -172,6 +184,18 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             doc.transform(&map);
             UndoStep::Transform(map.inverse())
         }
+        UndoStep::MaskedTransform { map, level, mask } => {
+            doc.transform_masked(&map, level, &mask);
+            UndoStep::MaskedTransform {
+                map: map.inverse(),
+                level,
+                mask,
+            }
+        }
+        UndoStep::Mask { level, data } => UndoStep::Mask {
+            level,
+            data: doc.restore_mask(level, data),
+        },
     }
 }
 
@@ -312,9 +336,12 @@ impl Stroke {
         self.snapshot(mesh, &chunks);
         let sign = if self.invert { -1.0 } else { 1.0 };
         let r = brush.radius;
+        // Masked vertices (Ctrl) are held still.
+        let mask = &mesh.mask;
         sel.dist
             .par_iter()
-            .map(|&d| falloff(d, r))
+            .zip(sel.verts.par_iter())
+            .map(|(&d, &v)| falloff(d, r) * crate::mask::freedom(mask, v))
             .collect_into_vec(&mut self.weights);
         let w = &self.weights;
         let new = &mut self.scratch;
@@ -395,11 +422,12 @@ impl Stroke {
             self.snapshot(mesh, &chunks);
             let r = brush.radius;
             // Signed by side: the mirrored half moves with a mirrored delta.
+            let mask = &mesh.mask;
             let weights = sel
                 .dist
                 .par_iter()
                 .enumerate()
-                .map(|(i, &d)| falloff(d, r) * sel.side(i))
+                .map(|(i, &d)| falloff(d, r) * sel.side(i) * crate::mask::freedom(mask, sel.verts[i]))
                 .collect();
             let orig = sel.par_map(|_, v| mesh.positions[v as usize]);
             self.last_count = sel.len();

@@ -100,6 +100,50 @@ impl Affine {
     }
 }
 
+/// A map applied only part of the way, vertex by vertex: the rotation angle, the
+/// logarithm of the scale and the translation are multiplied by a weight in 0..1 (how free
+/// the vertex is of the mask). For a pure translation, or a rotation and scale about a
+/// centre with no translation (every Transpose and Deformation map), the weighted map of
+/// the inverse is exactly the inverse of the weighted map, so a masked transform undoes
+/// with the same weights.
+pub struct Partial {
+    map: Affine,
+    axis: Vec3,
+    angle: f32,
+    ln_scale: f32,
+}
+
+impl Partial {
+    pub fn new(map: &Affine) -> Self {
+        let (axis, angle) = map.rotation.to_axis_angle();
+        Self {
+            map: *map,
+            axis,
+            angle,
+            ln_scale: map.scale.ln(),
+        }
+    }
+
+    pub fn at(&self, w: f32) -> Affine {
+        if w >= 1.0 {
+            return self.map;
+        }
+        if w <= 0.0 {
+            return Affine::IDENTITY;
+        }
+        Affine {
+            center: self.map.center,
+            rotation: if self.angle == 0.0 {
+                Quat::IDENTITY
+            } else {
+                Quat::from_axis_angle(self.axis, self.angle * w)
+            },
+            scale: (self.ln_scale * w).exp(),
+            translate: self.map.translate * w,
+        }
+    }
+}
+
 /// Scale factors a single Scale drag can reach.
 pub const MIN_SCALE: f32 = 0.01;
 pub const MAX_SCALE: f32 = 100.0;
@@ -289,6 +333,38 @@ mod tests {
         assert!(Affine::IDENTITY.is_identity());
         assert!(Affine::translation(Vec3::X).is_translation());
         assert!(!m.is_translation());
+    }
+
+    #[test]
+    fn partial_maps_blend_and_undo_with_the_same_weight() {
+        let p = Vec3::new(0.4, -0.3, 1.2);
+        for m in [
+            Affine::translation(Vec3::new(0.3, -1.0, 0.5)),
+            Affine {
+                translate: Vec3::ZERO,
+                ..sample()
+            },
+        ] {
+            let part = Partial::new(&m);
+            let inv = Partial::new(&m.inverse());
+            assert_eq!(part.at(1.0), m);
+            assert!(part.at(0.0).is_identity());
+            for w in [0.0, 0.25, 0.5, 0.9, 1.0] {
+                let q = part.at(w).apply(p);
+                assert!((inv.at(w).apply(q) - p).length() < 1e-5, "w {w}");
+                let d = Vec3::new(0.1, 0.2, -0.05);
+                assert!((inv.at(w).apply_vector(part.at(w).apply_vector(d)) - d).length() < 1e-6);
+            }
+            // Half way is between the ends, and a rotation keeps the distance to the centre.
+            let half = part.at(0.5);
+            if m.is_translation() {
+                assert!((half.apply(p) - (p + m.translate * 0.5)).length() < 1e-6);
+            } else {
+                let r0 = (p - m.center).length();
+                let r = (half.apply(p) - m.center).length();
+                assert!((r - r0 * m.scale.sqrt()).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]

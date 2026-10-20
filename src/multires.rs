@@ -15,7 +15,7 @@ use crate::mesh::{
     Aabb, CHUNK_TARGET, Chunk, PackedNormal, SculptMesh, crosses_chunk, pack_normal, partition_ids,
     split_ranges, vertex_normal,
 };
-use crate::transform::Affine;
+use crate::transform::{Affine, Partial};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::sync::LazyLock;
@@ -115,6 +115,39 @@ fn smooth(parent: &SculptMesh, s: Stencil) -> Vec3 {
         (p[s[0] as usize] + p[s[1] as usize]) * 0.375
             + (p[s[2] as usize] + p[s[3] as usize]) * 0.125
     }
+}
+
+/// Per-vertex values (mask, transform weights) of a parent level carried to its child:
+/// an even vertex takes its parent's value, an odd vertex the mean of its edge's ends.
+/// Simpler than Loop's weights on purpose: it keeps a hard mask edge hard.
+fn carry_up<T: Copy + Send + Sync>(link: &Link, parent: &[T], mid: impl Fn(T, T) -> T + Sync) -> Vec<T> {
+    link.stencil
+        .par_iter()
+        .map(|s| {
+            if s[1] == NONE {
+                parent[s[0] as usize]
+            } else {
+                mid(parent[s[0] as usize], parent[s[1] as usize])
+            }
+        })
+        .collect()
+}
+
+/// Per-vertex values of a child level carried to its parent: each parent vertex takes the
+/// value of its even child.
+fn carry_down<T: Copy + Send + Sync>(link: &Link, child: &[T], parent_count: usize) -> Vec<T> {
+    // Every parent vertex has exactly one even child; find them in parallel.
+    let even: Vec<AtomicU32> = (0..parent_count).map(|_| AtomicU32::new(0)).collect();
+    link.stencil.par_iter().enumerate().for_each(|(i, s)| {
+        if s[1] == NONE {
+            even[s[0] as usize].store(i as u32, Relaxed);
+        }
+    });
+    even.par_iter().map(|e| child[e.load(Relaxed) as usize]).collect()
+}
+
+fn mid_u8(a: u8, b: u8) -> u8 {
+    ((a as u16 + b as u16 + 1) / 2) as u8
 }
 
 /// Parent chunks a child vertex's stencil reads.
@@ -604,6 +637,8 @@ pub struct Packed {
     budget: usize,
     /// Vertex count per level, for display while parked.
     counts: Vec<usize>,
+    /// Mask of the shown level (empty when nothing is masked).
+    mask: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -624,7 +659,7 @@ impl Packed {
                     + l.offsets.iter().map(|o| o.len() * 12).sum::<usize>()
             })
             .sum();
-        self.positions.len() * 12 + self.indices.len() * 4 + self.ranges.len() * 20 + levels
+        self.positions.len() * 12 + self.indices.len() * 4 + self.ranges.len() * 20 + levels + self.mask.len()
     }
 
     /// Vertex count per level, lowest first.
@@ -659,12 +694,16 @@ impl Packed {
                 out.bytes(bytemuck::cast_slice(&l.offsets[c as usize]))?;
             }
         }
+        out.slice(&self.mask)?;
         Ok(())
     }
 
     /// Read what [`write_to`](Self::write_to) wrote. Sizes are checked here; topology in
     /// [`try_unpack`](Self::try_unpack).
-    pub fn read_from<R: std::io::Read>(input: &mut crate::project::In<R>) -> Result<Self, crate::project::Fail> {
+    pub fn read_from<R: std::io::Read>(
+        input: &mut crate::project::In<R>,
+        version: u32,
+    ) -> Result<Self, crate::project::Fail> {
         let active = input.u32()? as usize;
         let budget = input.u64()? as usize;
         let positions: Vec<Vec3> = input.vec()?;
@@ -708,6 +747,11 @@ impl Packed {
         if active >= counts.len() {
             return Err("the shown level is not one of the stored levels".into());
         }
+        // Version 1 files have no mask.
+        let mask: Vec<u8> = if version >= 2 { input.vec()? } else { Vec::new() };
+        if !mask.is_empty() && mask.len() != counts[active] {
+            return Err("the stored mask does not match the shown level".into());
+        }
         Ok(Packed {
             positions,
             indices,
@@ -716,6 +760,7 @@ impl Packed {
             active,
             budget,
             counts,
+            mask,
         })
     }
 
@@ -747,6 +792,7 @@ impl Packed {
             levels: packed,
             active,
             budget,
+            mask,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
@@ -789,6 +835,10 @@ impl Packed {
                 stale: vec![false; n],
             });
         }
+        if active >= levels.len() || (!mask.is_empty() && mask.len() != levels[active].mesh.vertex_count()) {
+            return Err("the stored mask does not match the shown level".into());
+        }
+        crate::mask::replace(&mut levels[active].mesh, mask);
         Ok(Multires {
             levels,
             active,
@@ -962,6 +1012,7 @@ impl Multires {
             stale: vec![false; n],
         });
         self.levels[top].stale.iter_mut().for_each(|s| *s = false);
+        self.move_mask(self.active, top + 1);
         self.active = top + 1;
         true
     }
@@ -975,8 +1026,43 @@ impl Multires {
         } else {
             0
         };
+        self.move_mask(self.active, level);
         self.active = level;
         synced
+    }
+
+    /// Carry the mask from level `from` (where it is) to level `to`, one level at a time.
+    /// Both meshes are marked for a mask upload: `to` gains it, `from` loses it.
+    fn move_mask(&mut self, from: usize, to: usize) {
+        if from == to || self.levels[from].mesh.mask.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let mut mask = crate::mask::replace(&mut self.levels[from].mesh, Vec::new());
+        let mut l = from;
+        while l < to {
+            mask = carry_up(self.levels[l + 1].link.as_ref().unwrap(), &mask, mid_u8);
+            l += 1;
+        }
+        while l > to {
+            let n = self.levels[l - 1].mesh.vertex_count();
+            mask = carry_down(self.levels[l].link.as_ref().unwrap(), &mask, n);
+            l -= 1;
+        }
+        crate::mask::replace(&mut self.levels[to].mesh, mask);
+        log::debug!("mask carried from level {from} to {to} in {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// Put back mask data saved for `level` and return what undoes it. The shown level
+    /// becomes `level` (the mask lives on the shown level).
+    pub fn restore_mask(&mut self, level: usize, data: crate::mask::MaskData) -> crate::mask::MaskData {
+        use crate::mask::MaskData;
+        self.set_active(level);
+        let mesh = &mut self.levels[level].mesh;
+        match data {
+            MaskData::Whole(mask) => MaskData::Whole(crate::mask::replace(mesh, mask)),
+            MaskData::Chunks(chunks) => MaskData::Chunks(crate::mask::restore_chunks(mesh, chunks)),
+        }
     }
 
     /// Bring every level up to `level` in line with the edits below it. Returns the number
@@ -1141,6 +1227,10 @@ impl Multires {
         if self.levels.len() <= 1 {
             return None;
         }
+        let top = self.top();
+        if self.active == top {
+            self.move_mask(top, top - 1);
+        }
         let level = self.levels.pop();
         self.active = self.active.min(self.top());
         level
@@ -1160,8 +1250,9 @@ impl Multires {
 
     /// The compact form of this stack (see [`Packed`]). Consumes the stack: this is what
     /// frees the memory of a subtool that is parked.
-    pub fn pack(self) -> Packed {
+    pub fn pack(mut self) -> Packed {
         let counts = self.vertex_counts();
+        let mask = std::mem::take(&mut self.levels[self.active].mesh.mask);
         let Multires {
             levels,
             active,
@@ -1187,6 +1278,7 @@ impl Multires {
             active,
             budget,
             counts,
+            mask,
         }
     }
 
@@ -1207,6 +1299,7 @@ impl Multires {
             active: self.active,
             budget: self.budget,
             counts: self.vertex_counts(),
+            mask: self.mesh().mask.clone(),
         }
     }
 
@@ -1259,6 +1352,100 @@ impl Multires {
             level,
             bounds,
         }
+    }
+
+    /// Map the stack by `m` weighted per vertex by how free it is in `mask`, the mask of
+    /// `level` (Transpose with a mask, ZBrush style). Level `level` is mapped exactly
+    /// ([`Partial`] per vertex, what the preview shows), so fully masked vertices there do
+    /// not move at all. The weights are carried to every other level: below it the base
+    /// positions and the offsets are mapped part of the way, so the pose shows at lower
+    /// levels too, and `level`'s own offsets take up the difference; above it the offsets
+    /// turn with the part they sit on. The inverse map with the same mask undoes it.
+    pub fn transform_masked(&mut self, m: &Affine, level: usize, mask: &[u8]) {
+        debug_assert!(m.is_translation() || m.translate == Vec3::ZERO, "see Partial");
+        let part = Partial::new(m);
+        let top = self.top();
+        self.sync_to(level);
+        // The mask carried to every level, as the levels themselves carry it.
+        let mut masks: Vec<Vec<u8>> = vec![Vec::new(); top + 1];
+        masks[level] = mask.to_vec();
+        for l in (0..level).rev() {
+            let n = self.levels[l].mesh.vertex_count();
+            masks[l] = carry_down(self.levels[l + 1].link.as_ref().unwrap(), &masks[l + 1], n);
+        }
+        for l in level + 1..=top {
+            masks[l] = carry_up(self.levels[l].link.as_ref().unwrap(), &masks[l - 1], mid_u8);
+        }
+        let at = |m: &[u8], v: usize| crate::mask::freedom(m, v as u32);
+        // The exact target at `level`.
+        let ml = &masks[level];
+        let target: Vec<Vec3> = self.levels[level]
+            .mesh
+            .positions
+            .par_iter()
+            .enumerate()
+            .map(|(v, &p)| if ml[v] == 255 { p } else { part.at(at(ml, v)).apply(p) })
+            .collect();
+        if level > 0 {
+            let base = &mut self.levels[0].mesh;
+            let m0 = &masks[0];
+            base.positions
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(v, p)| *p = part.at(at(m0, v)).apply(*p));
+            let all: Vec<u32> = (0..base.chunks.len() as u32).collect();
+            base.finish_edit(&all);
+        }
+        for (l, lvl) in self.levels.iter_mut().enumerate().skip(1) {
+            if l == level {
+                continue;
+            }
+            let ml = &masks[l];
+            let chunks = &lvl.mesh.chunks;
+            lvl.offsets.par_iter_mut().enumerate().for_each(|(c, off)| {
+                let s = chunks[c].vert_start as usize;
+                for (i, d) in off.iter_mut().enumerate() {
+                    *d = part.at(at(ml, s + i)).apply_vector(*d);
+                }
+            });
+        }
+        for lvl in &mut self.levels[..level] {
+            lvl.stale.iter_mut().for_each(|s| *s = true);
+        }
+        if level > 0 {
+            // Rebuild the levels below from the mapped base, then fit `level`'s offsets to
+            // the target over the moved parent.
+            self.sync_to(level - 1);
+            let (lower, upper) = self.levels.split_at_mut(level);
+            let parent = &lower[level - 1].mesh;
+            let lvl = &mut upper[0];
+            let link = lvl.link.as_ref().unwrap();
+            let chunks = &lvl.mesh.chunks;
+            lvl.offsets.par_iter_mut().enumerate().for_each(|(c, off)| {
+                let (s, e) = chunks[c].range();
+                let new: Vec<Vec3> = (s..e).map(|v| target[v] - smooth(parent, link.stencil[v])).collect();
+                // A chunk that was never sculpted and did not move keeps no offsets.
+                if !(off.is_empty() && new.iter().all(|d| *d == Vec3::ZERO)) {
+                    *off = new;
+                }
+            });
+            lower[level - 1].stale.iter_mut().for_each(|s| *s = false);
+        }
+        // Only chunks that moved are uploaded again; with most of a model masked (posing)
+        // that is a small part of it.
+        let lvl = &mut self.levels[level];
+        let mesh = &lvl.mesh;
+        let changed: Vec<u32> = (0..mesh.chunks.len() as u32)
+            .into_par_iter()
+            .filter(|&c| {
+                let (s, e) = mesh.chunks[c as usize].range();
+                mesh.positions[s..e] != target[s..e]
+            })
+            .collect();
+        lvl.mesh.positions = target;
+        lvl.mesh.finish_edit(&changed);
+        lvl.stale.iter_mut().for_each(|s| *s = true);
+        self.sync_to(self.active);
     }
 
     /// Map every level by `m` (see [`Affine`]). Loop's weights sum to one, so smoothing
@@ -1632,6 +1819,69 @@ mod tests {
             assert!(worst(&mr.mesh().positions, &before) < 1e-4, "inverse of {m:?}");
             mr.set_active(0);
         }
+    }
+
+    #[test]
+    fn the_mask_follows_the_shown_level_and_survives_packing() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        assert!(mr.divide());
+        assert!(mr.divide());
+        mr.set_active(0);
+        let half: Vec<u8> = mr.mesh().positions.iter().map(|p| if p.x > 0.0 { 255 } else { 0 }).collect();
+        crate::mask::replace(mr.mesh_mut(), half.clone());
+        mr.set_active(2);
+        assert!(mr.level_mesh(0).mask.is_empty(), "only the shown level carries it");
+        let top = mr.mesh();
+        assert_eq!(top.mask.len(), top.vertex_count());
+        for (p, &m) in top.positions.iter().zip(&top.mask) {
+            if p.x > 0.15 {
+                assert_eq!(m, 255);
+            } else if p.x < -0.15 {
+                assert_eq!(m, 0);
+            }
+        }
+        // Down again: even vertices carry their parent's value, so it comes back exactly.
+        mr.set_active(0);
+        assert_eq!(mr.mesh().mask, half);
+        // Packing keeps it with the shown level.
+        mr.set_active(1);
+        let shown = mr.mesh().mask.clone();
+        let back = mr.pack_copy().unpack();
+        assert_eq!(back.active(), 1);
+        assert_eq!(back.mesh().mask, shown);
+        // Undoing a divide while its level is shown carries the mask down.
+        mr.set_active(2);
+        mr.pop_level();
+        assert_eq!(mr.active(), 1);
+        assert_eq!(mr.mesh().mask, shown);
+    }
+
+    #[test]
+    fn masked_transform_holds_the_mask_and_undoes() {
+        let mut mr = Multires::new(sphere(10), usize::MAX);
+        assert!(mr.divide());
+        nudge(&mut mr, Vec3::Z, Vec3::Z * 0.2);
+        assert!(mr.divide());
+        let before = mr.mesh().positions.clone();
+        let mask: Vec<u8> = before.iter().map(|p| if p.x < 0.0 { 255 } else { 0 }).collect();
+        crate::mask::replace(mr.mesh_mut(), mask.clone());
+        let m = Affine::rotation_about(Vec3::ZERO, glam::Quat::from_rotation_y(0.7));
+        mr.transform_masked(&m, 2, &mask);
+        let after = mr.mesh().positions.clone();
+        for (p, q) in before.iter().zip(&after) {
+            if p.x < 0.0 {
+                assert_eq!(p, q, "masked vertices stay exactly");
+            } else {
+                assert!((m.apply(*p) - *q).length() < 1e-5, "free vertices turn with the map");
+            }
+        }
+        // Every level moved, not only the shown one.
+        mr.set_active(0);
+        assert!(mr.mesh().positions.iter().any(|p| p.x > 0.3));
+        mr.set_active(2);
+        mr.transform_masked(&m.inverse(), 2, &mask);
+        let worst = mr.mesh().positions.iter().zip(&before).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
     }
 
     #[test]

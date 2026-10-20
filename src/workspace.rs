@@ -410,6 +410,8 @@ pub struct Actions {
     pub move_subtool: i32,
     /// A Deformation slider was released at this value.
     pub deform: Option<(Deform, f32)>,
+    /// A Masking palette button (ZBrush: Masking > Invert, Clear, Mask All, Blur, Sharpen).
+    pub mask: Option<crate::mask::MaskOp>,
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
@@ -476,6 +478,8 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Shade the mask: Ctrl + H (ZBrush: View Mask).
+    pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
     pub solo: bool,
     /// Deformation slider being dragged, and its value.
@@ -524,6 +528,7 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            show_mask: true,
             solo: false,
             deform_drag: None,
             mode: Mode::Draw,
@@ -1880,16 +1885,47 @@ impl Workspace {
                     id,
                     "mask",
                     "Mask",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        use crate::mask::MaskOp;
+                        ui.horizontal(|ui| {
+                            for (label, op, hint) in [
+                                ("Invert", MaskOp::Invert, "Ctrl + I · Ctrl + click the background"),
+                                ("Clear", MaskOp::Clear, "Ctrl + Shift + A · Ctrl + drag the background"),
+                                ("Mask all", MaskOp::All, "Ctrl + A"),
+                            ] {
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    a.mask = Some(op);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            for (label, op, hint) in [
+                                ("Blur", MaskOp::Blur, "Ctrl + click the model"),
+                                ("Sharpen", MaskOp::Sharpen, "Ctrl + Alt + click the model"),
+                            ] {
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    a.mask = Some(op);
+                                }
+                            }
+                        });
+                        ui.checkbox(&mut ws.show_mask, "View mask").on_hover_text("Ctrl + H");
+                        note(ui, "Ctrl + drag paints · Ctrl + Alt + drag erases");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "masktype",
+                    "Mask type",
                     Some(NC),
                     true,
                     false,
                     &mut |_, ui| {
                         seg(ui, &["Paint", "Rect", "Lasso"], 0, false);
-                        ui.horizontal(|ui| {
-                            for label in ["Invert", "Clear", "Blur"] {
-                                let _ = ui.button(label);
-                            }
-                        });
                     },
                 );
             }
@@ -2208,6 +2244,11 @@ impl Workspace {
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("Space (hold)", "quick menu · also: right-click tap"),
                             ("Alt + click subtool", "select subtool"),
+                            ("Ctrl + drag model", "mask · Alt: unmask"),
+                            ("Ctrl + click model", "blur mask · Alt: sharpen"),
+                            ("Ctrl + click / drag bg", "invert / clear mask"),
+                            ("Ctrl + I / A / Shift+A", "invert / mask all / clear"),
+                            ("Ctrl + H", "view mask"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),

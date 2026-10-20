@@ -19,6 +19,7 @@ cargo run --release -- --divide 2 --subtools 3 --selftest-subtools   # pick and 
 cargo run --release -- --open model.klay                    # open a saved project
 cargo run --release -- --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
 cargo run --release -- --divide 2 --novsync --selftest-transpose     # Transpose move / scale / rotate + undo through the input path, log, exit
+cargo run --release -- --divide 2 --novsync --selftest-mask          # Ctrl masking, a masked move and undo through the input path, log, exit
 ```
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
@@ -52,7 +53,7 @@ The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail s
 presets, mesh rebuild, subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
 vertex budget), undo/redo, OBJ export, the Move / Scale / Rotate modes (Transpose action line)
 and live statistics are connected to the engine. Paint modes, Zcut, Focal Shift, stroke
-options, alpha, texture, masking, the Transform palette, symmetry and
+options, alpha, texture, mask types (rect / lasso), the Transform palette, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
 
 Brush thumbnails are rendered on the CPU at startup: a sphere in the current material with the
@@ -80,7 +81,12 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Left drag on the model | Sculpt with the current brush |
 | Alt + left drag on the model | Alternate brush (carve), like ZBrush's ZSub |
 | Shift + left drag | Smooth |
-| Ctrl + left drag | Reserved for masking (not connected yet) |
+| Ctrl + left drag on the model | Paint a mask (Draw Size, Z Intensity, X symmetry); masked clay goes dark and stays still |
+| Ctrl + Alt + left drag on the model | Erase the mask |
+| Ctrl + click on the model / Ctrl + Alt + click | Blur / sharpen the mask |
+| Ctrl + click on the background / Ctrl + drag on the background | Invert / clear the mask (the canvas border counts as background) |
+| Ctrl + `I` / Ctrl + `A` / Ctrl + Shift + `A` | Invert / mask all / clear the mask |
+| Ctrl + `H` | Show or hide the mask |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
 | Left drag in the border outside the canvas frame | Always navigates, even over the model, in every mode (as on empty canvas) |
@@ -161,6 +167,20 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   level is mapped in place by a compute pass (`affine.wgsl`) instead of being uploaded again;
   normals are recomputed only after a rotation, and the normal accumulators' fixed-point
   scale follows the change in face area.
+- `mask.rs`: ZBrush masking. The mask is one byte per vertex of the shown level only, and
+  it moves with the level: going up an even vertex takes its parent's value and an odd
+  vertex the mean of its edge's ends (a hard edge stays hard), going down a vertex takes its
+  even child's value, so a mask survives D / Shift + D and comes back unchanged. Every brush
+  multiplies its falloff by how free each vertex is, the GPU Grab included. Mask strokes
+  undo per touched chunk; invert, clear, blur and sharpen undo the whole mask. The renderer
+  keeps it as one byte per vertex beside the level and the vertex shader reads it, both for
+  the dark tint and for a masked Transpose preview; with no mask the shader skips it, so an
+  unmasked model draws exactly as fast as before. A masked Transpose moves each vertex part
+  of the way (rotation angle, log scale and translation times its freedom): the shown level
+  exactly as previewed, so masked vertices stay put to the bit; the levels below are mapped
+  with the mask carried down, so the pose shows at every level; the shown level's offsets
+  absorb the difference and the offsets above turn with the part they sit on. The inverse
+  map with the same mask undoes it, so the undo step keeps the mask, not the positions.
 - `project.rs`: `.klay` project files hold every subtool in the same packed form parked
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
@@ -225,6 +245,16 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Release of a rotation (chunk boxes refitted, full normal pass) | 25 ms |
 | Same releases re-uploading the shown level (184 MB) instead | 52–62 ms |
 | GPU copy vs CPU after three transforms and three undos | 9e-7 |
+
+### Masking (`--divide 2 --novsync --selftest-mask`, 15.4M vertices shown, three levels)
+
+| Step | Result |
+| --- | --- |
+| Frame with no mask, with a mask shown, while dragging a masked move | no measurable difference (also at 61M: 15.2 ms with and without) |
+| Mask dab (Ctrl + drag) | 0.5 ms (1.5 ms at 61M) |
+| Invert / blur the whole mask | 2 / 20 ms (7 / 73 ms at 61M) |
+| Carry the mask between 15.4M and 3.84M with Shift + D / D | 16 / 9 ms (43 / 35 ms between 61M and 15.4M) |
+| Release of a masked move: CPU over all three levels | 100 ms, plus 38 ms to upload the moved chunks |
 
 Project files (`--selftest-project`, one 15.4M-vertex three-level subtool plus two 960k
 spheres): 123 MB, saved in 0.09 s and opened in 1.35 s; after the demo strokes, including a
