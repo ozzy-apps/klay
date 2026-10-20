@@ -593,6 +593,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
 /// order, and for each level above it the labels that replay its subdivision plus the
 /// offsets of the chunks that were ever sculpted at that level. Adjacency, stencils and the
 /// positions of upper levels are not kept; [`unpack`](Self::unpack) rebuilds them.
+#[derive(Clone)]
 pub struct Packed {
     positions: Vec<Vec3>,
     indices: Vec<u32>,
@@ -604,6 +605,7 @@ pub struct Packed {
     counts: Vec<usize>,
 }
 
+#[derive(Clone)]
 struct PackedLevel {
     labels: Vec<u8>,
     offsets: Vec<Vec<Vec3>>,
@@ -633,9 +635,110 @@ impl Packed {
         self.active
     }
 
+    /// Serialise in the project file layout (see [`crate::project`]). Offsets are written as
+    /// three blocks (chunk ids, lengths, data) rather than one record per chunk.
+    pub fn write_to<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        out.u32(self.active as u32)?;
+        out.u64(self.budget as u64)?;
+        out.slice(&self.positions)?;
+        out.slice(&self.indices)?;
+        out.slice(&self.ranges)?;
+        out.u32(self.levels.len() as u32)?;
+        for l in &self.levels {
+            out.slice(&l.labels)?;
+            out.u64(l.offsets.len() as u64)?;
+            let ids: Vec<u32> = (0..l.offsets.len() as u32)
+                .filter(|&c| !l.offsets[c as usize].is_empty())
+                .collect();
+            let lens: Vec<u32> = ids.iter().map(|&c| l.offsets[c as usize].len() as u32).collect();
+            out.slice(&ids)?;
+            out.slice(&lens)?;
+            out.u64(lens.iter().map(|&n| n as u64).sum())?;
+            for &c in &ids {
+                out.bytes(bytemuck::cast_slice(&l.offsets[c as usize]))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read what [`write_to`](Self::write_to) wrote. Sizes are checked here; topology in
+    /// [`try_unpack`](Self::try_unpack).
+    pub fn read_from<R: std::io::Read>(input: &mut crate::project::In<R>) -> Result<Self, crate::project::Fail> {
+        let active = input.u32()? as usize;
+        let budget = input.u64()? as usize;
+        let positions: Vec<Vec3> = input.vec()?;
+        let indices: Vec<u32> = input.vec()?;
+        let ranges: Vec<[u32; 5]> = input.vec()?;
+        let n_levels = input.u32()? as usize;
+        if n_levels > 16 {
+            return Err(format!("{n_levels} subdivision levels is not plausible"));
+        }
+        let mut levels = Vec::with_capacity(n_levels);
+        let mut counts = vec![positions.len()];
+        for _ in 0..n_levels {
+            let labels: Vec<u8> = input.vec()?;
+            let n_chunks = input.u64()?;
+            if n_chunks > labels.len() as u64 {
+                return Err("a level lists more chunks than vertices".into());
+            }
+            let ids: Vec<u32> = input.vec()?;
+            let lens: Vec<u32> = input.vec()?;
+            if ids.len() != lens.len() || ids.iter().any(|&c| c as u64 >= n_chunks) {
+                return Err("sculpted chunk table is inconsistent".into());
+            }
+            let total = input.u64()?;
+            if total != lens.iter().map(|&n| n as u64).sum::<u64>() {
+                return Err("sculpted chunk sizes do not add up".into());
+            }
+            let mut offsets = vec![Vec::new(); n_chunks as usize];
+            for (&c, &n) in ids.iter().zip(&lens) {
+                // Read each chunk's block straight into its own vector.
+                let mut block = vec![Vec3::ZERO; n as usize];
+                let size = n as u64 * 12;
+                if size > input.left() {
+                    return Err("the file ends early (truncated or not a Klay project)".into());
+                }
+                tmp_fill(input, bytemuck::cast_slice_mut(&mut block))?;
+                offsets[c as usize] = block;
+            }
+            counts.push(labels.len());
+            levels.push(PackedLevel { labels, offsets });
+        }
+        if active >= counts.len() {
+            return Err("the shown level is not one of the stored levels".into());
+        }
+        Ok(Packed {
+            positions,
+            indices,
+            ranges,
+            levels,
+            active,
+            budget,
+            counts,
+        })
+    }
+
+    /// Rebuild the full level stack, checking everything subdivision relies on first: index
+    /// bounds, the chunk table, two-manifold edges with distinct corners, and for every
+    /// level the label table and the sculpted chunk sizes. Anything else that still goes
+    /// wrong while rebuilding is reported instead of crashing.
+    pub fn try_unpack(self) -> Result<Multires, String> {
+        check_base(&self.positions, &self.indices, &self.ranges)?;
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || self.unpack_checked()));
+        match checked {
+            Ok(r) => r,
+            Err(_) => Err("the stored mesh could not be rebuilt (corrupt data)".into()),
+        }
+    }
+
     /// Rebuild the full level stack: the base mesh as it was, then every level by replaying
-    /// its subdivision and adding its offsets.
+    /// its subdivision and adding its offsets. Only for data this build produced; files go
+    /// through [`try_unpack`](Self::try_unpack).
     pub fn unpack(self) -> Multires {
+        self.unpack_checked().expect("packed data from this session is consistent")
+    }
+
+    fn unpack_checked(self) -> Result<Multires, String> {
         let Packed {
             positions,
             indices,
@@ -646,9 +749,20 @@ impl Packed {
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
+        if levels[0].mesh.edges_over_two_triangles() {
+            return Err("the stored mesh has edges shared by more than two triangles".into());
+        }
         for pl in packed {
             let parent = &levels.last().unwrap().mesh;
+            check_labels(parent, &pl.labels)?;
             let (mut mesh, link) = subdivide_with(parent, Some(&pl.labels));
+            if pl.offsets.len() != mesh.chunks.len()
+                || pl.offsets.iter().zip(&mesh.chunks).any(|(o, ch)| {
+                    !o.is_empty() && o.len() != (ch.vert_end - ch.vert_start) as usize
+                })
+            {
+                return Err("sculpted offsets do not match the rebuilt level".into());
+            }
             let sculpted: Vec<u32> = (0..pl.offsets.len() as u32)
                 .filter(|&c| !pl.offsets[c as usize].is_empty())
                 .collect();
@@ -674,12 +788,87 @@ impl Packed {
                 stale: vec![false; n],
             });
         }
-        Multires {
+        Ok(Multires {
             levels,
             active,
             budget,
+        })
+    }
+}
+
+fn tmp_fill<R: std::io::Read>(input: &mut crate::project::In<R>, buf: &mut [u8]) -> Result<(), crate::project::Fail> {
+    input.fill_raw(buf)
+}
+
+/// Checks on a stored base mesh that the rebuild relies on.
+fn check_base(positions: &[Vec3], indices: &[u32], ranges: &[[u32; 5]]) -> Result<(), String> {
+    let n = positions.len() as u32;
+    if n == 0 || indices.is_empty() || indices.len() % 3 != 0 || ranges.is_empty() {
+        return Err("the stored mesh is empty or malformed".into());
+    }
+    if indices.par_chunks_exact(3).any(|t| {
+        t.iter().any(|&v| v >= n) || t[0] == t[1] || t[1] == t[2] || t[0] == t[2]
+    }) {
+        return Err("the stored triangles reference missing vertices or repeat a corner".into());
+    }
+    let tris = (indices.len() / 3) as u32;
+    let (mut v, mut t) = (0u32, 0u32);
+    for r in ranges {
+        let [vs, ve, ts, tb, te] = *r;
+        if vs != v || ve <= vs || ve - vs > CHUNK_TARGET as u32 || ts != t || tb < ts || te < tb {
+            return Err("the stored chunk table is inconsistent".into());
+        }
+        v = ve;
+        t = te;
+    }
+    if v != n || t != tris {
+        return Err("the stored chunk table does not cover the mesh".into());
+    }
+    // Every chunk owns exactly the triangles whose first vertex it owns, border ones first.
+    let bad = ranges.par_iter().any(|&[vs, ve, ts, tb, te]| {
+        (ts..te).any(|t| {
+            let tri = &indices[3 * t as usize..3 * t as usize + 3];
+            let owned = tri[0] >= vs && tri[0] < ve;
+            !owned || crosses_chunk(tri, vs, ve) != (t < tb)
+        })
+    });
+    if bad {
+        return Err("the stored triangles are not grouped by chunk".into());
+    }
+    Ok(())
+}
+
+/// Checks that `labels` can replay a subdivision of `parent`: one label per child, laid out
+/// per parent chunk, each parent chunk's labels forming groups `0..k` with no empty group
+/// and none larger than a chunk.
+fn check_labels(parent: &SculptMesh, labels: &[u8]) -> Result<(), String> {
+    let owned_edges = |v: u32| parent.neighbors(v).iter().filter(|&&w| w > v).count();
+    let expect = parent.vertex_count() + parent.edge_count();
+    if labels.len() != expect {
+        return Err(format!(
+            "a level has {} vertices where its parent subdivides into {expect}",
+            labels.len()
+        ));
+    }
+    let sizes: Vec<usize> = parent
+        .chunks
+        .par_iter()
+        .map(|ch| (ch.vert_start..ch.vert_end).map(|v| 1 + owned_edges(v)).sum())
+        .collect();
+    let mut at = 0;
+    for size in sizes {
+        let lab = &labels[at..at + size];
+        at += size;
+        let mut groups = [0usize; 256];
+        for &l in lab {
+            groups[l as usize] += 1;
+        }
+        let k = lab.iter().max().map_or(0, |&m| m as usize + 1);
+        if groups[..k].iter().any(|&g| g == 0 || g > CHUNK_TARGET) {
+            return Err("a level's chunk labels are inconsistent".into());
         }
     }
+    Ok(())
 }
 
 /// Draw-only copy of a parked subtool for the GPU (see [`Multires::stand_in`]).

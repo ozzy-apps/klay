@@ -1,6 +1,7 @@
 mod camera;
 mod mesh;
 mod multires;
+mod project;
 mod render;
 mod sculpt;
 mod subtool;
@@ -13,6 +14,7 @@ use multires::Multires;
 use render::{Gfx, Uniforms};
 use mesh::Aabb;
 use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
+use std::path::Path;
 use subtool::{Deform, Parked, STAND_IN_VERTICES, SubTool};
 use workspace::{Mode, QuickPopup, SubToolRow};
 use std::sync::Arc;
@@ -74,6 +76,14 @@ impl NavDrag {
     }
 }
 
+/// Document operations queued by the interface or a shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocOp {
+    New,
+    Open,
+    Save,
+}
+
 /// SubTool operations queued by the interface.
 #[derive(Clone, Copy, Debug)]
 enum SubToolOp {
@@ -101,6 +111,13 @@ struct App {
     /// `--selftest-subtools`: frames left before picking and switching subtools through
     /// the real GPU path, logging the results, then exiting.
     selftest: Option<u32>,
+    /// `--selftest-project`: frames left before a save and re-open round trip.
+    selftest_project: Option<u32>,
+    /// Project file shown in the Document palette, used by Save and Open.
+    project_path: String,
+    /// `--open PATH`: project to open once the window exists.
+    open_on_start: Option<String>,
+    pending_doc: Option<DocOp>,
     camera: Camera,
     brush: Brush,
     history: History,
@@ -177,6 +194,10 @@ impl App {
             next_tool_id: 2,
             initial_subtools: 0,
             selftest: None,
+            selftest_project: None,
+            project_path: "untitled.klay".to_string(),
+            open_on_start: None,
+            pending_doc: None,
             doc: Multires::new(mesh, budget),
             camera: Camera::new(),
             brush: Brush::default(),
@@ -453,6 +474,241 @@ impl App {
         self.drawn_parked()
             .iter()
             .fold(self.doc.bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds))
+    }
+
+    /// Every subtool as `(name, visible, packed)` for a project file, with the active one
+    /// packed as a copy so it is not disturbed.
+    fn with_project_tools<T>(&self, f: impl FnOnce(&[(&str, bool, &multires::Packed)]) -> T) -> T {
+        let active = self.doc.pack_copy();
+        let tools: Vec<(&str, bool, &multires::Packed)> = self
+            .subtools
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let packed = match &t.parked {
+                    Some(p) => &p.packed,
+                    None => &active,
+                };
+                (t.name.as_str(), t.visible || i == self.active_tool, packed)
+            })
+            .collect();
+        f(&tools)
+    }
+
+    /// The whole model as project bytes, in memory (tests and the self-test).
+    fn project_bytes(&self) -> Vec<u8> {
+        self.with_project_tools(|tools| project::write_to(Vec::new(), tools, self.active_tool))
+            .expect("writing to memory")
+    }
+
+    /// Write every subtool to `self.project_path` (ZBrush: Save; Ctrl + S).
+    fn save_project(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        let t = Instant::now();
+        let path = self.project_path.clone();
+        let result = self.with_project_tools(|tools| project::save(Path::new(&path), tools, self.active_tool));
+        self.status = match result {
+            Ok(bytes) => format!(
+                "Saved {path}: {} subtools, {:.1} MB in {:.2} s",
+                self.subtools.len(),
+                bytes as f64 / 1e6,
+                t.elapsed().as_secs_f32()
+            ),
+            Err(e) => format!("Save failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Replace the model with the project at `path` (ZBrush: Open; Ctrl + O). Every stack is
+    /// rebuilt and checked, one at a time, before the current model is let go; a file that
+    /// fails leaves the current model as it was.
+    fn open_project(&mut self, path: &str) {
+        if self.stroke.is_some() {
+            return;
+        }
+        let t = Instant::now();
+        match self.load_project(path) {
+            Ok(()) => {
+                self.project_path = path.to_string();
+                self.status = format!(
+                    "Opened {path}: {} subtools in {:.2} s",
+                    self.subtools.len(),
+                    t.elapsed().as_secs_f32()
+                );
+            }
+            Err(e) => self.status = format!("Could not open {path}: {e}"),
+        }
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    fn load_project(&mut self, path: &str) -> Result<(), String> {
+        let project = project::open(Path::new(path))?;
+        let active = project.active;
+        let mut staged: Vec<SubTool> = Vec::with_capacity(project.tools.len());
+        let mut active_doc = None;
+        let mut failure = None;
+        for (i, saved) in project.tools.into_iter().enumerate() {
+            let mut doc = match saved.packed.try_unpack() {
+                Ok(doc) => doc,
+                Err(e) => {
+                    failure = Some(format!("subtool {:?}: {e}", saved.name));
+                    break;
+                }
+            };
+            let id = self.new_tool_id();
+            if i == active {
+                staged.push(SubTool {
+                    id,
+                    name: saved.name,
+                    visible: true,
+                    bounds: doc.bounds(),
+                    parked: None,
+                });
+                active_doc = Some(doc);
+            } else {
+                let stand_in = doc.stand_in(STAND_IN_VERTICES);
+                let mut stand_in_vertices = stand_in.positions.len();
+                if let Some(gfx) = self.gfx.as_mut() {
+                    if !gfx.upload_stand_in(id, &stand_in) {
+                        stand_in_vertices = 0;
+                    }
+                }
+                staged.push(SubTool {
+                    id,
+                    name: saved.name,
+                    visible: saved.visible,
+                    bounds: stand_in.bounds,
+                    parked: Some(Box::new(Parked {
+                        packed: doc.pack(),
+                        history: History::new(32),
+                        stand_in_vertices,
+                    })),
+                });
+            }
+        }
+        let (Some(doc), None) = (active_doc, &failure) else {
+            if let Some(gfx) = self.gfx.as_mut() {
+                for t in &staged {
+                    gfx.drop_stand_in(t.id);
+                }
+            }
+            return Err(failure.unwrap_or_else(|| "no active subtool".into()));
+        };
+        if let Some(gfx) = self.gfx.as_mut() {
+            for t in &self.subtools {
+                gfx.drop_stand_in(t.id);
+            }
+            gfx.clear_levels();
+        }
+        self.subtools = staged;
+        self.active_tool = active;
+        self.doc = doc;
+        self.history = History::new(32);
+        self.show_active_level();
+        self.frame_camera();
+        Ok(())
+    }
+
+    /// Start over with one sphere subtool.
+    fn new_project(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
+        if let Some(gfx) = self.gfx.as_mut() {
+            for t in &self.subtools {
+                gfx.drop_stand_in(t.id);
+            }
+            gfx.clear_levels();
+        }
+        let budget = self.doc.budget;
+        let (p, i) = cube_sphere(self.segments, 1.0);
+        self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
+        self.history = History::new(32);
+        let id = self.new_tool_id();
+        self.subtools = vec![SubTool {
+            id,
+            name: format!("Sphere {id}"),
+            visible: true,
+            bounds: self.doc.bounds(),
+            parked: None,
+        }];
+        self.active_tool = 0;
+        self.project_path = "untitled.klay".to_string();
+        self.show_active_level();
+        self.home_camera();
+        self.status = "New project".to_string();
+    }
+
+    /// Export every visible subtool at its shown level as one OBJ with an object per
+    /// subtool. Parked subtools are rebuilt one at a time for this, so memory peaks at one
+    /// extra stack.
+    fn export_obj_all(&mut self) {
+        let t = Instant::now();
+        let path = self.export_path.clone();
+        let result = (|| -> std::io::Result<(usize, usize)> {
+            let file = std::fs::File::create(&path)?;
+            let mut w = std::io::BufWriter::with_capacity(8 << 20, file);
+            use std::io::Write;
+            writeln!(w, "# Klay export: {} subtools", self.subtools.len())?;
+            let (mut verts, mut count) = (0usize, 0usize);
+            for (i, tool) in self.subtools.iter().enumerate() {
+                if i == self.active_tool {
+                    self.doc.mesh().write_obj(&mut w, &tool.name, verts)?;
+                    verts += self.doc.mesh().vertex_count();
+                } else if let (true, Some(p)) = (tool.visible, &tool.parked) {
+                    let doc = p.packed.clone().unpack();
+                    doc.mesh().write_obj(&mut w, &tool.name, verts)?;
+                    verts += doc.mesh().vertex_count();
+                } else {
+                    continue;
+                }
+                count += 1;
+            }
+            w.flush()?;
+            Ok((count, verts))
+        })();
+        self.status = match result {
+            Ok((count, verts)) => format!(
+                "Exported {count} subtools ({} vertices) to {path} in {:.1} s",
+                fmt_count(verts),
+                t.elapsed().as_secs_f32()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        log::info!("{}", self.status);
+    }
+
+    /// `--selftest-project`: save the model, open it again, and check that every subtool
+    /// came back byte for byte. Logs sizes and times; returns whether it passed.
+    fn selftest_project(&mut self) -> bool {
+        let path = std::env::temp_dir().join(format!("klay-selftest-{}.klay", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        let before = self.project_bytes();
+        let names: Vec<String> = self.subtools.iter().map(|t| t.name.clone()).collect();
+        let active = self.active_tool;
+        self.project_path = path_str.clone();
+        let t = Instant::now();
+        self.save_project();
+        let save_s = t.elapsed().as_secs_f32();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let t = Instant::now();
+        self.open_project(&path_str);
+        let open_s = t.elapsed().as_secs_f32();
+        let after = self.project_bytes();
+        let same_names = self.subtools.iter().map(|t| t.name.clone()).collect::<Vec<_>>() == names;
+        let pass = before == after && same_names && self.active_tool == active;
+        log::info!(
+            "selftest: saved {} subtools in {save_s:.2} s ({:.1} MB), opened in {open_s:.2} s, round trip {}",
+            names.len(),
+            size as f64 / 1e6,
+            if pass { "identical (ok)" } else { "DIFFERS (FAIL)" }
+        );
+        let _ = std::fs::remove_file(&path);
+        pass
     }
 
     /// Pixel position of a world point on the canvas.
@@ -874,6 +1130,8 @@ impl App {
         match key {
             KeyCode::Escape if self.workspace.popup.is_some() => self.workspace.popup = None,
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
+            KeyCode::KeyS if ctrl => self.pending_doc = Some(DocOp::Save),
+            KeyCode::KeyO if ctrl => self.pending_doc = Some(DocOp::Open),
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
             KeyCode::KeyY if ctrl => self.pending_redo = true,
@@ -980,8 +1238,18 @@ impl App {
                 subtools: &rows,
                 parked_bytes,
                 stand_in_bytes,
+                project_path: &mut self.project_path,
             },
         );
+        if actions.new_project {
+            self.pending_doc = Some(DocOp::New);
+        }
+        if actions.open {
+            self.pending_doc = Some(DocOp::Open);
+        }
+        if actions.save {
+            self.pending_doc = Some(DocOp::Save);
+        }
         if let Some(i) = actions.select_subtool {
             self.pending_subtool = Some(SubToolOp::Select(i));
         }
@@ -1076,6 +1344,15 @@ impl App {
         if let Some(level) = self.pending_level.take() {
             self.set_level(level);
         }
+        match self.pending_doc.take() {
+            Some(DocOp::New) => self.new_project(),
+            Some(DocOp::Open) => {
+                let path = self.project_path.clone();
+                self.open_project(&path);
+            }
+            Some(DocOp::Save) => self.save_project(),
+            None => {}
+        }
         match self.pending_subtool.take() {
             Some(SubToolOp::Select(i)) => self.select_subtool(i),
             Some(SubToolOp::Append) => self.append_sphere(),
@@ -1086,15 +1363,7 @@ impl App {
         }
         if self.pending_export {
             self.pending_export = false;
-            let t = Instant::now();
-            self.status = match self.mesh().export_obj(&self.export_path) {
-                Ok(()) => format!(
-                    "Exported {} in {:.1} s",
-                    self.export_path,
-                    t.elapsed().as_secs_f32()
-                ),
-                Err(e) => format!("Export failed: {e}"),
-            };
+            self.export_obj_all();
         }
 
         if let Some((left, frame_acc, dab_acc)) = self.stress {
@@ -1135,6 +1404,15 @@ impl App {
         if self.stroke_pending {
             self.stroke_pending = false;
             self.apply_stroke();
+        }
+        if let Some(left) = self.selftest_project {
+            if left == 0 {
+                self.selftest_project = None;
+                self.selftest_project();
+                self.quit = true;
+            } else {
+                self.selftest_project = Some(left - 1);
+            }
         }
         if let Some(left) = self.selftest {
             if left == 0 {
@@ -1259,6 +1537,9 @@ impl ApplicationHandler for App {
             for (name, ms, dabs, count) in self.scripted_strokes() {
                 log::info!("demo stroke {name}: {dabs} dabs over {count} verts in {ms:.1} ms");
             }
+        }
+        if let Some(path) = self.open_on_start.take() {
+            self.open_project(&path);
         }
         for _ in 0..std::mem::take(&mut self.initial_subtools) {
             self.append_sphere();
@@ -1719,6 +2000,10 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-subtools") {
         app.selftest = Some(20);
     }
+    if args.iter().any(|a| a == "--selftest-project") {
+        app.selftest_project = Some(20);
+    }
+    app.open_on_start = flag("--open").cloned();
     if stress {
         app.stress = Some((240, 0.0, 0.0));
     }
@@ -1856,5 +2141,63 @@ mod subtool_tests {
         assert!(app.drawn_parked().is_empty());
         app.toggle_subtool(1);
         assert!(app.subtools[1].visible, "the active subtool cannot be hidden");
+    }
+
+    #[test]
+    fn projects_save_open_and_export_every_subtool() {
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        let project = dir.join(format!("klay-test-{tag}.klay"));
+        let obj = dir.join(format!("klay-test-{tag}.obj"));
+
+        let mut app = App::new(12, false, usize::MAX);
+        app.segments = 8;
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        app.deform(Deform::Size, 40.0);
+        app.append_sphere();
+        app.toggle_subtool(0);
+        app.toggle_subtool(0);
+        app.subtools[1].name = "Eye".to_string();
+        let before = app.project_bytes();
+        app.project_path = project.to_string_lossy().to_string();
+        app.save_project();
+        assert!(app.status.starts_with("Saved"), "{}", app.status);
+
+        let mut other = App::new(4, false, 1000);
+        let path = app.project_path.clone();
+        other.open_project(&path);
+        assert!(other.status.starts_with("Opened"), "{}", other.status);
+        assert_eq!(other.subtools.len(), 2);
+        assert_eq!(other.subtools[1].name, "Eye");
+        assert_eq!(other.active_tool, 1);
+        assert_eq!(other.project_bytes(), before, "the model came back byte for byte");
+
+        // A damaged file is refused and the open model stays as it was.
+        let mut bytes = std::fs::read(&project).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        std::fs::write(&project, &bytes).unwrap();
+        other.open_project(&path);
+        assert!(other.status.starts_with("Could not open"), "{}", other.status);
+        assert_eq!(other.project_bytes(), before);
+
+        // Whole-model OBJ: one object per visible subtool, indices continue across them.
+        other.export_path = obj.to_string_lossy().to_string();
+        other.export_obj_all();
+        let text = std::fs::read_to_string(&obj).unwrap();
+        let objects: Vec<&str> = text.lines().filter(|l| l.starts_with("o ")).collect();
+        assert_eq!(objects, ["o Sphere 1", "o Eye"]);
+        let verts = text.lines().filter(|l| l.starts_with("v ")).count();
+        let first = other.subtools[0].parked.as_ref().unwrap().packed.counts()[1];
+        assert_eq!(verts, first + other.doc.mesh().vertex_count());
+        let max_index = text
+            .lines()
+            .filter(|l| l.starts_with("f "))
+            .flat_map(|l| l[2..].split(' ').map(|c| c.split("//").next().unwrap().parse::<usize>().unwrap()))
+            .max()
+            .unwrap();
+        assert_eq!(max_index, verts);
+        let _ = std::fs::remove_file(&project);
+        let _ = std::fs::remove_file(&obj);
     }
 }

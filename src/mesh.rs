@@ -10,6 +10,7 @@
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Write;
 
 /// Target number of vertices per chunk.
@@ -257,6 +258,20 @@ impl SculptMesh {
 
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
         Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+    }
+
+    /// Whether some edge is shared by more than two triangles (subdivision needs a
+    /// two-manifold mesh, possibly with boundaries).
+    pub fn edges_over_two_triangles(&self) -> bool {
+        (0..self.vertex_count() as u32).into_par_iter().any(|v| {
+            self.neighbors(v).iter().filter(|&&w| w > v).any(|&w| {
+                self.incident(v)
+                    .iter()
+                    .filter(|&&t| self.indices[3 * t as usize..3 * t as usize + 3].contains(&w))
+                    .count()
+                    > 2
+            })
+        })
     }
 
     /// Owned ranges of every chunk: `[vert_start, vert_end, tri_start, tri_border, tri_end]`.
@@ -676,10 +691,19 @@ impl SculptMesh {
         aabb
     }
 
+    #[cfg(test)]
     pub fn export_obj(&self, path: &str) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
         writeln!(w, "# Klay export: {} vertices, {} triangles", self.vertex_count(), self.triangle_count())?;
+        self.write_obj(&mut w, "Klay", 0)?;
+        w.flush()
+    }
+
+    /// Append this mesh to an OBJ stream as object `name`, with normals. `first` is the
+    /// number of vertices already written (OBJ indices are global and 1-based).
+    pub fn write_obj<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize) -> std::io::Result<()> {
+        writeln!(w, "o {name}")?;
         for p in &self.positions {
             writeln!(w, "v {} {} {}", p.x, p.y, p.z)?;
         }
@@ -687,11 +711,12 @@ impl SculptMesh {
             let n = unpack_normal(n);
             writeln!(w, "vn {} {} {}", n.x, n.y, n.z)?;
         }
+        let first = first as u64 + 1;
         for tri in self.indices.chunks_exact(3) {
-            let (a, b, c) = (tri[0] + 1, tri[1] + 1, tri[2] + 1);
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|v| v as u64 + first);
             writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
         }
-        w.flush()
+        Ok(())
     }
 }
 

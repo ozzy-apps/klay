@@ -364,6 +364,8 @@ pub struct Model<'a> {
     pub parked_bytes: usize,
     /// GPU memory held by the stand-ins of parked subtools.
     pub stand_in_bytes: u64,
+    /// Project file used by Save and Open.
+    pub project_path: &'a mut String,
 }
 
 /// One line of the SubTool list.
@@ -405,6 +407,9 @@ pub struct Actions {
     pub move_subtool: i32,
     /// A Deformation slider was released at this value.
     pub deform: Option<(Deform, f32)>,
+    pub new_project: bool,
+    pub open: bool,
+    pub save: bool,
 }
 
 pub const MATERIALS: [(Color32, &str); 4] = [
@@ -1740,17 +1745,37 @@ impl Workspace {
                     None,
                     true,
                     true,
-                    &mut |ws, ui| {
-                        kv(ui, "Name", "Untitled");
-                        kv(ui, "Object", "Sphere");
-                        kv(ui, "Source", "procedural");
-                        ui.horizontal(|ui| {
-                            for label in ["New", "Open…", "Save"] {
-                                if ui.button(label).clicked() {
-                                    ws.flash(ui.ctx(), NC.to_string());
+                    &mut |_, ui| {
+                        let name = std::path::Path::new(m.project_path.as_str())
+                            .file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().to_string());
+                        kv(ui, "Name", &name);
+                        kv(ui, "Subtools", &m.subtools.len().to_string());
+                        ui.add(
+                            egui::TextEdit::singleline(m.project_path)
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::monospace(11.0)),
+                        );
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                        let w = (r.width() - 6.0) / 3.0;
+                        for (col, (label, hint)) in [
+                            ("New", "Start over with one sphere"),
+                            ("Open", "Open the project at this path · Ctrl + O"),
+                            ("Save", "Save every subtool to this path · Ctrl + S"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                            if ui.put(cell, egui::Button::new(label)).on_hover_text(hint).clicked() {
+                                match col {
+                                    0 => a.new_project = true,
+                                    1 => a.open = true,
+                                    _ => a.save = true,
                                 }
                             }
-                        });
+                        }
+                        note(ui, "Saves every subtool with its levels and sculpting; undo history is not saved.");
                     },
                 );
                 self.sec(
@@ -1773,6 +1798,7 @@ impl Workspace {
                                 [ui.available_width(), 20.0],
                                 egui::Button::new("Export OBJ"),
                             )
+                            .on_hover_text("Every visible subtool at its shown level, one OBJ object each")
                             .clicked()
                         {
                             a.export = true;
@@ -1780,7 +1806,7 @@ impl Workspace {
                         if m.status.is_empty() {
                             note(
                                 ui,
-                                "Writes positions and triangles; normals are recomputed on import.",
+                                "Every visible subtool at its shown level, as one object each.",
                             );
                         } else {
                             note(ui, m.status);
@@ -2178,6 +2204,7 @@ impl Workspace {
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("Space (hold)", "quick menu · also: right-click tap"),
                             ("Alt + click subtool", "select subtool"),
+                            ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
                             ("[ ]", "brush radius"),
@@ -3803,6 +3830,7 @@ mod tests {
                         subtools,
                         parked_bytes: 0,
                         stand_in_bytes: 0,
+                        project_path: &mut String::from("untitled.klay"),
                     },
                 );
             },

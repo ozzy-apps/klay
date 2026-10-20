@@ -16,6 +16,8 @@ cargo run --release -- --bench 400 --divide 2               # divide timings, ba
 cargo run --release -- --divide 2 --novsync --frames        # average frame time at the top level, then exit
 cargo run --release -- --subtools 4                         # start with four sphere subtools in a row
 cargo run --release -- --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
+cargo run --release -- --open model.klay                    # open a saved project
+cargo run --release -- --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
 ```
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
@@ -99,6 +101,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | `Home` | Reset the view angle and frame |
 | `Tab` | Toggle canvas focus |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
+| Ctrl+S / Ctrl+O | Save / open the project at the path in the Document palette |
 
 ## How it works
 
@@ -137,6 +140,15 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
   Delete and reordering; Deformation moves and sizes the active subtool exactly at every
   level, undoably.
+- `project.rs`: `.klay` project files hold every subtool in the same packed form parked
+  subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
+  large binary blocks behind a magic number and version, through a temporary file that is
+  moved into place. Reading checks every length against the bytes left before allocating;
+  rebuilding checks index bounds, the chunk table, manifold edges and every level's labels
+  and offsets, and turns anything else that fails into an error. Open rebuilds each
+  subtool once to bake its stand-in and swaps the model only when all of them succeeded.
+  Undo history is not saved. Export OBJ writes every visible subtool at its shown level as
+  its own object, rebuilding parked ones one at a time.
 - `render.rs`: positions, packed normals, indices and fixed-point normal accumulators live
   on the GPU (52 bytes per vertex), one set per subdivision level that has been shown, so
   stepping between levels is a pointer swap. Levels that are not shown keep their copies up
@@ -182,6 +194,11 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | 960k vertices, one level | 92 MB | 34 MB | 38 MB | 16 ms | 39 ms |
 | Two levels, 3.84M at the top | 526 MB | 38 MB | 38 MB | 49 ms | 0.19 s |
 | Three levels, 15.4M at the top | 2.26 GB | 53 MB | 38 MB | 0.19 s | 0.97 s |
+
+Project files (`--selftest-project`, one 15.4M-vertex three-level subtool plus two 960k
+spheres): 123 MB, saved in 0.09 s and opened in 1.35 s; after the demo strokes, including a
+grab that moved 5.2M top-level vertices, 189 MB, 0.12 s and 1.32 s. Both round trips are
+byte-identical.
 
 Parking bakes the stand-in and frees the stack (most of the time at three levels is giving
 2 GB back to the system). Activating replays the subdivisions from the stored labels, a
