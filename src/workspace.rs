@@ -419,7 +419,8 @@ pub const MATERIALS: [(Color32, &str); 4] = [
     (Color32::from_rgb(184, 174, 152), "Polished bronze"),
 ];
 
-/// Top-shelf edit mode (ZBrush: Q / W / E / R). Only Draw sculpts today.
+/// Top-shelf edit mode (ZBrush: Q / W / E / R). Draw sculpts; Move, Scale and Rotate drive the
+/// Transpose action line (see `transform.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Draw,
@@ -932,9 +933,9 @@ impl Workspace {
                     // mode buttons (Q / W / E / R)
                     for (glyph, label, mode, hint) in [
                         ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
-                        ("move", "Move", Mode::Move, "Move · W · not connected"),
-                        ("scale", "Scale", Mode::Scale, "Scale · E · not connected"),
-                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · not connected"),
+                        ("move", "Move", Mode::Move, "Move · W · drag the model for an action line, its middle circle moves"),
+                        ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle"),
+                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · drag the action line's end circle"),
                     ] {
                         if big_button(ui, glyph, label, vec2(46.0, 46.0), self.mode == mode, true)
                             .on_hover_text(hint)
@@ -2210,6 +2211,9 @@ impl Workspace {
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
                             ("Q W E R", "draw / move / scale / rotate"),
+                            ("W E R + drag model", "action line · Shift: 45°"),
+                            ("Drag circle", "middle: move · end: scale / rotate"),
+                            ("Drag ring / line", "move the action line"),
                             ("X", "symmetry"),
                             ("Ctrl + D", "divide (add a subdivision level)"),
                             ("D / Shift + D", "higher / lower subdivision level"),

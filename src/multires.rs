@@ -15,6 +15,7 @@ use crate::mesh::{
     Aabb, CHUNK_TARGET, Chunk, PackedNormal, SculptMesh, crosses_chunk, pack_normal, partition_ids,
     split_ranges, vertex_normal,
 };
+use crate::transform::Affine;
 use glam::Vec3;
 use rayon::prelude::*;
 use std::sync::LazyLock;
@@ -1260,22 +1261,26 @@ impl Multires {
         }
     }
 
-    /// Move and scale every level: `p -> c + s (p - c) + t`. Loop's weights sum to one, so
-    /// smoothing commutes with this map and the offsets only scale by `s`; the stack stays
-    /// exactly consistent, stale levels included.
-    pub fn transform(&mut self, c: Vec3, s: f32, t: Vec3) {
+    /// Map every level by `m` (see [`Affine`]). Loop's weights sum to one, so smoothing
+    /// commutes with the map: positions map and offsets turn and scale with its linear part,
+    /// which keeps the stack exactly consistent, stale levels included.
+    pub fn transform(&mut self, m: &Affine) {
         for lvl in &mut self.levels {
             lvl.mesh
                 .positions
                 .par_iter_mut()
-                .for_each(|p| *p = c + (*p - c) * s + t);
-            if s != 1.0 {
+                .for_each(|p| *p = m.apply(*p));
+            if !m.is_translation() {
                 lvl.offsets
                     .par_iter_mut()
-                    .for_each(|o| o.iter_mut().for_each(|d| *d *= s));
+                    .for_each(|o| o.iter_mut().for_each(|d| *d = m.apply_vector(*d)));
             }
-            let all: Vec<u32> = (0..lvl.mesh.chunks.len() as u32).collect();
-            lvl.mesh.finish_edit(&all);
+            if m.rotation == glam::Quat::IDENTITY && m.scale > 0.0 {
+                lvl.mesh.finish_monotone_edit(|p| m.apply(p));
+            } else {
+                let all: Vec<u32> = (0..lvl.mesh.chunks.len() as u32).collect();
+                lvl.mesh.finish_edit(&all);
+            }
         }
     }
 }
@@ -1574,39 +1579,59 @@ mod tests {
     fn transform_keeps_the_stack_consistent() {
         let mut mr = Multires::new(sphere(10), usize::MAX);
         assert!(mr.divide());
+        assert!(mr.divide());
         nudge(&mut mr, Vec3::Z, Vec3::Z * 0.2);
+        mr.set_active(1);
+        nudge(&mut mr, Vec3::Y, Vec3::Y * 0.15);
         mr.set_active(0);
         nudge(&mut mr, Vec3::X, Vec3::X * 0.2);
-        let (c, s, t) = (Vec3::new(0.1, 0.2, 0.3), 1.7, Vec3::new(-0.5, 0.25, 2.0));
-        let mut expect = mr.pack_copy().unpack();
-        expect.sync_to(1);
-        let want: Vec<Vec3> = expect.levels[1]
-            .mesh
-            .positions
-            .iter()
-            .map(|&p| c + (p - c) * s + t)
-            .collect();
-        mr.transform(c, s, t);
-        mr.set_active(1);
-        let worst = mr
-            .mesh()
-            .positions
-            .iter()
-            .zip(&want)
-            .map(|(p, q)| (*p - *q).length())
-            .fold(0.0f32, f32::max);
-        assert!(worst < 1e-4, "{worst}");
-        // The exact inverse brings it back.
-        mr.transform(c + t, 1.0 / s, -t);
-        let back: Vec<Vec3> = expect.levels[1].mesh.positions.clone();
-        let worst = mr
-            .mesh()
-            .positions
-            .iter()
-            .zip(&back)
-            .map(|(p, q)| (*p - *q).length())
-            .fold(0.0f32, f32::max);
-        assert!(worst < 1e-4, "{worst}");
+        let worst = |a: &[Vec3], b: &[Vec3]| {
+            a.iter().zip(b).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max)
+        };
+        let maps = [
+            Affine::scaling(Vec3::new(0.1, 0.2, 0.3), 1.7),
+            Affine::translation(Vec3::new(-0.5, 0.25, 2.0)),
+            Affine {
+                center: Vec3::new(0.1, -0.3, 0.2),
+                rotation: glam::Quat::from_axis_angle(Vec3::new(0.3, 1.0, -0.2).normalize(), 1.1),
+                scale: 0.6,
+                translate: Vec3::new(0.4, 0.0, -1.5),
+            },
+        ];
+        for m in maps {
+            // Level 2 is stale (edits at levels 0 and 1 are not synced up yet): the map has
+            // to commute with the lazy re-smoothing.
+            let mut expect = mr.pack_copy().unpack();
+            expect.sync_to(2);
+            let before: Vec<Vec3> = expect.levels[2].mesh.positions.clone();
+            let want: Vec<Vec3> = before.iter().map(|&p| m.apply(p)).collect();
+            mr.transform(&m);
+            mr.set_active(2);
+            assert!(worst(&mr.mesh().positions, &want) < 1e-4, "{m:?}");
+            // Every level matches a fresh subdivision of the mapped base plus mapped offsets.
+            let mut fresh = mr.pack_copy().unpack();
+            fresh.sync_to(2);
+            for l in 0..3 {
+                let a = &mr.level_mesh(l).positions;
+                let b = &fresh.level_mesh(l).positions;
+                assert!(worst(a, b) < 1e-4, "level {l}");
+            }
+            // Chunk boxes match a refit over the vertices (the scale and move skip it).
+            for l in 0..3 {
+                let mesh = mr.level_mesh(l);
+                for ch in &mesh.chunks {
+                    let mut b = crate::mesh::Aabb::empty();
+                    for v in ch.vert_start..ch.vert_end {
+                        b.grow(mesh.positions[v as usize]);
+                    }
+                    assert!(ch.aabb.min.cmple(b.min).all() && ch.aabb.max.cmpge(b.max).all());
+                }
+            }
+            // The exact inverse brings it back.
+            mr.transform(&m.inverse());
+            assert!(worst(&mr.mesh().positions, &before) < 1e-4, "inverse of {m:?}");
+            mr.set_active(0);
+        }
     }
 
     #[test]

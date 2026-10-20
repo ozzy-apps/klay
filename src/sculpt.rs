@@ -3,6 +3,7 @@
 
 use crate::mesh::{SculptMesh, Selection};
 use crate::multires::{ChunkData, Level, Multires};
+use crate::transform::Affine;
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -63,13 +64,9 @@ pub enum UndoStep {
     /// A subdivision level was added. In the undo list the level is live (`None`); the
     /// redo entry keeps the removed level so redo can put it back without recomputing it.
     Divide(Option<Box<Level>>),
-    /// Every level was mapped by `p -> center + scale (p - center) + translate`
-    /// (Deformation: Offset, Size).
-    Transform {
-        center: Vec3,
-        scale: f32,
-        translate: Vec3,
-    },
+    /// Every level was mapped by an [`Affine`] (Deformation: Offset, Size; Transpose Move,
+    /// Scale, Rotate). Like every entry it holds what undoes it: the inverse map.
+    Transform(Affine),
 }
 
 pub struct History {
@@ -93,6 +90,22 @@ impl History {
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// The map the next undo applies, when that step is a transform.
+    pub fn next_undo_map(&self) -> Option<Affine> {
+        match self.undo.last() {
+            Some(UndoStep::Transform(map)) => Some(*map),
+            _ => None,
+        }
+    }
+
+    /// The map the next redo applies, when that step is a transform.
+    pub fn next_redo_map(&self) -> Option<Affine> {
+        match self.redo.last() {
+            Some(UndoStep::Transform(map)) => Some(*map),
+            _ => None,
+        }
     }
 
     pub fn push(&mut self, step: UndoStep) {
@@ -137,7 +150,7 @@ impl History {
             .map(|s| match s {
                 UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
                 UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
-                UndoStep::Transform { .. } => 0,
+                UndoStep::Transform(_) => 0,
             })
             .sum()
     }
@@ -155,18 +168,9 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             doc.push_level(*level);
             UndoStep::Divide(None)
         }
-        UndoStep::Transform {
-            center,
-            scale,
-            translate,
-        } => {
-            doc.transform(center, scale, translate);
-            // p = c + (p' - c - t) / s, written in the same form.
-            UndoStep::Transform {
-                center: center + translate,
-                scale: 1.0 / scale,
-                translate: -translate,
-            }
+        UndoStep::Transform(map) => {
+            doc.transform(&map);
+            UndoStep::Transform(map.inverse())
         }
     }
 }

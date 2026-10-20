@@ -20,6 +20,9 @@ pub struct Uniforms {
     pub params: [f32; 4],
     pub viewport: [f32; 4],
     pub display: [f32; 4],
+    /// Map applied to the active subtool in the vertex shader: the live preview of a
+    /// Transpose move / scale / rotate (identity otherwise). Parked stand-ins ignore it.
+    pub model: [[f32; 4]; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -45,6 +48,14 @@ const NORMAL_CAP: f32 = (1u32 << 24) as f32;
 struct GrabParams {
     delta: [f32; 3],
     count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AffineParams {
+    model: [[f32; 4]; 4],
+    count: u32,
+    _pad: [u32; 3],
 }
 
 /// A grab stroke running on the GPU.
@@ -134,6 +145,12 @@ pub struct Gfx {
     grab_bgl: wgpu::BindGroupLayout,
     grab_params: wgpu::Buffer,
     grab: Option<GpuGrab>,
+    affine_pipeline: wgpu::ComputePipeline,
+    affine_bgl: wgpu::BindGroupLayout,
+    affine_params: wgpu::Buffer,
+    /// Map queued for the positions of a level by [`Gfx::transform_level`], run at the start
+    /// of the next frame: (level, matrix).
+    pending_affine: Option<(usize, glam::Mat4)>,
     /// One entry per subdivision level, uploaded the first time the level is shown so
     /// stepping between levels is a pointer swap.
     levels: Vec<Option<MeshBuffers>>,
@@ -478,6 +495,46 @@ impl Gfx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // --- Affine map of a whole level (Transpose release) ------------------------------
+        let affine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("affine"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("affine.wgsl").into()),
+        });
+        let affine_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("affine bgl"),
+            entries: &[
+                storage(0, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let affine_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("affine layout"),
+            bind_group_layouts: &[Some(&affine_bgl)],
+            immediate_size: 0,
+        });
+        let affine_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("affine pipeline"),
+            layout: Some(&affine_layout),
+            module: &affine_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let affine_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("affine params"),
+            size: std::mem::size_of::<AffineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -511,6 +568,10 @@ impl Gfx {
             grab_bgl,
             grab_params,
             grab: None,
+            affine_pipeline,
+            affine_bgl,
+            affine_params,
+            pending_affine: None,
             levels: Vec::new(),
             active: 0,
             needs_normals: false,
@@ -676,11 +737,37 @@ impl Gfx {
         id
     }
 
+    /// Read the shown level's positions back from the GPU (self-tests).
+    pub fn read_positions(&self) -> Option<Vec<glam::Vec3>> {
+        let b = self.active_buffers()?;
+        let size = b.positions.size();
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("positions readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        encoder.copy_buffer_to_buffer(&b.positions, 0, &readback, 0, size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let out = match readback.get_mapped_range(..) {
+            Ok(view) => bytemuck::pod_collect_to_vec(&view[..]),
+            Err(_) => return None,
+        };
+        readback.unmap();
+        Some(out)
+    }
+
     /// Forget every uploaded level (the document was replaced).
     pub fn clear_levels(&mut self) {
         self.levels.clear();
         self.active = 0;
         self.grab = None;
+        self.pending_affine = None;
     }
 
     /// Drop the GPU copies of levels at or above `count` (a level was removed).
@@ -771,6 +858,9 @@ impl Gfx {
             self.levels.resize_with(level + 1, || None);
         }
         self.levels[level] = None;
+        if self.pending_affine.is_some_and(|(l, _)| l == level) {
+            self.pending_affine = None;
+        }
         self.active = level;
         self.trim_cache();
         for attempt in 0..2 {
@@ -803,7 +893,8 @@ impl Gfx {
         let positions = self.upload(
             "positions",
             bytemuck::cast_slice(&mesh.positions),
-            U::VERTEX | U::STORAGE,
+            // COPY_SRC: read back by `--selftest-transpose`.
+            U::VERTEX | U::STORAGE | U::COPY_SRC,
         );
         let indices = self.upload(
             "indices",
@@ -999,6 +1090,40 @@ impl Gfx {
         self.grab = None;
     }
 
+    /// The CPU just mapped every level of the active subtool by `map`. Instead of uploading
+    /// the shown level again, map its GPU positions in place on the next frame and mark its
+    /// chunks clean; normals are recomputed only when the map turns them. `mesh` is the
+    /// shown level, and must have had no changes waiting for upload before the map (the
+    /// caller checks with [`SculptMesh`] chunk flags). Every cached level's normal
+    /// accumulator scale follows the change in face area.
+    pub fn transform_level(&mut self, mesh: &mut SculptMesh, map: &crate::transform::Affine) {
+        for b in self.levels.iter_mut().flatten() {
+            b.normal_scale /= map.scale * map.scale;
+        }
+        if self.active_buffers().is_none() {
+            return;
+        }
+        let level = self.active;
+        let m = map.matrix();
+        self.pending_affine = Some(match self.pending_affine.take() {
+            Some((l, earlier)) if l == level => (level, m * earlier),
+            _ => (level, m),
+        });
+        let turns = map.rotation != glam::Quat::IDENTITY;
+        for ch in &mut mesh.chunks {
+            ch.dirty_pos = false;
+            ch.dirty_nrm = turns;
+        }
+    }
+
+    /// Normal accumulator scale after a map that did not go through
+    /// [`transform_level`](Self::transform_level) (the shown level is uploaded again).
+    pub fn rescale_normals(&mut self, scale: f32) {
+        for b in self.levels.iter_mut().flatten() {
+            b.normal_scale /= scale * scale;
+        }
+    }
+
     pub fn gpu_grab_active(&self) -> bool {
         self.grab.is_some()
     }
@@ -1155,6 +1280,44 @@ impl Gfx {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
+        // Transpose release: map the positions of a level in place.
+        if let Some((level, m)) = self.pending_affine.take() {
+            if let Some(b) = self.levels.get(level).and_then(Option::as_ref) {
+                let count = (b.positions.size() / 12) as u32;
+                self.queue.write_buffer(
+                    &self.affine_params,
+                    0,
+                    bytemuck::bytes_of(&AffineParams {
+                        model: m.to_cols_array_2d(),
+                        count,
+                        _pad: [0; 3],
+                    }),
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("affine bg"),
+                    layout: &self.affine_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: b.positions.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.affine_params.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("affine"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.affine_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                let groups = count.div_ceil(256);
+                pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+            }
+        }
 
         // GPU grab: move the selected vertices.
         if let Some(g) = self.grab.as_mut() {

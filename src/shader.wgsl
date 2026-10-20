@@ -9,6 +9,9 @@ struct Uniforms {
     params: vec4<f32>,
     viewport: vec4<f32>,
     display: vec4<f32>,
+    // Live Transpose preview for the active subtool (identity otherwise); rotation and
+    // uniform scale only, so it also maps normals.
+    model: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -58,9 +61,15 @@ fn vs_main(
     @builtin(instance_index) instance: u32,
 ) -> VsOut {
     var out: VsOut;
-    out.clip = u.view_proj * vec4<f32>(pos, 1.0);
-    out.world_pos = pos;
-    out.normal = nrm.xyz;
+    var p = pos;
+    var n = nrm.xyz;
+    if (instance == 0u) {
+        p = (u.model * vec4<f32>(pos, 1.0)).xyz;
+        n = (u.model * vec4<f32>(n, 0.0)).xyz;
+    }
+    out.clip = u.view_proj * vec4<f32>(p, 1.0);
+    out.world_pos = p;
+    out.normal = n;
     out.parked = instance;
     return out;
 }

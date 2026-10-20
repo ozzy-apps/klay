@@ -18,6 +18,7 @@ cargo run --release -- --subtools 4                         # start with four sp
 cargo run --release -- --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
 cargo run --release -- --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
+cargo run --release -- --divide 2 --novsync --selftest-transpose     # Transpose move / scale / rotate + undo through the input path, log, exit
 ```
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
@@ -49,8 +50,9 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
 presets, mesh rebuild, subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
-vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
-Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
+vertex budget), undo/redo, OBJ export, the Move / Scale / Rotate modes (Transpose action line)
+and live statistics are connected to the engine. Paint modes, Zcut, Focal Shift, stroke
+options, alpha, texture, masking, the Transform palette, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
 
 Brush thumbnails are rendered on the CPU at startup: a sphere in the current material with the
@@ -91,7 +93,12 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | `S` / `U` | Draw-size / Z-intensity slider popup at the cursor (`I`, `O` are stubs) |
 | `[` `]` | Brush radius |
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
-| `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode (only Draw sculpts so far) |
+| `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode |
+| `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press (Shift snaps it to 45°) |
+| `W`, drag the line's middle circle | Move the active subtool in the view plane |
+| `E`, drag the line's end circle | Scale about the start circle by the change in distance to it (start circle: about the end) |
+| `R`, drag the line's end circle | Rotate about the start circle around the view axis (start circle: about the end) |
+| Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line; the model stays |
 | `X` | Symmetry across X |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
@@ -140,6 +147,19 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
   Delete and reordering; Deformation moves and sizes the active subtool exactly at every
   level, undoably.
+- `transform.rs`: moving, scaling and rotating a whole subtool, ZBrush Transpose style.
+  The map is `p -> c + s R (p - c) + t` (rotation, uniform scale, translation). Loop weights
+  sum to one, so subdivision commutes with it: every level maps exactly by mapping its
+  positions and turning its offsets by `s R`, stale levels included, and its exact inverse is
+  the undo step. The action line lives in world space; a drag on one of its circles turns
+  the cursor into a map (the press point follows the cursor on its view plane for Move, the
+  ratio of distances to the pivot on screen for Scale, the angle about the pivot for
+  Rotate, around the line of sight through it). While dragging nothing moves on the CPU: the
+  map goes to the vertex shader as a model matrix for the active subtool, so the drag costs
+  nothing per frame. On release the CPU maps every level once, and the GPU copy of the shown
+  level is mapped in place by a compute pass (`affine.wgsl`) instead of being uploaded again;
+  normals are recomputed only after a rotation, and the normal accumulators' fixed-point
+  scale follows the change in face area.
 - `project.rs`: `.klay` project files hold every subtool in the same packed form parked
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
@@ -194,6 +214,16 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | 960k vertices, one level | 92 MB | 34 MB | 38 MB | 16 ms | 39 ms |
 | Two levels, 3.84M at the top | 526 MB | 38 MB | 38 MB | 49 ms | 0.19 s |
 | Three levels, 15.4M at the top | 2.26 GB | 53 MB | 38 MB | 0.19 s | 0.97 s |
+
+### Transpose (`--divide 2 --novsync --selftest-transpose`, 15.4M vertices shown, three levels)
+
+| Step | Result |
+| --- | --- |
+| Frame while dragging (model matrix in the vertex shader) | 3.4 ms, idle 3.7 ms: no cost |
+| Release of a move / scale: CPU map of all three levels, GPU map in place | 16–17 ms |
+| Release of a rotation (chunk boxes refitted, full normal pass) | 25 ms |
+| Same releases re-uploading the shown level (184 MB) instead | 52–62 ms |
+| GPU copy vs CPU after three transforms and three undos | 9e-7 |
 
 Project files (`--selftest-project`, one 15.4M-vertex three-level subtool plus two 960k
 spheres): 123 MB, saved in 0.09 s and opened in 1.35 s; after the demo strokes, including a

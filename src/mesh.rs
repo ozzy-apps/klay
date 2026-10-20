@@ -627,6 +627,20 @@ impl SculptMesh {
         }
     }
 
+    /// Every vertex was moved by `f`, a map that keeps the order along each axis (a
+    /// translation and a positive scale): each chunk's box maps exactly through `f`, so it
+    /// needs no refit over the vertices. Marks every chunk for upload and normals.
+    pub fn finish_monotone_edit(&mut self, f: impl Fn(Vec3) -> Vec3 + Sync) {
+        self.chunks.par_iter_mut().for_each(|ch| {
+            ch.aabb = Aabb {
+                min: f(ch.aabb.min),
+                max: f(ch.aabb.max),
+            };
+            ch.dirty_pos = true;
+            ch.dirty_nrm = true;
+        });
+    }
+
     /// Per-chunk flags (1 = recompute normals) for `chunks` and their neighbours.
     pub fn normal_flags(&self, chunks: &[u32]) -> Vec<u32> {
         let mut flags = vec![0u32; self.chunks.len()];
