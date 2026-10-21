@@ -6,23 +6,52 @@ before polygon count becomes the bottleneck.
 ## Run
 
 ```bash
-cargo run --release                       # 960k vertices
+cargo run --release                       # a 4 058-vertex sphere, ZBrush's starting resolution
+cargo run --release -- --segments 400     # the 960k-vertex sphere Klay used to start with
+cargo run --release -- --primitive cube   # start from Cube3D: sphere, cube, cylinder, ring (torus), plane
+cargo run --release -- --primitive ring --segments 100      # resolution of the chosen primitive
 cargo run --release -- --segments 1200    # 8.6M vertices
-cargo run --release -- --demo             # apply scripted strokes on startup
+cargo run --release -- --segments 400 --demo                # apply scripted strokes on startup
 cargo run --release -- --bench 1500       # headless CPU benchmark at 13.5M vertices
 cargo run --release -- --segments 1500 --stress --novsync   # per-frame cost of a huge grab
-cargo run --release -- --divide 2                           # start two subdivision levels up (15.4M vertices)
+cargo run --release -- --segments 400 --divide 2            # start two subdivision levels up (15.4M vertices)
 cargo run --release -- --bench 400 --divide 2               # divide timings, base-level stroke, step-up cost
-cargo run --release -- --divide 2 --novsync --frames        # average frame time at the top level, then exit
-cargo run --release -- --subtools 4                         # start with four sphere subtools in a row
-cargo run --release -- --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
+cargo run --release -- --segments 400 --divide 2 --novsync --frames   # average frame time at the top level, then exit
+cargo run --release -- --subtools 4                         # start with four subtools in a row
+cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
-cargo run --release -- --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
+cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
 ```
 
+`--segments N` sets the resolution of the starting primitive (`--primitive NAME`, Sphere by
+default; ZBrush names such as `Cube3D` work too). `--bench N` builds the primitive at N
+segments, 400 by default, so the benchmark numbers below keep their meshes. The numbers for
+windowed runs below were taken with `--segments 400`.
+
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
-default sphere); the Geometry section of the Mesh palette has the same slider. Each level costs
+960k sphere); the Geometry section of the Mesh palette has the same slider. Each level costs
 about 140 bytes per vertex of RAM and 52 bytes per vertex of GPU memory while it is shown.
+
+### Primitives
+
+Models start low and gain detail through Divide, as in ZBrush. Mesh → Initialize picks the
+primitive and its resolution; Document → New, SubTool → Append and Initialize → Rebuild (which
+replaces the active subtool in place) all use it. Each primitive keeps its own resolution, and
+the slider shows the vertex count it gives.
+
+| Primitive | Shape | Segments mean | Default (Low) | Dense |
+| --- | --- | --- | --- | --- |
+| Sphere3D | cube sphere, no poles | quads per cube edge | 26: 4 058 vertices | 400: 960 002 |
+| Cube3D | box | quads per edge | 26: 4 058 | 400: 960 002 |
+| Cylinder3D | box mapped to a cylinder, caps without a centre pole | quads per quarter turn | 24: 4 130 | 380: 1.0M |
+| Ring3D | torus, outer radius 1, tube 0.25 | quads around the tube (3× around the ring) | 37: 4 107 | 577: 1.0M |
+| Plane3D | square facing the front view | quads per side | 63: 4 096 | 999: 1.0M |
+
+All of them are triangulated quad grids with interior vertices of valence 6, Loop
+subdivision's regular case, so dividing them twice gives clean, even meshes. All are closed
+except Plane3D, which has a border: Divide uses Loop's boundary rules there (border vertices
+follow the border, the four corners stay put), so the plane keeps its square outline and
+stays flat. It is drawn from the front only, like any open surface (back faces are culled).
 
 ## Workspace
 
@@ -48,7 +77,7 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
   Older `v1` layout files are ignored and replaced.
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
-presets, mesh rebuild, subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
+presets, primitives (Mesh → Initialize), subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
 vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
 Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
@@ -57,7 +86,8 @@ Brush thumbnails are rendered on the CPU at startup: a sphere in the current mat
 stroke each brush produces (Draw and Inflate flip in Zsub). They re-render when the material
 changes.
 
-For a lighter preview: `cargo run --release -- --segments 200`.
+The default start is light (4k vertices); `cargo run --release -- --segments 400` gives the
+960k-vertex sphere.
 
 ### Extending the UI
 
@@ -118,6 +148,9 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   chunk the first time a stroke touches it. Grab runs on the GPU (`grab.wgsl`): the
   selection, original positions and weights go up once, each frame sends one delta, and
   the CPU applies the final result when the stroke ends.
+- `primitive.rs`: the starting meshes (Sphere3D, Cube3D, Cylinder3D, Ring3D, Plane3D). Sphere,
+  Cube and Cylinder are the surface of a lattice box mapped onto the shape, so `--segments`
+  still gives the old cube sphere bit for bit.
 - `multires.rs`: ZBrush-style subdivision levels. Divide Loop-subdivides the top level 1:4,
   keeping chunk locality (each parent chunk's vertices and edge midpoints are split spatially
   into its child chunks) and building every table of the new mesh in parallel over chunks.
@@ -125,7 +158,9 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   chunk and only for chunks that were sculpted at that level. Sculpting edits the active
   level; its offsets are refreshed for the touched chunks when the stroke ends. Levels above
   are synced lazily: edited chunks are marked stale, and stepping up re-smooths only the
-  dependent child chunks and re-applies their offsets, one level at a time. Edits at the top
+  dependent child chunks and re-applies their offsets, one level at a time. Meshes with a
+  border (Plane3D) get Loop's boundary rules, chosen from topology alone so a replay gets
+  the same stencils; on a closed mesh nothing changes. Edits at the top
   level touch nothing else. Undo stores positions at level 0 and offsets above it, so it
   works at any level, and the displayed level follows; Divide itself is undoable.
 - `subtool.rs`: ZBrush-style SubTools. One subtool is active and holds its full level

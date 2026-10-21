@@ -328,7 +328,8 @@ impl DockLayout {
 // ---------------------------------------------------------------- app interface
 pub struct Model<'a> {
     pub brush: &'a mut Brush,
-    pub segments: &'a mut u32,
+    /// Primitive and resolution used by New, Append and Rebuild.
+    pub primitive: &'a mut crate::primitive::Settings,
     pub export_path: &'a mut String,
     pub status: &'a str,
     pub can_undo: bool,
@@ -555,7 +556,14 @@ impl Workspace {
         if self.dropdown.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.dropdown = None;
         }
-        self.menubar(ui);
+        let title = {
+            let file = std::path::Path::new(m.project_path.as_str())
+                .file_stem()
+                .map_or_else(|| "Untitled".to_string(), |n| n.to_string_lossy().to_string());
+            let active = m.subtools.iter().find(|r| r.active).map_or("", |r| r.name.as_str());
+            format!("{file} · {active}")
+        };
+        self.menubar(ui, &title);
         self.status_bar(ui, m);
         if !self.focus {
             self.shelf_top(ui, m, &mut a);
@@ -736,7 +744,7 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ menu bar
-    fn menubar(&mut self, ui: &mut Ui) {
+    fn menubar(&mut self, ui: &mut Ui, title: &str) {
         let response = egui::Panel::top("menubar")
             .exact_size(MENUBAR_H)
             .resizable(false)
@@ -806,7 +814,7 @@ impl Workspace {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("Untitled · Sphere").size(11.0).color(FG3));
+                        ui.label(RichText::new(title).size(11.0).color(FG3));
                     });
                 });
             })
@@ -1759,7 +1767,7 @@ impl Workspace {
                         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
                         let w = (r.width() - 6.0) / 3.0;
                         for (col, (label, hint)) in [
-                            ("New", "Start over with one sphere"),
+                            ("New", "Start over with one subtool from Mesh › Initialize"),
                             ("Open", "Open the project at this path · Ctrl + O"),
                             ("Save", "Save every subtool to this path · Ctrl + S"),
                         ]
@@ -1946,7 +1954,7 @@ impl Workspace {
                         // instead of widening the tray.
                         let mut clicked = [false; 6];
                         let labels = [
-                            ("Append", true, "Add a sphere subtool next to the model and select it"),
+                            ("Append", true, "Add the Initialize primitive next to the model and select it"),
                             ("Duplicate", true, "Copy the active subtool below it"),
                             ("Delete", count > 1, "Delete the active subtool · not undoable"),
                             ("Up", active > 0, "Move the active subtool up the list"),
@@ -2086,31 +2094,78 @@ impl Workspace {
                     ui,
                     h,
                     id,
-                    "rebuild",
-                    "Rebuild",
+                    "initialize",
+                    "Initialize",
                     None,
                     true,
                     true,
                     &mut |_, ui| {
-                        let mut s = *m.segments as f32;
-                        if zslider(ui, "Segments", &mut s, 50.0..=1500.0, true, false, 0) {
-                            *m.segments = s.round() as u32;
+                        use crate::primitive::Primitive;
+                        // Three fixed cells per row, like the SubTool buttons.
+                        for row in Primitive::ALL.chunks(3) {
+                            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                            let w = (r.width() - 6.0) / 3.0;
+                            for (col, &kind) in row.iter().enumerate() {
+                                let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                                child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                                let hint = format!(
+                                    "{} vertices at {} segments",
+                                    crate::fmt_count(kind.vertex_count(m.primitive.segments[kind.index()])),
+                                    m.primitive.segments[kind.index()]
+                                );
+                                if child
+                                    .put(
+                                        cell,
+                                        egui::Button::new(RichText::new(kind.name()).size(11.0))
+                                            .truncate()
+                                            .selected(m.primitive.kind == kind),
+                                    )
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    m.primitive.kind = kind;
+                                }
+                            }
                         }
-                        let estimate = 6 * *m.segments as usize * *m.segments as usize + 2;
-                        note(
-                            ui,
-                            &format!("≈ {} vertices after rebuild", crate::fmt_count(estimate)),
-                        );
+                        let kind = m.primitive.kind;
+                        let (lo, hi) = kind.segment_range();
+                        let mut s = m.primitive.current() as f32;
+                        if zslider(ui, "Segments", &mut s, lo as f32..=hi as f32, true, false, 0) {
+                            m.primitive.set_current(s.round() as u32);
+                        }
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            for (label, segments, hint) in [
+                                ("Low", kind.default_segments(), "About 4 000 vertices, ZBrush's starting resolution"),
+                                (
+                                    "Dense",
+                                    kind.dense_segments(),
+                                    "About a million vertices (Sphere3D: the 960k sphere, --segments 400)",
+                                ),
+                            ] {
+                                let on = m.primitive.current() == segments;
+                                if ui
+                                    .add(egui::Button::new(label).selected(on).min_size(vec2(w, 20.0)))
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    m.primitive.set_current(segments);
+                                }
+                            }
+                        });
+                        kv(ui, "Vertices", &crate::fmt_count(m.primitive.vertex_count()));
+                        if !kind.closed() {
+                            note(ui, "Open surface: its border stays put when divided; seen from the front only.");
+                        }
                         if ui
-                            .add_sized(
-                                [ui.available_width(), 20.0],
-                                egui::Button::new("Rebuild sphere"),
-                            )
-                            .on_hover_text("Replaces the mesh and clears undo history")
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Rebuild"))
+                            .on_hover_text("Replace the active subtool with this primitive, in place · clears its levels and undo history")
                             .clicked()
                         {
                             a.rebuild = true;
                         }
+                        note(ui, "New (Document) and Append (SubTool) also start from this primitive.");
                     },
                 );
                 self.sec(
@@ -2556,7 +2611,8 @@ impl Workspace {
                             }
                         }
                     });
-                    ui.label(RichText::new("/  Sphere").size(11.0).color(FG3));
+                    let active = m.subtools.iter().find(|r| r.active).map_or("", |r| r.name.as_str());
+                    ui.label(RichText::new(format!("/  {active}")).size(11.0).color(FG3));
                 });
             });
         if !self.focus {
@@ -3789,11 +3845,23 @@ mod tests {
         events: Vec<egui::Event>,
         subtools: &[SubToolRow],
     ) -> egui::FullOutput {
+        let mut primitive = crate::primitive::Settings::default();
+        frame_full(workspace, ctx, size, events, subtools, &mut primitive).0
+    }
+
+    fn frame_full(
+        workspace: &mut Workspace,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+        subtools: &[SubToolRow],
+        primitive: &mut crate::primitive::Settings,
+    ) -> (egui::FullOutput, Actions) {
         let mut brush = Brush::default();
-        let mut segments = 200;
+        let mut actions = Actions::default();
         let mut budget = 20_000_000usize;
         let mut path = String::from("test.obj");
-        ctx.run_ui(
+        let out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                 events,
@@ -3801,11 +3869,11 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                workspace.show(
+                actions = workspace.show(
                     ui,
                     &mut Model {
                         brush: &mut brush,
-                        segments: &mut segments,
+                        primitive,
                         export_path: &mut path,
                         status: "",
                         can_undo: false,
@@ -3834,7 +3902,8 @@ mod tests {
                     },
                 );
             },
-        )
+        );
+        (out, actions)
     }
 
     fn pointer(pos: Pos2, pressed: bool) -> egui::Event {
@@ -4129,5 +4198,33 @@ mod tests {
         let (wide, narrow) = (place(&three, 262.0), place(&three, 200.0));
         assert!((narrow.0 - wide.0 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
         assert!((narrow.1 - wide.1 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
+    }
+
+    #[test]
+    fn initialize_picks_the_primitive_its_resolution_and_rebuilds() {
+        use crate::primitive::{Primitive, Settings};
+        let (mut workspace, ctx) = test_workspace("initialize");
+        let size = vec2(1600.0, 2600.0);
+        let mut settings = Settings::default();
+        let rows = [row("Sphere 1", true)];
+        let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
+        assert_eq!(text_count(&out, "4 058"), 1, "the sphere's vertex count is shown");
+        let click = |workspace: &mut Workspace, settings: &mut Settings, at: Pos2| {
+            frame_full(workspace, &ctx, size, vec![egui::Event::PointerMoved(at)], &rows, settings);
+            frame_full(workspace, &ctx, size, vec![pointer(at, true)], &rows, settings);
+            frame_full(workspace, &ctx, size, vec![pointer(at, false)], &rows, settings).1
+        };
+        let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
+        click(&mut workspace, &mut settings, text_position(&out, "Ring3D") + vec2(4.0, 4.0));
+        assert_eq!(settings.kind, Primitive::Ring);
+        let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
+        assert_eq!(text_count(&out, "4 107"), 1, "the ring's vertex count follows");
+        click(&mut workspace, &mut settings, text_position(&out, "Dense") + vec2(4.0, 4.0));
+        assert_eq!(settings.current(), Primitive::Ring.dense_segments());
+        assert_eq!(settings.segments[Primitive::Sphere.index()], 26, "each primitive keeps its own resolution");
+        let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
+        let a = click(&mut workspace, &mut settings, text_position(&out, "Rebuild") + vec2(4.0, 4.0));
+        assert!(a.rebuild);
+        let _ = std::fs::remove_file(&workspace.persistence_path);
     }
 }

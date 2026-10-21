@@ -22,10 +22,11 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 const NONE: u32 = u32::MAX;
 
-/// How a child vertex is smoothed from its parent level. `[p, NONE, _, _]` is the even
-/// vertex above parent vertex `p` (its ring comes from the parent's adjacency); `[a, b, c, d]`
-/// is the odd vertex on parent edge `a-b` with opposite vertices `c` and `d` (`d == NONE` on a
-/// boundary edge).
+/// How a child vertex is smoothed from its parent level. `[p, NONE, NONE, NONE]` is the even
+/// vertex above interior parent vertex `p` (its ring comes from the parent's adjacency);
+/// `[p, NONE, a, b]` is the even vertex above a border vertex with border neighbours `a` and
+/// `b` (a corner, which stays put, has `a == b == p`); `[a, b, c, d]` is the odd vertex on
+/// parent edge `a-b` with opposite vertices `c` and `d` (`d == NONE` on a border edge).
 type Stencil = [u32; 4];
 
 /// Chunk positions saved for undo: at level 0 these are positions, above it offsets.
@@ -97,6 +98,10 @@ fn smooth(parent: &SculptMesh, s: Stencil) -> Vec3 {
     let p = &parent.positions;
     if s[1] == NONE {
         let v = s[0] as usize;
+        if s[2] != NONE {
+            // Loop's boundary rule: the border is smoothed as a curve of its own.
+            return p[v] * 0.75 + (p[s[2] as usize] + p[s[3] as usize]) * 0.125;
+        }
         let nb = parent.neighbors(s[0]);
         let n = nb.len();
         if n == 0 {
@@ -204,9 +209,10 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     // Natural ids: even vertex `v` is `v`, odd vertex of edge `e` is `v_count + e`.
     let odd_nat = |a: u32, b: u32| (v_count as u32) + edge_id(a, b);
 
-    // 2. Odd stencils in edge order, filled per parent chunk.
+    // 2. Odd stencils in edge order, filled per parent chunk, collecting the edges on a
+    // border (those with one triangle; a closed mesh has none).
     let mut odd = vec![[NONE; 4]; e_count];
-    {
+    let border_edges: Vec<(u32, u32)> = {
         let ranges = pc.iter().map(|ch| {
             (
                 edge_base[ch.vert_start as usize] as usize,
@@ -216,8 +222,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         split_ranges(&mut odd, ranges)
             .into_par_iter()
             .zip(pc.par_iter())
-            .for_each(|(slice, ch)| {
+            .flat_map_iter(|(slice, ch)| {
                 let mut k = 0;
+                let mut border = Vec::new();
                 for v in ch.vert_start..ch.vert_end {
                     for &w in parent.neighbors(v) {
                         if w <= v {
@@ -227,12 +234,56 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
                         for (i, (_, _, _, o)) in edge_tris(parent, v, w).enumerate() {
                             s[2 + i] = o;
                         }
+                        if s[3] == NONE {
+                            border.push((v, w));
+                        }
                         slice[k] = s;
                         k += 1;
                     }
                 }
-            });
-    }
+                border
+            })
+            .collect()
+    };
+
+    // Even stencils. On a mesh with a border every border vertex gets Loop's boundary rule:
+    // it follows its two border neighbours, and one that touches a single triangle is a
+    // corner and stays put (so does a vertex where several borders meet). Topology alone
+    // decides, so a replay gets the same stencils whatever the positions are now.
+    let border: Option<Vec<Stencil>> = (!border_edges.is_empty()).then(|| {
+        let mut st: Vec<Stencil> = (0..v_count as u32)
+            .into_par_iter()
+            .map(|v| [v, NONE, NONE, NONE])
+            .collect();
+        for &(a, b) in &border_edges {
+            for (v, w) in [(a, b), (b, a)] {
+                let s = &mut st[v as usize];
+                if s[2] == NONE {
+                    s[2] = w;
+                } else if s[3] == NONE {
+                    s[3] = w;
+                } else {
+                    *s = [v, NONE, v, v];
+                }
+            }
+        }
+        for &(a, b) in &border_edges {
+            for v in [a, b] {
+                let s = &mut st[v as usize];
+                if s[3] == NONE || parent.incident(v).len() == 1 {
+                    *s = [v, NONE, v, v];
+                }
+            }
+        }
+        st
+    });
+    drop(border_edges);
+    let even_stencil = |v: u32| -> Stencil {
+        match &border {
+            Some(b) => b[v as usize],
+            None => [v, NONE, NONE, NONE],
+        }
+    };
 
     // 3. Smoothed positions in natural order.
     let mut pos_nat = vec![Vec3::ZERO; n_count];
@@ -240,7 +291,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         let (even, odd_pos) = pos_nat.split_at_mut(v_count);
         even.par_iter_mut()
             .enumerate()
-            .for_each(|(v, p)| *p = smooth(parent, [v as u32, NONE, 0, 0]));
+            .for_each(|(v, p)| *p = smooth(parent, even_stencil(v as u32)));
         odd_pos
             .par_iter_mut()
             .zip(odd.par_iter())
@@ -351,7 +402,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
                     p[i] = pos_nat[nat as usize];
                     vc[i] = ci as u32;
                     let s = if (nat as usize) < v_count {
-                        [nat, NONE, 0, 0]
+                        even_stencil(nat)
                     } else {
                         odd[nat as usize - v_count]
                     };
@@ -369,6 +420,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     }
     drop(pos_nat);
     drop(odd);
+    drop(border);
     for i in 0..n_count {
         adj_offsets[i + 1] += adj_offsets[i];
         vt_offsets[i + 1] += vt_offsets[i];

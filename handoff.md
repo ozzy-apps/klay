@@ -74,5 +74,5 @@ The requested UI mockup is complete. Further product work can proceed independen
 ## Practical notes for the next AI
 - Keep the user's saved layout; use Workspace → Reset layout only when explicitly desired. Tests use isolated temporary persistence files.
 - Layout tests emulate pen-style pointer drags; hardware stylus pressure has not been implemented or verified.
-- Run `cargo run --release -- --segments 200` for a light native preview. The default remains the original 960k-vertex sphere.
+- `cargo run --release` starts from a 4k-vertex sphere (Mesh → Initialize primitives); `--segments 400` gives the original 960k-vertex sphere for benchmarks.
 - The existing code was already untracked at the start of this task; do not infer that all untracked files were created by this change.

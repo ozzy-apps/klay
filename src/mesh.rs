@@ -9,9 +9,10 @@
 
 use glam::Vec3;
 use rayon::prelude::*;
-use std::collections::HashMap;
 #[cfg(test)]
 use std::io::Write;
+
+pub use crate::primitive::cube_sphere;
 
 /// Target number of vertices per chunk.
 pub const CHUNK_TARGET: usize = 4096;
@@ -871,59 +872,4 @@ pub(crate) fn partition_ids(ids: Vec<u32>, positions: &[Vec3]) -> Vec<Vec<u32>> 
         stack.push(right);
     }
     out
-}
-
-/// A sphere built from a subdivided cube (`segments` quads per cube edge), giving
-/// near-uniform triangle density with no pole pinching. Vertex count is about 6*segments^2.
-pub fn cube_sphere(segments: u32, radius: f32) -> (Vec<Vec3>, Vec<u32>) {
-    let n = segments;
-    let mut ids: HashMap<u64, u32> = HashMap::with_capacity((6 * n * n) as usize);
-    let mut positions: Vec<Vec3> = Vec::with_capacity((6 * n * n) as usize);
-    let key = |x: u32, y: u32, z: u32| (x as u64) | ((y as u64) << 21) | ((z as u64) << 42);
-
-    let mut vertex = |lattice: [u32; 3], positions: &mut Vec<Vec3>| -> u32 {
-        let k = key(lattice[0], lattice[1], lattice[2]);
-        *ids.entry(k).or_insert_with(|| {
-            let p = Vec3::new(lattice[0] as f32, lattice[1] as f32, lattice[2] as f32) / n as f32 * 2.0 - 1.0;
-            // Cube-to-sphere mapping with better area uniformity than plain normalisation.
-            let (x2, y2, z2) = (p.x * p.x, p.y * p.y, p.z * p.z);
-            let s = Vec3::new(
-                p.x * (1.0 - y2 / 2.0 - z2 / 2.0 + y2 * z2 / 3.0).sqrt(),
-                p.y * (1.0 - z2 / 2.0 - x2 / 2.0 + z2 * x2 / 3.0).sqrt(),
-                p.z * (1.0 - x2 / 2.0 - y2 / 2.0 + x2 * y2 / 3.0).sqrt(),
-            );
-            positions.push(s.normalize() * radius);
-            (positions.len() - 1) as u32
-        })
-    };
-
-    let mut indices: Vec<u32> = Vec::with_capacity((6 * n * n * 6) as usize);
-    // Each face: fixed axis and its value (0 or n), the other two axes vary.
-    for axis in 0..3usize {
-        for &side in &[0u32, n] {
-            let (u_axis, v_axis) = ((axis + 1) % 3, (axis + 2) % 3);
-            for i in 0..n {
-                for j in 0..n {
-                    let mut l = |a: u32, b: u32| {
-                        let mut lat = [0u32; 3];
-                        lat[axis] = side;
-                        lat[u_axis] = a;
-                        lat[v_axis] = b;
-                        vertex(lat, &mut positions)
-                    };
-                    let v00 = l(i, j);
-                    let v10 = l(i + 1, j);
-                    let v11 = l(i + 1, j + 1);
-                    let v01 = l(i, j + 1);
-                    // Outward winding: flip when the face sits on the negative side.
-                    if side == n {
-                        indices.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
-                    } else {
-                        indices.extend_from_slice(&[v00, v11, v10, v00, v01, v11]);
-                    }
-                }
-            }
-        }
-    }
-    (positions, indices)
 }

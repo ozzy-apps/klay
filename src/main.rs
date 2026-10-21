@@ -1,6 +1,7 @@
 mod camera;
 mod mesh;
 mod multires;
+mod primitive;
 mod project;
 mod render;
 mod sculpt;
@@ -10,6 +11,7 @@ mod workspace;
 use camera::Camera;
 use glam::{Vec2, Vec3};
 use mesh::{SculptMesh, cube_sphere};
+use primitive::Primitive;
 use multires::Multires;
 use render::{Gfx, Uniforms};
 use mesh::Aabb;
@@ -137,7 +139,8 @@ struct App {
     // UI state.
     workspace: workspace::Workspace,
     canvas_rect: egui::Rect,
-    segments: u32,
+    /// Primitive and resolution used by New, Append and Rebuild (ZBrush: Tool > Initialize).
+    primitive: primitive::Settings,
     export_path: String,
     status: String,
     pending_rebuild: bool,
@@ -173,9 +176,18 @@ struct App {
 }
 
 impl App {
+    /// Start with a sphere of `segments` (tests).
+    #[cfg(test)]
     fn new(segments: u32, demo: bool, budget: usize) -> Self {
+        let mut settings = primitive::Settings::default();
+        settings.set_current(segments);
+        Self::with_primitive(settings, demo, budget)
+    }
+
+    /// Start with one subtool made from `settings`.
+    fn with_primitive(settings: primitive::Settings, demo: bool, budget: usize) -> Self {
         let t = Instant::now();
-        let (p, i) = cube_sphere(segments, 1.0);
+        let (p, i) = settings.build(1.0);
         let mesh = SculptMesh::from_raw(p, i);
         let build_ms = t.elapsed().as_secs_f32() * 1000.0;
         Self {
@@ -185,7 +197,7 @@ impl App {
             egui_state: None,
             subtools: vec![SubTool {
                 id: 1,
-                name: "Sphere 1".to_string(),
+                name: format!("{} 1", settings.kind.short()),
                 visible: true,
                 bounds: mesh.bounds(),
                 parked: None,
@@ -213,7 +225,7 @@ impl App {
             hover: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
-            segments,
+            primitive: settings,
             export_path: "klay_export.obj".to_string(),
             status: String::new(),
             pending_rebuild: false,
@@ -326,28 +338,32 @@ impl App {
         id
     }
 
-    /// Add a sphere subtool next to the visible model and make it active (ZBrush: Append).
-    fn append_sphere(&mut self) {
+    /// Add a subtool made from the current primitive next to the visible model and make it
+    /// active (ZBrush: Append). It is half the size of a new project's first subtool and
+    /// sits to the right of the model's bounds with a small gap.
+    fn append_primitive(&mut self) {
         if self.stroke.is_some() {
             return;
         }
         let bounds = self.model_bounds();
-        let radius = 0.5;
-        let center = Vec3::new(
-            bounds.max.x + radius * 1.25,
-            (bounds.min.y + bounds.max.y) * 0.5,
-            (bounds.min.z + bounds.max.z) * 0.5,
-        );
         let budget = self.doc.budget;
         self.park_active();
         let t = Instant::now();
-        let (p, i) = cube_sphere(self.segments, radius);
+        let size = 0.5;
+        let (p, i) = self.primitive.build(size);
+        let half_x = p.iter().fold(0.0f32, |m, q| m.max(q.x.abs()));
+        let center = Vec3::new(
+            bounds.max.x + half_x + size * 0.25,
+            (bounds.min.y + bounds.max.y) * 0.5,
+            (bounds.min.z + bounds.max.z) * 0.5,
+        );
         let p = p.into_iter().map(|q| q + center).collect();
         self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
         let id = self.new_tool_id();
+        let name = format!("{} {id}", self.primitive.kind.short());
         self.subtools.push(SubTool {
             id,
-            name: format!("Sphere {id}"),
+            name: name.clone(),
             visible: true,
             bounds: self.doc.bounds(),
             parked: None,
@@ -358,7 +374,7 @@ impl App {
         }
         self.show_active_level();
         self.status = format!(
-            "Appended Sphere {id}: {} vertices in {:.0} ms",
+            "Appended {name}: {} vertices in {:.0} ms",
             fmt_count(self.mesh().vertex_count()),
             t.elapsed().as_secs_f32() * 1000.0
         );
@@ -613,7 +629,7 @@ impl App {
         Ok(())
     }
 
-    /// Start over with one sphere subtool.
+    /// Start over with one subtool made from the current primitive.
     fn new_project(&mut self) {
         if self.stroke.is_some() {
             return;
@@ -625,13 +641,13 @@ impl App {
             gfx.clear_levels();
         }
         let budget = self.doc.budget;
-        let (p, i) = cube_sphere(self.segments, 1.0);
+        let (p, i) = self.primitive.build(1.0);
         self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
         self.subtools = vec![SubTool {
             id,
-            name: format!("Sphere {id}"),
+            name: format!("{} {id}", self.primitive.kind.short()),
             visible: true,
             bounds: self.doc.bounds(),
             parked: None,
@@ -727,11 +743,20 @@ impl App {
         let saved = self.cursor;
         for i in 0..self.subtools.len() {
             let b = if i == self.active_tool { self.doc.bounds() } else { self.subtools[i].bounds };
-            self.cursor = self.project((b.min + b.max) * 0.5);
-            let got = self.pick_subtool();
+            // The centre of the bounds, or for a shape with a hole there (Ring3D) a point
+            // three eighths of the way out along X or Z.
+            let (c, e) = ((b.min + b.max) * 0.5, (b.max - b.min) * 0.375);
+            let mut got = None;
+            for p in [c, c + Vec3::X * e.x, c - Vec3::X * e.x, c + Vec3::Z * e.z, c - Vec3::Z * e.z] {
+                self.cursor = self.project(p);
+                got = self.pick_subtool();
+                if got == Some(i) {
+                    break;
+                }
+            }
             let pass = got == Some(i);
             ok &= pass;
-            log::info!("selftest: pick at the centre of {} -> {:?} ({})", self.subtools[i].name, got.map(|g| &self.subtools[g].name), if pass { "ok" } else { "FAIL" });
+            log::info!("selftest: pick on {} -> {:?} ({})", self.subtools[i].name, got.map(|g| &self.subtools[g].name), if pass { "ok" } else { "FAIL" });
         }
         self.cursor = self.canvas_origin() + Vec2::splat(4.0);
         let got = self.pick_subtool();
@@ -739,7 +764,13 @@ impl App {
         log::info!("selftest: pick in the canvas corner -> {got:?} ({})", if got.is_none() { "ok" } else { "FAIL" });
         let target = (self.active_tool + 1) % self.subtools.len();
         let b = self.subtools[target].bounds;
-        self.cursor = self.project((b.min + b.max) * 0.5);
+        let (c, e) = ((b.min + b.max) * 0.5, (b.max - b.min) * 0.375);
+        for p in [c, c + Vec3::X * e.x, c - Vec3::X * e.x, c + Vec3::Z * e.z, c - Vec3::Z * e.z] {
+            self.cursor = self.project(p);
+            if self.pick_subtool() == Some(target) {
+                break;
+            }
+        }
         if let Some(i) = self.pick_subtool().filter(|&i| i != self.active_tool) {
             self.select_subtool(i);
         }
@@ -1104,11 +1135,23 @@ impl App {
         egui::pos2(self.cursor.x / self.scale, self.cursor.y / self.scale)
     }
 
-    /// Replace the active subtool's mesh with a fresh sphere of `segments`.
+    /// Replace the active subtool's mesh with the current primitive, in the same place and
+    /// at the same size. Its levels and undo history go.
     fn rebuild(&mut self) {
+        if self.stroke.is_some() {
+            return;
+        }
         let t = Instant::now();
-        let (p, i) = cube_sphere(self.segments, 1.0);
+        let b = self.doc.bounds();
+        let center = (b.min + b.max) * 0.5;
+        let size = ((b.max - b.min).max_element() * 0.5).max(1e-3);
+        let (p, i) = self.primitive.build(size);
+        let p = p.into_iter().map(|q| q + center).collect();
         self.doc = Multires::new(SculptMesh::from_raw(p, i), self.doc.budget);
+        let tool = &mut self.subtools[self.active_tool];
+        if let Some(rest) = auto_name_number(&tool.name) {
+            tool.name = format!("{} {rest}", self.primitive.kind.short());
+        }
         self.build_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.history.clear();
         self.stroke = None;
@@ -1206,7 +1249,7 @@ impl App {
             ui,
             &mut workspace::Model {
                 brush: &mut self.brush,
-                segments: &mut self.segments,
+                primitive: &mut self.primitive,
                 export_path: &mut self.export_path,
                 status: &self.status,
                 can_undo: self.history.can_undo(),
@@ -1355,7 +1398,7 @@ impl App {
         }
         match self.pending_subtool.take() {
             Some(SubToolOp::Select(i)) => self.select_subtool(i),
-            Some(SubToolOp::Append) => self.append_sphere(),
+            Some(SubToolOp::Append) => self.append_primitive(),
             Some(SubToolOp::Duplicate) => self.duplicate_subtool(),
             Some(SubToolOp::Delete) => self.delete_subtool(),
             Some(SubToolOp::Deform(kind, value)) => self.deform(kind, value),
@@ -1542,7 +1585,7 @@ impl ApplicationHandler for App {
             self.open_project(&path);
         }
         for _ in 0..std::mem::take(&mut self.initial_subtools) {
-            self.append_sphere();
+            self.append_primitive();
             log::info!("{}", self.status);
         }
         if self.subtools.len() > 1 {
@@ -1731,6 +1774,14 @@ impl ApplicationHandler for App {
     }
 }
 
+/// The number of a subtool name made from a primitive ("Cube 3" gives "3"), so Rebuild can
+/// rename it to the new primitive; `None` for a name the user chose.
+fn auto_name_number(name: &str) -> Option<&str> {
+    let (head, number) = name.rsplit_once(' ')?;
+    let known = Primitive::ALL.iter().any(|p| p.short() == head);
+    (known && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(number)
+}
+
 fn fmt_count(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -1759,8 +1810,8 @@ fn line(a: Vec2, b: Vec2, n: usize) -> Vec<Vec2> {
 }
 
 /// Headless benchmark: build, optional subdivision, scripted strokes, undo/redo, export.
-fn bench(segments: u32, divide: u32, budget: usize) {
-    let mut app = App::new(segments, false, budget);
+fn bench(settings: primitive::Settings, divide: u32, budget: usize) {
+    let mut app = App::with_primitive(settings, false, budget);
     println!(
         "mesh: {} vertices, {} triangles, {} chunks, built in {:.0} ms",
         fmt_count(app.mesh().vertex_count()),
@@ -1967,20 +2018,33 @@ fn main() {
     };
     let divide: u32 = flag("--divide").and_then(|s| s.parse().ok()).unwrap_or(0);
     let budget: usize = flag("--budget").and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_BUDGET);
-    if let Some(i) = args.iter().position(|a| a == "--bench") {
-        let segments = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(400);
-        bench(segments, divide, budget);
-        return;
-    }
     let demo = args.iter().any(|a| a == "--demo");
     let stress = args.iter().any(|a| a == "--stress");
     let frames = args.iter().any(|a| a == "--frames");
     let vsync = !args.iter().any(|a| a == "--novsync");
-    let segments = flag("--segments").and_then(|s| s.parse().ok()).unwrap_or(400);
+    // `--primitive NAME` picks the starting primitive (sphere, cube, cylinder, ring or
+    // torus, plane; ZBrush names work too); `--segments N` sets its resolution. Without
+    // them the model starts as a 4k-vertex sphere; `--segments 400` is the 960k one.
+    let mut settings = primitive::Settings::default();
+    if let Some(name) = flag("--primitive") {
+        match Primitive::parse(name) {
+            Some(kind) => settings.kind = kind,
+            None => eprintln!("--primitive {name}: unknown (sphere, cube, cylinder, ring, plane); using a sphere"),
+        }
+    }
+    if let Some(segments) = flag("--segments").and_then(|s| s.parse().ok()) {
+        settings.set_current(segments);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench") {
+        // `--bench N`: N segments of the primitive, 400 (the 960k sphere) by default.
+        settings.set_current(args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(400));
+        bench(settings, divide, budget);
+        return;
+    }
     let subtools: usize = flag("--subtools").and_then(|s| s.parse().ok()).unwrap_or(1);
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(segments, demo, budget);
+    let mut app = App::with_primitive(settings, demo, budget);
     app.vsync = vsync;
     for _ in 0..divide {
         let t = Instant::now();
@@ -2094,14 +2158,13 @@ mod subtool_tests {
     #[test]
     fn subtools_park_light_and_come_back_with_their_history() {
         let mut app = App::new(16, false, usize::MAX);
-        app.segments = 16;
         assert!(app.doc.divide());
         app.history.push(UndoStep::Divide(None));
         app.deform(Deform::OffsetX, -50.0);
         let shown = app.doc.mesh().positions.clone();
         let stack = app.doc.bytes();
 
-        app.append_sphere();
+        app.append_primitive();
         assert_eq!(app.subtools.len(), 2);
         assert_eq!(app.active_tool, 1);
         assert_eq!(app.doc.top(), 0, "the appended sphere starts undivided");
@@ -2144,6 +2207,66 @@ mod subtool_tests {
     }
 
     #[test]
+    fn append_new_and_rebuild_use_the_chosen_primitive() {
+        for kind in Primitive::ALL {
+            let mut app = App::new(8, false, usize::MAX);
+            app.primitive.kind = kind;
+            app.primitive.set_current(kind.default_segments());
+            let first = app.doc.bounds();
+            app.append_primitive();
+            assert_eq!(app.subtools.len(), 2);
+            assert_eq!(app.active_tool, 1);
+            assert_eq!(app.subtools[1].name, format!("{} 2", kind.short()));
+            assert_eq!(app.doc.mesh().vertex_count(), kind.vertex_count(kind.default_segments()));
+            assert_eq!(app.doc.top(), 0, "an appended primitive starts undivided");
+            // Beside the model like the old sphere append: to its right with a gap of a
+            // quarter of its size, centred on the model in Y and Z, half the size.
+            let b = app.doc.bounds();
+            let gap = b.min.x - first.max.x;
+            assert!((gap - 0.125).abs() < 1e-3, "{kind:?} gap {gap}");
+            let (c, fc) = ((b.min + b.max) * 0.5, (first.min + first.max) * 0.5);
+            assert!((c.y - fc.y).abs() < 1e-3 && (c.z - fc.z).abs() < 1e-3, "{kind:?} centre {c:?}");
+            assert!(((b.max - b.min).max_element() - 1.0).abs() < 1e-3, "{kind:?} is half size");
+            // It divides like any subtool.
+            app.divide();
+            assert_eq!(app.doc.top(), 1);
+
+            // Rebuild keeps the place and size, renames an automatic name, keeps a chosen one.
+            app.primitive.kind = Primitive::Sphere;
+            app.rebuild();
+            let r = app.doc.bounds();
+            assert_eq!(app.doc.top(), 0);
+            assert_eq!(app.subtools[1].name, "Sphere 2");
+            assert!((((r.min + r.max) * 0.5) - c).length() < 1e-3, "{kind:?} rebuilt in place");
+            app.subtools[1].name = "Head".into();
+            app.rebuild();
+            assert_eq!(app.subtools[1].name, "Head");
+
+            app.primitive.kind = kind;
+            app.new_project();
+            assert_eq!(app.subtools.len(), 1);
+            assert_eq!(app.doc.mesh().vertex_count(), kind.vertex_count(kind.default_segments()));
+            assert!(app.subtools[0].name.starts_with(kind.short()));
+            let b = app.doc.bounds();
+            assert!(((b.max - b.min).max_element() - 2.0).abs() < 1e-3, "{kind:?} new project size");
+        }
+    }
+
+    #[test]
+    fn the_default_start_is_a_4k_sphere_and_segments_400_the_old_one() {
+        let app = App::with_primitive(primitive::Settings::default(), false, usize::MAX);
+        assert_eq!(app.doc.mesh().vertex_count(), 4058);
+        assert_eq!(app.subtools[0].name, "Sphere 1");
+        let mut dense = primitive::Settings::default();
+        dense.set_current(Primitive::Sphere.dense_segments());
+        assert_eq!(dense.vertex_count(), 960_002);
+        assert_eq!(auto_name_number("Cube 12"), Some("12"));
+        assert_eq!(auto_name_number("Cube"), None);
+        assert_eq!(auto_name_number("Eye 2"), None);
+        assert_eq!(auto_name_number("Sphere 1 copy"), None);
+    }
+
+    #[test]
     fn projects_save_open_and_export_every_subtool() {
         let dir = std::env::temp_dir();
         let tag = std::process::id();
@@ -2151,11 +2274,11 @@ mod subtool_tests {
         let obj = dir.join(format!("klay-test-{tag}.obj"));
 
         let mut app = App::new(12, false, usize::MAX);
-        app.segments = 8;
+        app.primitive.set_current(8);
         assert!(app.doc.divide());
         app.history.push(UndoStep::Divide(None));
         app.deform(Deform::Size, 40.0);
-        app.append_sphere();
+        app.append_primitive();
         app.toggle_subtool(0);
         app.toggle_subtool(0);
         app.subtools[1].name = "Eye".to_string();
