@@ -58,6 +58,10 @@ except Plane3D, which has a border: Divide uses Loop's boundary rules there (bor
 follow the border, the four corners stay put), so the plane keeps its square outline and
 stays flat. It is drawn from the front only, like any open surface (back faces are culled).
 
+Cube3D starts with a polygroup per face and Cylinder3D with one for the wall and one per cap,
+so Ctrl + Shift + click isolates a face or cap straight away; the others start as one
+polygroup. The groups are carried through Divide and Wedge like any others.
+
 ## Workspace
 
 The native egui workspace follows ZBrush's model. Every palette lives in the menu bar and opens
@@ -129,7 +133,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Ctrl + Shift + click on empty canvas | Show everything |
 | Ctrl + Shift + drag on empty canvas, around nothing | Invert visibility |
 | Ctrl + `W` | With a mask: one new polygroup of the masked polygons, and the mask is cleared (Group Masked); without one: of the visible polygons (Group Visible) |
-| Shift + `F` | Polygroup colours and the polygon frame (ZBrush PolyF). A new model is one polygroup, shown in blue; Ctrl + W or the Polygroups palette makes more |
+| Shift + `F` | Polygroup colours and the polygon frame (ZBrush PolyF). A new Sphere, Ring or Plane is one polygroup, shown in blue; a Cube has one per face, a Cylinder one for the wall and each cap. Ctrl + W or the Polygroups palette makes more |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
 | Left drag in the border outside the canvas frame | Always navigates, even over the model, in every mode (as on empty canvas) |
@@ -177,7 +181,8 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   the CPU applies the final result when the stroke ends.
 - `primitive.rs`: the starting meshes (Sphere3D, Cube3D, Cylinder3D, Ring3D, Plane3D). Sphere,
   Cube and Cylinder are the surface of a lattice box mapped onto the shape, so `--segments`
-  still gives the old cube sphere bit for bit.
+  still gives the old cube sphere bit for bit. The box is built face by face, so the Cube's
+  and Cylinder's starting polygroups are runs of that order (`Primitive::groups`).
 - `multires.rs`: ZBrush-style subdivision levels. Divide Loop-subdivides the top level 1:4,
   keeping chunk locality (each parent chunk's vertices and edge midpoints are split spatially
   into its child chunks) and building every table of the new mesh in parallel over chunks.

@@ -236,8 +236,9 @@ struct App {
     /// `--selftest-groups`: `(phase, frames left)` of the polygroup / visibility self-test,
     /// which runs its steps a few frames apart so the GPU state can be checked in between.
     selftest_groups: Option<(u8, u32)>,
-    /// What the polygroup self-test expects to find, and whether every check passed.
-    selftest_groups_state: (usize, bool),
+    /// What the polygroup self-test expects to find, whether every check passed, and the
+    /// polygroups the model started with.
+    selftest_groups_state: (usize, bool, usize),
     /// `--selftest-transpose`: frame counter of the scripted move / scale / rotate / undo.
     selftest_transpose: Option<TransposeTest>,
     /// `--selftest-mask`: the scripted masking session.
@@ -334,8 +335,8 @@ impl App {
     /// Start with one subtool made from `settings`.
     fn with_primitive(settings: primitive::Settings, demo: bool, budget: usize) -> Self {
         let t = Instant::now();
-        let (p, i) = settings.build(1.0);
-        let mesh = SculptMesh::from_raw(p, i);
+        let (p, i, g) = settings.build(1.0);
+        let mesh = SculptMesh::from_raw_with_groups(p, i, g);
         let build_ms = t.elapsed().as_secs_f32() * 1000.0;
         Self {
             window: None,
@@ -356,7 +357,7 @@ impl App {
             selftest: None,
             selftest_project: None,
             selftest_groups: None,
-            selftest_groups_state: (0, true),
+            selftest_groups_state: (0, true, 1),
             selftest_transpose: None,
             selftest_mask: None,
             project_path: "untitled.klay".to_string(),
@@ -523,7 +524,7 @@ impl App {
         self.park_active();
         let t = Instant::now();
         let size = 0.5;
-        let (p, i) = self.primitive.build(size);
+        let (p, i, g) = self.primitive.build(size);
         let half_x = p.iter().fold(0.0f32, |m, q| m.max(q.x.abs()));
         let center = Vec3::new(
             bounds.max.x + half_x + size * 0.25,
@@ -531,7 +532,7 @@ impl App {
             (bounds.min.z + bounds.max.z) * 0.5,
         );
         let p = p.into_iter().map(|q| q + center).collect();
-        self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
+        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
         self.subtools.push(SubTool {
@@ -1065,8 +1066,8 @@ impl App {
             gfx.clear_levels();
         }
         let budget = self.doc.budget;
-        let (p, i) = self.primitive.build(1.0);
-        self.doc = Multires::new(SculptMesh::from_raw(p, i), budget);
+        let (p, i, g) = self.primitive.build(1.0);
+        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
         self.subtools = vec![SubTool {
@@ -1458,7 +1459,7 @@ impl App {
         };
         match phase {
             0 => {
-                self.selftest_groups_state = (self.mesh().vertex_count(), true);
+                self.selftest_groups_state = (self.mesh().vertex_count(), true, 1);
                 let before = self.mesh().vertex_count();
                 let t = Instant::now();
                 self.pending_geo = Some(GeoOp::WedgeToggle);
@@ -1522,6 +1523,9 @@ impl App {
         match phase {
             0 => {
                 let total = self.mesh().triangle_count();
+                // A Cube or Cylinder starts with several polygroups.
+                let before = self.mesh().group_count();
+                self.selftest_groups_state.2 = before;
                 let t = Instant::now();
                 self.gesture(cs, centre - half, centre + half);
                 let rect_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -1534,7 +1538,7 @@ impl App {
                 self.run_pending_vis();
                 let group_ms = t.elapsed().as_secs_f32() * 1000.0;
                 let groups = self.mesh().group_count();
-                check(self, &format!("Ctrl + W made {groups} polygroups in {group_ms:.0} ms"), groups == 2);
+                check(self, &format!("Ctrl + W made {groups} polygroups in {group_ms:.0} ms"), groups == before + 1);
                 self.workspace.polyframe = true;
                 self.selftest_groups_state.0 = kept;
                 Some(1)
@@ -1576,8 +1580,9 @@ impl App {
                 self.history.undo(&mut self.doc);
                 self.show_active_level();
                 let undo_ms = t.elapsed().as_secs_f32() * 1000.0;
-                let clean = self.mesh().hidden_count() == 0 && self.mesh().group_count() == 1;
-                check(self, &format!("three undos back to one group, nothing hidden, in {undo_ms:.0} ms"), clean);
+                let before = self.selftest_groups_state.2;
+                let clean = self.mesh().hidden_count() == 0 && self.mesh().group_count() == before;
+                check(self, &format!("three undos back to {before} polygroup(s), nothing hidden, in {undo_ms:.0} ms"), clean);
                 let ok = self.selftest_groups_state.1;
                 log::info!("selftest: {}", if ok { "all passed" } else { "FAILED" });
                 None
@@ -2617,9 +2622,9 @@ impl App {
         let b = self.doc.bounds();
         let center = (b.min + b.max) * 0.5;
         let size = ((b.max - b.min).max_element() * 0.5).max(1e-3);
-        let (p, i) = self.primitive.build(size);
+        let (p, i, g) = self.primitive.build(size);
         let p = p.into_iter().map(|q| q + center).collect();
-        self.doc = Multires::new(SculptMesh::from_raw(p, i), self.doc.budget);
+        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), self.doc.budget);
         let tool = &mut self.subtools[self.active_tool];
         if let Some(rest) = auto_name_number(&tool.name) {
             tool.name = format!("{} {rest}", self.primitive.kind.short());
@@ -3869,6 +3874,13 @@ mod subtool_tests {
             assert_eq!(app.subtools[1].name, format!("{} 2", kind.short()));
             assert_eq!(app.doc.mesh().vertex_count(), kind.vertex_count(kind.default_segments()));
             assert_eq!(app.doc.top(), 0, "an appended primitive starts undivided");
+            // Cube: a polygroup per face; Cylinder: the wall and each cap; the rest: one.
+            let groups = match kind {
+                Primitive::Cube => 6,
+                Primitive::Cylinder => 3,
+                _ => 1,
+            };
+            assert_eq!(app.doc.mesh().group_count(), groups, "{kind:?} appended");
             // Beside the model like the old sphere append: to its right with a gap of a
             // quarter of its size, centred on the model in Y and Z, half the size.
             let b = app.doc.bounds();
@@ -3877,9 +3889,10 @@ mod subtool_tests {
             let (c, fc) = ((b.min + b.max) * 0.5, (first.min + first.max) * 0.5);
             assert!((c.y - fc.y).abs() < 1e-3 && (c.z - fc.z).abs() < 1e-3, "{kind:?} centre {c:?}");
             assert!(((b.max - b.min).max_element() - 1.0).abs() < 1e-3, "{kind:?} is half size");
-            // It divides like any subtool.
+            // It divides like any subtool, keeping its polygroups.
             app.divide();
             assert_eq!(app.doc.top(), 1);
+            assert_eq!(app.doc.mesh().group_count(), groups, "{kind:?} divided");
 
             // Rebuild keeps the place and size, renames an automatic name, keeps a chosen one.
             app.primitive.kind = Primitive::Sphere;
@@ -3887,6 +3900,7 @@ mod subtool_tests {
             let r = app.doc.bounds();
             assert_eq!(app.doc.top(), 0);
             assert_eq!(app.subtools[1].name, "Sphere 2");
+            assert_eq!(app.doc.mesh().group_count(), 1, "a rebuilt Sphere is one polygroup");
             assert!((((r.min + r.max) * 0.5) - c).length() < 1e-3, "{kind:?} rebuilt in place");
             app.subtools[1].name = "Head".into();
             app.rebuild();
@@ -3897,6 +3911,7 @@ mod subtool_tests {
             assert_eq!(app.subtools.len(), 1);
             assert_eq!(app.doc.mesh().vertex_count(), kind.vertex_count(kind.default_segments()));
             assert!(app.subtools[0].name.starts_with(kind.short()));
+            assert_eq!(app.doc.mesh().group_count(), groups, "{kind:?} new project");
             let b = app.doc.bounds();
             assert!(((b.max - b.min).max_element() - 2.0).abs() < 1e-3, "{kind:?} new project size");
         }

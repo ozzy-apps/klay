@@ -6,7 +6,8 @@
 //! Cylinder are the surface of a lattice box mapped onto their shape (the sphere is the
 //! cube sphere Klay always used), so they have no poles. All of them are closed manifolds
 //! except Plane, whose border is subdivided with Loop's boundary rules (see
-//! `crate::multires`). Each fits the box `[-size, size]^3`.
+//! `crate::multires`). Each fits the box `[-size, size]^3`. Cube starts with a polygroup per
+//! face and Cylinder with one for its wall and one per cap; the others are one polygroup.
 
 use glam::Vec3;
 use std::collections::HashMap;
@@ -134,6 +135,24 @@ impl Primitive {
             Self::Plane => plane(n, size),
         }
     }
+
+    /// The polygroup of every triangle [`build`](Self::build) makes, in its order: Cube has
+    /// one per face, Cylinder one for the wall and one per cap. Empty (one group) for the
+    /// others.
+    pub fn groups(self, segments: u32) -> Vec<u16> {
+        let (lo, hi) = self.segment_range();
+        let n = segments.clamp(lo, hi);
+        // Per box face, in `box_surface` order: -x, +x, -y, +y, -z, +z.
+        let (dims, faces) = match self {
+            // The front (+z) is group 0. Opposite faces get the closest colours (groups 0 and
+            // 5, 1 and 4), so faces that meet at an edge always look clearly different.
+            Self::Cube => ([n, n, n], [4, 1, 3, 2, 5, 0]),
+            // Wall 0, top cap 1, bottom cap 2: the box's y faces are the caps.
+            Self::Cylinder => ([n, Self::cylinder_rows(n), n], [0, 0, 2, 1, 0, 0]),
+            _ => return Vec::new(),
+        };
+        box_face_groups(dims, faces)
+    }
 }
 
 /// The primitive used by New, Append and Rebuild, with one resolution per primitive
@@ -168,8 +187,10 @@ impl Settings {
         self.kind.vertex_count(self.current())
     }
 
-    pub fn build(&self, size: f32) -> (Vec<Vec3>, Vec<u32>) {
-        self.kind.build(self.current(), size)
+    /// Positions, triangles and the polygroup of each triangle (empty for one group).
+    pub fn build(&self, size: f32) -> (Vec<Vec3>, Vec<u32>, Vec<u16>) {
+        let (p, i) = self.kind.build(self.current(), size);
+        (p, i, self.kind.groups(self.current()))
     }
 }
 
@@ -230,6 +251,19 @@ fn box_surface(dims: [u32; 3], map: impl Fn(Vec3) -> Vec3) -> (Vec<Vec3>, Vec<u3
     }
     debug_assert_eq!(positions.len(), count);
     (positions, indices)
+}
+
+/// `faces[k]` for every triangle of [`box_surface`] with `dims`, face `k` being its faces
+/// in order (-x, +x, -y, +y, -z, +z), each `2 × quads` triangles.
+fn box_face_groups(dims: [u32; 3], faces: [u16; 6]) -> Vec<u16> {
+    let d = dims.map(|x| x as usize);
+    let mut out = Vec::with_capacity(4 * (d[0] * d[1] + d[1] * d[2] + d[2] * d[0]));
+    for (k, &g) in faces.iter().enumerate() {
+        let axis = k / 2;
+        let quads = d[(axis + 1) % 3] * d[(axis + 2) % 3];
+        out.resize(out.len() + 2 * quads, g);
+    }
+    out
 }
 
 /// A sphere built from a subdivided cube (`segments` quads per cube edge), giving
@@ -449,6 +483,40 @@ mod tests {
     }
 
     #[test]
+    fn cube_and_cylinder_start_with_a_polygroup_per_face() {
+        for p in Primitive::ALL {
+            for n in [p.segment_range().0, 5, p.default_segments()] {
+                let (pos, idx) = p.build(n, 1.0);
+                let groups = p.groups(n);
+                let expect_count = match p {
+                    Primitive::Cube => 6,
+                    Primitive::Cylinder => 3,
+                    _ => {
+                        assert!(groups.is_empty(), "{p:?} is one polygroup");
+                        continue;
+                    }
+                };
+                assert_eq!(groups.len(), idx.len() / 3, "{p:?} at {n}");
+                for (t, &g) in idx.chunks_exact(3).zip(&groups) {
+                    let c = (pos[t[0] as usize] + pos[t[1] as usize] + pos[t[2] as usize]) / 3.0;
+                    let face = if p == Primitive::Cube {
+                        // On a cube the face is the axis where the centre sits on the box.
+                        let a = (0..3).max_by(|&i, &j| c[i].abs().total_cmp(&c[j].abs())).unwrap();
+                        [[4, 1], [3, 2], [5, 0]][a][(c[a] > 0.0) as usize]
+                    } else if (c.y.abs() - 1.0).abs() < 1e-6 {
+                        if c.y > 0.0 { 1 } else { 2 }
+                    } else {
+                        0
+                    };
+                    assert_eq!(g, face, "{p:?} at {n}: triangle centred at {c:?}");
+                }
+                let mesh = SculptMesh::from_raw_with_groups(pos, idx, groups);
+                assert_eq!(mesh.group_count(), expect_count, "{p:?} at {n}");
+            }
+        }
+    }
+
+    #[test]
     fn every_primitive_divides_twice_cleanly() {
         for p in Primitive::ALL {
             let n = p.default_segments();
@@ -458,9 +526,23 @@ mod tests {
                 pos.iter().for_each(|&q| b.grow(q));
                 b
             };
-            let mut mr = Multires::new(SculptMesh::from_raw(pos, idx), usize::MAX);
+            let mut mr = Multires::new(SculptMesh::from_raw_with_groups(pos, idx, p.groups(n)), usize::MAX);
             assert!(mr.divide() && mr.divide(), "{p:?}");
             let counts = mr.vertex_counts();
+            // Each polygroup keeps its four children per triangle on every level.
+            let per_group = |m: &SculptMesh| {
+                let mut c = vec![0usize; 6];
+                if m.groups.is_empty() {
+                    c[0] = m.triangle_count();
+                }
+                m.groups.iter().for_each(|&g| c[g as usize] += 1);
+                c
+            };
+            let base = per_group(mr.level_mesh(0));
+            for l in 1..3 {
+                let expect: Vec<usize> = base.iter().map(|&c| c << (2 * l)).collect();
+                assert_eq!(per_group(mr.level_mesh(l)), expect, "{p:?} polygroups at level {l}");
+            }
             for l in 1..3 {
                 let (parent, child) = (mr.level_mesh(l - 1), mr.level_mesh(l));
                 assert_eq!(counts[l], parent.vertex_count() + parent.edge_count(), "{p:?} level {l}");
@@ -506,7 +588,7 @@ mod tests {
     fn every_primitive_survives_a_project_round_trip_with_its_levels() {
         for p in Primitive::ALL {
             let (pos, idx) = p.build(6, 1.0);
-            let mut mr = Multires::new(SculptMesh::from_raw(pos, idx), usize::MAX);
+            let mut mr = Multires::new(SculptMesh::from_raw_with_groups(pos, idx, p.groups(6)), usize::MAX);
             assert!(mr.divide() && mr.divide());
             // A sculpted base after dividing: the replay must still rebuild the same stencils.
             mr.set_active(0);
@@ -522,6 +604,7 @@ mod tests {
             let back = project.tools.into_iter().next().unwrap().packed.try_unpack().expect("rebuilds");
             for l in 0..3 {
                 assert_eq!(back.level_mesh(l).indices, mr.level_mesh(l).indices, "{p:?} level {l}");
+                assert_eq!(back.level_mesh(l).groups, mr.level_mesh(l).groups, "{p:?} polygroups at level {l}");
                 let worst = back
                     .level_mesh(l)
                     .positions

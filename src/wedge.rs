@@ -1168,6 +1168,29 @@ mod tests {
     }
 
     #[test]
+    fn a_new_cube_keeps_its_six_face_groups() {
+        let (pos, idx) = Primitive::Cube.build(16, 1.0);
+        let m = SculptMesh::from_raw_with_groups(pos, idx, Primitive::Cube.groups(16));
+        assert_eq!(m.group_count(), 6);
+        let out = remesh(&m, &Settings::default()).unwrap();
+        check_closed(&out.positions, &out.indices);
+        let mesh = SculptMesh::from_raw_with_groups(out.positions, out.indices, out.groups);
+        assert_eq!(mesh.group_count(), 6);
+        // Away from the cube's edges every triangle has its face's group (see
+        // `Primitive::groups`: -x, +x, -y, +y, -z, +z).
+        let faces = [[4, 1], [3, 2], [5, 0]];
+        for t in 0..mesh.triangle_count() as u32 {
+            let c = (0..3).map(|k| mesh.positions[mesh.indices[3 * t as usize + k] as usize]).sum::<Vec3>() / 3.0;
+            let mut a = c.abs().to_array();
+            let axis = (0..3).max_by(|&i, &j| a[i].total_cmp(&a[j])).unwrap();
+            a[axis] = 0.0;
+            if a.iter().all(|&x| x < 0.85) {
+                assert_eq!(mesh.group(t), faces[axis][(c[axis] > 0.0) as usize], "triangle at {c:?}");
+            }
+        }
+    }
+
+    #[test]
     fn project_keeps_the_surface_and_groups_ride_along() {
         let (pos, idx) = Primitive::Cube.build(16, 1.0);
         let mut m = SculptMesh::from_raw(pos, idx);
