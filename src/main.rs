@@ -1121,7 +1121,10 @@ impl App {
             return false;
         }
         let t = Instant::now();
-        let out = match wedge::remesh(self.doc.mesh(), &self.wedge) {
+        // An internal inconsistency is reported, not allowed to take the model down.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wedge::remesh(self.doc.mesh(), &self.wedge)))
+            .unwrap_or_else(|_| Err("the remesh failed on this mesh (internal error)".into()));
+        let out = match result {
             Ok(out) => out,
             Err(e) => {
                 self.status = format!("Wedge: {e}");
