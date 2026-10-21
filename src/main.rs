@@ -8,6 +8,7 @@ mod project;
 mod render;
 mod sculpt;
 mod subtool;
+mod tablet;
 mod transform;
 mod wedge;
 mod workspace;
@@ -253,6 +254,14 @@ struct App {
     history: History,
     stroke: Option<Stroke>,
     stroke_brush: Brush,
+    /// Pen pressure from the tablet (X11), read on every pointer event.
+    tablet: Option<tablet::Tablet>,
+    /// Pressure of the pen moving the pointer, 0..=1; `None` for a mouse (full strength).
+    pressure: Option<f32>,
+    /// Why there is no tablet, for the interface.
+    tablet_error: Option<String>,
+    /// `--selftest-pressure`: frames left before the scripted pressure strokes.
+    selftest_pressure: Option<u32>,
 
     cursor: Vec2,
     last_cursor: Vec2,
@@ -369,6 +378,10 @@ impl App {
             history: History::new(32),
             stroke: None,
             stroke_brush: Brush::default(),
+            tablet: None,
+            pressure: None,
+            tablet_error: None,
+            selftest_pressure: None,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             scale: 1.0,
@@ -1826,6 +1839,90 @@ impl App {
         false
     }
 
+    /// `--selftest-pressure`: the tablet connection, then Draw strokes through the window's
+    /// own handlers at set pen pressures (a mouse, 100 %, 50 %, 25 %, and 50 % with each of
+    /// Size and Z Intensity off), each measured and undone. Logs every check and exits.
+    fn selftest_pressure(&mut self) {
+        let mut ok = true;
+        let mut check = |what: &str, pass: bool| {
+            ok &= pass;
+            log::info!("selftest-pressure: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        match (&self.tablet, &self.tablet_error) {
+            (Some(t), _) => check(&format!("XInput2 connection open; pens: {}", t.describe()), true),
+            (None, e) => check(&format!("no tablet connection: {}", e.as_deref().unwrap_or("?")), false),
+        }
+        // Real raw events reach the listener: an XTest move comes from a device without
+        // pressure, so it reads as a mouse.
+        if let Some(t) = &self.tablet {
+            let before = t.state().events;
+            let sent = tablet::fake_motion(300, 300);
+            let t0 = Instant::now();
+            while t.state().events == before && t0.elapsed().as_millis() < 500 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let (seen, source) = {
+                let s = t.state();
+                (s.events > before, s.last_source)
+            };
+            check(
+                &format!("an XTest pointer move reached the listener in {:.0} ms from device {source:?}, read as a mouse", t0.elapsed().as_secs_f32() * 1000.0),
+                sent.is_ok() && seen && t.pressure().is_none(),
+            );
+        }
+        // The scripted pressures stand in for the pen: keep the tablet from overwriting them.
+        let tablet = self.tablet.take();
+        let centre = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+        let step = Vec2::new(self.viewport().y * 0.01, 0.0);
+        // (vertices moved, deepest move, ms per stroke); every stroke is undone.
+        let mut undone = true;
+        let mut stroke = |app: &mut App, p: Option<f32>, size: bool, intensity: bool| -> (usize, f32, f32) {
+            app.pressure = p;
+            app.workspace.pressure_size = size;
+            app.workspace.pressure_intensity = intensity;
+            let before = app.doc.mesh().positions.clone();
+            let t = Instant::now();
+            app.cursor_moved(centre, false);
+            app.left_press(false, false);
+            for k in 1..=10 {
+                app.cursor_moved(centre + step * k as f32, false);
+            }
+            app.left_release();
+            let ms = t.elapsed().as_secs_f32() * 1000.0;
+            let moves: Vec<f32> = app.doc.mesh().positions.par_iter().zip(&before).map(|(a, b)| (*a - *b).length()).collect();
+            app.history.undo(&mut app.doc);
+            undone &= app.doc.mesh().positions.par_iter().zip(&before).all(|(a, b)| (*a - *b).length() < 1e-6);
+            let moved = moves.iter().filter(|&&d| d > 1e-7).count();
+            (moved, moves.iter().copied().fold(0.0, f32::max), ms)
+        };
+        let mouse = stroke(self, None, true, true);
+        let full = stroke(self, Some(1.0), true, true);
+        let half = stroke(self, Some(0.5), true, true);
+        let quarter = stroke(self, Some(0.25), true, true);
+        let half_depth_only = stroke(self, Some(0.5), false, true);
+        let half_size_only = stroke(self, Some(0.5), true, false);
+        let none = stroke(self, Some(0.0), true, true);
+        for (name, r) in [("mouse", mouse), ("100 %", full), ("50 %", half), ("25 %", quarter), ("50 %, Z Intensity only", half_depth_only), ("50 %, Size only", half_size_only), ("0 %", none)] {
+            log::info!("selftest-pressure: {name}: {} vertices moved, deepest {:.5}, stroke {:.1} ms", fmt_count(r.0), r.1, r.2);
+        }
+        check("a mouse strokes like full pressure", mouse.0 == full.0 && (mouse.1 - full.1).abs() < 1e-6);
+        check("half pressure: a narrower, shallower stroke", half.0 < full.0 && half.1 < full.1 * 0.5);
+        check("quarter pressure: narrower and shallower still", quarter.0 < half.0 && quarter.1 < half.1);
+        let depth_ratio = half_depth_only.1 / full.1;
+        check(
+            &format!("Size off: the same width ({} vs {}), half the depth ({depth_ratio:.2})", fmt_count(half_depth_only.0), fmt_count(full.0)),
+            half_depth_only.0 as f32 > full.0 as f32 * 0.95 && (depth_ratio - 0.5).abs() < 0.05,
+        );
+        check("Z Intensity off: narrower, deeper than with both", half_size_only.0 < full.0 && half_size_only.1 > half.1);
+        check("no pressure moves nothing", none.0 == 0);
+        check("undo restores every stroke", undone);
+        self.pressure = None;
+        self.workspace.pressure_size = true;
+        self.workspace.pressure_intensity = true;
+        self.tablet = tablet;
+        log::info!("selftest-pressure: {}", if ok { "all passed" } else { "FAILED" });
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -2237,10 +2334,34 @@ impl App {
         self.apply_stroke();
     }
 
+    /// The pressure of the pen in use, or `None` once a mouse moves the pointer (kept up to
+    /// date by the tablet's thread). A lost connection turns pressure off.
+    fn poll_tablet(&mut self) {
+        let Some(t) = self.tablet.as_mut() else {
+            return;
+        };
+        match t.poll() {
+            Ok(()) => self.pressure = t.pressure(),
+            Err(e) => {
+                log::warn!("tablet: {e}; pen pressure is off");
+                self.tablet_error = Some(format!("lost the X connection: {e}"));
+                self.tablet = None;
+                self.pressure = None;
+            }
+        }
+    }
+
+    /// `brush` for one dab at the current pen pressure (Brush > Tablet pressure).
+    fn at_pressure(&self, brush: Brush) -> Brush {
+        brush.at_pressure(self.pressure, self.workspace.pressure_size, self.workspace.pressure_intensity)
+    }
+
     fn apply_stroke(&mut self) {
         let t = Instant::now();
         let ray = self.cursor_ray();
         let fwd = self.camera.forward();
+        // Grab keeps the size it picked up with; the other brushes follow the pen.
+        let brush = self.at_pressure(self.stroke_brush);
         let Some(stroke) = self.stroke.as_mut() else {
             return;
         };
@@ -2255,9 +2376,10 @@ impl App {
             );
         } else if let Some(hit) = self.doc.mesh().raycast(ray.0, ray.1) {
             self.hover = Some(hit.point);
+            let brush = if self.stroke_brush.kind == BrushKind::Grab { self.stroke_brush } else { brush };
             stroke.dab(
                 self.doc.mesh_mut(),
-                &self.stroke_brush,
+                &brush,
                 hit.point,
                 hit.normal,
                 fwd,
@@ -2431,7 +2553,7 @@ impl App {
         let Some(hit) = self.mesh().raycast(o, d).map(|h| h.point) else {
             return;
         };
-        let brush = self.brush;
+        let brush = self.at_pressure(self.brush);
         if let Some(stroke) = self.mask_stroke.as_mut() {
             stroke.dab(self.doc.mesh_mut(), &brush, hit);
         }
@@ -2462,7 +2584,7 @@ impl App {
         // A drag on the model: paint from the press point on.
         self.mask_press = None;
         let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry);
-        let brush = self.brush;
+        let brush = self.at_pressure(self.brush);
         stroke.dab(self.doc.mesh_mut(), &brush, hit);
         self.mask_stroke = Some(stroke);
         self.mask_dab();
@@ -2736,6 +2858,11 @@ impl App {
         let area = self.wedge_info().1;
         let wedge_estimate = self.wedge.estimate(area);
         let wedge_on = self.subtools[self.active_tool].wedge;
+        let tablet = match (&self.tablet, &self.tablet_error) {
+            (Some(t), _) => t.describe(),
+            (None, Some(e)) => e.clone(),
+            (None, None) => String::new(),
+        };
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -2780,6 +2907,9 @@ impl App {
                 wedge_on,
                 wedge_refusal: wedge_refusal.as_deref(),
                 wedge_estimate,
+                tablet: &tablet,
+                tablet_on: self.tablet.is_some(),
+                pressure: self.pressure,
             },
         );
         if actions.new_project {
@@ -3006,6 +3136,15 @@ impl App {
                 self.selftest_groups = Some((phase, left - 1));
             }
         }
+        if let Some(left) = self.selftest_pressure {
+            if left == 0 {
+                self.selftest_pressure = None;
+                self.selftest_pressure();
+                self.quit = true;
+            } else {
+                self.selftest_pressure = Some(left - 1);
+            }
+        }
         if let Some(left) = self.selftest_project {
             if left == 0 {
                 self.selftest_project = None;
@@ -3148,6 +3287,16 @@ impl ApplicationHandler for App {
         );
         self.egui_state = Some(state);
         self.gfx = Some(gfx);
+        match tablet::Tablet::for_window(&window) {
+            Ok(t) => {
+                log::info!("tablet: listening for pen pressure; {}", t.describe());
+                self.tablet = Some(t);
+            }
+            Err(e) => {
+                log::info!("tablet: {e}");
+                self.tablet_error = Some(e);
+            }
+        }
         self.window = Some(window);
         self.show_active_level();
         self.status = format!(
@@ -3176,6 +3325,12 @@ impl ApplicationHandler for App {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if matches!(
+            event,
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::RedrawRequested
+        ) {
+            self.poll_tablet();
+        }
         let consumed = match self.egui_state.as_mut() {
             Some(state) => state.on_window_event(&window, &event).consumed,
             None => false,
@@ -3721,6 +3876,9 @@ fn main() {
     }
     if args.iter().any(|a| a == "--selftest-project") {
         app.selftest_project = Some(20);
+    }
+    if args.iter().any(|a| a == "--selftest-pressure") {
+        app.selftest_pressure = Some(20);
     }
     app.open_on_start = flag("--open").cloned();
     if stress {
@@ -4557,5 +4715,86 @@ mod mask_tests {
         assert!(other.status.starts_with("Opened"), "{}", other.status);
         assert_eq!(other.doc.mesh().mask, mask);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new(30, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app
+    }
+
+    fn drag(app: &mut App, from: Vec2, to: Vec2, m: ModifiersState) {
+        app.modifiers = m;
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for k in 1..=10 {
+            app.cursor_moved(from + (to - from) * (k as f32 / 10.0), false);
+        }
+        app.left_release();
+        app.modifiers = ModifiersState::empty();
+    }
+
+    /// Largest move of any vertex since `before`, and how many moved.
+    fn moved(app: &App, before: &[Vec3]) -> (f32, usize) {
+        let d: Vec<f32> = app.doc.mesh().positions.iter().zip(before).map(|(a, b)| (*a - *b).length()).collect();
+        (d.iter().copied().fold(0.0, f32::max), d.iter().filter(|&&x| x > 1e-7).count())
+    }
+
+    #[test]
+    fn mask_strokes_follow_pen_pressure() {
+        let total = |p: Option<f32>| -> u64 {
+            let mut app = app();
+            app.pressure = p;
+            let c = app.project(Vec3::ZERO);
+            drag(&mut app, c, c + Vec2::new(80.0, 0.0), ModifiersState::CONTROL);
+            app.doc.mesh().mask.iter().map(|&m| m as u64).sum()
+        };
+        let (mouse, full, half) = (total(None), total(Some(1.0)), total(Some(0.5)));
+        assert!(mouse > 0);
+        assert_eq!(mouse, full, "a mouse masks like full pressure");
+        assert!(half < full / 2, "half pressure: a smaller, lighter mask ({half} vs {full})");
+    }
+
+    #[test]
+    fn grab_keeps_its_size_and_strength_under_any_pressure() {
+        let pull = |p: Option<f32>| -> (f32, usize) {
+            let mut app = app();
+            app.brush.kind = BrushKind::Grab;
+            app.pressure = p;
+            let before = app.doc.mesh().positions.clone();
+            let c = app.project(Vec3::ZERO);
+            drag(&mut app, c, c + Vec2::new(60.0, 0.0), ModifiersState::empty());
+            moved(&app, &before)
+        };
+        let (full, light) = (pull(None), pull(Some(0.1)));
+        assert!(full.1 > 0);
+        assert_eq!(full.1, light.1);
+        assert!((full.0 - light.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn draw_follows_pen_pressure_and_the_toggles() {
+        let stroke = |p: Option<f32>, size: bool, intensity: bool| -> (f32, usize) {
+            let mut app = app();
+            app.pressure = p;
+            app.workspace.pressure_size = size;
+            app.workspace.pressure_intensity = intensity;
+            let before = app.doc.mesh().positions.clone();
+            let c = app.project(Vec3::ZERO);
+            drag(&mut app, c, c + Vec2::new(60.0, 0.0), ModifiersState::empty());
+            moved(&app, &before)
+        };
+        let full = stroke(None, true, true);
+        assert_eq!(full, stroke(Some(1.0), true, true));
+        let half = stroke(Some(0.5), true, true);
+        assert!(half.1 < full.1 && half.0 < full.0 * 0.5);
+        // Both off: pressure changes nothing.
+        assert_eq!(stroke(Some(0.3), false, false), full);
     }
 }

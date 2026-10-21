@@ -381,6 +381,12 @@ pub struct Model<'a> {
     pub wedge_on: bool,
     pub wedge_refusal: Option<&'a str>,
     pub wedge_estimate: usize,
+    /// The pen in use or found, or why pen pressure is unavailable.
+    pub tablet: &'a str,
+    /// Whether pen pressure is being read.
+    pub tablet_on: bool,
+    /// Pressure of the pen moving the pointer; `None` for a mouse.
+    pub pressure: Option<f32>,
 }
 
 /// One line of the SubTool list.
@@ -501,6 +507,9 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
+    pub pressure_size: bool,
+    pub pressure_intensity: bool,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -556,6 +565,8 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            pressure_size: true,
+            pressure_intensity: true,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -1775,6 +1786,36 @@ impl Workspace {
                     ui,
                     h,
                     id,
+                    "tablet",
+                    "Tablet pressure",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 16.0;
+                            ui.checkbox(&mut ws.pressure_size, "Size")
+                                .on_hover_text("Pen pressure scales Draw Size");
+                            ui.checkbox(&mut ws.pressure_intensity, "Z Intensity")
+                                .on_hover_text("Pen pressure scales Z Intensity (strength)");
+                        });
+                        let reading = match (m.tablet_on, m.pressure) {
+                            (false, _) => "off".to_string(),
+                            (true, Some(p)) => format!("{:.0} %", p * 100.0),
+                            (true, None) => "mouse".to_string(),
+                        };
+                        kv(ui, "Pressure", &reading);
+                        // Device names and reasons are long: a wrapping line, not a value.
+                        if !m.tablet.is_empty() {
+                            note(ui, &format!("Pen: {}", m.tablet));
+                        }
+                        note(ui, "Linear, like ZBrush's default curves · Grab keeps its size");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
                     "auto",
                     "Auto masking",
                     Some(NC),
@@ -2537,10 +2578,10 @@ impl Workspace {
                     true,
                     false,
                     &mut |_, ui| {
-                        let (mut spacing, mut stab, mut pressure) = (0.12, 0.0, true);
+                        let (mut spacing, mut stab) = (0.12, 0.0);
                         zslider(ui, "Spacing", &mut spacing, 0.0..=1.0, false, false, 2);
                         zslider(ui, "Stabilizer", &mut stab, 0.0..=1.0, false, false, 2);
-                        ui.checkbox(&mut pressure, "Pen pressure → strength");
+                        note(ui, "Pen pressure: Brush › Tablet pressure");
                     },
                 );
             }
@@ -4159,6 +4200,9 @@ mod tests {
                         wedge_on: false,
                         wedge_refusal: None,
                         wedge_estimate: 75_000,
+                        tablet: "UGTABLET 15.6 inch PenDisplay Pen (0)",
+                        tablet_on: true,
+                        pressure: Some(0.42),
                     },
                 );
             },
@@ -4199,13 +4243,14 @@ mod tests {
         let (mut workspace, ctx) = test_workspace("quick-menu");
         let size = vec2(1600.0, 1000.0);
         let output = frame(&mut workspace, &ctx, size, vec![]);
-        let shelf = text_count(&output, "Draw Size");
+        // Before: the shelf's (and the Tablet pressure section's Z Intensity toggle).
+        let (size_before, z_before) = (text_count(&output, "Draw Size"), text_count(&output, "Z Intensity"));
         workspace.open_quick_menu(pos2(800.0, 500.0), false);
         // A new egui area spends its first frame in an invisible sizing pass.
         frame(&mut workspace, &ctx, size, vec![]);
         let output = frame(&mut workspace, &ctx, size, vec![]);
-        assert_eq!(text_count(&output, "Draw Size"), shelf + 1);
-        assert_eq!(text_count(&output, "Z Intensity"), shelf + 1);
+        assert_eq!(text_count(&output, "Draw Size"), size_before + 1);
+        assert_eq!(text_count(&output, "Z Intensity"), z_before + 1);
         // A press far from the menu closes it; a held (Space) menu ignores that.
         frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), true)]);
         frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), false)]);

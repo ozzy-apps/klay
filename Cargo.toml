@@ -25,3 +25,8 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 debug = 1
+
+# Pen pressure on X11 through XInput2, which winit does not report (winit already builds it);
+# XTest only for `--selftest-pressure`.
+[target.'cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.13", features = ["xinput", "xtest"] }

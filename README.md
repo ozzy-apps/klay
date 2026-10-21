@@ -25,6 +25,7 @@ cargo run --release -- --segments 400 --divide 2 --novsync --selftest-transpose 
 cargo run --release -- --segments 400 --divide 2 --novsync --selftest-mask          # Ctrl masking, a masked move and undo through the input path, log, exit
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
+cargo run --release -- --divide 2 --selftest-pressure                # tablet connection (moves the pointer once via XTest), strokes at set pen pressures, log, exit
 cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
 ```
 
@@ -62,6 +63,22 @@ Cube3D starts with a polygroup per face and Cylinder3D with one for the wall and
 so Ctrl + Shift + click isolates a face or cap straight away; the others start as one
 polygroup. The groups are carried through Divide and Wedge like any others.
 
+### Pen pressure
+
+With a drawing tablet on X11 (XP-Pen, Wacom, Huion: any pen whose driver reports an "Abs
+Pressure" axis, as the libinput and wacom drivers do), pen pressure scales each dab like
+ZBrush's Brush › Tablet Pressure with its default linear curves: **Draw Size** and **Z
+Intensity** both follow the pen, and either can be turned off in Brush › Tablet pressure.
+The lightest touch still leaves a dab 5 % of Draw Size wide, with no strength. Sculpting
+brushes, Shift smoothing and Ctrl mask painting follow the pen; Grab (Move) keeps the size it
+picked up with. A mouse, or any device without pressure, sculpts at full Draw Size and Z
+Intensity, so switching between pen and mouse needs no setting.
+
+Brush › Tablet pressure shows the live pressure and the pen found. The libinput driver adds
+the pen's device the first time the pen comes near the screen, so it shows "none yet" until
+then. Pressure is not read on Wayland yet (winit, the window library, does not report it):
+run an X11 session.
+
 ## Workspace
 
 The native egui workspace follows ZBrush's model. Every palette lives in the menu bar and opens
@@ -91,10 +108,11 @@ presets, primitives (Mesh → Initialize), Wedge remeshing and Del Higher / Del 
 Wedge, Geometry), polygroups and visibility (Mesh → Visibility and Polygroups, Ctrl + Shift
 gestures, Ctrl + W, PolyF), masking (Ctrl, Masking palette), subdivision levels (Mesh →
 Geometry: Divide, SDiv slider, vertex counts, vertex budget), undo/redo, OBJ export, the Move /
-Scale / Rotate modes (Transpose action line) and live statistics are connected to the engine.
-Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, mask types (rect / lasso), the
-Transform palette, symmetry and
-the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
+Scale / Rotate modes (Transpose action line), X symmetry, pen pressure, the Persp and Solo
+toggles and live statistics are connected to the engine. Paint modes, Zcut, Focal Shift,
+stroke options (spacing, stabilizer), alpha, texture, mask types (rect / lasso), the Transform
+palette, Y / Z / radial symmetry and the Local/Transp/Ghost toggles are drawn dimmed and
+marked **Not connected**.
 
 Brush thumbnails are rendered on the CPU at startup: a sphere in the current material with the
 stroke each brush produces (Draw and Inflate flip in Zsub). They re-render when the material
@@ -166,6 +184,15 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 
 ## How it works
 
+- `tablet.rs`: pen pressure on X11. winit does not report it on Linux, so Klay opens a
+  second connection to the X server that only listens: XInput2 raw events (motion and
+  buttons, from every device) and device changes, selected on the root window. Devices with
+  an axis labelled "Abs Pressure" (or, unlabelled, valuator 2 of a device named like a pen)
+  are pens; the device of the latest raw event decides whether the next dab has a pressure
+  (its last value, as drivers only send the axes that changed) or none (a mouse). A thread
+  owns the connection and blocks on it, so the events, sent for every pointer move on the
+  screen, never pile up, even while Klay is minimised; the window reads the shared state on
+  each pointer event and scales a copy of the brush per dab (`Brush::at_pressure`).
 - `mesh.rs`: vertices are structure-of-arrays and physically sorted into spatial chunks of
   about 4096 vertices (recursive median split). Each chunk owns a contiguous vertex range,
   a contiguous range of the index buffer (the triangles whose first vertex it owns, those

@@ -57,6 +57,28 @@ impl Default for Brush {
     }
 }
 
+/// Smallest share of the radius pen pressure leaves, so the lightest touch still makes a
+/// small dab (and the falloff never divides by a zero radius).
+pub const MIN_PRESSURE_SIZE: f32 = 0.05;
+
+impl Brush {
+    /// This brush for one dab at pen pressure `p` (0..=1; `None` for a mouse): ZBrush's
+    /// Tablet Pressure with its default linear curves, scaling Draw Size (`size`) and Z
+    /// Intensity (`intensity`).
+    pub fn at_pressure(mut self, p: Option<f32>, size: bool, intensity: bool) -> Self {
+        if let Some(p) = p {
+            let p = p.clamp(0.0, 1.0);
+            if size {
+                self.radius *= p.max(MIN_PRESSURE_SIZE);
+            }
+            if intensity {
+                self.strength *= p;
+            }
+        }
+        self
+    }
+}
+
 /// One undo step.
 pub enum UndoStep {
     /// A stroke at `level`: the chunk data it replaced (positions at level 0, offsets
@@ -581,5 +603,33 @@ mod symmetry_tests {
         assert!(db.x < -0.05, "mirror side should move the other way: {db:?}");
         assert!((da.y - db.y).abs() < 1e-3 && (da.z - db.z).abs() < 1e-3);
         assert!(stroke.end(&mut mesh).is_some());
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    #[test]
+    fn pen_pressure_scales_size_and_intensity_like_zbrush() {
+        let b = Brush { kind: BrushKind::Draw, radius: 0.4, strength: 0.8 };
+        // A mouse: unchanged.
+        let m = b.at_pressure(None, true, true);
+        assert_eq!((m.radius, m.strength), (0.4, 0.8));
+        // Linear on both by default.
+        let h = b.at_pressure(Some(0.5), true, true);
+        assert!((h.radius - 0.2).abs() < 1e-6 && (h.strength - 0.4).abs() < 1e-6);
+        // Each can be turned off.
+        let s = b.at_pressure(Some(0.5), false, true);
+        assert_eq!(s.radius, 0.4);
+        let i = b.at_pressure(Some(0.5), true, false);
+        assert_eq!(i.strength, 0.8);
+        // The lightest touch keeps a small, non-zero radius and no strength.
+        let z = b.at_pressure(Some(0.0), true, true);
+        assert!((z.radius - 0.4 * MIN_PRESSURE_SIZE).abs() < 1e-6 && z.strength == 0.0);
+        // Out of range pressure is clamped.
+        let o = b.at_pressure(Some(1.7), true, true);
+        assert_eq!((o.radius, o.strength), (0.4, 0.8));
+        assert_eq!(b.at_pressure(Some(-1.0), true, true).strength, 0.0);
     }
 }
