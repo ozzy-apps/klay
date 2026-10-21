@@ -15,12 +15,16 @@ use crate::mesh::{
     Aabb, CHUNK_TARGET, Chunk, PackedNormal, SculptMesh, crosses_chunk, pack_normal, partition_ids,
     split_ranges, vertex_normal,
 };
+use crate::polygroup::{GroupRuns, flags_of_runs, runs_of_flags};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering::Relaxed};
 
 const NONE: u32 = u32::MAX;
+
+/// Flag on a [`Multires::tri_parents`] entry: the triangle is the centre child.
+const CENTRE: u32 = 1 << 31;
 
 /// How a child vertex is smoothed from its parent level. `[p, NONE, NONE, NONE]` is the even
 /// vertex above interior parent vertex `p` (its ring comes from the parent's adjacency);
@@ -473,16 +477,31 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         .map(|_| AtomicU32::new(0))
         .collect();
     let mut indices = vec![0u32; 3 * t_count];
+    // Polygroups and hidden flags are inherited from the parent triangle, when it has any.
+    let mut child_groups = if parent.groups.is_empty() { Vec::new() } else { vec![0u16; t_count] };
+    let mut child_hidden = if parent.hidden.is_empty() { Vec::new() } else { vec![0u8; t_count] };
     let borders: Vec<u32> = {
         let tri_ranges = chunk_tri
             .windows(2)
             .map(|w| (3 * w[0] as usize, 3 * w[1] as usize));
+        let per_tri = || chunk_tri.windows(2).map(|w| (w[0] as usize, w[1] as usize));
+        let group_out: Vec<Option<&mut [u16]>> = if child_groups.is_empty() {
+            (0..c_count).map(|_| None).collect()
+        } else {
+            split_ranges(&mut child_groups, per_tri()).into_iter().map(Some).collect()
+        };
+        let hidden_out: Vec<Option<&mut [u8]>> = if child_hidden.is_empty() {
+            (0..c_count).map(|_| None).collect()
+        } else {
+            split_ranges(&mut child_hidden, per_tri()).into_iter().map(Some).collect()
+        };
         split_ranges(&mut indices, tri_ranges)
             .into_par_iter()
             .zip(owned.par_iter())
             .zip(ranges().collect::<Vec<_>>().into_par_iter())
             .zip(chunk_tri.par_iter())
-            .map(|(((out, o), (s, e)), &start)| {
+            .zip(group_out.into_par_iter().zip(hidden_out.into_par_iter()))
+            .map(|((((out, o), (s, e)), &start), (mut group_out, mut hidden_out))| {
                 // The children of one parent triangle share its remapped corners and edge
                 // midpoints, and are consecutive in the sorted list when one chunk owns
                 // several of them.
@@ -522,6 +541,12 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
                             let at = 3 * n as usize;
                             out[at..at + 3].copy_from_slice(&tris[i]);
                             tri_remap[nat as usize].store(start + n, Relaxed);
+                            if let Some(g) = group_out.as_deref_mut() {
+                                g[n as usize] = parent.groups[(nat / 4) as usize];
+                            }
+                            if let Some(h) = hidden_out.as_deref_mut() {
+                                h[n as usize] = parent.hidden[(nat / 4) as usize];
+                            }
                             n += 1;
                         }
                     }
@@ -616,7 +641,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         }
     }
 
-    let mesh = SculptMesh::assemble(
+    let mut mesh = SculptMesh::assemble(
         positions,
         indices,
         chunks,
@@ -626,6 +651,12 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         vt_offsets,
         vt_tris,
     );
+    if !child_groups.is_empty() {
+        mesh.set_groups(child_groups);
+    }
+    if !child_hidden.is_empty() {
+        mesh.set_hidden(child_hidden);
+    }
     debug_assert!(
         mesh.chunks
             .iter()
@@ -655,6 +686,41 @@ pub struct Packed {
     budget: usize,
     /// Vertex count per level, for display while parked.
     counts: Vec<usize>,
+    /// Polygroups and hidden triangles of every level, base first, run-length coded.
+    marks: Vec<Marks>,
+}
+
+/// Polygroups and hidden triangles of one level in run-length form (see `crate::polygroup`).
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Marks {
+    pub groups: GroupRuns,
+    pub hidden: Vec<u32>,
+}
+
+impl Marks {
+    fn of(mesh: &SculptMesh) -> Self {
+        Self {
+            groups: GroupRuns::of(&mesh.groups),
+            hidden: runs_of_flags(&mesh.hidden),
+        }
+    }
+
+    fn apply(&self, mesh: &mut SculptMesh) -> Result<(), String> {
+        let n = mesh.triangle_count();
+        let groups = self.groups.expand(n)?;
+        let hidden = flags_of_runs(&self.hidden, n)?;
+        if !mesh.groups.is_empty() || !groups.is_empty() {
+            mesh.set_groups(groups);
+        }
+        if !mesh.hidden.is_empty() || !hidden.is_empty() {
+            mesh.set_hidden(hidden);
+        }
+        Ok(())
+    }
+
+    fn bytes(&self) -> usize {
+        self.groups.bytes() + self.hidden.len() * 4
+    }
 }
 
 #[derive(Clone)]
@@ -675,8 +741,50 @@ impl Packed {
                     + l.offsets.iter().map(|o| o.len() * 12).sum::<usize>()
             })
             .sum();
-        self.positions.len() * 12 + self.indices.len() * 4 + self.ranges.len() * 20 + levels
+        self.positions.len() * 12
+            + self.indices.len() * 4
+            + self.ranges.len() * 20
+            + levels
+            + self.marks.iter().map(Marks::bytes).sum::<usize>()
     }
+
+    #[cfg(test)]
+    pub fn set_marks_for_test(&mut self, marks: Vec<Marks>) {
+        self.marks = marks;
+    }
+
+    /// Serialise the polygroups and hidden triangles of every level (project version 3).
+    pub fn write_marks<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        out.u32(self.marks.len() as u32)?;
+        for m in &self.marks {
+            out.slice(&m.groups.lens)?;
+            out.slice(&m.groups.values)?;
+            out.slice(&m.hidden)?;
+        }
+        Ok(())
+    }
+
+    /// Read what [`write_marks`](Self::write_marks) wrote. Lengths are checked against the
+    /// levels when the stack is rebuilt.
+    pub fn read_marks<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+        let n = input.u32()? as usize;
+        if n != self.levels.len() + 1 {
+            return Err("polygroups are stored for a different number of levels".into());
+        }
+        self.marks = (0..n)
+            .map(|_| {
+                Ok(Marks {
+                    groups: GroupRuns {
+                        lens: input.vec()?,
+                        values: input.vec()?,
+                    },
+                    hidden: input.vec()?,
+                })
+            })
+            .collect::<Result<_, crate::project::Fail>>()?;
+        Ok(())
+    }
+
 
     /// Vertex count per level, lowest first.
     pub fn counts(&self) -> &[usize] {
@@ -759,6 +867,7 @@ impl Packed {
         if active >= counts.len() {
             return Err("the shown level is not one of the stored levels".into());
         }
+        let marks = vec![Marks::default(); levels.len() + 1];
         Ok(Packed {
             positions,
             indices,
@@ -767,6 +876,7 @@ impl Packed {
             active,
             budget,
             counts,
+            marks,
         })
     }
 
@@ -798,6 +908,7 @@ impl Packed {
             levels: packed,
             active,
             budget,
+            marks,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
@@ -839,6 +950,11 @@ impl Packed {
                 offsets: pl.offsets,
                 stale: vec![false; n],
             });
+        }
+        // Groups and visibility as they were on every level (the replay inherited them
+        // from below, which edits made at upper levels may differ from).
+        for (lvl, m) in levels.iter_mut().zip(&marks) {
+            m.apply(&mut lvl.mesh)?;
         }
         Ok(Multires {
             levels,
@@ -1213,6 +1329,7 @@ impl Multires {
     /// frees the memory of a subtool that is parked.
     pub fn pack(self) -> Packed {
         let counts = self.vertex_counts();
+        let marks = self.marks();
         let Multires {
             levels,
             active,
@@ -1238,6 +1355,7 @@ impl Multires {
             active,
             budget,
             counts,
+            marks,
         }
     }
 
@@ -1258,7 +1376,162 @@ impl Multires {
             active: self.active,
             budget: self.budget,
             counts: self.vertex_counts(),
+            marks: self.marks(),
         }
+    }
+
+    /// Polygroups and hidden triangles of every level, run-length coded.
+    pub fn marks(&self) -> Vec<Marks> {
+        self.levels.par_iter().map(|l| Marks::of(&l.mesh)).collect()
+    }
+
+    /// For every triangle of level `l` (above the base): the triangle of level `l - 1` it
+    /// was cut from, with [`CENTRE`] set for the middle one of the four. Found from the
+    /// stencils: a corner child holds one even vertex (above the parent's corner) and the
+    /// midpoints of the two edges from it; the centre child holds three midpoints.
+    fn tri_parents(&self, l: usize) -> Vec<u32> {
+        let parent = &self.levels[l - 1].mesh;
+        let child = &self.levels[l].mesh;
+        let st = &self.levels[l].link.as_ref().expect("level above the base has a link").stencil;
+        child
+            .indices
+            .par_chunks_exact(3)
+            .map(|tri| {
+                let even = tri.iter().find(|&&v| st[v as usize][1] == NONE);
+                let (a, b, c, centre) = match even {
+                    Some(&e) => {
+                        let p = st[e as usize][0];
+                        let mut ends = [NONE; 2];
+                        let mut k = 0;
+                        for &v in tri {
+                            let s = st[v as usize];
+                            if s[1] != NONE && k < 2 {
+                                ends[k] = if s[0] == p { s[1] } else { s[0] };
+                                k += 1;
+                            }
+                        }
+                        (p, ends[0], ends[1], false)
+                    }
+                    None => {
+                        let (s0, s1) = (st[tri[0] as usize], st[tri[1] as usize]);
+                        let third = if s1[0] != s0[0] && s1[0] != s0[1] { s1[0] } else { s1[1] };
+                        (s0[0], s0[1], third, true)
+                    }
+                };
+                let t = parent
+                    .incident(a)
+                    .iter()
+                    .copied()
+                    .find(|&t| {
+                        let pt = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                        pt.contains(&b) && pt.contains(&c)
+                    })
+                    .expect("a child triangle lies in a parent triangle");
+                t | if centre { CENTRE } else { 0 }
+            })
+            .collect()
+    }
+
+    /// Hide triangles of `level` (one flag per triangle, empty for none) and carry the
+    /// change to every other level: above, a triangle is hidden exactly when the one it was
+    /// cut from is; below, when all four of its children are.
+    pub fn set_hidden(&mut self, level: usize, hidden: Vec<u8>) {
+        self.levels[level].mesh.set_hidden(hidden);
+        for l in level + 1..self.levels.len() {
+            let h = if self.levels[l - 1].mesh.hidden.is_empty() {
+                Vec::new()
+            } else {
+                let parents = self.tri_parents(l);
+                let above = &self.levels[l - 1].mesh.hidden;
+                parents.par_iter().map(|&p| above[(p & !CENTRE) as usize]).collect()
+            };
+            self.levels[l].mesh.set_hidden(h);
+        }
+        for l in (0..level).rev() {
+            let h = if self.levels[l + 1].mesh.hidden.is_empty() {
+                Vec::new()
+            } else {
+                let parents = self.tri_parents(l + 1);
+                let below = &self.levels[l + 1].mesh.hidden;
+                let all: Vec<AtomicU8> = (0..self.levels[l].mesh.triangle_count())
+                    .into_par_iter()
+                    .map(|_| AtomicU8::new(1))
+                    .collect();
+                parents.par_iter().zip(below.par_iter()).for_each(|(&p, &h)| {
+                    if h == 0 {
+                        all[(p & !CENTRE) as usize].store(0, Relaxed);
+                    }
+                });
+                all.into_iter().map(AtomicU8::into_inner).collect()
+            };
+            self.levels[l].mesh.set_hidden(h);
+        }
+    }
+
+    /// Set the polygroups of `level` and carry them to every other level: above, a
+    /// triangle takes the group of the one it was cut from; below, the group of its centre
+    /// child.
+    pub fn set_groups(&mut self, level: usize, groups: Vec<u16>) {
+        self.levels[level].mesh.set_groups(groups);
+        for l in level + 1..self.levels.len() {
+            let g = if self.levels[l - 1].mesh.groups.is_empty() {
+                Vec::new()
+            } else {
+                let parents = self.tri_parents(l);
+                let above = &self.levels[l - 1].mesh.groups;
+                parents.par_iter().map(|&p| above[(p & !CENTRE) as usize]).collect()
+            };
+            self.levels[l].mesh.set_groups(g);
+        }
+        for l in (0..level).rev() {
+            let g = if self.levels[l + 1].mesh.groups.is_empty() {
+                Vec::new()
+            } else {
+                let parents = self.tri_parents(l + 1);
+                let below = &self.levels[l + 1].mesh.groups;
+                let out: Vec<AtomicU16> = (0..self.levels[l].mesh.triangle_count())
+                    .into_par_iter()
+                    .map(|_| AtomicU16::new(0))
+                    .collect();
+                parents.par_iter().zip(below.par_iter()).for_each(|(&p, &g)| {
+                    if p & CENTRE != 0 {
+                        out[(p & !CENTRE) as usize].store(g, Relaxed);
+                    }
+                });
+                out.into_iter().map(AtomicU16::into_inner).collect()
+            };
+            self.levels[l].mesh.set_groups(g);
+        }
+    }
+
+    /// Hidden triangles of every level, run-length coded (for undo).
+    pub fn visibility(&self) -> Vec<Vec<u32>> {
+        self.levels.par_iter().map(|l| runs_of_flags(&l.mesh.hidden)).collect()
+    }
+
+    /// Put back what [`visibility`](Self::visibility) returned; returns the state it replaced.
+    pub fn restore_visibility(&mut self, saved: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
+        let now = self.visibility();
+        for (lvl, runs) in self.levels.iter_mut().zip(&saved) {
+            let n = lvl.mesh.triangle_count();
+            lvl.mesh.set_hidden(flags_of_runs(runs, n).unwrap_or_default());
+        }
+        now
+    }
+
+    /// Polygroups of every level, run-length coded (for undo).
+    pub fn group_runs(&self) -> Vec<GroupRuns> {
+        self.levels.par_iter().map(|l| GroupRuns::of(&l.mesh.groups)).collect()
+    }
+
+    /// Put back what [`group_runs`](Self::group_runs) returned; returns the state it replaced.
+    pub fn restore_groups(&mut self, saved: Vec<GroupRuns>) -> Vec<GroupRuns> {
+        let now = self.group_runs();
+        for (lvl, runs) in self.levels.iter_mut().zip(&saved) {
+            let n = lvl.mesh.triangle_count();
+            lvl.mesh.set_groups(runs.expand(n).unwrap_or_default());
+        }
+        now
     }
 
     /// A draw-only copy for when this subtool is parked: the topology of the highest level
@@ -1306,7 +1579,8 @@ impl Multires {
         StandIn {
             positions,
             normals,
-            indices: m.indices.clone(),
+            // Hidden parts stay hidden while the subtool is parked.
+            indices: m.visible_indices().unwrap_or_else(|| m.indices.clone()),
             level,
             bounds,
         }
@@ -1693,5 +1967,120 @@ mod tests {
         assert_eq!(mr.count(), 2);
         assert_eq!(mr.active(), 1);
         assert_eq!(mr.mesh().vertex_count(), n);
+    }
+
+    #[test]
+    fn every_child_triangle_finds_its_parent() {
+        let mut mr = Multires::new(sphere(6), usize::MAX);
+        assert!(mr.divide() && mr.divide());
+        for l in 1..3 {
+            let parents = mr.tri_parents(l);
+            let parent = &mr.levels[l - 1].mesh;
+            let child = &mr.levels[l].mesh;
+            let st = &mr.levels[l].link.as_ref().unwrap().stencil;
+            let mut kids = vec![(0u32, 0u32); parent.triangle_count()];
+            for (c, &p) in parents.iter().enumerate() {
+                let t = (p & !CENTRE) as usize;
+                kids[t].0 += 1;
+                kids[t].1 += (p & CENTRE != 0) as u32;
+                // Every vertex of the child comes from the parent triangle's corners.
+                let pt = &parent.indices[3 * t..3 * t + 3];
+                for &v in &child.indices[3 * c..3 * c + 3] {
+                    let s = st[v as usize];
+                    assert!(pt.contains(&s[0]));
+                    if s[1] != NONE {
+                        assert!(pt.contains(&s[1]));
+                    }
+                }
+            }
+            assert!(kids.iter().all(|&k| k == (4, 1)), "four children, one of them the centre");
+        }
+    }
+
+    #[test]
+    fn groups_and_visibility_carry_across_levels() {
+        let mut mr = Multires::new(sphere(8), usize::MAX);
+        // Groups and hidden triangles made at the base ride along when dividing.
+        let n0 = mr.mesh().triangle_count();
+        let base_groups: Vec<u16> = (0..n0).map(|t| (t % 5) as u16).collect();
+        mr.set_groups(0, base_groups.clone());
+        let base_hidden: Vec<u8> = (0..n0).map(|t| (t % 7 == 0) as u8).collect();
+        mr.set_hidden(0, base_hidden.clone());
+        assert!(mr.divide() && mr.divide());
+        for l in 1..3 {
+            let parents = mr.tri_parents(l);
+            let (p, c) = (&mr.levels[l - 1].mesh, &mr.levels[l].mesh);
+            for (t, &pt) in parents.iter().enumerate() {
+                let pt = (pt & !CENTRE) as usize;
+                assert_eq!(c.groups[t], p.groups[pt]);
+                assert_eq!(c.hidden[t], p.hidden[pt]);
+            }
+            assert_eq!(c.group_count(), 5);
+            assert_eq!(c.hidden_count(), p.hidden_count() * 4);
+        }
+        // Vertices of hidden triangles only are not shown; the others are.
+        let top = &mr.levels[2].mesh;
+        for v in 0..top.vertex_count() {
+            let any_visible = top.incident(v as u32).iter().any(|&t| top.hidden[t as usize] == 0);
+            assert_eq!(top.shown[v] != 0, any_visible);
+        }
+
+        // A change at the middle level: exact above, approximate below.
+        let before = mr.visibility();
+        let n1 = mr.levels[1].mesh.triangle_count();
+        let mid: Vec<u8> = (0..n1).map(|t| (t < n1 / 2) as u8).collect();
+        mr.set_hidden(1, mid.clone());
+        assert_eq!(mr.levels[1].mesh.hidden, mid);
+        let parents = mr.tri_parents(2);
+        for (t, &p) in parents.iter().enumerate() {
+            assert_eq!(mr.levels[2].mesh.hidden[t], mid[(p & !CENTRE) as usize]);
+        }
+        let parents = mr.tri_parents(1);
+        let mut all = vec![true; n0];
+        for (t, &p) in parents.iter().enumerate() {
+            all[(p & !CENTRE) as usize] &= mid[t] != 0;
+        }
+        let want: Vec<u8> = all.iter().map(|&a| a as u8).collect();
+        assert_eq!(mr.levels[0].mesh.hidden, want);
+        // Undo puts every level back exactly, including the lossy one below.
+        let after = mr.restore_visibility(before);
+        assert_eq!(mr.levels[0].mesh.hidden, base_hidden);
+        mr.restore_visibility(after);
+        assert_eq!(mr.levels[1].mesh.hidden, mid);
+        // Showing everything empties the arrays.
+        mr.set_hidden(2, Vec::new());
+        assert!(mr.levels.iter().all(|l| l.mesh.hidden.is_empty() && l.mesh.shown.is_empty()));
+
+        // Groups changed at the top: the base takes the centre child's group.
+        let n2 = mr.levels[2].mesh.triangle_count();
+        let top_groups: Vec<u16> = (0..n2).map(|t| (t / 100) as u16).collect();
+        let saved = mr.group_runs();
+        mr.set_groups(2, top_groups.clone());
+        let parents = mr.tri_parents(2);
+        for (t, &p) in parents.iter().enumerate() {
+            if p & CENTRE != 0 {
+                assert_eq!(mr.levels[1].mesh.groups[(p & !CENTRE) as usize], top_groups[t]);
+            }
+        }
+        mr.restore_groups(saved);
+        assert_eq!(mr.levels[0].mesh.groups, base_groups);
+    }
+
+    #[test]
+    fn packing_keeps_groups_and_visibility_of_every_level() {
+        let mut mr = Multires::new(sphere(8), usize::MAX);
+        assert!(mr.divide());
+        let n1 = mr.mesh().triangle_count();
+        // Made at level 1, so level 1 differs from what level 0 alone would give it.
+        mr.set_groups(1, (0..n1).map(|t| (t % 3) as u16).collect());
+        mr.set_hidden(1, (0..n1).map(|t| (t % 11 == 0) as u8).collect());
+        let want = mr.marks();
+        assert!(!want[1].groups.lens.is_empty() && !want[1].hidden.is_empty());
+        let back = mr.pack_copy().unpack();
+        assert_eq!(back.marks(), want);
+        assert_eq!(back.levels[1].mesh.shown, mr.levels[1].mesh.shown);
+        // The stand-in leaves hidden triangles out.
+        let si = mr.stand_in(usize::MAX);
+        assert_eq!(si.indices.len() / 3, n1 - mr.mesh().hidden_count());
     }
 }

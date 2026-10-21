@@ -78,10 +78,24 @@ struct MeshBuffers {
     /// Flagged and listed chunks of the next normal passes.
     flagged: u32,
     listed: u32,
-    /// GPU memory held by this level.
+    /// GPU memory held by this level (with `draw` and `groups`).
     bytes: u64,
+    /// Visible triangles only, drawn and picked instead of `indices` while some are hidden
+    /// (12 bytes per visible triangle), and the mesh's `vis_version` it was made for.
+    draw: Option<(wgpu::Buffer, u32)>,
+    vis_version: Option<u32>,
+    /// Polygroup per drawn triangle for the PolyF pass (2 bytes per triangle), while shown.
+    groups: Option<GroupBuffers>,
     // Kept alive for the bind group.
     _tables: [wgpu::Buffer; 4],
+}
+
+struct GroupBuffers {
+    bind_group: wgpu::BindGroup,
+    /// `(vis_version, group_version)` of the mesh it was made for.
+    versions: (u32, u32),
+    bytes: u64,
+    _buffer: wgpu::Buffer,
 }
 
 /// Draw-only GPU copy of a parked subtool: 40 bytes per vertex (positions 12, baked
@@ -118,6 +132,9 @@ pub struct Gfx {
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
+    /// Polygroup colours (PolyF); `None` when the GPU has no primitive index.
+    group_pipeline: Option<wgpu::RenderPipeline>,
+    group_bgl: wgpu::BindGroupLayout,
     background_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
     pick_target: Option<PickTarget>,
@@ -169,9 +186,16 @@ impl Gfx {
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         log::info!("adapter: {adapter_name}");
 
+        // The polygroup pass reads the triangle index in the fragment shader; only that
+        // pipeline uses it.
+        let primitive_index = adapter.features().contains(wgpu::Features::PRIMITIVE_INDEX);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("klay"),
-            required_features: wgpu::Features::empty(),
+            required_features: if primitive_index {
+                wgpu::Features::PRIMITIVE_INDEX
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: adapter.limits(),
             ..Default::default()
         }))
@@ -298,6 +322,85 @@ impl Gfx {
             }),
             multiview_mask: None,
             cache: None,
+        });
+
+        let group_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("polygroup bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let group_pipeline = primitive_index.then(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("polygroup shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "enable primitive_index;\n{}\n{}",
+                        include_str!("shader.wgsl"),
+                        include_str!("groups.wgsl")
+                    )
+                    .into(),
+                ),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("polygroup layout"),
+                bind_group_layouts: &[Some(&bgl), Some(&group_bgl)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("polygroup pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 12,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &pos_attr,
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 4,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &nrm_attr,
+                        }),
+                    ],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_groups"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
         });
 
         let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -496,6 +599,8 @@ impl Gfx {
             config,
             depth_view,
             pipeline,
+            group_pipeline,
+            group_bgl,
             uniform_buf,
             background_pipeline,
             pick_pipeline,
@@ -557,6 +662,26 @@ impl Gfx {
             },
         );
         true
+    }
+
+    /// Triangles drawn for the active level (fewer than it has while some are hidden).
+    pub fn drawn_triangles(&self) -> usize {
+        self.active_buffers().map_or(0, |m| m.drawn().1 as usize / 3)
+    }
+
+    /// GPU bytes of the active level's visible-index and polygroup buffers.
+    pub fn marks_bytes(&self) -> (u64, u64) {
+        self.active_buffers().map_or((0, 0), |m| {
+            (
+                m.draw.as_ref().map_or(0, |(b, _)| b.size()),
+                m.groups.as_ref().map_or(0, |g| g.bytes),
+            )
+        })
+    }
+
+    /// Whether polygroup colours can be shown (the GPU has primitive index support).
+    pub fn group_overlay_supported(&self) -> bool {
+        self.group_pipeline.is_some()
     }
 
     pub fn drop_stand_in(&mut self, id: u64) {
@@ -632,9 +757,10 @@ impl Gfx {
             pass.set_pipeline(&self.pick_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             if let Some(m) = self.levels.get(self.active).and_then(Option::as_ref) {
+                let (indices, count) = m.drawn();
                 pass.set_vertex_buffer(0, m.positions.slice(..));
-                pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..m.index_count, 0, active_id..active_id + 1);
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..count, 0, active_id..active_id + 1);
             }
             for &(key, id) in parked {
                 if let Some(s) = self.stand_ins.get(&key) {
@@ -932,8 +1058,64 @@ impl Gfx {
             flagged: 0,
             listed: 0,
             bytes,
+            draw: None,
+            vis_version: None,
+            groups: None,
             _tables: [chunk_verts, chunk_tris, chunk_border, acc],
         })
+    }
+
+    /// Bring the active level's visible-triangle index buffer and, while `want_groups`, its
+    /// polygroup buffer in line with the mesh. Both exist only while needed, so a model
+    /// with nothing hidden and polygroups off holds and draws exactly what it did before.
+    fn sync_marks(&mut self, mesh: &SculptMesh, want_groups: bool) {
+        let can_group = self.group_pipeline.is_some();
+        let Some(m) = self.levels.get(self.active).and_then(Option::as_ref) else {
+            return;
+        };
+        let vis_stale = m.vis_version != Some(mesh.vis_version);
+        let versions = (mesh.vis_version, mesh.group_version);
+        let groups_stale = want_groups && can_group && m.groups.as_ref().is_none_or(|g| g.versions != versions);
+        let drop_groups = !(want_groups && can_group) && m.groups.is_some();
+        if !vis_stale && !groups_stale && !drop_groups {
+            return;
+        }
+        let draw = vis_stale.then(|| {
+            mesh.visible_indices().map(|ix| {
+                let buffer = self.upload("visible indices", bytemuck::cast_slice(&ix), wgpu::BufferUsages::INDEX);
+                (buffer, ix.len() as u32)
+            })
+        });
+        let groups = groups_stale.then(|| {
+            let packed = mesh.drawn_groups_packed();
+            let buffer = self.upload("polygroups", bytemuck::cast_slice(&packed), wgpu::BufferUsages::STORAGE);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("polygroup bg"),
+                layout: &self.group_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            GroupBuffers {
+                bind_group,
+                versions,
+                bytes: buffer.size(),
+                _buffer: buffer,
+            }
+        });
+        let m = self.levels[self.active].as_mut().unwrap();
+        if let Some(draw) = draw {
+            m.bytes -= m.draw.as_ref().map_or(0, |(b, _)| b.size());
+            m.bytes += draw.as_ref().map_or(0, |(b, _)| b.size());
+            m.draw = draw;
+            m.vis_version = Some(mesh.vis_version);
+        }
+        if groups.is_some() || drop_groups {
+            m.bytes -= m.groups.as_ref().map_or(0, |g| g.bytes);
+            m.bytes += groups.as_ref().map_or(0, |g| g.bytes);
+            m.groups = groups;
+        }
     }
 
     /// Start a grab on the GPU: upload the selection, its original positions and weights once.
@@ -1005,7 +1187,8 @@ impl Gfx {
 
     /// Re-upload positions of chunks whose vertices moved (runs of consecutive dirty chunks
     /// are merged into one copy each) and flag chunks whose normals must be recomputed.
-    pub fn upload_dirty(&mut self, mesh: &mut SculptMesh) {
+    pub fn upload_dirty(&mut self, mesh: &mut SculptMesh, want_groups: bool) {
+        self.sync_marks(mesh, want_groups);
         let Some(buffers) = self.levels.get_mut(self.active).and_then(Option::as_mut) else {
             return;
         };
@@ -1131,6 +1314,7 @@ impl Gfx {
         &mut self,
         uniforms: &Uniforms,
         parked: &[u64],
+        polyframe: bool,
         paint_jobs: &[egui::ClippedPrimitive],
         mut textures_delta: egui::TexturesDelta,
         pixels_per_point: f32,
@@ -1235,12 +1419,19 @@ impl Gfx {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
             if let Some(m) = self.active_buffers() {
-                pass.set_pipeline(&self.pipeline);
+                match (&self.group_pipeline, &m.groups, polyframe) {
+                    (Some(pipeline), Some(g), true) => {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(1, &g.bind_group, &[]);
+                    }
+                    _ => pass.set_pipeline(&self.pipeline),
+                }
+                let (indices, count) = m.drawn();
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, m.positions.slice(..));
                 pass.set_vertex_buffer(1, m.normals.slice(..));
-                pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..m.index_count, 0, 0..1);
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..count, 0, 0..1);
             }
             pass.set_pipeline(&self.pipeline);
             for key in parked {
@@ -1299,6 +1490,16 @@ impl Gfx {
         self.queue.present(frame);
         for id in textures_delta.free.drain() {
             self.egui_renderer.free_texture(&id);
+        }
+    }
+}
+
+impl MeshBuffers {
+    /// The index buffer to draw and pick with, and its index count.
+    fn drawn(&self) -> (&wgpu::Buffer, u32) {
+        match &self.draw {
+            Some((b, n)) => (b, *n),
+            None => (&self.indices, self.index_count),
         }
     }
 }

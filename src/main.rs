@@ -1,6 +1,7 @@
 mod camera;
 mod mesh;
 mod multires;
+mod polygroup;
 mod primitive;
 mod project;
 mod render;
@@ -13,6 +14,7 @@ use glam::{Vec2, Vec3};
 use mesh::{SculptMesh, cube_sphere};
 use primitive::Primitive;
 use multires::Multires;
+use rayon::prelude::*;
 use render::{Gfx, Uniforms};
 use mesh::Aabb;
 use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
@@ -78,12 +80,36 @@ impl NavDrag {
     }
 }
 
+/// A Ctrl + Shift press in progress (ZBrush: SelectRect). A click acts on the polygroup
+/// under it (or shows everything on the background); a drag draws a rectangle.
+#[derive(Clone, Copy, Debug)]
+struct SelectDrag {
+    start: Vec2,
+    /// Triangle of the active subtool under the press; `None` on the background.
+    hit: Option<u32>,
+}
+
+/// Presses this close to the canvas edge count as background even over the model, so the
+/// background gestures stay reachable when the model fills the view (logical pixels).
+const CANVAS_BORDER: f32 = 12.0;
+
+/// A press that moves less than this (physical pixels) before release is a click.
+const CLICK_SLOP: f32 = 4.0;
+
 /// Document operations queued by the interface or a shortcut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DocOp {
     New,
     Open,
     Save,
+}
+
+/// Polygroup and visibility operations queued by the interface or a shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisOp {
+    GroupVisible,
+    ShowAll,
+    Invert,
 }
 
 /// SubTool operations queued by the interface.
@@ -115,6 +141,11 @@ struct App {
     selftest: Option<u32>,
     /// `--selftest-project`: frames left before a save and re-open round trip.
     selftest_project: Option<u32>,
+    /// `--selftest-groups`: `(phase, frames left)` of the polygroup / visibility self-test,
+    /// which runs its steps a few frames apart so the GPU state can be checked in between.
+    selftest_groups: Option<(u8, u32)>,
+    /// What the polygroup self-test expects to find, and whether every check passed.
+    selftest_groups_state: (usize, bool),
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// `--open PATH`: project to open once the window exists.
@@ -134,6 +165,8 @@ struct App {
     nav_press: Vec2,
     modifiers: ModifiersState,
     nav: Option<NavDrag>,
+    /// Ctrl + Shift selection in progress.
+    select: Option<SelectDrag>,
     hover: Option<Vec3>,
 
     // UI state.
@@ -149,6 +182,8 @@ struct App {
     pending_redo: bool,
     pending_divide: bool,
     pending_level: Option<usize>,
+    /// Polygroup / visibility operation from the interface or a key, run outside the egui pass.
+    pending_vis: Option<VisOp>,
     /// SubTool list operation from the interface, run outside the egui pass.
     pending_subtool: Option<SubToolOp>,
     /// Frames left in `--frames` mode (plain frame timing at the active level) and the
@@ -207,6 +242,8 @@ impl App {
             initial_subtools: 0,
             selftest: None,
             selftest_project: None,
+            selftest_groups: None,
+            selftest_groups_state: (0, true),
             project_path: "untitled.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
@@ -222,6 +259,7 @@ impl App {
             nav_press: Vec2::ZERO,
             modifiers: ModifiersState::empty(),
             nav: None,
+            select: None,
             hover: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
@@ -234,6 +272,7 @@ impl App {
             pending_redo: false,
             pending_divide: false,
             pending_level: None,
+            pending_vis: None,
             pending_subtool: None,
             measure: None,
             quit: false,
@@ -727,6 +766,342 @@ impl App {
         pass
     }
 
+    // ------------------------------------------------------------ polygroups and visibility
+
+    /// Replace the hidden triangles of the shown level (carried to every level), undoably.
+    /// Hiding everything is refused, as in ZBrush.
+    fn apply_hidden(&mut self, hidden: Vec<u8>, what: &str) {
+        let mesh = self.doc.mesh();
+        let n = mesh.triangle_count();
+        if hidden.len() == n && !hidden.par_iter().any(|&h| h == 0) {
+            self.workspace.notify("Every polygon would be hidden · nothing changed");
+            return;
+        }
+        if hidden == mesh.hidden || (hidden.is_empty() && mesh.hidden.is_empty()) {
+            return;
+        }
+        let t = Instant::now();
+        let before = self.doc.visibility();
+        let level = self.doc.active();
+        self.doc.set_hidden(level, hidden);
+        self.history.push(UndoStep::Visibility(before));
+        self.update_hover();
+        let mesh = self.doc.mesh();
+        self.status = format!(
+            "{what}: {} of {} triangles hidden ({:.0} ms over {} levels)",
+            fmt_count(mesh.hidden_count()),
+            fmt_count(mesh.triangle_count()),
+            t.elapsed().as_secs_f32() * 1000.0,
+            self.doc.count()
+        );
+        log::info!("{}", self.status);
+    }
+
+    /// Show every polygon (ZBrush: Ctrl + Shift + click on the background).
+    fn show_all(&mut self) {
+        self.apply_hidden(Vec::new(), "Show all");
+    }
+
+    /// Hidden becomes visible and visible hidden (ZBrush: Ctrl + Shift + drag on the
+    /// background).
+    fn invert_visibility(&mut self) {
+        let mesh = self.doc.mesh();
+        if mesh.hidden.is_empty() {
+            self.workspace.notify("Nothing is hidden · nothing to invert");
+            return;
+        }
+        let inverted = mesh.hidden.par_iter().map(|&h| (h == 0) as u8).collect();
+        self.apply_hidden(inverted, "Invert visibility");
+    }
+
+    /// Ctrl + Shift + click on the model: show only the polygroup of triangle `tri`, or with
+    /// `hide` (Alt) hide it.
+    fn isolate_group(&mut self, tri: u32, hide: bool) {
+        let mesh = self.doc.mesh();
+        let g = mesh.group(tri);
+        let hidden: Vec<u8> = (0..mesh.triangle_count() as u32)
+            .into_par_iter()
+            .map(|t| (!mesh.visible(t) || (mesh.group(t) == g) == hide) as u8)
+            .collect();
+        self.apply_hidden(hidden, if hide { "Hide group" } else { "Isolate group" });
+    }
+
+    /// Ctrl + Shift + drag between `a` and `b` (pixels): keep what lies inside visible, or
+    /// with `hide` (Alt) hide it. A rectangle around no visible polygon inverts visibility.
+    fn select_rect(&mut self, a: Vec2, b: Vec2, hide: bool) {
+        let t = Instant::now();
+        let origin = self.canvas_origin();
+        let (lo, hi) = (a.min(b) - origin, a.max(b) - origin);
+        let mesh = self.doc.mesh();
+        let inside = polygroup::tris_in_rect(mesh, self.camera.view_proj(), self.viewport(), lo, hi);
+        let any = inside.par_iter().enumerate().any(|(t, &i)| i != 0 && mesh.visible(t as u32));
+        log::debug!("select rect: {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+        if !any {
+            self.invert_visibility();
+            return;
+        }
+        let hidden: Vec<u8> = inside
+            .par_iter()
+            .enumerate()
+            .map(|(t, &i)| (!mesh.visible(t as u32) || (i != 0) == hide) as u8)
+            .collect();
+        self.apply_hidden(hidden, if hide { "Hide rectangle" } else { "Select rectangle" });
+    }
+
+    /// Make one new polygroup of the visible polygons (ZBrush: Ctrl + W, Group Visible).
+    fn group_visible(&mut self) {
+        let t = Instant::now();
+        let mesh = self.doc.mesh();
+        let next = mesh.groups.par_iter().copied().max().map_or(1, |m| m.wrapping_add(1));
+        let groups: Vec<u16> = (0..mesh.triangle_count() as u32)
+            .into_par_iter()
+            .map(|t| if mesh.visible(t) { next } else { mesh.group(t) })
+            .collect();
+        let before = self.doc.group_runs();
+        let level = self.doc.active();
+        self.doc.set_groups(level, groups);
+        self.history.push(UndoStep::Groups(before));
+        self.status = format!(
+            "Group visible: {} polygroups ({:.0} ms over {} levels)",
+            self.doc.mesh().group_count(),
+            t.elapsed().as_secs_f32() * 1000.0,
+            self.doc.count()
+        );
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Run a queued polygroup / visibility operation (not during a stroke or a selection).
+    fn run_pending_vis(&mut self) {
+        if self.stroke.is_some() || self.select.is_some() {
+            return;
+        }
+        match self.pending_vis.take() {
+            Some(VisOp::GroupVisible) => self.group_visible(),
+            Some(VisOp::ShowAll) => self.show_all(),
+            Some(VisOp::Invert) => self.invert_visibility(),
+            None => {}
+        }
+    }
+
+    /// Polygroup colours on the shown subtool (ZBrush: PolyF, Shift + F).
+    fn toggle_polyframe(&mut self) {
+        self.workspace.polyframe = !self.workspace.polyframe;
+        if self.workspace.polyframe && self.gfx.as_ref().is_some_and(|g| !g.group_overlay_supported()) {
+            self.workspace.notify("Polygroup colours need a GPU with primitive-index support");
+        }
+    }
+
+    /// Whether the cursor is in the thin band along the canvas edge that counts as
+    /// background.
+    fn on_canvas_border(&self) -> bool {
+        if !self.canvas_rect.is_positive() {
+            return false;
+        }
+        let m = CANVAS_BORDER * self.scale;
+        let r = self.canvas_rect.shrink(m);
+        !r.contains(egui::pos2(self.cursor.x, self.cursor.y))
+    }
+
+    /// The selection rectangle for the workspace to draw, in logical pixels.
+    fn show_select_rect(&mut self) {
+        self.workspace.select_rect = self.select.and_then(|s| {
+            ((self.cursor - s.start).length() >= CLICK_SLOP).then(|| {
+                let (a, b) = (s.start / self.scale, self.cursor / self.scale);
+                (egui::Rect::from_two_pos(egui::pos2(a.x, a.y), egui::pos2(b.x, b.y)), self.modifiers.alt_key())
+            })
+        });
+    }
+
+    /// Left button pressed on the window: brushes, navigation, subtool picking and the
+    /// Ctrl + Shift selection, ZBrush style. `consumed` / `over_ui`: the interface took it.
+    fn left_press(&mut self, consumed: bool, over_ui: bool) {
+        let free = !consumed && !over_ui && self.nav.is_none() && self.stroke.is_none() && self.select.is_none();
+        if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
+            // The press that closes a popup or menu does nothing else.
+            return;
+        }
+        let selecting = self.modifiers.control_key() && self.modifiers.shift_key();
+        if selecting {
+            if free {
+                // ZBrush: Ctrl + Shift starts a selection on the model or the background.
+                let hit = if self.on_canvas_border() {
+                    None
+                } else {
+                    let (o, d) = self.cursor_ray();
+                    self.mesh().raycast(o, d).map(|h| h.tri)
+                };
+                self.select = Some(SelectDrag { start: self.cursor, hit });
+                self.hover = None;
+            }
+            return;
+        }
+        let picked = if self.modifiers.alt_key() && self.subtools.len() > 1 && free {
+            self.pick_subtool().filter(|&i| i != self.active_tool)
+        } else {
+            None
+        };
+        if let Some(i) = picked {
+            // ZBrush: Alt + click on another subtool selects it.
+            self.select_subtool(i);
+        } else if free {
+            // ZBrush: a left drag on the model sculpts (Alt = alternate brush, Ctrl =
+            // masking); on empty canvas, or on the canvas border, it rotates, with Alt it
+            // moves, and releasing Alt turns it into a zoom.
+            let hit = if self.on_canvas_border() {
+                None
+            } else {
+                let (o, d) = self.cursor_ray();
+                self.mesh().raycast(o, d)
+            };
+            log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
+            if hit.is_none() {
+                self.begin_nav(MouseButton::Left);
+            } else if self.modifiers.control_key() {
+                self.workspace.notify("Masking is not connected yet");
+            } else if self.workspace.mode != Mode::Draw {
+                self.workspace.notify(format!(
+                    "{} mode is not connected yet · Q returns to Draw",
+                    self.workspace.mode.name()
+                ));
+            } else {
+                self.begin_stroke();
+            }
+        }
+    }
+
+    /// Left button released.
+    fn left_release(&mut self) {
+        if let Some(sel) = self.select.take() {
+            self.workspace.select_rect = None;
+            let alt = self.modifiers.alt_key();
+            if (self.cursor - sel.start).length() < CLICK_SLOP {
+                match sel.hit {
+                    Some(tri) => self.isolate_group(tri, alt),
+                    None => self.show_all(),
+                }
+            } else {
+                self.select_rect(sel.start, self.cursor, alt);
+            }
+            self.update_hover();
+            return;
+        }
+        self.end_stroke();
+        self.end_nav(MouseButton::Left);
+    }
+
+    /// The cursor moved to `pos` (physical pixels).
+    fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
+        self.last_cursor = self.cursor;
+        self.cursor = pos;
+        let delta = self.cursor - self.last_cursor;
+        if let Some(drag) = self.nav {
+            self.nav_move(drag, delta);
+        } else if self.select.is_some() {
+            self.show_select_rect();
+        } else if self.stroke.is_some() {
+            if self.stroke_brush.kind == BrushKind::Grab {
+                self.stroke_pending = true;
+            } else {
+                self.apply_stroke();
+            }
+        } else if !over_ui {
+            self.update_hover();
+        } else {
+            self.hover = None;
+        }
+    }
+
+    /// Press the left button at `from` with `mods`, drag to `to` and release, through the
+    /// handlers the window uses (self-tests and tests).
+    fn gesture(&mut self, mods: ModifiersState, from: Vec2, to: Vec2) {
+        let saved = self.modifiers;
+        self.modifiers = mods;
+        self.cursor_moved(from, false);
+        self.left_press(false, false);
+        self.cursor_moved((from + to) * 0.5, false);
+        self.cursor_moved(to, false);
+        self.left_release();
+        self.modifiers = saved;
+    }
+
+    /// `--selftest-groups`, one phase per call, a few frames apart: Ctrl + Shift rectangle
+    /// and Ctrl + W, then checks of what the GPU draws and picks, then show all and undo.
+    /// Logs every check and its time; returns the next phase, or `None` when done.
+    fn selftest_groups(&mut self, phase: u8) -> Option<u8> {
+        let centre = self.canvas_origin() + self.viewport() * 0.5;
+        let half = Vec2::splat(self.viewport().y * 0.12);
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_groups_state.1 &= pass;
+            log::info!("selftest: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        match phase {
+            0 => {
+                let total = self.mesh().triangle_count();
+                let t = Instant::now();
+                self.gesture(cs, centre - half, centre + half);
+                let rect_ms = t.elapsed().as_secs_f32() * 1000.0;
+                let kept = total - self.mesh().hidden_count();
+                check(self, &format!("Ctrl + Shift rectangle kept {} of {} triangles in {rect_ms:.0} ms", fmt_count(kept), fmt_count(total)), kept > 0 && kept < total);
+                let t = Instant::now();
+                self.modifiers = ModifiersState::CONTROL;
+                self.on_key(KeyCode::KeyW);
+                self.modifiers = ModifiersState::empty();
+                self.run_pending_vis();
+                let group_ms = t.elapsed().as_secs_f32() * 1000.0;
+                let groups = self.mesh().group_count();
+                check(self, &format!("Ctrl + W made {groups} polygroups in {group_ms:.0} ms"), groups == 2);
+                self.workspace.polyframe = true;
+                self.selftest_groups_state.0 = kept;
+                Some(1)
+            }
+            1 => {
+                let kept = self.selftest_groups_state.0;
+                let drawn = self.gfx.as_ref().map_or(0, Gfx::drawn_triangles);
+                check(self, &format!("GPU draws {} visible triangles", fmt_count(drawn)), drawn == kept);
+                if let Some(gfx) = &self.gfx {
+                    let (draw, groups) = gfx.marks_bytes();
+                    let supported = gfx.group_overlay_supported();
+                    log::info!(
+                        "selftest: GPU extra for this level: visible indices {:.1} MB, polygroups {:.1} MB (PolyF {})",
+                        draw as f64 / 1e6,
+                        groups as f64 / 1e6,
+                        if supported { "on" } else { "not supported" }
+                    );
+                    check(self, "polygroup buffer is up while PolyF is on", !supported || groups > 0);
+                }
+                self.cursor = centre;
+                let at_centre = self.pick_subtool();
+                self.cursor = centre + Vec2::new(half.x * 2.2, 0.0);
+                let off_centre = self.pick_subtool();
+                check(self, &format!("GPU pick: visible centre -> {at_centre:?}, hidden side -> {off_centre:?}"), at_centre == Some(self.active_tool) && off_centre.is_none());
+                let corner = self.canvas_origin() + Vec2::splat(30.0);
+                let t = Instant::now();
+                self.gesture(cs, corner, corner);
+                let show_ms = t.elapsed().as_secs_f32() * 1000.0;
+                check(self, &format!("Ctrl + Shift + click on the background showed all in {show_ms:.0} ms"), self.mesh().hidden_count() == 0);
+                Some(2)
+            }
+            _ => {
+                let total = self.mesh().triangle_count();
+                let drawn = self.gfx.as_ref().map_or(0, Gfx::drawn_triangles);
+                check(self, &format!("GPU draws all {} triangles again", fmt_count(drawn)), drawn == total);
+                let t = Instant::now();
+                self.history.undo(&mut self.doc);
+                self.history.undo(&mut self.doc);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                let undo_ms = t.elapsed().as_secs_f32() * 1000.0;
+                let clean = self.mesh().hidden_count() == 0 && self.mesh().group_count() == 1;
+                check(self, &format!("three undos back to one group, nothing hidden, in {undo_ms:.0} ms"), clean);
+                let ok = self.selftest_groups_state.1;
+                log::info!("selftest: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// Pixel position of a world point on the canvas.
     fn project(&self, p: Vec3) -> Vec2 {
         let clip = self.camera.view_proj() * p.extend(1.0);
@@ -1070,8 +1445,13 @@ impl App {
         );
     }
 
+    /// Frame the visible model: the shown part of the active subtool and the visible
+    /// parked ones (ZBrush: F).
     fn frame_camera(&mut self) {
-        let b = self.model_bounds();
+        let b = self
+            .drawn_parked()
+            .iter()
+            .fold(self.doc.mesh().visible_bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds));
         self.camera.target = (b.min + b.max) * 0.5;
         self.camera.distance = (b.max - b.min).length() * 1.1;
     }
@@ -1178,6 +1558,9 @@ impl App {
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
             KeyCode::KeyY if ctrl => self.pending_redo = true,
+            // ZBrush: Ctrl + W groups the visible polygons; Shift + F shows polygroups (PolyF).
+            KeyCode::KeyW if ctrl => self.pending_vis = Some(VisOp::GroupVisible),
+            KeyCode::KeyF if shift => self.toggle_polyframe(),
             // ZBrush: Ctrl + D divides, D and Shift + D step through the levels.
             KeyCode::KeyD if ctrl => self.pending_divide = true,
             KeyCode::KeyD if shift => self.pending_level = Some(self.doc.active().saturating_sub(1)),
@@ -1245,6 +1628,7 @@ impl App {
             })
             .collect();
         let parked_bytes = rows.iter().filter(|r| !r.active).map(|r| r.bytes).sum();
+        let (groups, hidden) = (self.doc.mesh().group_count(), self.doc.mesh().hidden_count());
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -1282,6 +1666,9 @@ impl App {
                 parked_bytes,
                 stand_in_bytes,
                 project_path: &mut self.project_path,
+                groups,
+                hidden,
+                polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
             },
         );
         if actions.new_project {
@@ -1307,6 +1694,15 @@ impl App {
         }
         if actions.delete {
             self.pending_subtool = Some(SubToolOp::Delete);
+        }
+        if actions.group_visible {
+            self.pending_vis = Some(VisOp::GroupVisible);
+        }
+        if actions.show_all {
+            self.pending_vis = Some(VisOp::ShowAll);
+        }
+        if actions.invert_visibility {
+            self.pending_vis = Some(VisOp::Invert);
         }
         if actions.move_subtool != 0 {
             self.move_subtool(actions.move_subtool);
@@ -1387,6 +1783,7 @@ impl App {
         if let Some(level) = self.pending_level.take() {
             self.set_level(level);
         }
+        self.run_pending_vis();
         match self.pending_doc.take() {
             Some(DocOp::New) => self.new_project(),
             Some(DocOp::Open) => {
@@ -1447,6 +1844,16 @@ impl App {
         if self.stroke_pending {
             self.stroke_pending = false;
             self.apply_stroke();
+        }
+        if let Some((phase, left)) = self.selftest_groups {
+            if left == 0 {
+                self.selftest_groups = self.selftest_groups(phase).map(|next| (next, 10));
+                if self.selftest_groups.is_none() {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_groups = Some((phase, left - 1));
+            }
         }
         if let Some(left) = self.selftest_project {
             if left == 0 {
@@ -1529,10 +1936,10 @@ impl App {
         let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
-        gfx.upload_dirty(self.doc.mesh_mut());
+        gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
         let t = Instant::now();
-        gfx.render(&uniforms, &parked, &jobs, full.textures_delta, full.pixels_per_point);
+        gfx.render(&uniforms, &parked, self.workspace.polyframe, &jobs, full.textures_delta, full.pixels_per_point);
         self.render_ms = t.elapsed().as_secs_f32() * 1000.0;
         if self.stress.is_some() {
             self.stress_upload += self.upload_ms;
@@ -1618,6 +2025,10 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                // Alt during a Ctrl + Shift drag turns the rectangle into a hide (red) one.
+                if self.select.is_some() {
+                    self.show_select_rect();
+                }
                 // Pressing Alt during a left drag arms the pan/zoom pair for the rest of it.
                 if let Some(drag) = self.nav.as_mut() {
                     if drag.button == MouseButton::Left && self.modifiers.alt_key() {
@@ -1630,73 +2041,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.last_cursor = self.cursor;
-                self.cursor = Vec2::new(position.x as f32, position.y as f32);
-                let delta = self.cursor - self.last_cursor;
-                if let Some(drag) = self.nav {
-                    self.nav_move(drag, delta);
-                } else if self.stroke.is_some() {
-                    if self.stroke_brush.kind == BrushKind::Grab {
-                        self.stroke_pending = true;
-                    } else {
-                        self.apply_stroke();
-                    }
-                } else if !over_ui {
-                    self.update_hover();
-                } else {
-                    self.hover = None;
-                }
+                self.cursor_moved(Vec2::new(position.x as f32, position.y as f32), over_ui);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
                         if pressed {
-                            let picked = if self.modifiers.alt_key()
-                                && self.subtools.len() > 1
-                                && !consumed
-                                && !over_ui
-                                && self.stroke.is_none()
-                                && self.nav.is_none()
-                                && self.workspace.popup.is_none()
-                                && self.workspace.quick_menu.is_none()
-                            {
-                                self.pick_subtool().filter(|&i| i != self.active_tool)
-                            } else {
-                                None
-                            };
-                            if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
-                                // The press that closes a popup or menu does nothing else.
-                            } else if let Some(i) = picked {
-                                // ZBrush: Alt + click on another subtool selects it.
-                                self.select_subtool(i);
-                            } else if !consumed
-                                && !over_ui
-                                && self.nav.is_none()
-                                && self.stroke.is_none()
-                            {
-                                // ZBrush: a left drag on the model sculpts (Alt = alternate
-                                // brush, Ctrl = masking); on empty canvas it rotates, with
-                                // Alt it moves, and releasing Alt turns it into a zoom.
-                                let (o, d) = self.cursor_ray();
-                                let hit = self.mesh().raycast(o, d);
-                                log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
-                                if hit.is_none() {
-                                    self.begin_nav(MouseButton::Left);
-                                } else if self.modifiers.control_key() {
-                                    self.workspace.notify("Masking is not connected yet");
-                                } else if self.workspace.mode != Mode::Draw {
-                                    self.workspace.notify(format!(
-                                        "{} mode is not connected yet · Q returns to Draw",
-                                        self.workspace.mode.name()
-                                    ));
-                                } else {
-                                    self.begin_stroke();
-                                }
-                            }
+                            self.left_press(consumed, over_ui);
                         } else {
-                            self.end_stroke();
-                            self.end_nav(MouseButton::Left);
+                            self.left_release();
                         }
                     }
                     MouseButton::Right | MouseButton::Middle => {
@@ -1826,6 +2180,7 @@ fn bench(settings: primitive::Settings, divide: u32, budget: usize) {
     if divide > 0 {
         bench_multires(&mut app, divide);
     }
+    bench_groups(&mut app);
     bench_subtool(&mut app);
     let t = Instant::now();
     let hit = app.mesh().raycast(app.camera.eye(), app.camera.forward());
@@ -1974,6 +2329,75 @@ fn bench_multires(app: &mut App, times: u32) {
     app.brush = Brush::default();
 }
 
+/// Polygroups and visibility at the shown level through the input handlers: a Ctrl + Shift
+/// rectangle, Ctrl + W, isolate, show all, undo, and what they cost in memory.
+fn bench_groups(app: &mut App) {
+    let level = app.doc.top();
+    app.doc.set_active(level);
+    let centre = app.canvas_origin() + app.viewport() * 0.5;
+    let half = Vec2::splat(app.viewport().y * 0.12);
+    let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+    let total = app.mesh().triangle_count();
+    let t = Instant::now();
+    app.gesture(cs, centre - half, centre + half);
+    let kept = total - app.mesh().hidden_count();
+    println!(
+        "visibility: Ctrl + Shift rectangle at level {level} kept {} of {} triangles in {:.0} ms (all {} levels updated)",
+        fmt_count(kept),
+        fmt_count(total),
+        t.elapsed().as_secs_f32() * 1000.0,
+        app.doc.count()
+    );
+    let t = Instant::now();
+    let visible = app.mesh().visible_indices().map_or(0, |v| v.len() / 3);
+    println!(
+        "visibility: visible index buffer of {} triangles built in {:.1} ms ({:.1} MB to upload)",
+        fmt_count(visible),
+        t.elapsed().as_secs_f32() * 1000.0,
+        visible as f64 * 12.0 / 1e6
+    );
+    let t = Instant::now();
+    app.group_visible();
+    println!("polygroups: Ctrl + W in {:.0} ms", t.elapsed().as_secs_f32() * 1000.0);
+    let t = Instant::now();
+    let packed = app.mesh().drawn_groups_packed();
+    println!(
+        "polygroups: PolyF buffer for {} drawn triangles in {:.1} ms ({:.1} MB)",
+        fmt_count(visible),
+        t.elapsed().as_secs_f32() * 1000.0,
+        packed.len() as f64 * 4.0 / 1e6
+    );
+    let corner = app.canvas_origin() + Vec2::splat(8.0);
+    let t = Instant::now();
+    app.gesture(cs, corner, corner);
+    println!("visibility: show all in {:.0} ms", t.elapsed().as_secs_f32() * 1000.0);
+    let t = Instant::now();
+    app.gesture(cs, centre, centre);
+    println!(
+        "visibility: isolate the new group in {:.0} ms, {} triangles shown",
+        t.elapsed().as_secs_f32() * 1000.0,
+        fmt_count(total - app.mesh().hidden_count())
+    );
+    let mesh = app.mesh();
+    let ram = mesh.groups.len() * 2 + mesh.hidden.len() + mesh.shown.len();
+    println!(
+        "polygroups + visibility in RAM at this level: {:.0} MB ({:.1} bytes per vertex); history {:.1} MB",
+        ram as f64 / 1e6,
+        ram as f64 / mesh.vertex_count() as f64,
+        app.history.bytes() as f64 / 1e6
+    );
+    let t = Instant::now();
+    for _ in 0..4 {
+        app.history.undo(&mut app.doc);
+    }
+    println!(
+        "4 undos (isolate, show all, group, rectangle) in {:.0} ms, back to {} hidden and {} group",
+        t.elapsed().as_secs_f32() * 1000.0,
+        app.mesh().hidden_count(),
+        app.mesh().group_count()
+    );
+}
+
 /// Parking and re-activating the active subtool: memory before and after, and the times.
 fn bench_subtool(app: &mut App) {
     let levels = app.doc.vertex_counts();
@@ -2063,6 +2487,9 @@ fn main() {
     app.initial_subtools = subtools.saturating_sub(1);
     if args.iter().any(|a| a == "--selftest-subtools") {
         app.selftest = Some(20);
+    }
+    if args.iter().any(|a| a == "--selftest-groups") {
+        app.selftest_groups = Some((0, 20));
     }
     if args.iter().any(|a| a == "--selftest-project") {
         app.selftest_project = Some(20);
@@ -2322,5 +2749,93 @@ mod subtool_tests {
         assert_eq!(max_index, verts);
         let _ = std::fs::remove_file(&project);
         let _ = std::fs::remove_file(&obj);
+    }
+
+    fn drag(app: &mut App, mods: ModifiersState, from: Vec2, to: Vec2) {
+        app.gesture(mods, from, to);
+    }
+
+    fn ctrl_shift() -> ModifiersState {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    }
+
+    #[test]
+    fn ctrl_shift_gestures_hide_isolate_show_and_invert_like_zbrush() {
+        let mut app = App::new(24, false, usize::MAX);
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        let total = app.doc.mesh().triangle_count();
+        let centre = app.viewport() * 0.5;
+        // The sphere covers the middle of the canvas; the corner is background.
+        let corner = Vec2::new(8.0, 8.0);
+
+        // Ctrl + Shift + drag a rectangle: what is inside stays, the rest is hidden.
+        drag(&mut app, ctrl_shift(), centre - Vec2::splat(80.0), centre + Vec2::splat(80.0));
+        let kept = total - app.doc.mesh().hidden_count();
+        assert!(kept > 0 && kept < total / 4, "kept {kept} of {total}");
+        assert!(app.workspace.select_rect.is_none(), "the rectangle is gone after release");
+        // Hidden triangles cannot be hit: off-centre the ray finds nothing to sculpt.
+        app.cursor = centre + Vec2::new(250.0, 0.0);
+        let (o, d) = app.cursor_ray();
+        assert!(app.mesh().raycast(o, d).is_none());
+        // The level below follows: its triangles are hidden where all children are.
+        assert!(app.doc.level_mesh(0).hidden_count() > 0);
+
+        // A brush stroke over the border only moves vertices that touch a visible triangle.
+        let before = app.doc.mesh().positions.clone();
+        app.brush = Brush { kind: BrushKind::Draw, radius: 0.8, strength: 1.0 };
+        drag(&mut app, ModifiersState::empty(), centre, centre + Vec2::new(30.0, 0.0));
+        let mesh = app.doc.mesh();
+        let moved: Vec<usize> = (0..before.len()).filter(|&v| mesh.positions[v] != before[v]).collect();
+        assert!(!moved.is_empty());
+        assert!(moved.iter().all(|&v| mesh.shown[v] != 0), "a hidden vertex moved");
+
+        // Ctrl + W: one new polygroup of the visible part.
+        app.modifiers = ModifiersState::CONTROL;
+        app.on_key(KeyCode::KeyW);
+        app.run_pending_vis();
+        app.modifiers = ModifiersState::empty();
+        assert_eq!(app.doc.mesh().group_count(), 2);
+        assert_eq!(app.doc.level_mesh(0).group_count(), 2, "groups reach the base");
+
+        // Ctrl + Shift + click on the background: show everything.
+        drag(&mut app, ctrl_shift(), corner, corner);
+        assert_eq!(app.doc.mesh().hidden_count(), 0);
+        assert!(app.doc.mesh().hidden.is_empty() && app.doc.mesh().shown.is_empty());
+
+        // Ctrl + Shift + click on the new group: only it stays.
+        drag(&mut app, ctrl_shift(), centre, centre);
+        assert_eq!(total - app.doc.mesh().hidden_count(), kept);
+        // Ctrl + Shift + Alt + click on it would hide everything: refused.
+        drag(&mut app, ctrl_shift() | ModifiersState::ALT, centre, centre);
+        assert_eq!(total - app.doc.mesh().hidden_count(), kept);
+        // Ctrl + Shift + drag on the background around nothing: inverted.
+        drag(&mut app, ctrl_shift(), corner, corner + Vec2::splat(30.0));
+        assert_eq!(app.doc.mesh().hidden_count(), kept);
+        // Show all, then Alt + drag (red rectangle) hides what it covers.
+        drag(&mut app, ctrl_shift(), corner, corner);
+        drag(&mut app, ctrl_shift() | ModifiersState::ALT, centre - Vec2::splat(80.0), centre + Vec2::splat(80.0));
+        let hid = app.doc.mesh().hidden_count();
+        // The stroke moved a few triangle centres in or out of the rectangle since.
+        assert!(hid.abs_diff(kept) * 20 < kept, "hid {hid}, kept {kept} before");
+
+        // Shift + F toggles polygroup colours.
+        app.modifiers = ModifiersState::SHIFT;
+        app.on_key(KeyCode::KeyF);
+        assert!(app.workspace.polyframe);
+
+        // Save and open: groups and visibility come back.
+        let bytes = app.project_bytes();
+        let project = project::read_from(&bytes[..], bytes.len() as u64).unwrap();
+        let back = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.marks(), app.doc.marks());
+
+        // Undo every step, back to one group and nothing hidden; the divide stays.
+        while app.doc.mesh().hidden_count() > 0 || app.doc.mesh().group_count() > 1 {
+            assert!(app.history.can_undo());
+            app.history.undo(&mut app.doc);
+        }
+        assert_eq!(app.doc.top(), 1);
+        assert!(app.doc.marks().iter().all(|m| m.groups.lens.is_empty() && m.hidden.is_empty()));
     }
 }

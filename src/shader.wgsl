@@ -86,15 +86,21 @@ fn fs_pick(in: PickOut) -> @location(0) u32 {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    var base = vec3<f32>(0.78, 0.62, 0.50);
+    if (u.params.w > 0.5 && u.params.w < 1.5) { base = vec3<f32>(0.52, 0.58, 0.66); }
+    if (u.params.w > 1.5 && u.params.w < 2.5) { base = vec3<f32>(0.62, 0.29, 0.20); }
+    if (u.params.w > 2.5) { base = vec3<f32>(0.55, 0.43, 0.25); }
+    return shade(in, base);
+}
+
+// Shading shared by the plain pass and the polygroup pass (groups.wgsl): `base` is the
+// surface colour (the material's, or a polygroup's).
+fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
     let n = normalize(in.normal);
     let v = normalize(u.cam_pos.xyz - in.world_pos);
     let l = normalize(u.light_dir.xyz);
 
     // Clay-like shading: key light, soft fill from the opposite side, rim and a small highlight.
-    var base = vec3<f32>(0.78, 0.62, 0.50);
-    if (u.params.w > 0.5 && u.params.w < 1.5) { base = vec3<f32>(0.52, 0.58, 0.66); }
-    if (u.params.w > 1.5 && u.params.w < 2.5) { base = vec3<f32>(0.62, 0.29, 0.20); }
-    if (u.params.w > 2.5) { base = vec3<f32>(0.55, 0.43, 0.25); }
     let diff = max(dot(n, l), 0.0);
     let fill = max(dot(n, -l), 0.0) * 0.25;
     let ambient = 0.22 + 0.10 * (n.y * 0.5 + 0.5);

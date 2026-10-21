@@ -182,6 +182,19 @@ pub struct SculptMesh {
     /// CSR adjacency: vertex -> incident triangles.
     pub vt_offsets: Vec<u32>,
     pub vt_tris: Vec<u32>,
+    /// Polygroup per triangle (ZBrush: PolyGroups). Empty while the whole mesh is group 0.
+    pub groups: Vec<u16>,
+    /// 1 per hidden triangle (ZBrush: visibility). Empty while nothing is hidden.
+    pub hidden: Vec<u8>,
+    /// 1 per vertex with at least one visible triangle: the vertices brushes may move.
+    /// Empty while nothing is hidden.
+    pub shown: Vec<u8>,
+    /// Bumped whenever `hidden` / `groups` change, so the renderer knows to re-upload.
+    pub vis_version: u32,
+    pub group_version: u32,
+    /// Distinct groups and hidden triangles, kept with the arrays.
+    group_count: usize,
+    hidden_count: usize,
     stamp_id: u32,
 }
 
@@ -190,6 +203,8 @@ pub struct RayHit {
     pub t: f32,
     pub point: Vec3,
     pub normal: Vec3,
+    /// Triangle hit.
+    pub tri: u32,
 }
 
 impl SculptMesh {
@@ -396,6 +411,13 @@ impl SculptMesh {
             adj_verts,
             vt_offsets,
             vt_tris,
+            groups: Vec::new(),
+            hidden: Vec::new(),
+            shown: Vec::new(),
+            vis_version: 0,
+            group_version: 0,
+            group_count: 1,
+            hidden_count: 0,
             stamp_id: 0,
         };
 
@@ -443,6 +465,7 @@ impl SculptMesh {
     /// Vertices within `r` of `c`, grouped by chunk. Parallel over chunks.
     pub fn select_sphere(&self, c: Vec3, r: f32) -> Selection {
         let r2 = r * r;
+        let shown = &self.shown;
         let per_chunk: Vec<(u32, Vec<(u32, f32)>)> = self
             .chunks
             .par_iter()
@@ -451,6 +474,10 @@ impl SculptMesh {
             .map(|(ci, ch)| {
                 let hits: Vec<(u32, f32)> = (ch.vert_start..ch.vert_end)
                     .filter_map(|v| {
+                        // Vertices of hidden triangles only are left alone.
+                        if !shown.is_empty() && shown[v as usize] == 0 {
+                            return None;
+                        }
                         let d2 = (self.positions[v as usize] - c).length_squared();
                         if d2 <= r2 { Some((v, d2.sqrt())) } else { None }
                     })
@@ -496,6 +523,7 @@ impl SculptMesh {
     pub fn select_sphere_mirror_x(&self, c: Vec3, r: f32) -> Selection {
         let m = Vec3::new(-c.x, c.y, c.z);
         let r2 = r * r;
+        let shown = &self.shown;
         let per_chunk: Vec<(u32, Vec<(u32, f32, f32)>)> = self
             .chunks
             .par_iter()
@@ -504,6 +532,9 @@ impl SculptMesh {
             .map(|(ci, ch)| {
                 let hits: Vec<(u32, f32, f32)> = (ch.vert_start..ch.vert_end)
                     .filter_map(|v| {
+                        if !shown.is_empty() && shown[v as usize] == 0 {
+                            return None;
+                        }
                         let p = self.positions[v as usize];
                         let a = (p - c).length_squared();
                         let b = (p - m).length_squared();
@@ -659,6 +690,9 @@ impl SculptMesh {
                 }
             }
             for t in self.chunks[ci].tris() {
+                if !self.hidden.is_empty() && self.hidden[t as usize] != 0 {
+                    continue;
+                }
                 let i = 3 * t as usize;
                 let a = self.positions[self.indices[i] as usize];
                 let b = self.positions[self.indices[i + 1] as usize];
@@ -679,8 +713,133 @@ impl SculptMesh {
                 t,
                 point: o + d * t,
                 normal: (b - a).cross(c - a).normalize_or(Vec3::Y),
+                tri,
             }
         })
+    }
+
+    /// Whether triangle `t` is drawn.
+    #[inline]
+    pub fn visible(&self, t: u32) -> bool {
+        self.hidden.is_empty() || self.hidden[t as usize] == 0
+    }
+
+    /// Polygroup of triangle `t`.
+    #[inline]
+    pub fn group(&self, t: u32) -> u16 {
+        if self.groups.is_empty() { 0 } else { self.groups[t as usize] }
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.hidden_count
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    /// Replace the hidden flags (one per triangle, or empty for none). All-visible is
+    /// stored as empty so a mesh with nothing hidden costs nothing anywhere. Refreshes the
+    /// per-vertex `shown` flags.
+    pub fn set_hidden(&mut self, mut hidden: Vec<u8>) {
+        let count = hidden.par_iter().filter(|&&h| h != 0).count();
+        if count == 0 {
+            hidden = Vec::new();
+        }
+        debug_assert!(hidden.is_empty() || hidden.len() == self.triangle_count());
+        self.shown = if hidden.is_empty() {
+            Vec::new()
+        } else {
+            (0..self.vertex_count())
+                .into_par_iter()
+                .map(|v| {
+                    let (a, b) = (self.vt_offsets[v] as usize, self.vt_offsets[v + 1] as usize);
+                    self.vt_tris[a..b].iter().any(|&t| hidden[t as usize] == 0) as u8
+                })
+                .collect()
+        };
+        self.hidden = hidden;
+        self.hidden_count = count;
+        self.vis_version = self.vis_version.wrapping_add(1);
+    }
+
+    /// Replace the polygroups (one per triangle, or empty for all group 0). A single group
+    /// 0 is stored as empty.
+    pub fn set_groups(&mut self, mut groups: Vec<u16>) {
+        debug_assert!(groups.is_empty() || groups.len() == self.triangle_count());
+        let seen = groups
+            .par_chunks(1 << 16)
+            .fold(
+                || vec![0u64; 1024],
+                |mut acc, block| {
+                    for &g in block {
+                        acc[g as usize >> 6] |= 1 << (g & 63);
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0u64; 1024],
+                |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x |= y);
+                    a
+                },
+            );
+        let count: usize = seen.iter().map(|w| w.count_ones() as usize).sum();
+        if groups.is_empty() || (count == 1 && groups[0] == 0) {
+            groups = Vec::new();
+        }
+        self.group_count = count.max(1);
+        self.groups = groups;
+        self.group_version = self.group_version.wrapping_add(1);
+    }
+
+    /// The index buffer of the visible triangles, in order; `None` while nothing is hidden.
+    pub fn visible_indices(&self) -> Option<Vec<u32>> {
+        if self.hidden.is_empty() {
+            return None;
+        }
+        Some(
+            self.indices
+                .par_chunks_exact(3)
+                .zip(self.hidden.par_iter())
+                .filter(|(_, h)| **h == 0)
+                .flat_map_iter(|(t, _)| t.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Polygroup of every drawn (visible) triangle in draw order, two per word.
+    pub fn drawn_groups_packed(&self) -> Vec<u32> {
+        let drawn: Vec<u16> = (0..self.triangle_count() as u32)
+            .into_par_iter()
+            .filter(|&t| self.visible(t))
+            .map(|t| self.group(t))
+            .collect();
+        drawn
+            .par_chunks(2)
+            .map(|p| p[0] as u32 | (p.get(1).copied().unwrap_or(0) as u32) << 16)
+            .collect()
+    }
+
+    /// Bounds of the vertices that are shown (all of them while nothing is hidden).
+    pub fn visible_bounds(&self) -> Aabb {
+        if self.shown.is_empty() {
+            return self.bounds();
+        }
+        self.positions
+            .par_iter()
+            .zip(self.shown.par_iter())
+            .filter(|(_, s)| **s != 0)
+            .fold(Aabb::empty, |mut b, (p, _)| {
+                b.grow(*p);
+                b
+            })
+            .reduce(Aabb::empty, |mut a, b| {
+                a.grow(b.min);
+                a.grow(b.max);
+                a
+            })
     }
 
     pub fn bounds(&self) -> Aabb {
@@ -713,7 +872,13 @@ impl SculptMesh {
             writeln!(w, "vn {} {} {}", n.x, n.y, n.z)?;
         }
         let first = first as u64 + 1;
-        for tri in self.indices.chunks_exact(3) {
+        // Polygroups become OBJ groups, as ZBrush exports them.
+        let mut group = None;
+        for (t, tri) in self.indices.chunks_exact(3).enumerate() {
+            if !self.groups.is_empty() && group != Some(self.groups[t]) {
+                group = Some(self.groups[t]);
+                writeln!(w, "g {name}_{}", self.groups[t])?;
+            }
             let [a, b, c] = [tri[0], tri[1], tri[2]].map(|v| v as u64 + first);
             writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
         }

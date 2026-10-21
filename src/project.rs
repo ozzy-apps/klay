@@ -6,8 +6,14 @@
 //! ```text
 //! magic "KLAYPRJ\0" · version u32 · subtool count u32 · active subtool u32
 //! per subtool: name (u32 length + UTF-8) · visible u8 · packed stack
+//!              · (version 3) polygroups and hidden triangles of every level
 //! end marker "KLAYEND\0"
 //! ```
+//!
+//! Version 1 files (no polygroups, nothing hidden) still open. Version 3 adds the
+//! polygroups and hidden triangles of every level as run-length blocks (ZBrush keeps both
+//! in its tools). It is 3 rather than 2 so it cannot be mistaken for the version 2 files of
+//! the masking branch; merging the two should make version 3 = version 2 plus these blocks.
 //!
 //! Every length is checked against the bytes left in the file before anything is
 //! allocated, so a truncated or foreign file is refused with a message, never a crash. The
@@ -20,7 +26,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
+/// Older versions this build still reads.
+const READS: [u32; 2] = [1, 3];
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -152,15 +160,23 @@ impl<R: Read> In<R> {
 
 /// Serialise a project into `w`.
 pub fn write_to<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize) -> io::Result<W> {
+    write_version(w, tools, active, VERSION)
+}
+
+/// Serialise in the layout of `version` (1 or 3; tests write version 1 files with it).
+pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize, version: u32) -> io::Result<W> {
     let mut out = Out::new(w);
     out.bytes(MAGIC)?;
-    out.u32(VERSION)?;
+    out.u32(version)?;
     out.u32(tools.len() as u32)?;
     out.u32(active as u32)?;
     for (name, visible, packed) in tools {
         out.slice(name.as_bytes())?;
         out.u8(*visible as u8)?;
         packed.write_to(&mut out)?;
+        if version >= 3 {
+            packed.write_marks(&mut out)?;
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -185,8 +201,8 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
     let mut input = In::new(r, len);
     input.exact(MAGIC, "Klay project header")?;
     let version = input.u32()?;
-    if version != VERSION {
-        return Err(format!("project version {version} is not supported (this build reads {VERSION})"));
+    if !READS.contains(&version) {
+        return Err(format!("project version {version} is not supported (this build reads {READS:?})"));
     }
     let count = input.u32()? as usize;
     let active = input.u32()? as usize;
@@ -198,7 +214,10 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         let name: Vec<u8> = input.vec()?;
         let name = String::from_utf8(name).map_err(|_| "a subtool name is not valid text")?;
         let visible = input.u8()? != 0;
-        let packed = Packed::read_from(&mut input)?;
+        let mut packed = Packed::read_from(&mut input)?;
+        if version >= 3 {
+            packed.read_marks(&mut input)?;
+        }
         tools.push(SavedTool {
             name,
             visible,
@@ -350,5 +369,32 @@ mod tests {
         let mut wrong_version = bytes.clone();
         wrong_version[8] = 9;
         assert!(read_from(&wrong_version[..], bytes.len() as u64).is_err_and(|e| e.contains("version")));
+    }
+
+    #[test]
+    fn version_1_files_open_and_version_3_keeps_groups_and_visibility() {
+        let mut a = Multires::new(sphere(8, 1.0), usize::MAX);
+        assert!(a.divide());
+        let n = a.mesh().triangle_count();
+        a.set_groups(1, (0..n).map(|t| (t % 4) as u16).collect());
+        a.set_hidden(1, (0..n).map(|t| (t % 9 == 0) as u8).collect());
+        let p = a.pack_copy();
+        // Version 1: the same stack, no polygroups or visibility.
+        let v1 = write_version(Vec::new(), &[("Old", true, &p)], 0, 1).unwrap();
+        let project = read_from(&v1[..], v1.len() as u64).expect("version 1 opens");
+        let old = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(old.level_mesh(1).positions, a.level_mesh(1).positions);
+        assert!(old.marks().iter().all(|m| m.groups.lens.is_empty() && m.hidden.is_empty()));
+        // Version 3: both come back on every level.
+        let v3 = bytes_of(&[("New", true, &p)], 0);
+        let project = read_from(&v3[..], v3.len() as u64).unwrap();
+        let back = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.marks(), a.marks());
+        // A run table that does not cover its level is refused, not trusted.
+        let mut bad = p.clone();
+        let mut marks = a.marks();
+        marks[1].hidden[0] += 1;
+        bad.set_marks_for_test(marks);
+        assert!(bad.try_unpack().is_err());
     }
 }

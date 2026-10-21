@@ -367,6 +367,11 @@ pub struct Model<'a> {
     pub stand_in_bytes: u64,
     /// Project file used by Save and Open.
     pub project_path: &'a mut String,
+    /// Polygroups and hidden triangles at the shown level of the active subtool.
+    pub groups: usize,
+    pub hidden: usize,
+    /// The GPU can show polygroup colours.
+    pub polyframe_supported: bool,
 }
 
 /// One line of the SubTool list.
@@ -411,6 +416,11 @@ pub struct Actions {
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
+    /// Polygroups: one new group of the visible polygons (Ctrl + W).
+    pub group_visible: bool,
+    /// Visibility: show everything / swap hidden and visible.
+    pub show_all: bool,
+    pub invert_visibility: bool,
 }
 
 pub const MATERIALS: [(Color32, &str); 4] = [
@@ -475,6 +485,11 @@ pub struct Workspace {
     pub symmetry: bool,
     /// Draw only the active subtool (ZBrush: Solo).
     pub solo: bool,
+    /// Polygroup colours on the active subtool (ZBrush: PolyF, Shift + F).
+    pub polyframe: bool,
+    /// Ctrl + Shift selection rectangle being dragged (logical pixels), and whether it
+    /// hides (Alt, red) rather than keeps (green) what it covers.
+    pub select_rect: Option<(Rect, bool)>,
     /// Deformation slider being dragged, and its value.
     deform_drag: Option<(Deform, f32)>,
     pub mode: Mode,
@@ -522,6 +537,8 @@ impl Workspace {
             perspective: true,
             symmetry: false,
             solo: false,
+            polyframe: false,
+            select_rect: None,
             deform_drag: None,
             mode: Mode::Draw,
             popup: None,
@@ -1197,6 +1214,12 @@ impl Workspace {
                     self.symmetry = !self.symmetry;
                 }
                 nav_separator(ui);
+                if big_button(ui, "polyf", "PolyF", size, self.polyframe, true)
+                    .on_hover_text("Polygroup colours · Shift + F")
+                    .clicked()
+                {
+                    self.polyframe = !self.polyframe;
+                }
                 for (g, label) in [("local", "Local"), ("transp", "Transp"), ("ghost", "Ghost")] {
                     big_button(ui, g, label, size, false, false).on_hover_text(NC);
                 }
@@ -2094,6 +2117,76 @@ impl Workspace {
                     ui,
                     h,
                     id,
+                    "visibility",
+                    "Visibility",
+                    None,
+                    true,
+                    true,
+                    &mut |_, ui| {
+                        kv(
+                            ui,
+                            "Hidden",
+                            &format!("{} of {} triangles", crate::fmt_count(m.hidden), crate::fmt_count(m.triangles)),
+                        );
+                        ui.add_enabled_ui(m.hidden > 0, |ui| {
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 4.0) * 0.5;
+                                if ui
+                                    .add(egui::Button::new("Show all").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Ctrl + Shift + click on the background")
+                                    .clicked()
+                                {
+                                    a.show_all = true;
+                                }
+                                if ui
+                                    .add(egui::Button::new("Invert").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Swap hidden and visible · Ctrl + Shift + drag on the background")
+                                    .clicked()
+                                {
+                                    a.invert_visibility = true;
+                                }
+                            });
+                        });
+                        note(ui, "Ctrl + Shift + drag: keep the rectangle (Alt: hide it) · click a group to isolate it (Alt: hide it)");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "polygroups",
+                    "Polygroups",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        kv(ui, "Polygroups", &crate::fmt_count(m.groups));
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            if ui
+                                .add(egui::Button::new("Group Visible").min_size(vec2(w, 20.0)))
+                                .on_hover_text("One new polygroup of the visible polygons · Ctrl + W")
+                                .clicked()
+                            {
+                                a.group_visible = true;
+                            }
+                            ui.add_enabled_ui(m.polyframe_supported, |ui| {
+                                if ui
+                                    .add(egui::Button::new("PolyF").selected(ws.polyframe).min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Polygroup colours · Shift + F")
+                                    .on_disabled_hover_text("Needs a GPU with primitive-index support")
+                                    .clicked()
+                                {
+                                    ws.polyframe = !ws.polyframe;
+                                }
+                            });
+                        });
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
                     "initialize",
                     "Initialize",
                     None,
@@ -2259,6 +2352,12 @@ impl Workspace {
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("Space (hold)", "quick menu · also: right-click tap"),
                             ("Alt + click subtool", "select subtool"),
+                            ("Ctrl + Shift + drag", "keep the rectangle visible · Alt: hide it"),
+                            ("Ctrl + Shift + click group", "isolate the polygroup · Alt: hide it"),
+                            ("Ctrl + Shift + click canvas", "show all"),
+                            ("Ctrl + Shift + drag canvas", "invert visibility (a rectangle around nothing)"),
+                            ("Ctrl + W", "group visible: one new polygroup"),
+                            ("Shift + F", "polygroup colours (PolyF)"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
@@ -2575,6 +2674,17 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if let Some((r, hide)) = self.select_rect {
+            // ZBrush SelectRect: green keeps what it covers, red (Alt) hides it.
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("select-rect")));
+            let (fill, line) = if hide {
+                (Color32::from_rgba_unmultiplied(220, 60, 50, 40), Color32::from_rgb(235, 80, 65))
+            } else {
+                (Color32::from_rgba_unmultiplied(70, 200, 90, 40), Color32::from_rgb(90, 220, 110))
+            };
+            p.rect_filled(r, 0, fill);
+            p.rect_stroke(r, 0, Stroke::new(1.0, line), StrokeKind::Inside);
+        }
         let canvas = self.canvas;
         let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(canvas);
@@ -3662,6 +3772,12 @@ fn glyph(p: &egui::Painter, c: Pos2, name: &str, color: Color32) {
                 Stroke::new(1.0, color.gamma_multiply(0.4)),
             );
         }
+        "polyf" => {
+            // A quad grid: the polyframe.
+            p.rect_stroke(Rect::from_center_size(c, vec2(14.0, 12.0)), 0, s, StrokeKind::Middle);
+            line(&[vec2(0.0, -6.0), vec2(0.0, 6.0)]);
+            line(&[vec2(-7.0, 0.0), vec2(7.0, 0.0)]);
+        }
         "detail" => {
             let wave = |dy: f32, amp: f32, col: Color32| {
                 let pts: Vec<Pos2> = (0..15)
@@ -3899,6 +4015,9 @@ mod tests {
                         parked_bytes: 0,
                         stand_in_bytes: 0,
                         project_path: &mut String::from("untitled.klay"),
+                        groups: 1,
+                        hidden: 0,
+                        polyframe_supported: true,
                     },
                 );
             },

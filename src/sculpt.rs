@@ -70,6 +70,10 @@ pub enum UndoStep {
         scale: f32,
         translate: Vec3,
     },
+    /// Hidden triangles of every level before a visibility change (run-length coded).
+    Visibility(Vec<Vec<u32>>),
+    /// Polygroups of every level before a group change (run-length coded).
+    Groups(Vec<crate::polygroup::GroupRuns>),
 }
 
 pub struct History {
@@ -138,6 +142,8 @@ impl History {
                 UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
                 UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
                 UndoStep::Transform { .. } => 0,
+                UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
+                UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
             })
             .sum()
     }
@@ -168,6 +174,8 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
                 translate: -translate,
             }
         }
+        UndoStep::Visibility(runs) => UndoStep::Visibility(doc.restore_visibility(runs)),
+        UndoStep::Groups(runs) => UndoStep::Groups(doc.restore_groups(runs)),
     }
 }
 

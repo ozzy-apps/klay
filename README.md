@@ -21,6 +21,7 @@ cargo run --release -- --subtools 4                         # start with four su
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
+cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
 ```
 
 `--segments N` sets the resolution of the starting primitive (`--primitive NAME`, Sphere by
@@ -70,14 +71,16 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
 - **Top shelf**: Sculpt mode, Zadd/Zsub, Z Intensity (strength), Draw Size (radius), Undo/Redo.
 - **Left shelf**: the current brush and material as rendered sphere thumbnails (click for a
   picker), stroke/alpha/texture slots, and an HSV colour picker with swap.
-- **Right shelf**: Frame, Floor grid, Detail shading, Hide interface, plus reserved toggles.
+- **Right shelf**: Frame, Floor grid, Symmetry, PolyF (polygroup colours), Solo, Detail
+  shading, Hide interface, plus reserved toggles.
 - **Tab** hides the whole interface; **Tab** or **Escape** restores it.
 - Layout (placement, order, collapse state, sections, trays, tray width) saves automatically to
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
-presets, primitives (Mesh → Initialize), subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
+presets, primitives (Mesh → Initialize), polygroups and visibility (Mesh → Visibility and
+Polygroups, Ctrl + Shift gestures, Ctrl + W, PolyF), subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
 vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
 Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
@@ -109,6 +112,12 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Alt + left drag on the model | Alternate brush (carve), like ZBrush's ZSub |
 | Shift + left drag | Smooth |
 | Ctrl + left drag | Reserved for masking (not connected yet) |
+| Ctrl + Shift + drag | Keep what the rectangle covers visible, hide the rest (ZBrush SelectRect); hold Alt during the drag to hide what it covers instead (the rectangle turns red) |
+| Ctrl + Shift + click on the model | Isolate the polygroup under the cursor (Alt: hide it) |
+| Ctrl + Shift + click on empty canvas | Show everything |
+| Ctrl + Shift + drag on empty canvas, around nothing | Invert visibility |
+| Ctrl + `W` | Group Visible: one new polygroup of the visible polygons |
+| Shift + `F` | Polygroup colours (ZBrush PolyF) |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
 | Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to move) |
@@ -126,7 +135,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
 | Alt + click another subtool | Select it (Alt + drag on the active one still carves) |
-| `F` | Frame the visible subtools |
+| `F` | Frame the visible subtools (the shown part of the active one) |
 | `P` / Shift + `P` | Perspective toggle / floor grid |
 | `Home` | Reset the view angle and frame |
 | `Tab` | Toggle canvas focus |
@@ -175,10 +184,31 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
   Delete and reordering; Deformation moves and sizes the active subtool exactly at every
   level, undoably.
+- `polygroup.rs` with `mesh.rs` / `multires.rs`: ZBrush polygroups and visibility. Every
+  level keeps a polygroup per triangle (16 bits) and a hidden flag per triangle, plus a
+  per-vertex flag for the vertices that touch a visible triangle; all three arrays stay empty
+  while the mesh is one group with nothing hidden, so a plain model costs nothing. Divide
+  hands them to the four children of each triangle. An edit at any level (Ctrl + Shift
+  gestures, Ctrl + W) is carried to every other level: upwards exactly (a child takes its
+  parent's flag and group), downwards by rule (a triangle is hidden when all four children
+  are, and takes its centre child's group). The child-to-parent triangle map is not stored
+  (it would cost 8 bytes per vertex); it is derived from the subdivision stencils when an
+  edit needs it. Brushes skip vertices that touch only hidden triangles, the ray cast skips
+  hidden triangles, Frame frames the visible part. On the GPU a level with hidden triangles
+  draws and picks from a second index buffer of the visible ones (12 bytes per visible
+  triangle, only while something is hidden); PolyF draws with a separate pipeline whose
+  fragment shader reads the triangle's group from a 2-bytes-per-triangle buffer by primitive
+  index (only while PolyF is on). With nothing hidden and PolyF off, the buffers and the
+  pipeline are exactly the ones used before. Undo stores the previous groups or visibility
+  of every level run-length coded; parked subtools and project files keep them the same way,
+  and stand-ins of parked subtools leave hidden triangles out. OBJ export writes polygroups
+  as OBJ groups.
 - `project.rs`: `.klay` project files hold every subtool in the same packed form parked
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
-  moved into place. Reading checks every length against the bytes left before allocating;
+  moved into place. Version 3 adds the polygroups and hidden triangles of every level
+  (ZBrush keeps both in its tools); version 1 files still open. (Version 3, not 2, so it
+  cannot be confused with the masking branch's version 2.) Reading checks every length against the bytes left before allocating;
   rebuilding checks index bounds, the chunk table, manifold edges and every level's labels
   and offsets, and turns anything else that fails into an error. Open rebuilds each
   subtool once to bake its stand-in and swaps the model only when all of them succeeded.
@@ -239,6 +269,29 @@ Parking bakes the stand-in and frees the stack (most of the time at three levels
 2 GB back to the system). Activating replays the subdivisions from the stored labels, a
 little faster than dividing because there is no spatial split. Frame time at level 2 is
 unchanged by the natural-order chunks.
+
+### Polygroups and visibility (`--bench 400 --divide 2`, 15.4M vertices at level 2)
+
+Measured on a 4-core cloud VM (not the RTX machine above); the work is parallel, so expect
+these to drop by about the core ratio there.
+
+| Step at level 2 (30.7M triangles) | Time |
+| --- | --- |
+| Ctrl + Shift rectangle around the middle (1.35M triangles kept), all three levels updated | 0.35 s |
+| Of that: which triangles the rectangle covers / the level-to-level triangle map | 27 ms / 0.2 s |
+| Visible index buffer for the GPU (16 MB) | 12–60 ms |
+| Ctrl + W (Group Visible), all levels | 0.35 s |
+| Ctrl + Shift + click on the background (show all) | 27 ms |
+| Ctrl + Shift + click on a group (isolate) | 0.33 s |
+| Undo of those four steps | 0.14 s |
+
+Memory while something is hidden and there are two groups: 7 bytes per vertex at the level
+in RAM (groups 4, hidden flags 2, shown flags 1); GPU: 12 bytes per visible triangle for the
+visible index buffer, and 2 bytes per drawn triangle while PolyF is on. A plain model
+(one group, nothing hidden) keeps 52 bytes per vertex and the same draw path; frame time in
+the A/B run on software rendering (llvmpipe, 960k vertices, `--novsync --frames`) was within
+the noise of `main`. In-window checks at 15.4M vertices were not possible on that VM, whose
+software GPU caps a buffer binding at 128 MB.
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of
