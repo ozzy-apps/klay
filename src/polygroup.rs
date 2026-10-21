@@ -121,7 +121,8 @@ fn runs_by_block<T: Sync>(data: &[T], key: impl Fn(&T) -> u16 + Sync) -> Vec<(u3
 /// neighbouring ids differ clearly. Must match `group_color` in `groups.wgsl`.
 #[allow(dead_code)]
 pub fn group_color(g: u16) -> [f32; 3] {
-    let h = (g as f32 * 0.618_034 + 0.1).fract() * 6.0;
+    // Offset so group 0, the whole of a new model, is a clear blue, far from the clay.
+    let h = (g as f32 * 0.618_034 + 0.55).fract() * 6.0;
     let (s, v) = (0.55, 0.85);
     let c = v * s;
     let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
@@ -214,6 +215,15 @@ mod tests {
         assert_eq!(GroupRuns::of(&vec![0; 5]), GroupRuns::default());
         assert!(GroupRuns::of(&vec![3; 5]).lens == vec![5]);
         assert!(r.expand(groups.len() + 1).is_err());
+    }
+
+    #[test]
+    fn group_0_does_not_look_like_clay() {
+        // Warm clay, the default material (shader.wgsl).
+        let clay = [0.78, 0.62, 0.50];
+        let c = group_color(0);
+        let d: f32 = c.iter().zip(&clay).map(|(x, y)| (x - y).abs()).sum();
+        assert!(d > 0.4, "group 0 {c:?} is too close to the clay");
     }
 
     #[test]

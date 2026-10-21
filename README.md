@@ -129,7 +129,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Ctrl + Shift + click on empty canvas | Show everything |
 | Ctrl + Shift + drag on empty canvas, around nothing | Invert visibility |
 | Ctrl + `W` | With a mask: one new polygroup of the masked polygons, and the mask is cleared (Group Masked); without one: of the visible polygons (Group Visible) |
-| Shift + `F` | Polygroup colours (ZBrush PolyF) |
+| Shift + `F` | Polygroup colours and the polygon frame (ZBrush PolyF). A new model is one polygroup, shown in blue; Ctrl + W or the Polygroups palette makes more |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
 | Left drag in the border outside the canvas frame | Always navigates, even over the model, in every mode (as on empty canvas) |
@@ -245,7 +245,11 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   draws and picks from a second index buffer of the visible ones (12 bytes per visible
   triangle, only while something is hidden); PolyF draws with a separate pipeline whose
   fragment shader reads the triangle's group from a 2-bytes-per-triangle buffer by primitive
-  index (only while PolyF is on). With nothing hidden and PolyF off, the buffers and the
+  index (only while PolyF is on). The same shader draws the polyframe: it fetches the
+  triangle's three corners from the index and position buffers it already has, measures the
+  pixel distance to each edge, leaves out a quad's diagonal (the longest edge in the world
+  when it is over 1.1 times the next) and fades the lines where polygons are under a few
+  pixels, so a dense level does not turn black. No extra memory is used. With nothing hidden and PolyF off, the buffers and the
   pipeline are exactly the ones used before. Undo stores the previous groups or visibility
   of every level run-length coded; parked subtools and project files keep them the same way,
   and stand-ins of parked subtools leave hidden triangles out. OBJ export writes polygroups

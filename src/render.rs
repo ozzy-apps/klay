@@ -296,7 +296,8 @@ impl Gfx {
             label: Some("mask bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The PolyF pass places its triangle's corners the way the vertex shader does.
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -387,18 +388,21 @@ impl Gfx {
             cache: None,
         });
 
+        // PolyF: the polygroup of each drawn triangle, the drawn index buffer and the
+        // positions, so the fragment shader can find its triangle's edges.
+        let fragment_storage = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let group_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("polygroup bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[fragment_storage(0), fragment_storage(1), fragment_storage(2)],
         });
         let group_pipeline = primitive_index.then(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1255,20 +1259,40 @@ impl Gfx {
         }
         let draw = vis_stale.then(|| {
             mesh.visible_indices().map(|ix| {
-                let buffer = self.upload("visible indices", bytemuck::cast_slice(&ix), wgpu::BufferUsages::INDEX);
-                (buffer, ix.len() as u32)
+                // STORAGE: PolyF reads the corners of the drawn triangles from it.
+                let usage = wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE;
+                (self.upload("visible indices", bytemuck::cast_slice(&ix), usage), ix.len() as u32)
             })
         });
+        if let Some(draw) = draw {
+            let m = self.levels[self.active].as_mut().unwrap();
+            m.bytes -= m.draw.as_ref().map_or(0, |(b, _)| b.size());
+            m.bytes += draw.as_ref().map_or(0, |(b, _)| b.size());
+            m.draw = draw;
+            m.vis_version = Some(mesh.vis_version);
+        }
+        // Made after the visible indices, which it binds.
         let groups = groups_stale.then(|| {
+            let m = self.levels[self.active].as_ref().unwrap();
             let packed = mesh.drawn_groups_packed();
             let buffer = self.upload("polygroups", bytemuck::cast_slice(&packed), wgpu::BufferUsages::STORAGE);
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("polygroup bg"),
                 layout: &self.group_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: m.drawn().0.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: m.positions.as_entire_binding(),
+                    },
+                ],
             });
             GroupBuffers {
                 bind_group,
@@ -1278,12 +1302,6 @@ impl Gfx {
             }
         });
         let m = self.levels[self.active].as_mut().unwrap();
-        if let Some(draw) = draw {
-            m.bytes -= m.draw.as_ref().map_or(0, |(b, _)| b.size());
-            m.bytes += draw.as_ref().map_or(0, |(b, _)| b.size());
-            m.draw = draw;
-            m.vis_version = Some(mesh.vis_version);
-        }
         if groups.is_some() || drop_groups {
             m.bytes -= m.groups.as_ref().map_or(0, |g| g.bytes);
             m.bytes += groups.as_ref().map_or(0, |g| g.bytes);
