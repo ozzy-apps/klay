@@ -68,6 +68,8 @@ pub struct Chunk {
     pub dirty_pos: bool,
     /// Some vertex normal in this chunk may have changed: GPU recompute.
     pub dirty_nrm: bool,
+    /// Mask values of the owned range changed: re-upload them.
+    pub dirty_mask: bool,
     /// Chunks that share at least one edge with this one.
     pub neighbors: Vec<u32>,
     /// Vertices referenced by `tris` but owned by another chunk.
@@ -86,6 +88,7 @@ impl Chunk {
             aabb: Aabb::empty(),
             dirty_pos: true,
             dirty_nrm: true,
+            dirty_mask: false,
             neighbors: Vec::new(),
             external: Vec::new(),
             stamp: 0,
@@ -182,6 +185,10 @@ pub struct SculptMesh {
     /// CSR adjacency: vertex -> incident triangles.
     pub vt_offsets: Vec<u32>,
     pub vt_tris: Vec<u32>,
+    /// Mask per vertex, 0 = free to edit, 255 = fully masked (ZBrush: Ctrl). Empty when
+    /// nothing is masked. Only the shown level of a stack carries it (see
+    /// [`crate::multires::Multires::set_active`]).
+    pub mask: Vec<u8>,
     /// Polygroup per triangle (ZBrush: PolyGroups). Empty while the whole mesh is group 0.
     pub groups: Vec<u16>,
     /// 1 per hidden triangle (ZBrush: visibility). Empty while nothing is hidden.
@@ -421,6 +428,7 @@ impl SculptMesh {
             adj_verts,
             vt_offsets,
             vt_tris,
+            mask: Vec::new(),
             groups: Vec::new(),
             hidden: Vec::new(),
             shown: Vec::new(),
@@ -667,6 +675,20 @@ impl SculptMesh {
         for &c in changed {
             self.chunks[c as usize].dirty_pos = true;
         }
+    }
+
+    /// Every vertex was moved by `f`, a map that keeps the order along each axis (a
+    /// translation and a positive scale): each chunk's box maps exactly through `f`, so it
+    /// needs no refit over the vertices. Marks every chunk for upload and normals.
+    pub fn finish_monotone_edit(&mut self, f: impl Fn(Vec3) -> Vec3 + Sync) {
+        self.chunks.par_iter_mut().for_each(|ch| {
+            ch.aabb = Aabb {
+                min: f(ch.aabb.min),
+                max: f(ch.aabb.max),
+            };
+            ch.dirty_pos = true;
+            ch.dirty_nrm = true;
+        });
     }
 
     /// Per-chunk flags (1 = recompute normals) for `chunks` and their neighbours.

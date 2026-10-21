@@ -21,6 +21,8 @@ cargo run --release -- --subtools 4                         # start with four su
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
+cargo run --release -- --segments 400 --divide 2 --novsync --selftest-transpose     # Transpose move / scale / rotate + undo through the input path, log, exit
+cargo run --release -- --segments 400 --divide 2 --novsync --selftest-mask          # Ctrl masking, a masked move and undo through the input path, log, exit
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
 cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
@@ -82,10 +84,12 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
 presets, primitives (Mesh → Initialize), Wedge remeshing and Del Higher / Del Lower (Mesh →
-Wedge, Geometry), polygroups and visibility (Mesh → Visibility and
-Polygroups, Ctrl + Shift gestures, Ctrl + W, PolyF), subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
-vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
-Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
+Wedge, Geometry), polygroups and visibility (Mesh → Visibility and Polygroups, Ctrl + Shift
+gestures, Ctrl + W, PolyF), masking (Ctrl, Masking palette), subdivision levels (Mesh →
+Geometry: Divide, SDiv slider, vertex counts, vertex budget), undo/redo, OBJ export, the Move /
+Scale / Rotate modes (Transpose action line) and live statistics are connected to the engine.
+Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, mask types (rect / lasso), the
+Transform palette, symmetry and
 the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
 
 Brush thumbnails are rendered on the CPU at startup: a sphere in the current material with the
@@ -114,16 +118,21 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Left drag on the model | Sculpt with the current brush |
 | Alt + left drag on the model | Alternate brush (carve), like ZBrush's ZSub |
 | Shift + left drag | Smooth |
-| Ctrl + left drag | Reserved for masking (not connected yet) |
-| Ctrl + left drag on empty canvas | With Wedge on: Wedge again on release (ZBrush: re-DynaMesh); it no longer rotates |
+| Ctrl + left drag on the model | Paint a mask (Draw Size, Z Intensity, X symmetry); masked clay goes dark and stays still |
+| Ctrl + Alt + left drag on the model | Erase the mask |
+| Ctrl + click on the model / Ctrl + Alt + click | Blur / sharpen the mask |
+| Ctrl + click on the background / Ctrl + drag on the background | Invert / clear the mask (the canvas border counts as background); with Wedge on, the drag also Wedges again on release (ZBrush: re-DynaMesh) |
+| Ctrl + `I` / Ctrl + `A` / Ctrl + Shift + `A` | Invert / mask all / clear the mask (invert and mask all leave hidden polygons alone) |
+| Ctrl + `H` | Show or hide the mask |
 | Ctrl + Shift + drag | Keep what the rectangle covers visible, hide the rest (ZBrush SelectRect); hold Alt during the drag to hide what it covers instead (the rectangle turns red) |
 | Ctrl + Shift + click on the model | Isolate the polygroup under the cursor (Alt: hide it) |
 | Ctrl + Shift + click on empty canvas | Show everything |
 | Ctrl + Shift + drag on empty canvas, around nothing | Invert visibility |
-| Ctrl + `W` | Group Visible: one new polygroup of the visible polygons |
+| Ctrl + `W` | With a mask: one new polygroup of the masked polygons, and the mask is cleared (Group Masked); without one: of the visible polygons (Group Visible) |
 | Shift + `F` | Polygroup colours (ZBrush PolyF) |
 | Left drag on empty canvas | Rotate (hold Shift to snap to axis views) |
 | Alt + left drag on empty canvas | Move |
+| Left drag in the border outside the canvas frame | Always navigates, even over the model, in every mode (as on empty canvas) |
 | Alt + click, release Alt, drag | Zoom (ZBrush style; press Alt again to move) |
 | Shift + click on empty canvas, release Shift, drag | Roll about the view axis |
 | Right / middle drag | Rotate, anywhere (ZBrush right-click navigation) |
@@ -134,7 +143,12 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | `S` / `U` | Draw-size / Z-intensity slider popup at the cursor (`I`, `O` are stubs) |
 | `[` `]` | Brush radius |
 | `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
-| `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode (only Draw sculpts so far) |
+| `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode |
+| `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press (Shift snaps it to 45°) |
+| `W`, drag the line's middle circle | Move the active subtool in the view plane |
+| `E`, drag the line's end circle | Scale about the start circle by the change in distance to it (start circle: about the end) |
+| `R`, drag the line's end circle | Rotate about the start circle around the view axis (start circle: about the end) |
+| Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line; the model stays |
 | `X` | Symmetry across X |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
@@ -188,6 +202,33 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
   Delete and reordering; Deformation moves and sizes the active subtool exactly at every
   level, undoably.
+- `transform.rs`: moving, scaling and rotating a whole subtool, ZBrush Transpose style.
+  The map is `p -> c + s R (p - c) + t` (rotation, uniform scale, translation). Loop weights
+  sum to one, so subdivision commutes with it: every level maps exactly by mapping its
+  positions and turning its offsets by `s R`, stale levels included, and its exact inverse is
+  the undo step. The action line lives in world space; a drag on one of its circles turns
+  the cursor into a map (the press point follows the cursor on its view plane for Move, the
+  ratio of distances to the pivot on screen for Scale, the angle about the pivot for
+  Rotate, around the line of sight through it). While dragging nothing moves on the CPU: the
+  map goes to the vertex shader as a model matrix for the active subtool, so the drag costs
+  nothing per frame. On release the CPU maps every level once, and the GPU copy of the shown
+  level is mapped in place by a compute pass (`affine.wgsl`) instead of being uploaded again;
+  normals are recomputed only after a rotation, and the normal accumulators' fixed-point
+  scale follows the change in face area.
+- `mask.rs`: ZBrush masking. The mask is one byte per vertex of the shown level only, and
+  it moves with the level: going up an even vertex takes its parent's value and an odd
+  vertex the mean of its edge's ends (a hard edge stays hard), going down a vertex takes its
+  even child's value, so a mask survives D / Shift + D and comes back unchanged. Every brush
+  multiplies its falloff by how free each vertex is, the GPU Grab included. Mask strokes
+  undo per touched chunk; invert, clear, blur and sharpen undo the whole mask. The renderer
+  keeps it as one byte per vertex beside the level and the vertex shader reads it, both for
+  the dark tint and for a masked Transpose preview; with no mask the shader skips it, so an
+  unmasked model draws exactly as fast as before. A masked Transpose moves each vertex part
+  of the way (rotation angle, log scale and translation times its freedom): the shown level
+  exactly as previewed, so masked vertices stay put to the bit; the levels below are mapped
+  with the mask carried down, so the pose shows at every level; the shown level's offsets
+  absorb the difference and the offsets above turn with the part they sit on. The inverse
+  map with the same mask undoes it, so the undo step keeps the mask, not the positions.
 - `polygroup.rs` with `mesh.rs` / `multires.rs`: ZBrush polygroups and visibility. Every
   level keeps a polygroup per triangle (16 bits) and a hidden flag per triangle, plus a
   per-vertex flag for the vertices that touch a visible triangle; all three arrays stay empty
@@ -197,8 +238,10 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   parent's flag and group), downwards by rule (a triangle is hidden when all four children
   are, and takes its centre child's group). The child-to-parent triangle map is not stored
   (it would cost 8 bytes per vertex); it is derived from the subdivision stencils when an
-  edit needs it. Brushes skip vertices that touch only hidden triangles, the ray cast skips
-  hidden triangles, Frame frames the visible part. On the GPU a level with hidden triangles
+  edit needs it. Brushes, mask strokes, Mask All / Invert and Transpose leave alone the
+  vertices that touch only hidden triangles (Transpose treats them as masked); the ray cast
+  skips hidden triangles, Frame frames the visible part. Ctrl + W with a mask groups the
+  masked polygons and clears the mask, one undo step for both. On the GPU a level with hidden triangles
   draws and picks from a second index buffer of the visible ones (12 bytes per visible
   triangle, only while something is hidden); PolyF draws with a separate pipeline whose
   fragment shader reads the triangle's group from a 2-bytes-per-triangle buffer by primitive
@@ -230,9 +273,9 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 - `project.rs`: `.klay` project files hold every subtool in the same packed form parked
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
-  moved into place. Version 3 adds the polygroups and hidden triangles of every level
-  (ZBrush keeps both in its tools); version 1 files still open. (Version 3, not 2, so it
-  cannot be confused with the masking branch's version 2.) Reading checks every length against the bytes left before allocating;
+  moved into place. Version 2 added the shown level's mask, version 3 the polygroups and
+  hidden triangles of every level (ZBrush keeps both in its tools); version 1 and 2 files
+  still open. Reading checks every length against the bytes left before allocating;
   rebuilding checks index bounds, the chunk table, manifold edges and every level's labels
   and offsets, and turns anything else that fails into an error. Open rebuilds each
   subtool once to bake its stand-in and swaps the model only when all of them succeeded.
@@ -283,6 +326,26 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | 960k vertices, one level | 92 MB | 34 MB | 38 MB | 16 ms | 39 ms |
 | Two levels, 3.84M at the top | 526 MB | 38 MB | 38 MB | 49 ms | 0.19 s |
 | Three levels, 15.4M at the top | 2.26 GB | 53 MB | 38 MB | 0.19 s | 0.97 s |
+
+### Transpose (`--divide 2 --novsync --selftest-transpose`, 15.4M vertices shown, three levels)
+
+| Step | Result |
+| --- | --- |
+| Frame while dragging (model matrix in the vertex shader) | 3.4 ms, idle 3.7 ms: no cost |
+| Release of a move / scale: CPU map of all three levels, GPU map in place | 16–17 ms |
+| Release of a rotation (chunk boxes refitted, full normal pass) | 25 ms |
+| Same releases re-uploading the shown level (184 MB) instead | 52–62 ms |
+| GPU copy vs CPU after three transforms and three undos | 9e-7 |
+
+### Masking (`--divide 2 --novsync --selftest-mask`, 15.4M vertices shown, three levels)
+
+| Step | Result |
+| --- | --- |
+| Frame with no mask, with a mask shown, while dragging a masked move | no measurable difference (also at 61M: 15.2 ms with and without) |
+| Mask dab (Ctrl + drag) | 0.5 ms (1.5 ms at 61M) |
+| Invert / blur the whole mask | 2 / 20 ms (7 / 73 ms at 61M) |
+| Carry the mask between 15.4M and 3.84M with Shift + D / D | 16 / 9 ms (43 / 35 ms between 61M and 15.4M) |
+| Release of a masked move: CPU over all three levels | 100 ms, plus 38 ms to upload the moved chunks |
 
 Project files (`--selftest-project`, one 15.4M-vertex three-level subtool plus two 960k
 spheres): 123 MB, saved in 0.09 s and opened in 1.35 s; after the demo strokes, including a
@@ -343,10 +406,9 @@ ZBrush's DynaMesh decisions and what Wedge does:
 - **Groups**: polygroups are always carried over with clean borders. ZBrush's Groups button,
   which splits the result into separate pieces at group borders, is not implemented.
 - **Re-wedge gesture**: in ZBrush, Ctrl + drag on the background clears the mask, and while
-  DynaMesh is on it remeshes. Klay follows ZBrush: while Wedge is on, Ctrl + drag on the
-  background re-wedges (a Ctrl click does not); with Wedge off it does nothing, where it used
-  to rotate. This base has no masking yet; when it is merged with the masking branch, the
-  same gesture should clear the mask with Wedge off and re-wedge with Wedge on.
+  DynaMesh is on it remeshes. Klay does both: with Wedge off it clears the mask, with Wedge
+  on it re-wedges, and the new surface starts without a mask (undo brings back the old
+  surface with its mask). A Ctrl click on the background still inverts the mask.
 - **Merge of overlapping subtools and Alt carving** (subtractive inserts) are not done: they
   need a SubTool Merge first. Within one subtool, overlapping parts already merge.
 - The Wedge on/off state is per subtool and not saved in project files.

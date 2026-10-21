@@ -6,14 +6,14 @@
 //! ```text
 //! magic "KLAYPRJ\0" · version u32 · subtool count u32 · active subtool u32
 //! per subtool: name (u32 length + UTF-8) · visible u8 · packed stack
+//!              · (version 2 on) the shown level's mask, inside the packed stack
 //!              · (version 3) polygroups and hidden triangles of every level
 //! end marker "KLAYEND\0"
 //! ```
 //!
-//! Version 1 files (no polygroups, nothing hidden) still open. Version 3 adds the
-//! polygroups and hidden triangles of every level as run-length blocks (ZBrush keeps both
-//! in its tools). It is 3 rather than 2 so it cannot be mistaken for the version 2 files of
-//! the masking branch; merging the two should make version 3 = version 2 plus these blocks.
+//! Version 1 files (no mask) and version 2 files (no polygroups, nothing hidden) still open.
+//! Version 3 adds the polygroups and hidden triangles of every level as run-length blocks
+//! (ZBrush keeps both in its tools).
 //!
 //! Every length is checked against the bytes left in the file before anything is
 //! allocated, so a truncated or foreign file is refused with a message, never a crash. The
@@ -26,9 +26,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
+/// 3: polygroups and hidden triangles of every level; 2: a mask per subtool. Versions 1 and
+/// 2 still open (without what they did not store).
 pub const VERSION: u32 = 3;
-/// Older versions this build still reads.
-const READS: [u32; 2] = [1, 3];
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -163,7 +163,7 @@ pub fn write_to<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize) 
     write_version(w, tools, active, VERSION)
 }
 
-/// Serialise in the layout of `version` (1 or 3; tests write version 1 files with it).
+/// Serialise in the layout of `version` (1 to 3; tests write older files with it).
 pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize, version: u32) -> io::Result<W> {
     let mut out = Out::new(w);
     out.bytes(MAGIC)?;
@@ -173,7 +173,7 @@ pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: us
     for (name, visible, packed) in tools {
         out.slice(name.as_bytes())?;
         out.u8(*visible as u8)?;
-        packed.write_to(&mut out)?;
+        packed.write_to(&mut out, version)?;
         if version >= 3 {
             packed.write_marks(&mut out)?;
         }
@@ -201,8 +201,8 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
     let mut input = In::new(r, len);
     input.exact(MAGIC, "Klay project header")?;
     let version = input.u32()?;
-    if !READS.contains(&version) {
-        return Err(format!("project version {version} is not supported (this build reads {READS:?})"));
+    if version == 0 || version > VERSION {
+        return Err(format!("project version {version} is not supported (this build reads 1 to {VERSION})"));
     }
     let count = input.u32()? as usize;
     let active = input.u32()? as usize;
@@ -214,7 +214,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         let name: Vec<u8> = input.vec()?;
         let name = String::from_utf8(name).map_err(|_| "a subtool name is not valid text")?;
         let visible = input.u8()? != 0;
-        let mut packed = Packed::read_from(&mut input)?;
+        let mut packed = Packed::read_from(&mut input, version)?;
         if version >= 3 {
             packed.read_marks(&mut input)?;
         }

@@ -3,6 +3,8 @@
 
 use crate::mesh::{SculptMesh, Selection};
 use crate::multires::{ChunkData, Level, Multires};
+use crate::mask::MaskData;
+use crate::transform::Affine;
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -63,12 +65,15 @@ pub enum UndoStep {
     /// A subdivision level was added. In the undo list the level is live (`None`); the
     /// redo entry keeps the removed level so redo can put it back without recomputing it.
     Divide(Option<Box<Level>>),
-    /// Every level was mapped by `p -> center + scale (p - center) + translate`
-    /// (Deformation: Offset, Size).
-    Transform {
-        center: Vec3,
-        scale: f32,
-        translate: Vec3,
+    /// Every level was mapped by an [`Affine`] (Deformation: Offset, Size; Transpose Move,
+    /// Scale, Rotate). Like every entry it holds what undoes it: the inverse map.
+    Transform(Affine),
+    /// Every level was mapped by `map` weighted per vertex by how free each vertex is in
+    /// `mask`, the mask of `level` when the transform was made (Transpose with a mask).
+    MaskedTransform {
+        map: Affine,
+        level: usize,
+        mask: Vec<u8>,
     },
     /// Hidden triangles of every level before a visibility change (run-length coded).
     Visibility(Vec<Vec<u32>>),
@@ -76,6 +81,11 @@ pub enum UndoStep {
     Groups(Vec<crate::polygroup::GroupRuns>),
     /// The whole stack before it was replaced (Wedge), packed.
     Replace(Box<crate::multires::Packed>),
+    /// The mask of `level` changed (Ctrl).
+    Mask { level: usize, data: MaskData },
+    /// Several steps made by one action (Ctrl + W on a mask: the new group and the cleared
+    /// mask), applied in the order listed (the undo of the last change first).
+    Steps(Vec<UndoStep>),
 }
 
 pub struct History {
@@ -99,6 +109,22 @@ impl History {
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// The map the next undo applies, when that step is a transform.
+    pub fn next_undo_map(&self) -> Option<Affine> {
+        match self.undo.last() {
+            Some(UndoStep::Transform(map)) => Some(*map),
+            _ => None,
+        }
+    }
+
+    /// The map the next redo applies, when that step is a transform.
+    pub fn next_redo_map(&self) -> Option<Affine> {
+        match self.redo.last() {
+            Some(UndoStep::Transform(map)) => Some(*map),
+            _ => None,
+        }
     }
 
     pub fn push(&mut self, step: UndoStep) {
@@ -137,18 +163,21 @@ impl History {
 
     /// Approximate memory held by history, in bytes.
     pub fn bytes(&self) -> usize {
-        self.undo
-            .iter()
-            .chain(self.redo.iter())
-            .map(|s| match s {
-                UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
-                UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
-                UndoStep::Transform { .. } => 0,
-                UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
-                UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
-                UndoStep::Replace(packed) => packed.bytes(),
-            })
-            .sum()
+        self.undo.iter().chain(self.redo.iter()).map(step_bytes).sum()
+    }
+}
+
+fn step_bytes(s: &UndoStep) -> usize {
+    match s {
+        UndoStep::Stroke { chunks, .. } => chunks.iter().map(|(_, v)| v.len() * 12).sum::<usize>(),
+        UndoStep::Divide(level) => level.as_ref().map_or(0, |l| l.bytes()),
+        UndoStep::Transform(_) => 0,
+        UndoStep::MaskedTransform { mask, .. } => mask.len(),
+        UndoStep::Mask { data, .. } => data.bytes(),
+        UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
+        UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
+        UndoStep::Replace(packed) => packed.bytes(),
+        UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
     }
 }
 
@@ -164,19 +193,22 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             doc.push_level(*level);
             UndoStep::Divide(None)
         }
-        UndoStep::Transform {
-            center,
-            scale,
-            translate,
-        } => {
-            doc.transform(center, scale, translate);
-            // p = c + (p' - c - t) / s, written in the same form.
-            UndoStep::Transform {
-                center: center + translate,
-                scale: 1.0 / scale,
-                translate: -translate,
+        UndoStep::Transform(map) => {
+            doc.transform(&map);
+            UndoStep::Transform(map.inverse())
+        }
+        UndoStep::MaskedTransform { map, level, mask } => {
+            doc.transform_masked(&map, level, &mask);
+            UndoStep::MaskedTransform {
+                map: map.inverse(),
+                level,
+                mask,
             }
         }
+        UndoStep::Mask { level, data } => UndoStep::Mask {
+            level,
+            data: doc.restore_mask(level, data),
+        },
         UndoStep::Visibility(runs) => UndoStep::Visibility(doc.restore_visibility(runs)),
         UndoStep::Groups(runs) => UndoStep::Groups(doc.restore_groups(runs)),
         UndoStep::Replace(packed) => {
@@ -184,6 +216,12 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             let now = std::mem::replace(doc, packed.unpack());
             doc.budget = budget;
             UndoStep::Replace(Box::new(now.pack()))
+        }
+        UndoStep::Steps(steps) => {
+            // Applied in order; their inverses run the other way.
+            let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, s)).collect();
+            inverse.reverse();
+            UndoStep::Steps(inverse)
         }
     }
 }
@@ -325,9 +363,12 @@ impl Stroke {
         self.snapshot(mesh, &chunks);
         let sign = if self.invert { -1.0 } else { 1.0 };
         let r = brush.radius;
+        // Masked vertices (Ctrl) are held still.
+        let mask = &mesh.mask;
         sel.dist
             .par_iter()
-            .map(|&d| falloff(d, r))
+            .zip(sel.verts.par_iter())
+            .map(|(&d, &v)| falloff(d, r) * crate::mask::freedom(mask, v))
             .collect_into_vec(&mut self.weights);
         let w = &self.weights;
         let new = &mut self.scratch;
@@ -408,11 +449,12 @@ impl Stroke {
             self.snapshot(mesh, &chunks);
             let r = brush.radius;
             // Signed by side: the mirrored half moves with a mirrored delta.
+            let mask = &mesh.mask;
             let weights = sel
                 .dist
                 .par_iter()
                 .enumerate()
-                .map(|(i, &d)| falloff(d, r) * sel.side(i))
+                .map(|(i, &d)| falloff(d, r) * sel.side(i) * crate::mask::freedom(mask, sel.verts[i]))
                 .collect();
             let orig = sel.par_map(|_, v| mesh.positions[v as usize]);
             self.last_count = sel.len();

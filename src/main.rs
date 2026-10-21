@@ -1,4 +1,5 @@
 mod camera;
+mod mask;
 mod mesh;
 mod multires;
 mod polygroup;
@@ -7,6 +8,7 @@ mod project;
 mod render;
 mod sculpt;
 mod subtool;
+mod transform;
 mod wedge;
 mod workspace;
 
@@ -21,6 +23,8 @@ use mesh::Aabb;
 use sculpt::{Brush, BrushKind, History, Stroke, UndoStep};
 use std::path::Path;
 use subtool::{Deform, Parked, STAND_IN_VERTICES, SubTool};
+use transform::{ActionLine, Affine, Hit, Part, View};
+use mask::{MaskData, MaskOp};
 use workspace::{Mode, QuickPopup, SubToolRow};
 use std::sync::Arc;
 use std::time::Instant;
@@ -90,10 +94,6 @@ struct SelectDrag {
     hit: Option<u32>,
 }
 
-/// Presses this close to the canvas edge count as background even over the model, so the
-/// background gestures stay reachable when the model fills the view (logical pixels).
-const CANVAS_BORDER: f32 = 12.0;
-
 /// A press that moves less than this (physical pixels) before release is a click.
 const CLICK_SLOP: f32 = 4.0;
 
@@ -134,6 +134,86 @@ enum SubToolOp {
     Deform(Deform, f32),
 }
 
+/// A left press with Ctrl that has not yet become a drag: on the model a drag paints the
+/// mask and a click blurs it; on the background a click inverts and a drag clears it.
+#[derive(Clone, Copy, Debug)]
+struct MaskPress {
+    at: Vec2,
+    /// Surface point under the press, when it was on the active subtool.
+    hit: Option<Vec3>,
+    /// Alt at the press: erase instead of paint, sharpen instead of blur.
+    alt: bool,
+    moved: bool,
+}
+
+/// State of `--selftest-mask`: masking through the same handlers the window events call,
+/// one input event per frame, then a masked Transpose move, a clear and undo of it all.
+#[derive(Default)]
+struct MaskTest {
+    phase: usize,
+    k: u32,
+    original: Vec<Vec3>,
+    before: Vec<Vec3>,
+    press: Vec2,
+    /// Frame times (ms): no mask, mask shown, dragging a masked move.
+    idle: Vec<f32>,
+    shaded: Vec<f32>,
+    drag: Vec<f32>,
+    dabs: Vec<f32>,
+    /// Named costs in ms, logged at the end.
+    costs: Vec<(&'static str, f32)>,
+    ok: bool,
+}
+
+/// State of `--selftest-transpose`: a scripted Move, Scale and Rotate through the same press /
+/// move / release handlers the window events call, one input event per frame, then three
+/// undos.
+#[derive(Default)]
+struct TransposeTest {
+    phase: usize,
+    /// Frame within the phase.
+    k: u32,
+    /// Shown level before the first move, and before the current action.
+    original: Vec<Vec3>,
+    before: Vec<Vec3>,
+    /// Pixel positions of the current action: press and the drag's full offset.
+    press: Vec2,
+    pivot: Vec2,
+    /// Frame times (ms): idle, while dragging with the GPU preview, and the whole frame of
+    /// each release (Move, Scale, Rotate).
+    idle: Vec<f32>,
+    drag: Vec<f32>,
+    release_frame: Vec<f32>,
+    /// CPU transform time of each release (ms).
+    release: Vec<f32>,
+    /// The map applied by the last release and the line as shown when it was let go.
+    applied: Option<(Affine, ActionLine)>,
+    ok: bool,
+}
+
+/// A left drag in Move / Scale / Rotate mode (ZBrush Transpose, see `transform.rs`).
+#[derive(Clone, Copy, Debug)]
+enum TransposeDrag {
+    /// Drawing a new action line from the point on the surface under the press.
+    Draw { start: Vec3 },
+    /// Moving the line, or one end of it (`ends`: start, end), without touching the model.
+    Line {
+        line: ActionLine,
+        press: Vec2,
+        ends: [bool; 2],
+    },
+    /// Moving, scaling or rotating the active subtool about `anchor`. `map` is only shown
+    /// (the vertex shader applies it to the shown level) until the release applies it to
+    /// every level as one undo step.
+    Act {
+        mode: Mode,
+        anchor: Vec3,
+        press: Vec2,
+        line: ActionLine,
+        map: Affine,
+    },
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
@@ -158,6 +238,10 @@ struct App {
     selftest_groups: Option<(u8, u32)>,
     /// What the polygroup self-test expects to find, and whether every check passed.
     selftest_groups_state: (usize, bool),
+    /// `--selftest-transpose`: frame counter of the scripted move / scale / rotate / undo.
+    selftest_transpose: Option<TransposeTest>,
+    /// `--selftest-mask`: the scripted masking session.
+    selftest_mask: Option<MaskTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// `--open PATH`: project to open once the window exists.
@@ -179,15 +263,17 @@ struct App {
     nav: Option<NavDrag>,
     /// Ctrl + Shift selection in progress.
     select: Option<SelectDrag>,
-    /// A Ctrl press on the background in progress (ZBrush: with DynaMesh on, a Ctrl drag
-    /// there remeshes), and where it started.
-    ctrl_background: Option<Vec2>,
     /// Wedge settings (ZBrush: Tool > Geometry > DynaMesh).
     wedge: wedge::Settings,
     /// For the Wedge section: whether the shown mesh is closed and its area, kept for the
     /// stack generation and level they were measured on (both cost a pass over the mesh).
     wedge_info: Option<(u64, usize, bool, f32)>,
     hover: Option<Vec3>,
+    /// The Transpose action line, kept between drags (shown in Move / Scale / Rotate mode).
+    action_line: Option<ActionLine>,
+    transpose: Option<TransposeDrag>,
+    mask_press: Option<MaskPress>,
+    mask_stroke: Option<mask::MaskStroke>,
 
     // UI state.
     workspace: workspace::Workspace,
@@ -201,6 +287,8 @@ struct App {
     pending_undo: bool,
     pending_redo: bool,
     pending_divide: bool,
+    /// Whole-mask operation from a shortcut or the Masking palette.
+    pending_mask: Option<MaskOp>,
     pending_level: Option<usize>,
     /// Polygroup / visibility operation from the interface or a key, run outside the egui pass.
     pending_vis: Option<VisOp>,
@@ -269,6 +357,8 @@ impl App {
             selftest_project: None,
             selftest_groups: None,
             selftest_groups_state: (0, true),
+            selftest_transpose: None,
+            selftest_mask: None,
             project_path: "untitled.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
@@ -285,10 +375,13 @@ impl App {
             modifiers: ModifiersState::empty(),
             nav: None,
             select: None,
-            ctrl_background: None,
             wedge: wedge::Settings::default(),
             wedge_info: None,
             hover: None,
+            action_line: None,
+            transpose: None,
+            mask_press: None,
+            mask_stroke: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
             primitive: settings,
@@ -299,6 +392,7 @@ impl App {
             pending_undo: false,
             pending_redo: false,
             pending_divide: false,
+            pending_mask: None,
             pending_level: None,
             pending_vis: None,
             pending_geo: None,
@@ -325,6 +419,16 @@ impl App {
 
     fn mesh(&self) -> &SculptMesh {
         self.doc.mesh()
+    }
+
+    /// A stroke or a Transpose drag is in progress: operations that replace or reshape the
+    /// active stack wait for it to end.
+    fn busy(&self) -> bool {
+        self.stroke.is_some()
+            || self.transpose.is_some()
+            || self.mask_press.is_some()
+            || self.mask_stroke.is_some()
+            || self.select.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -384,7 +488,7 @@ impl App {
 
     /// Make subtool `i` the active one (SubTool list, or Alt + click on it).
     fn select_subtool(&mut self, i: usize) {
-        if i == self.active_tool || i >= self.subtools.len() || self.stroke.is_some() {
+        if i == self.active_tool || i >= self.subtools.len() || self.busy() {
             return;
         }
         let park_ms = self.park_active();
@@ -411,7 +515,7 @@ impl App {
     /// active (ZBrush: Append). It is half the size of a new project's first subtool and
     /// sits to the right of the model's bounds with a small gap.
     fn append_primitive(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         let bounds = self.model_bounds();
@@ -452,7 +556,7 @@ impl App {
 
     /// Insert a parked copy of the active subtool below it (ZBrush: Duplicate).
     fn duplicate_subtool(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         let packed = self.doc.pack_copy();
@@ -487,7 +591,7 @@ impl App {
     /// Delete the active subtool and activate the one below it, or above it when it was
     /// the last (ZBrush: Delete). Not undoable.
     fn delete_subtool(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         if self.subtools.len() < 2 {
@@ -527,21 +631,267 @@ impl App {
 
     /// Offset or size the active subtool, undoably (ZBrush: Tool > Deformation).
     fn deform(&mut self, kind: Deform, value: f32) {
-        if self.stroke.is_some() || value.abs() < 0.5 {
+        if self.busy() || value.abs() < 0.5 {
             return;
         }
-        let (center, scale, translate) = subtool::deform_map(kind, value, self.doc.bounds());
-        self.doc.transform(center, scale, translate);
-        // History entries hold what undoes them: the inverse map.
-        self.history.push(UndoStep::Transform {
-            center: center + translate,
-            scale: 1.0 / scale,
-            translate: -translate,
-        });
-        self.subtools[self.active_tool].bounds = self.doc.bounds();
-        self.update_hover();
+        self.apply_transform(subtool::deform_map(kind, value, self.doc.bounds()));
         self.workspace
             .notify(format!("{} {:+.0} applied", kind.label(), value));
+    }
+
+    /// Map every level of the active subtool by `map` as one undo step. Returns the time
+    /// taken in ms (the GPU copy of the shown level is re-uploaded by the next frame).
+    fn apply_transform(&mut self, map: Affine) -> f32 {
+        let t = Instant::now();
+        let mesh = self.doc.mesh();
+        let hidden = !mesh.shown.is_empty();
+        if hidden || mesh.mask.iter().any(|&m| m > 0) {
+            // ZBrush: masked vertices stay; partly masked ones move part of the way. So do
+            // the vertices of hidden polygons only: Transpose moves what is shown.
+            let level = self.doc.active();
+            let mask: Vec<u8> = if hidden {
+                (0..mesh.vertex_count())
+                    .into_par_iter()
+                    .map(|v| if mesh.shown[v] == 0 { 255 } else { mesh.mask.get(v).copied().unwrap_or(0) })
+                    .collect()
+            } else {
+                mesh.mask.clone()
+            };
+            self.doc.transform_masked(&map, level, &mask);
+            self.history.push(UndoStep::MaskedTransform {
+                map: map.inverse(),
+                level,
+                mask,
+            });
+            self.subtools[self.active_tool].bounds = self.doc.bounds();
+            let ms = t.elapsed().as_secs_f32() * 1000.0;
+            self.update_hover();
+            return ms;
+        }
+        self.transform_doc(&map, |app| app.doc.transform(&map));
+        // History entries hold what undoes them: the inverse map.
+        self.history.push(UndoStep::Transform(map.inverse()));
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.update_hover();
+        ms
+    }
+
+    /// Run `f`, which maps every level of the active subtool by `map` on the CPU, and bring
+    /// the GPU along: when the shown level had nothing waiting for upload its GPU copy is
+    /// mapped in place rather than uploaded again (184 MB at 15M vertices).
+    fn transform_doc(&mut self, map: &Affine, f: impl FnOnce(&mut Self)) {
+        let clean = self
+            .doc
+            .mesh()
+            .chunks
+            .iter()
+            .all(|c| !c.dirty_pos && !c.dirty_nrm);
+        f(self);
+        if let Some(gfx) = self.gfx.as_mut() {
+            if clean {
+                gfx.transform_level(self.doc.mesh_mut(), map);
+            } else {
+                gfx.rescale_normals(map.scale);
+            }
+        }
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+    }
+
+    /// The canvas as the camera shows it, for the Transpose maths.
+    fn view(&self) -> View<'_> {
+        View {
+            camera: &self.camera,
+            size: self.viewport(),
+        }
+    }
+
+    /// The cursor is in the margin between the document frame and the canvas edge, where a
+    /// left drag always navigates (ZBrush: the border acts as empty canvas).
+    fn in_canvas_border(&self) -> bool {
+        if !self.canvas_rect.is_positive() {
+            return false;
+        }
+        let inner = self.canvas_rect.shrink(workspace::FRAME_INSET * self.scale);
+        !inner.contains(egui::pos2(self.cursor.x, self.cursor.y))
+    }
+
+    /// Cursor in canvas pixels.
+    fn canvas_cursor(&self) -> Vec2 {
+        self.cursor - self.canvas_origin()
+    }
+
+    /// Start a Transpose drag for a left press in Move / Scale / Rotate mode: on the action
+    /// line's circles or the line itself if the press is there, else a new line when the
+    /// press is on the active subtool. Returns false when the press is on neither (the
+    /// caller navigates).
+    fn begin_transpose(&mut self) -> bool {
+        let mode = self.workspace.mode;
+        let press = self.canvas_cursor();
+        if let Some(line) = self.action_line {
+            if let Some(hit) = transform::hit_test(&self.view(), &line, press, self.scale) {
+                let act = |anchor| TransposeDrag::Act {
+                    mode,
+                    anchor,
+                    press,
+                    line,
+                    map: Affine::IDENTITY,
+                };
+                let drag_line = |ends| TransposeDrag::Line { line, press, ends };
+                // ZBrush: the middle circle moves, the end circle scales or rotates about
+                // the start (the start circle about the end); the rings and the line move
+                // the line itself.
+                let drag = match (mode, hit) {
+                    (Mode::Move, Hit::Inner(Part::Middle)) => act(line.mid()),
+                    (Mode::Scale | Mode::Rotate, Hit::Inner(Part::End)) => act(line.start),
+                    (Mode::Scale | Mode::Rotate, Hit::Inner(Part::Start)) => act(line.end),
+                    (_, Hit::Inner(Part::Start) | Hit::Ring(Part::Start)) => drag_line([true, false]),
+                    (_, Hit::Inner(Part::End) | Hit::Ring(Part::End)) => drag_line([false, true]),
+                    _ => drag_line([true, true]),
+                };
+                log::debug!("transpose: {hit:?} in {} mode", mode.name());
+                self.transpose = Some(drag);
+                self.hover = None;
+                return true;
+            }
+        }
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d) else {
+            return false;
+        };
+        self.transpose = Some(TransposeDrag::Draw { start: hit.point });
+        self.action_line = Some(ActionLine {
+            start: hit.point,
+            end: hit.point,
+        });
+        self.hover = None;
+        true
+    }
+
+    /// Follow the cursor during a Transpose drag.
+    fn transpose_move(&mut self) {
+        let to = self.canvas_cursor();
+        let view = View {
+            camera: &self.camera,
+            size: self.viewport(),
+        };
+        let Some(drag) = self.transpose.as_mut() else {
+            return;
+        };
+        match drag {
+            TransposeDrag::Draw { start } => {
+                let from = view.project(*start);
+                // ZBrush: Shift while drawing snaps the line to 45° steps.
+                let to = if self.modifiers.shift_key() { transform::snap_45(from, to) } else { to };
+                self.action_line = Some(ActionLine {
+                    start: *start,
+                    end: view.unproject_at(to, *start),
+                });
+            }
+            TransposeDrag::Line { line, press, ends } => {
+                let follow = |p: Vec3, on: bool| {
+                    if on { p + view.unproject_at(to, p) - view.unproject_at(*press, p) } else { p }
+                };
+                self.action_line = Some(ActionLine {
+                    start: follow(line.start, ends[0]),
+                    end: follow(line.end, ends[1]),
+                });
+            }
+            TransposeDrag::Act {
+                mode,
+                anchor,
+                press,
+                line,
+                map,
+            } => {
+                *map = match mode {
+                    Mode::Move => transform::move_map(&view, *anchor, *press, to),
+                    Mode::Scale => transform::scale_map(&view, *anchor, *press, to),
+                    Mode::Rotate => transform::rotate_map(&view, *anchor, *press, to),
+                    Mode::Draw => Affine::IDENTITY,
+                };
+                self.action_line = Some(line.mapped(map));
+            }
+        }
+    }
+
+    /// Release of a Transpose drag: a move / scale / rotate is applied to every level of
+    /// the active subtool as one undo step. Returns the time the CPU transform took in ms.
+    fn end_transpose(&mut self) -> Option<f32> {
+        match self.transpose.take()? {
+            TransposeDrag::Draw { .. } => {
+                // A click without a drag leaves no line.
+                if let Some(line) = self.action_line {
+                    let view = self.view();
+                    if (view.project(line.end) - view.project(line.start)).length() < 2.0 {
+                        self.action_line = None;
+                    }
+                }
+                None
+            }
+            TransposeDrag::Line { .. } => None,
+            TransposeDrag::Act { mode, line, map, .. } => {
+                if map.is_identity() {
+                    return None;
+                }
+                let ms = self.apply_transform(map);
+                self.action_line = Some(line.mapped(&map));
+                self.status = match mode {
+                    Mode::Move => format!("Moved by {:.3} in {ms:.0} ms", map.translate.length()),
+                    Mode::Scale => format!("Scaled by {:.3} in {ms:.0} ms", map.scale),
+                    _ => format!(
+                        "Rotated by {:.1}° in {ms:.0} ms",
+                        map.rotation.to_axis_angle().1.to_degrees()
+                    ),
+                };
+                log::info!("{}", self.status);
+                Some(ms)
+            }
+        }
+    }
+
+    /// The map the vertex shader applies to the active subtool: the Transpose drag's while
+    /// one is in progress.
+    fn preview_map(&self) -> Affine {
+        match self.transpose {
+            Some(TransposeDrag::Act { map, .. }) => map,
+            _ => Affine::IDENTITY,
+        }
+    }
+
+    /// Draw the action line in Move / Scale / Rotate mode: a line with start, middle and
+    /// end circles (inner circle acts, outer ring moves that point).
+    fn paint_action_line(&self, ctx: &egui::Context) {
+        let Some(line) = self.action_line else {
+            return;
+        };
+        if self.workspace.mode == Mode::Draw || !self.canvas_rect.is_positive() {
+            return;
+        }
+        let view = self.view();
+        let to_pos = |p: Vec3| {
+            let px = view.project(p) + self.canvas_origin();
+            egui::pos2(px.x / self.scale, px.y / self.scale)
+        };
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("action line")))
+            .with_clip_rect(self.workspace.canvas);
+        let (a, m, b) = (to_pos(line.start), to_pos(line.mid()), to_pos(line.end));
+        let white = egui::Color32::from_rgb(232, 232, 232);
+        let accent = egui::Color32::from_rgb(227, 131, 79);
+        let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(140));
+        let len = (b - a).length();
+        if len > 2.0 * transform::OUTER {
+            let dir = (b - a) / len;
+            let (p, q) = (a + dir * transform::OUTER, b - dir * transform::OUTER);
+            painter.line_segment([p, q], dark);
+            painter.line_segment([p, q], egui::Stroke::new(1.5, white));
+        }
+        for (c, color) in [(a, accent), (m, white), (b, white)] {
+            for r in [transform::OUTER, transform::INNER] {
+                painter.circle_stroke(c, r, dark);
+                painter.circle_stroke(c, r, egui::Stroke::new(1.5, color));
+            }
+        }
     }
 
     /// Parked subtools that are drawn: `(gpu key, list index)`.
@@ -591,7 +941,7 @@ impl App {
 
     /// Write every subtool to `self.project_path` (ZBrush: Save; Ctrl + S).
     fn save_project(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         let t = Instant::now();
@@ -614,7 +964,7 @@ impl App {
     /// rebuilt and checked, one at a time, before the current model is let go; a file that
     /// fails leaves the current model as it was.
     fn open_project(&mut self, path: &str) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         let t = Instant::now();
@@ -705,7 +1055,7 @@ impl App {
 
     /// Start over with one subtool made from the current primitive.
     fn new_project(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         if let Some(gfx) = self.gfx.as_mut() {
@@ -885,20 +1235,45 @@ impl App {
     }
 
     /// Make one new polygroup of the visible polygons (ZBrush: Ctrl + W, Group Visible).
+    /// With a mask, make one new polygroup of the visible masked polygons and clear the
+    /// mask (ZBrush: Ctrl + W, Group Masked); without one, of the visible polygons (Group
+    /// Visible). One undo step either way.
     fn group_visible(&mut self) {
         let t = Instant::now();
         let mesh = self.doc.mesh();
+        let masked = mesh.mask.par_iter().any(|&m| m > 127);
         let next = mesh.groups.par_iter().copied().max().map_or(1, |m| m.wrapping_add(1));
+        let takes = |t: u32| {
+            if !mesh.visible(t) {
+                return false;
+            }
+            if !masked {
+                return true;
+            }
+            // A polygon is masked when its corners are on average.
+            let tri = &mesh.indices[3 * t as usize..3 * t as usize + 3];
+            tri.iter().map(|&v| mesh.mask[v as usize] as u32).sum::<u32>() > 3 * 127
+        };
         let groups: Vec<u16> = (0..mesh.triangle_count() as u32)
             .into_par_iter()
-            .map(|t| if mesh.visible(t) { next } else { mesh.group(t) })
+            .map(|t| if takes(t) { next } else { mesh.group(t) })
             .collect();
         let before = self.doc.group_runs();
         let level = self.doc.active();
         self.doc.set_groups(level, groups);
-        self.history.push(UndoStep::Groups(before));
+        if masked {
+            let old = mask::replace(self.doc.mesh_mut(), Vec::new());
+            // Undone in this order: the mask comes back, then the groups.
+            self.history.push(UndoStep::Steps(vec![
+                UndoStep::Mask { level, data: MaskData::Whole(old) },
+                UndoStep::Groups(before),
+            ]));
+        } else {
+            self.history.push(UndoStep::Groups(before));
+        }
         self.status = format!(
-            "Group visible: {} polygroups ({:.0} ms over {} levels)",
+            "Group {}: {} polygroups ({:.0} ms over {} levels)",
+            if masked { "masked" } else { "visible" },
             self.doc.mesh().group_count(),
             t.elapsed().as_secs_f32() * 1000.0,
             self.doc.count()
@@ -909,7 +1284,7 @@ impl App {
 
     /// Run a queued polygroup / visibility operation (not during a stroke or a selection).
     fn run_pending_vis(&mut self) {
-        if self.stroke.is_some() || self.select.is_some() {
+        if self.busy() {
             return;
         }
         match self.pending_vis.take() {
@@ -928,17 +1303,6 @@ impl App {
         }
     }
 
-    /// Whether the cursor is in the thin band along the canvas edge that counts as
-    /// background.
-    fn on_canvas_border(&self) -> bool {
-        if !self.canvas_rect.is_positive() {
-            return false;
-        }
-        let m = CANVAS_BORDER * self.scale;
-        let r = self.canvas_rect.shrink(m);
-        !r.contains(egui::pos2(self.cursor.x, self.cursor.y))
-    }
-
     /// The selection rectangle for the workspace to draw, in logical pixels.
     fn show_select_rect(&mut self) {
         self.workspace.select_rect = self.select.and_then(|s| {
@@ -949,125 +1313,11 @@ impl App {
         });
     }
 
-    /// Left button pressed on the window: brushes, navigation, subtool picking and the
-    /// Ctrl + Shift selection, ZBrush style. `consumed` / `over_ui`: the interface took it.
-    fn left_press(&mut self, consumed: bool, over_ui: bool) {
-        let free = !consumed && !over_ui && self.nav.is_none() && self.stroke.is_none() && self.select.is_none();
-        if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
-            // The press that closes a popup or menu does nothing else.
-            return;
-        }
-        let selecting = self.modifiers.control_key() && self.modifiers.shift_key();
-        if selecting {
-            if free {
-                // ZBrush: Ctrl + Shift starts a selection on the model or the background.
-                let hit = if self.on_canvas_border() {
-                    None
-                } else {
-                    let (o, d) = self.cursor_ray();
-                    self.mesh().raycast(o, d).map(|h| h.tri)
-                };
-                self.select = Some(SelectDrag { start: self.cursor, hit });
-                self.hover = None;
-            }
-            return;
-        }
-        let picked = if self.modifiers.alt_key() && self.subtools.len() > 1 && free {
-            self.pick_subtool().filter(|&i| i != self.active_tool)
-        } else {
-            None
-        };
-        if let Some(i) = picked {
-            // ZBrush: Alt + click on another subtool selects it.
-            self.select_subtool(i);
-        } else if free {
-            // ZBrush: a left drag on the model sculpts (Alt = alternate brush, Ctrl =
-            // masking); on empty canvas, or on the canvas border, it rotates, with Alt it
-            // moves, and releasing Alt turns it into a zoom.
-            let hit = if self.on_canvas_border() {
-                None
-            } else {
-                let (o, d) = self.cursor_ray();
-                self.mesh().raycast(o, d)
-            };
-            log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
-            if hit.is_none() && self.modifiers.control_key() {
-                // ZBrush: a Ctrl drag on the background does not rotate; with DynaMesh
-                // (here Wedge) on it remeshes when released.
-                self.ctrl_background = Some(self.cursor);
-            } else if hit.is_none() {
-                self.begin_nav(MouseButton::Left);
-            } else if self.modifiers.control_key() {
-                self.workspace.notify("Masking is not connected yet");
-            } else if self.workspace.mode != Mode::Draw {
-                self.workspace.notify(format!(
-                    "{} mode is not connected yet · Q returns to Draw",
-                    self.workspace.mode.name()
-                ));
-            } else {
-                self.begin_stroke();
-            }
-        }
-    }
-
-    /// Left button released.
-    fn left_release(&mut self) {
-        if let Some(start) = self.ctrl_background.take() {
-            if (self.cursor - start).length() >= CLICK_SLOP {
-                if self.subtools[self.active_tool].wedge {
-                    self.pending_geo = Some(GeoOp::Wedge);
-                    self.run_pending_geo();
-                } else {
-                    self.workspace.notify("Ctrl + drag on the background re-wedges while Wedge is on (Mesh: Wedge)");
-                }
-            }
-            return;
-        }
-        if let Some(sel) = self.select.take() {
-            self.workspace.select_rect = None;
-            let alt = self.modifiers.alt_key();
-            if (self.cursor - sel.start).length() < CLICK_SLOP {
-                match sel.hit {
-                    Some(tri) => self.isolate_group(tri, alt),
-                    None => self.show_all(),
-                }
-            } else {
-                self.select_rect(sel.start, self.cursor, alt);
-            }
-            self.update_hover();
-            return;
-        }
-        self.end_stroke();
-        self.end_nav(MouseButton::Left);
-    }
-
-    /// The cursor moved to `pos` (physical pixels).
-    fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
-        self.last_cursor = self.cursor;
-        self.cursor = pos;
-        let delta = self.cursor - self.last_cursor;
-        if let Some(drag) = self.nav {
-            self.nav_move(drag, delta);
-        } else if self.select.is_some() {
-            self.show_select_rect();
-        } else if self.stroke.is_some() {
-            if self.stroke_brush.kind == BrushKind::Grab {
-                self.stroke_pending = true;
-            } else {
-                self.apply_stroke();
-            }
-        } else if !over_ui {
-            self.update_hover();
-        } else {
-            self.hover = None;
-        }
-    }
-
     // ------------------------------------------------------------ Wedge, Del Higher / Lower
 
     /// Run a queued geometry operation (not during a stroke or a selection).
     fn run_pending_geo(&mut self) {
-        if self.stroke.is_some() || self.select.is_some() {
+        if self.busy() {
             return;
         }
         match self.pending_geo.take() {
@@ -1397,6 +1647,376 @@ impl App {
         ok
     }
 
+    /// One frame of `--selftest-transpose` (see [`TransposeTest`]); `dt` is the time since
+    /// the previous frame in ms. Returns true when the test is over.
+    fn selftest_transpose_frame(&mut self, t: &mut TransposeTest, dt: f32) -> bool {
+        use std::f32::consts::FRAC_PI_2;
+        const DRAG: u32 = 60;
+        let vp = self.viewport();
+        let k = t.k;
+        t.k += 1;
+        let next = |t: &mut TransposeTest| {
+            t.phase += 1;
+            t.k = 0;
+        };
+        let worst = |a: &[Vec3], b: &[Vec3]| -> f32 {
+            use rayon::prelude::*;
+            a.par_iter().zip(b).map(|(p, q)| (*p - *q).length()).reduce(|| 0.0, f32::max)
+        };
+        match t.phase {
+            // Warm up (upload, first normal pass), then time idle frames.
+            0 => {
+                if k > 30 {
+                    t.idle.push(dt);
+                }
+                if k == 90 {
+                    t.ok = true;
+                    t.original = self.doc.mesh().positions.clone();
+                    // Centre the active subtool, so the action line stays inside the frame
+                    // however many subtools there are.
+                    let b = self.doc.bounds();
+                    self.camera.target = (b.min + b.max) * 0.5;
+                    self.camera.distance = (b.max - b.min).length() * 1.6;
+                    next(t);
+                }
+            }
+            // W, then draw an action line from the middle of the subtool to the right.
+            1 => {
+                let b = self.doc.bounds();
+                let centre = self.project((b.min + b.max) * 0.5);
+                // Short enough that the circles stay inside the document frame (the border
+                // around it always navigates) even with several subtools framed.
+                let path = Vec2::new(0.12 * vp.y, 0.0);
+                if k == 0 {
+                    self.on_key(KeyCode::KeyW);
+                    self.cursor_moved(centre, false);
+                    self.left_press(false, false);
+                    let pass = matches!(self.transpose, Some(TransposeDrag::Draw { .. }));
+                    t.ok &= pass;
+                    log::info!("selftest-transpose: press on the subtool starts a line ({})", if pass { "ok" } else { "FAIL" });
+                    t.press = centre;
+                } else if k <= 10 {
+                    self.cursor_moved(t.press + path * (k as f32 / 10.0), false);
+                } else {
+                    self.left_release();
+                    let pass = self.action_line.is_some_and(|l| (l.end - l.start).length() > 1e-3);
+                    t.ok &= pass;
+                    log::info!("selftest-transpose: drew the action line ({})", if pass { "ok" } else { "FAIL" });
+                    next(t);
+                }
+            }
+            // Move (W): drag the middle circle; Scale (E) and Rotate (R): drag the end circle.
+            2..=4 => {
+                let mode = [Mode::Move, Mode::Scale, Mode::Rotate][t.phase - 2];
+                let line = self.action_line.unwrap();
+                if k == 0 {
+                    self.on_key([KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyR][t.phase - 2]);
+                    t.before = self.doc.mesh().positions.clone();
+                    t.press = self.project(if mode == Mode::Move { line.mid() } else { line.end });
+                    t.pivot = self.project(line.start);
+                    self.cursor_moved(t.press, false);
+                    self.left_press(false, false);
+                    let pass = matches!(self.transpose, Some(TransposeDrag::Act { .. }));
+                    t.ok &= pass;
+                    if !pass {
+                        log::info!("selftest-transpose: {} press missed its circle (FAIL)", mode.name());
+                        return true;
+                    }
+                } else if k <= DRAG {
+                    if k >= 2 {
+                        t.drag.push(dt);
+                    }
+                    let f = k as f32 / DRAG as f32;
+                    let to = match mode {
+                        Mode::Move => t.press + Vec2::new(0.08, -0.06) * vp.y * f,
+                        Mode::Scale => t.pivot + (t.press - t.pivot) * (1.0 + 0.5 * f),
+                        _ => {
+                            let r = t.press - t.pivot;
+                            t.pivot + Vec2::from_angle(FRAC_PI_2 * f).rotate(r)
+                        }
+                    };
+                    self.cursor_moved(to, false);
+                } else if k == DRAG + 1 {
+                    // Only the release in this frame, so the next frame time is its cost.
+                    let map = self.preview_map();
+                    let shown = self.action_line.unwrap();
+                    t.release.push(self.end_transpose_timed());
+                    t.applied = Some((map, shown));
+                } else if k == DRAG + 2 {
+                    t.release_frame.push(dt);
+                } else if k == DRAG + 3 {
+                    // GPU work queued by the release (the in-place map, the normal pass after a
+                    // rotation) can finish in the frame after it.
+                    t.release_frame.push(dt);
+                    let (map, shown) = t.applied.take().unwrap();
+                    let ms = *t.release.last().unwrap();
+                    // The exact CPU transform is the map the GPU showed during the drag.
+                    let want: Vec<Vec3> = {
+                        use rayon::prelude::*;
+                        t.before.par_iter().map(|&p| map.apply(p)).collect()
+                    };
+                    let err = worst(&self.doc.mesh().positions, &want);
+                    let (detail, pass) = match mode {
+                        Mode::Move => {
+                            let got = self.project(shown.mid());
+                            let want = t.press + Vec2::new(0.08, -0.06) * vp.y;
+                            (format!("middle circle {:.2} px from the cursor", (got - want).length()), (got - want).length() < 0.5)
+                        }
+                        Mode::Scale => (format!("scale {:.4} (want 1.5)", map.scale), (map.scale - 1.5).abs() < 1e-3),
+                        _ => {
+                            let deg = map.rotation.to_axis_angle().1.to_degrees();
+                            (format!("rotation {deg:.2}° (want 90)"), (deg - 90.0).abs() < 0.5)
+                        }
+                    };
+                    let pass = pass && err < 1e-4 && self.history.can_undo();
+                    t.ok &= pass;
+                    let n = t.release_frame.len();
+                    log::info!(
+                        "selftest-transpose: {}: {detail}, CPU result vs the previewed map {err:.1e}, CPU transform {ms:.1} ms, release frame {:.1} ms + next frame {:.1} ms ({})",
+                        mode.name(),
+                        t.release_frame[n - 2],
+                        dt,
+                        if pass { "ok" } else { "FAIL" }
+                    );
+                } else if k > DRAG + 4 {
+                    next(t);
+                }
+            }
+            // Ctrl + Z three times through the deferred-undo path, then compare.
+            _ => {
+                if k < 3 {
+                    self.pending_undo = true;
+                } else if k == 4 {
+                    let err = worst(&self.doc.mesh().positions, &t.original);
+                    let pass = err < 1e-4 && self.history.can_redo();
+                    t.ok &= pass;
+                    log::info!("selftest-transpose: three undos restore the subtool to {err:.1e} ({})", if pass { "ok" } else { "FAIL" });
+                    // The GPU copy was mapped in place six times, never uploaded: it has to
+                    // agree with the CPU.
+                    if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                        let err = worst(&gpu, &self.doc.mesh().positions);
+                        let pass = err < 1e-4;
+                        t.ok &= pass;
+                        log::info!("selftest-transpose: GPU copy of the shown level vs CPU {err:.1e} ({})", if pass { "ok" } else { "FAIL" });
+                    }
+                    let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+                    log::info!(
+                        "selftest-transpose: level {} ({} vertices): idle frame {:.2} ms, frame while dragging (GPU preview) {:.2} ms, release frame + next frame: move {:.1} + {:.1}, scale {:.1} + {:.1}, rotate {:.1} + {:.1} ms",
+                        self.doc.active(),
+                        fmt_count(self.mesh().vertex_count()),
+                        avg(&t.idle),
+                        avg(&t.drag),
+                        t.release_frame[0],
+                        t.release_frame[1],
+                        t.release_frame[2],
+                        t.release_frame[3],
+                        t.release_frame[4],
+                        t.release_frame[5],
+                    );
+                    log::info!("selftest-transpose: {}", if t.ok { "all passed" } else { "FAILED" });
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
+    fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
+        let vp = self.viewport();
+        let k = t.k;
+        t.k += 1;
+        let next = |t: &mut MaskTest| {
+            t.phase += 1;
+            t.k = 0;
+        };
+        let check = |t: &mut MaskTest, what: &str, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-mask: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let masked = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 127).count();
+        let centre = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+        // Inside the document frame but off the model.
+        let background = self.canvas_origin() + Vec2::splat(50.0 * self.scale);
+        // Press, then release on the same frame: a click.
+        let click = |app: &mut App, at: Vec2, m: ModifiersState| -> f32 {
+            app.modifiers = m;
+            app.cursor_moved(at, false);
+            let t0 = Instant::now();
+            app.left_press(false, false);
+            app.left_release();
+            app.modifiers = ModifiersState::empty();
+            t0.elapsed().as_secs_f32() * 1000.0
+        };
+        match t.phase {
+            0 => {
+                if k > 30 {
+                    t.idle.push(dt);
+                }
+                if k == 90 {
+                    t.ok = true;
+                    t.original = self.doc.mesh().positions.clone();
+                    self.on_key(KeyCode::KeyQ);
+                    next(t);
+                }
+            }
+            // Ctrl + drag on the model paints the mask.
+            1 => {
+                if k == 0 {
+                    t.press = centre;
+                    self.modifiers = ModifiersState::CONTROL;
+                    self.cursor_moved(centre, false);
+                    self.left_press(false, false);
+                } else if k <= 30 {
+                    self.cursor_moved(t.press + Vec2::new(0.25 * vp.y, 0.0) * (k as f32 / 30.0), false);
+                    if self.mask_stroke.is_some() {
+                        t.dabs.push(self.stroke_ms);
+                    }
+                } else {
+                    self.left_release();
+                    self.modifiers = ModifiersState::empty();
+                    let n = masked(self);
+                    check(t, &format!("Ctrl + drag masked {n} vertices"), n > 0 && self.history.can_undo());
+                    next(t);
+                }
+            }
+            // Frames with the mask shown.
+            2 => {
+                if k > 2 {
+                    t.shaded.push(dt);
+                }
+                if k == 60 {
+                    let gpu = self.gfx.as_ref().and_then(Gfx::read_mask).unwrap_or_default();
+                    let cpu = &self.doc.mesh().mask;
+                    check(t, "GPU mask matches the CPU", gpu.len() >= cpu.len() && gpu[..cpu.len()] == cpu[..]);
+                    next(t);
+                }
+            }
+            // Ctrl + click on the background inverts (twice), Ctrl + click on the model blurs.
+            3 => {
+                let n = masked(self);
+                let ms = click(self, background, ModifiersState::CONTROL);
+                t.costs.push(("invert (Ctrl + click background)", ms));
+                let total = self.doc.mesh().vertex_count();
+                check(t, "Ctrl + click on the background inverts", masked(self) == total - n);
+                click(self, background, ModifiersState::CONTROL);
+                let soft = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 10 && m < 245).count();
+                let s0 = soft(self);
+                let ms = click(self, centre, ModifiersState::CONTROL);
+                t.costs.push(("blur (Ctrl + click model)", ms));
+                check(t, "Ctrl + click on the model blurs", masked(self) > 0 && soft(self) > s0);
+                next(t);
+            }
+            // The mask follows a level change and comes back unchanged.
+            4 => {
+                let level = self.doc.active();
+                if level > 0 {
+                    let mask = self.doc.mesh().mask.clone();
+                    let t0 = Instant::now();
+                    self.set_level(level - 1);
+                    let down = t0.elapsed().as_secs_f32() * 1000.0;
+                    let t0 = Instant::now();
+                    self.set_level(level);
+                    let up = t0.elapsed().as_secs_f32() * 1000.0;
+                    t.costs.push(("level down with the mask", down));
+                    t.costs.push(("level up with the mask", up));
+                    // Blurred values do not survive the round trip exactly: even vertices do.
+                    let same = self.doc.mesh().mask.len() == mask.len();
+                    check(t, "the mask follows D / Shift + D", same && masked(self) > 0);
+                }
+                next(t);
+            }
+            // W: a line from the middle, then drag its middle circle up.
+            5 => {
+                if k == 0 {
+                    self.on_key(KeyCode::KeyW);
+                    self.cursor_moved(centre, false);
+                    self.left_press(false, false);
+                } else if k <= 5 {
+                    self.cursor_moved(centre + Vec2::new(0.2 * vp.y, 0.0) * (k as f32 / 5.0), false);
+                } else if k == 6 {
+                    self.left_release();
+                    t.before = self.doc.mesh().positions.clone();
+                    t.press = self.project(self.action_line.unwrap().mid());
+                    self.cursor_moved(t.press, false);
+                    self.left_press(false, false);
+                } else if k <= 66 {
+                    if k > 8 {
+                        t.drag.push(dt);
+                    }
+                    self.cursor_moved(t.press + Vec2::new(0.0, -0.15 * vp.y) * ((k - 6) as f32 / 60.0), false);
+                } else if k == 67 {
+                    let t0 = Instant::now();
+                    self.left_release();
+                    t.costs.push(("masked move release (CPU)", t0.elapsed().as_secs_f32() * 1000.0));
+                } else if k == 68 {
+                    t.costs.push(("masked move release frame", dt));
+                } else {
+                    let mesh = self.doc.mesh();
+                    let (mut held, mut moved) = (0.0f32, 0.0f32);
+                    for ((p, q), &m) in t.before.iter().zip(&mesh.positions).zip(&mesh.mask) {
+                        let d = (*p - *q).length();
+                        if m == 255 {
+                            held = held.max(d);
+                        } else if m == 0 {
+                            moved = moved.max(d);
+                        }
+                    }
+                    check(t, &format!("masked move: fully masked vertices moved {held:.1e}, free ones up to {moved:.3}"), held < 1e-4 && moved > 0.05);
+                    if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                        let err = gpu.iter().zip(&mesh.positions).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+                        check(t, &format!("GPU positions match the CPU after the masked move ({err:.1e})"), err < 1e-4);
+                    }
+                    next(t);
+                }
+            }
+            // Ctrl + drag on the background clears; then undo everything.
+            6 => {
+                if k == 0 {
+                    self.modifiers = ModifiersState::CONTROL;
+                    self.cursor_moved(background, false);
+                    self.left_press(false, false);
+                } else if k == 1 {
+                    self.cursor_moved(background + Vec2::new(40.0, 30.0), false);
+                } else if k == 2 {
+                    self.left_release();
+                    self.modifiers = ModifiersState::empty();
+                    check(t, "Ctrl + drag on the background clears", self.doc.mesh().mask.is_empty());
+                } else if k < 9 {
+                    // Clear, move, blur, invert, invert, stroke.
+                    self.pending_undo = true;
+                } else if k == 10 {
+                    let err = self.doc.mesh().positions.iter().zip(&t.original).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+                    check(t, &format!("six undos restore positions ({err:.1e}) and the empty mask"), err < 1e-4 && masked(self) == 0);
+                    let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+                    log::info!(
+                        "selftest-mask: level {} ({} vertices): frame {:.2} ms without a mask, {:.2} ms with it shown, {:.2} ms dragging a masked move; mask dab {:.2} ms avg",
+                        self.doc.active(),
+                        fmt_count(self.mesh().vertex_count()),
+                        avg(&t.idle),
+                        avg(&t.shaded),
+                        avg(&t.drag),
+                        avg(&t.dabs),
+                    );
+                    for (what, ms) in &t.costs {
+                        log::info!("selftest-mask: {what}: {ms:.1} ms");
+                    }
+                    log::info!("selftest-mask: {}", if t.ok { "all passed" } else { "FAILED" });
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+        false
+    }
+
+    /// Release the left button and return how long the CPU side took (ms).
+    fn end_transpose_timed(&mut self) -> f32 {
+        let t = Instant::now();
+        self.left_release();
+        t.elapsed().as_secs_f32() * 1000.0
+    }
+
     /// The subtool under the cursor, from the GPU id pass.
     fn pick_subtool(&mut self) -> Option<usize> {
         let parked: Vec<(u64, u32)> = self
@@ -1418,7 +2038,7 @@ impl App {
 
     /// Add a subdivision level above the top one and show it (ZBrush: Ctrl + D).
     fn divide(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         if !self.doc.can_divide() {
@@ -1445,7 +2065,7 @@ impl App {
 
     /// Show another subdivision level (ZBrush: D up, Shift + D down).
     fn set_level(&mut self, level: usize) {
-        if self.stroke.is_some() || level == self.doc.active() || level > self.doc.top() {
+        if self.busy() || level == self.doc.active() || level > self.doc.top() {
             return;
         }
         let t = Instant::now();
@@ -1748,6 +2368,240 @@ impl App {
         }
     }
 
+    /// A whole-mask operation as one undo step (Masking palette, Ctrl + I / A / Shift + A,
+    /// Ctrl + click). Returns false when it changed nothing.
+    fn mask_op(&mut self, op: MaskOp) -> bool {
+        if self.busy() {
+            return false;
+        }
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let new = mask::apply(mesh, op);
+        // Invert and Mask All act on what is shown: vertices of hidden polygons only keep
+        // their mask.
+        let new = if matches!(op, MaskOp::Invert | MaskOp::All) && !mesh.shown.is_empty() && !new.is_empty() {
+            let (old, shown) = (&mesh.mask, &mesh.shown);
+            new.par_iter()
+                .enumerate()
+                .map(|(v, &m)| if shown[v] != 0 { m } else { old.get(v).copied().unwrap_or(0) })
+                .collect()
+        } else {
+            new
+        };
+        let unchanged = new == mesh.mask
+            || (new.is_empty() && mesh.mask.iter().all(|&m| m == 0))
+            || (mesh.mask.is_empty() && new.iter().all(|&m| m == 0));
+        if unchanged {
+            return false;
+        }
+        let old = mask::replace(mesh, new);
+        self.history.push(UndoStep::Mask {
+            level,
+            data: MaskData::Whole(old),
+        });
+        true
+    }
+
+    /// Ctrl + left press (ZBrush masking): decided on the first move or on release.
+    fn begin_mask_press(&mut self, border: bool) {
+        let hit = if border {
+            None
+        } else {
+            let (o, d) = self.cursor_ray();
+            self.mesh().raycast(o, d).map(|h| h.point)
+        };
+        self.mask_press = Some(MaskPress {
+            at: self.cursor,
+            hit,
+            alt: self.modifiers.alt_key(),
+            moved: false,
+        });
+        self.hover = None;
+    }
+
+    /// One mask dab under the cursor.
+    fn mask_dab(&mut self) {
+        let t = Instant::now();
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d).map(|h| h.point) else {
+            return;
+        };
+        let brush = self.brush;
+        if let Some(stroke) = self.mask_stroke.as_mut() {
+            stroke.dab(self.doc.mesh_mut(), &brush, hit);
+        }
+        self.hover = Some(hit);
+        self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn mask_move(&mut self) {
+        if self.mask_stroke.is_some() {
+            self.mask_dab();
+            return;
+        }
+        let Some(press) = self.mask_press.as_mut() else {
+            return;
+        };
+        if press.moved || (self.cursor - press.at).length() < 4.0 {
+            return;
+        }
+        press.moved = true;
+        let press = *press;
+        let Some(hit) = press.hit else {
+            return; // a drag on the background clears the mask on release
+        };
+        if self.workspace.mode != Mode::Draw {
+            self.workspace.notify("Masking along the action line is not connected yet · Q to paint masks");
+            return;
+        }
+        // A drag on the model: paint from the press point on.
+        self.mask_press = None;
+        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry);
+        let brush = self.brush;
+        stroke.dab(self.doc.mesh_mut(), &brush, hit);
+        self.mask_stroke = Some(stroke);
+        self.mask_dab();
+    }
+
+    fn end_mask(&mut self) {
+        if let Some(stroke) = self.mask_stroke.take() {
+            if let Some(chunks) = stroke.end() {
+                self.history.push(UndoStep::Mask {
+                    level: self.doc.active(),
+                    data: MaskData::Chunks(chunks),
+                });
+            }
+        }
+        let Some(press) = self.mask_press.take() else {
+            return;
+        };
+        if press.hit.is_none() && press.moved && self.subtools[self.active_tool].wedge {
+            // ZBrush: while DynaMesh is on, Ctrl + drag on the background remeshes; the new
+            // surface starts without a mask (undo brings back the old one with its mask).
+            self.pending_geo = Some(GeoOp::Wedge);
+            self.run_pending_geo();
+            return;
+        }
+        let op = match (press.hit.is_some(), press.moved, press.alt) {
+            (true, false, false) => Some(MaskOp::Blur),
+            (true, false, true) => Some(MaskOp::Sharpen),
+            (false, false, _) => Some(MaskOp::Invert),
+            (false, true, _) => Some(MaskOp::Clear),
+            (true, true, _) => None,
+        };
+        if let Some(op) = op {
+            self.mask_op(op);
+        }
+    }
+
+    /// The cursor moved to `pos` (window pixels).
+    fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
+        self.last_cursor = self.cursor;
+        self.cursor = pos;
+        let delta = self.cursor - self.last_cursor;
+        if let Some(drag) = self.nav {
+            self.nav_move(drag, delta);
+        } else if self.select.is_some() {
+            self.show_select_rect();
+        } else if self.transpose.is_some() {
+            self.transpose_move();
+        } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
+            self.mask_move();
+        } else if self.stroke.is_some() {
+            if self.stroke_brush.kind == BrushKind::Grab {
+                self.stroke_pending = true;
+            } else {
+                self.apply_stroke();
+            }
+        } else if !over_ui && !self.in_canvas_border() {
+            self.update_hover();
+        } else {
+            self.hover = None;
+        }
+    }
+
+    /// Left button pressed. `consumed`: egui took the event; `over_ui`: the cursor is off
+    /// the canvas.
+    fn left_press(&mut self, consumed: bool, over_ui: bool) {
+        let border = self.in_canvas_border();
+        let free = !consumed && !over_ui && self.nav.is_none() && !self.busy();
+        if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
+            // The press that closes a popup or menu does nothing else.
+            return;
+        }
+        if self.modifiers.control_key() && self.modifiers.shift_key() {
+            // ZBrush: Ctrl + Shift selects (SelectRect) on the model or on the background;
+            // the border outside the document frame counts as background.
+            if free {
+                let hit = if border {
+                    None
+                } else {
+                    let (o, d) = self.cursor_ray();
+                    self.mesh().raycast(o, d).map(|h| h.tri)
+                };
+                self.select = Some(SelectDrag { start: self.cursor, hit });
+                self.hover = None;
+            }
+            return;
+        }
+        let picked = if self.modifiers.alt_key() && !self.modifiers.control_key() && !border && self.subtools.len() > 1 && free {
+            self.pick_subtool().filter(|&i| i != self.active_tool)
+        } else {
+            None
+        };
+        if let Some(i) = picked {
+            // ZBrush: Alt + click on another subtool selects it.
+            self.select_subtool(i);
+        } else if free {
+            // ZBrush: a left drag on the model sculpts (Alt = alternate brush, Ctrl =
+            // masking), or in Move / Scale / Rotate mode draws and drives the Transpose
+            // action line; on empty canvas it rotates, with Alt it moves, and releasing Alt
+            // turns it into a zoom. The border outside the document frame is always canvas.
+            // Ctrl masks (see `begin_mask_press`).
+            if self.modifiers.control_key() {
+                self.begin_mask_press(border);
+                return;
+            }
+            if border {
+                self.begin_nav(MouseButton::Left);
+                return;
+            }
+            if self.workspace.mode != Mode::Draw && self.begin_transpose() {
+                return;
+            }
+            let (o, d) = self.cursor_ray();
+            let hit = self.mesh().raycast(o, d);
+            log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
+            if hit.is_none() {
+                self.begin_nav(MouseButton::Left);
+            } else {
+                self.begin_stroke();
+            }
+        }
+    }
+
+    /// Left button released.
+    fn left_release(&mut self) {
+        if let Some(sel) = self.select.take() {
+            self.workspace.select_rect = None;
+            let alt = self.modifiers.alt_key();
+            if (self.cursor - sel.start).length() < CLICK_SLOP {
+                match sel.hit {
+                    Some(tri) => self.isolate_group(tri, alt),
+                    None => self.show_all(),
+                }
+            } else {
+                self.select_rect(sel.start, self.cursor, alt);
+            }
+            self.update_hover();
+            return;
+        }
+        self.end_mask();
+        self.end_stroke();
+        self.end_transpose();
+        self.end_nav(MouseButton::Left);
+    }
+
     /// Logical (egui) position of the cursor.
     fn cursor_pos(&self) -> egui::Pos2 {
         egui::pos2(self.cursor.x / self.scale, self.cursor.y / self.scale)
@@ -1756,7 +2610,7 @@ impl App {
     /// Replace the active subtool's mesh with the current primitive, in the same place and
     /// at the same size. Its levels and undo history go.
     fn rebuild(&mut self) {
-        if self.stroke.is_some() {
+        if self.busy() {
             return;
         }
         let t = Instant::now();
@@ -1793,6 +2647,12 @@ impl App {
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
             KeyCode::KeyS if ctrl => self.pending_doc = Some(DocOp::Save),
             KeyCode::KeyO if ctrl => self.pending_doc = Some(DocOp::Open),
+            // ZBrush masking: Ctrl + I invert, Ctrl + A mask all, Ctrl + Shift + A clear,
+            // Ctrl + H view mask.
+            KeyCode::KeyI if ctrl => self.pending_mask = Some(MaskOp::Invert),
+            KeyCode::KeyA if ctrl && shift => self.pending_mask = Some(MaskOp::Clear),
+            KeyCode::KeyA if ctrl => self.pending_mask = Some(MaskOp::All),
+            KeyCode::KeyH if ctrl => self.workspace.show_mask = !self.workspace.show_mask,
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
             KeyCode::KeyY if ctrl => self.pending_redo = true,
@@ -1973,6 +2833,9 @@ impl App {
         self.pending_undo |= actions.undo;
         self.pending_redo |= actions.redo;
         self.pending_divide |= actions.divide;
+        if actions.mask.is_some() {
+            self.pending_mask = actions.mask;
+        }
         if actions.level.is_some() {
             self.pending_level = actions.level;
         }
@@ -1986,6 +2849,7 @@ impl App {
             self.camera.yaw = yaw;
             self.camera.pitch = pitch;
         }
+        self.paint_action_line(ui.ctx());
     }
 
     fn redraw(&mut self) {
@@ -2022,21 +2886,34 @@ impl App {
         }
         if self.pending_undo {
             self.pending_undo = false;
-            if self.stroke.is_none() {
-                self.history.undo(&mut self.doc);
+            if !self.busy() {
+                match self.history.next_undo_map() {
+                    Some(map) => {
+                        self.transform_doc(&map, |app| app.history.undo(&mut app.doc));
+                    }
+                    None => self.history.undo(&mut self.doc),
+                }
                 self.show_active_level();
             }
         }
         if self.pending_redo {
             self.pending_redo = false;
-            if self.stroke.is_none() {
-                self.history.redo(&mut self.doc);
+            if !self.busy() {
+                match self.history.next_redo_map() {
+                    Some(map) => {
+                        self.transform_doc(&map, |app| app.history.redo(&mut app.doc));
+                    }
+                    None => self.history.redo(&mut self.doc),
+                }
                 self.show_active_level();
             }
         }
         if self.pending_divide {
             self.pending_divide = false;
             self.divide();
+        }
+        if let Some(op) = self.pending_mask.take() {
+            self.mask_op(op);
         }
         if let Some(level) = self.pending_level.take() {
             self.set_level(level);
@@ -2133,6 +3010,20 @@ impl App {
                 self.selftest_project = Some(left - 1);
             }
         }
+        if let Some(mut t) = self.selftest_mask.take() {
+            if self.selftest_mask_frame(&mut t, dt * 1000.0) {
+                self.quit = true;
+            } else {
+                self.selftest_mask = Some(t);
+            }
+        }
+        if let Some(mut t) = self.selftest_transpose.take() {
+            if self.selftest_transpose_frame(&mut t, dt * 1000.0) {
+                self.quit = true;
+            } else {
+                self.selftest_transpose = Some(t);
+            }
+        }
         if let Some(left) = self.selftest {
             if left == 0 {
                 self.selftest = None;
@@ -2166,7 +3057,9 @@ impl App {
         self.camera.aspect = vp.x / vp.y;
         self.camera.ortho = !self.workspace.perspective;
         let brush_pos = self.hover.unwrap_or(Vec3::ZERO);
-        let show_brush = self.hover.is_some() && !ctx.is_pointer_over_egui();
+        let show_brush = self.hover.is_some()
+            && !ctx.is_pointer_over_egui()
+            && self.workspace.mode == Mode::Draw;
         let radius = if self.stroke.is_some() {
             self.stroke_brush.radius
         } else {
@@ -2177,6 +3070,8 @@ impl App {
         let light = (self.camera.right() * 0.6 + self.camera.up() * 0.8
             - self.camera.forward() * 0.9)
             .normalize();
+        let preview = self.preview_map();
+        let (preview_axis, preview_angle) = preview.rotation.to_axis_angle();
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
             inv_view_proj: self.camera.view_proj().inverse().to_cols_array_2d(),
@@ -2198,9 +3093,12 @@ impl App {
             display: [
                 if self.workspace.grid { 1.0 } else { 0.0 },
                 if self.workspace.symmetry { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+                if self.workspace.show_mask { 1.0 } else { 0.0 },
+                if self.doc.mesh().mask.is_empty() { 0.0 } else { 1.0 },
             ],
+            xf_center: preview.center.extend(if preview.is_identity() { 0.0 } else { 1.0 }).to_array(),
+            xf_rotation: preview_axis.extend(preview_angle).to_array(),
+            xf_move: preview.translate.extend(preview.scale).to_array(),
         };
         let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
@@ -2810,6 +3708,12 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-groups") {
         app.selftest_groups = Some((0, 20));
     }
+    if args.iter().any(|a| a == "--selftest-mask") {
+        app.selftest_mask = Some(MaskTest::default());
+    }
+    if args.iter().any(|a| a == "--selftest-transpose") {
+        app.selftest_transpose = Some(TransposeTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-project") {
         app.selftest_project = Some(20);
     }
@@ -3165,7 +4069,8 @@ mod subtool_tests {
         let original = app.doc.mesh().positions.clone();
         let corner = Vec2::new(8.0, 8.0);
 
-        // Ctrl + drag on the background does nothing while Wedge is off (and never rotates).
+        // Ctrl + drag on the background only clears the mask while Wedge is off (it never
+        // rotates).
         let yaw = app.camera.yaw;
         drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
         assert_eq!(app.doc.mesh().positions, original);
@@ -3192,11 +4097,23 @@ mod subtool_tests {
         drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
         let second = app.doc.mesh().vertex_count();
         assert!(second > first, "{second} after {first}");
-        // A Ctrl click (no drag) does not.
+        // A Ctrl click on the background inverts the mask (ZBrush), it does not re-wedge.
         drag(&mut app, ModifiersState::CONTROL, corner, corner);
         assert_eq!(app.doc.mesh().vertex_count(), second);
+        assert!(app.doc.mesh().mask.iter().all(|&m| m == 255));
+        // With a mask, Ctrl + drag on the background still re-wedges; the new surface starts
+        // without a mask, and undo brings the masked one back.
+        app.wedge.resolution = 56;
+        drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
+        let third = app.doc.mesh().vertex_count();
+        assert!(third != second && app.doc.mesh().mask.is_empty());
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().vertex_count(), second);
+        assert!(app.doc.mesh().mask.iter().all(|&m| m == 255), "the mask came back");
+        app.history.undo(&mut app.doc);
+        assert!(app.doc.mesh().mask.iter().all(|&m| m == 0));
 
-        // Undo twice: the sphere exactly as it was, with its groups.
+        // Undo twice more: the sphere exactly as it was, with its groups.
         app.history.undo(&mut app.doc);
         assert_eq!(app.doc.mesh().vertex_count(), first);
         app.history.undo(&mut app.doc);
@@ -3251,5 +4168,379 @@ mod subtool_tests {
         app.run_pending_geo();
         assert!(!app.subtools[0].wedge);
         assert!(app.status.contains("closed"), "{}", app.status);
+    }
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::*;
+
+    fn worst(a: &[Vec3], b: &[Vec3]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(p, q)| (*p - *q).length()).fold(0.0, f32::max)
+    }
+
+    /// Press, drag in `steps` moves to `to`, release, through the window-event handlers.
+    fn drag(app: &mut App, from: Vec2, to: Vec2) {
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for k in 1..=8 {
+            app.cursor_moved(from + (to - from) * (k as f32 / 8.0), false);
+        }
+        app.left_release();
+    }
+
+    fn centre(app: &App) -> Vec3 {
+        let b = app.doc.bounds();
+        (b.min + b.max) * 0.5
+    }
+
+    #[test]
+    fn transpose_moves_scales_rotates_and_undoes() {
+        let mut app = App::new(24, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        // A stroke at level 1, so the stack carries offsets that have to turn with it.
+        let c = app.project(Vec3::ZERO);
+        let plain = app.doc.mesh().positions.clone();
+        drag(&mut app, c, c + Vec2::new(40.0, 20.0));
+        assert!(worst(&app.doc.mesh().positions, &plain) > 1e-3, "the stroke sculpted");
+        let original = app.doc.mesh().positions.clone();
+
+        // W: a drag on the model draws the line and leaves the model alone.
+        app.on_key(KeyCode::KeyW);
+        drag(&mut app, c, c + Vec2::new(200.0, 0.0));
+        let line = app.action_line.expect("a line was drawn");
+        assert!((app.project(line.start) - c).length() < 0.5);
+        assert!((app.project(line.end) - (c + Vec2::new(200.0, 0.0))).length() < 0.5);
+        assert_eq!(app.doc.mesh().positions, original);
+
+        // Middle circle: during the drag only the preview map changes; release applies it.
+        let mid = app.project(line.mid());
+        let target = mid + Vec2::new(150.0, -80.0);
+        app.cursor_moved(mid, false);
+        app.left_press(false, false);
+        app.cursor_moved(target, false);
+        let map = app.preview_map();
+        assert!(map.is_translation() && !map.is_identity());
+        assert_eq!(app.doc.mesh().positions, original, "nothing moves on the CPU mid-drag");
+        let c0 = centre(&app);
+        app.left_release();
+        assert!(app.preview_map().is_identity());
+        assert!((centre(&app) - (c0 + map.translate)).length() < 1e-4);
+        assert!((app.project(app.action_line.unwrap().mid()) - target).length() < 0.5);
+        let moved = app.doc.mesh().positions.clone();
+
+        // E: end circle out to twice its distance from the start doubles the size.
+        app.on_key(KeyCode::KeyE);
+        let line = app.action_line.unwrap();
+        let (s, e) = (app.project(line.start), app.project(line.end));
+        let size0 = app.doc.bounds().max - app.doc.bounds().min;
+        drag(&mut app, e, s + (e - s) * 2.0);
+        let size1 = app.doc.bounds().max - app.doc.bounds().min;
+        assert!((size1 / size0 - Vec3::splat(2.0)).abs().max_element() < 1e-3, "{size1} vs {size0}");
+        // The pivot (line start) stays put.
+        assert!((app.action_line.unwrap().start - line.start).length() < 1e-5);
+
+        // R: end circle a quarter turn about the start.
+        app.on_key(KeyCode::KeyR);
+        let line = app.action_line.unwrap();
+        let (s, e) = (app.project(line.start), app.project(line.end));
+        let before = app.doc.mesh().positions.clone();
+        app.cursor_moved(e, false);
+        app.left_press(false, false);
+        for k in 1..=8 {
+            let a = std::f32::consts::FRAC_PI_2 * k as f32 / 8.0;
+            app.cursor_moved(s + Vec2::from_angle(a).rotate(e - s), false);
+        }
+        let map = app.preview_map();
+        app.left_release();
+        assert!((map.rotation.to_axis_angle().1.to_degrees() - 90.0).abs() < 0.5);
+        let pivot = line.start;
+        for (p, q) in before.iter().zip(&app.doc.mesh().positions).step_by(97) {
+            assert!(((*p - pivot).length() - (*q - pivot).length()).abs() < 1e-4, "rigid about the pivot");
+        }
+        let rotated = app.doc.mesh().positions.clone();
+
+        // Undo the three transforms, redo them.
+        for _ in 0..3 {
+            app.history.undo(&mut app.doc);
+        }
+        assert!(worst(&app.doc.mesh().positions, &original) < 1e-4);
+        app.history.redo(&mut app.doc);
+        assert!(worst(&app.doc.mesh().positions, &moved) < 1e-4);
+        app.history.redo(&mut app.doc);
+        app.history.redo(&mut app.doc);
+        assert!(worst(&app.doc.mesh().positions, &rotated) < 1e-4);
+        // Lower levels followed: level 0 under the same maps subdivides to the shown level.
+        app.set_level(0);
+        app.set_level(1);
+        assert!(worst(&app.doc.mesh().positions, &rotated) < 1e-4);
+    }
+
+    #[test]
+    fn transpose_mode_keeps_navigation_and_draw_keeps_sculpting() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        let c = app.project(Vec3::ZERO);
+        app.on_key(KeyCode::KeyW);
+        // Off the model (and away from any line) a left drag still rotates the view.
+        app.cursor_moved(Vec2::new(20.0, 20.0), false);
+        app.left_press(false, false);
+        assert!(app.nav.is_some() && app.transpose.is_none());
+        app.left_release();
+        // A click without a drag leaves no line.
+        drag(&mut app, c, c);
+        assert!(app.action_line.is_none());
+        // Ctrl stays reserved for masking: no line, no stroke.
+        app.modifiers = ModifiersState::CONTROL;
+        drag(&mut app, c, c + Vec2::new(100.0, 0.0));
+        assert!(app.action_line.is_none() && !app.history.can_undo());
+        app.modifiers = ModifiersState::empty();
+        // The line's ring moves an end without touching the model.
+        drag(&mut app, c, c + Vec2::new(100.0, 0.0));
+        let line = app.action_line.unwrap();
+        let ring = app.project(line.end) + Vec2::new(transform::INNER + 3.0, 0.0);
+        drag(&mut app, ring, ring + Vec2::new(0.0, 50.0));
+        let moved = app.action_line.unwrap();
+        assert_eq!(moved.start, line.start);
+        assert!((app.project(moved.end) - app.project(line.end) - Vec2::new(0.0, 50.0)).length() < 0.5);
+        assert!(!app.history.can_undo(), "moving the line is not an edit");
+        // Back in Draw mode the same drag sculpts.
+        app.on_key(KeyCode::KeyQ);
+        drag(&mut app, c, c + Vec2::new(30.0, 0.0));
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn the_canvas_border_navigates_even_over_the_model() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        // Zoomed in so far that the model fills the whole canvas.
+        app.camera.distance = 1.05;
+        let corner = Vec2::new(6.0, 6.0);
+        let (o, d) = app.camera.ray(corner.x, corner.y, 1600.0, 1000.0);
+        assert!(app.mesh().raycast(o, d).is_some(), "the model is under the border");
+        for key in [KeyCode::KeyQ, KeyCode::KeyW] {
+            app.on_key(key);
+            app.cursor_moved(corner, false);
+            assert!(app.hover.is_none(), "no brush ring in the border");
+            app.left_press(false, false);
+            assert!(app.nav.is_some() && app.stroke.is_none() && app.transpose.is_none());
+            // Alt + click, release Alt, drag: zoom back out.
+            app.modifiers = ModifiersState::ALT;
+            app.left_release();
+            app.left_press(false, false);
+            app.modifiers = ModifiersState::empty();
+            let before = app.camera.distance;
+            app.cursor_moved(corner - Vec2::new(0.0, 5.0), false);
+            assert!(app.camera.distance > before, "zoomed out");
+            app.left_release();
+            app.camera.distance = 1.05;
+        }
+        // Inside the frame the same press sculpts.
+        app.on_key(KeyCode::KeyQ);
+        drag(&mut app, Vec2::new(40.0, 40.0), Vec2::new(60.0, 40.0));
+        assert!(app.history.can_undo());
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new(30, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app
+    }
+
+    fn drag(app: &mut App, from: Vec2, to: Vec2, m: ModifiersState) {
+        app.modifiers = m;
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for k in 1..=10 {
+            app.cursor_moved(from + (to - from) * (k as f32 / 10.0), false);
+        }
+        app.left_release();
+        app.modifiers = ModifiersState::empty();
+    }
+
+    fn masked(app: &App) -> usize {
+        app.doc.mesh().mask.iter().filter(|&&m| m > 127).count()
+    }
+
+    #[test]
+    fn ctrl_paints_erases_inverts_clears_and_blurs() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let background = Vec2::new(200.0, 200.0);
+        let ctrl = ModifiersState::CONTROL;
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ctrl);
+        let painted = masked(&app);
+        assert!(painted > 0 && painted < app.doc.mesh().vertex_count() / 2, "{painted}");
+        assert!(app.history.can_undo());
+        // Ctrl + click on the background inverts, again inverts back.
+        drag(&mut app, background, background, ctrl);
+        assert_eq!(masked(&app), app.doc.mesh().vertex_count() - painted);
+        drag(&mut app, background, background, ctrl);
+        assert_eq!(masked(&app), painted);
+        // Ctrl + click on the model blurs: the soft band widens.
+        let soft = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m > 10 && m < 245).count();
+        let s0 = soft(&app);
+        drag(&mut app, c, c, ctrl);
+        assert!(soft(&app) > s0);
+        // Ctrl + Alt + drag erases.
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ctrl | ModifiersState::ALT);
+        assert!(masked(&app) < painted / 2);
+        // Ctrl + drag on the background clears.
+        drag(&mut app, background, background + Vec2::new(60.0, 40.0), ctrl);
+        assert!(app.doc.mesh().mask.is_empty());
+        // Undo walks back through the five steps after the first stroke.
+        for _ in 0..5 {
+            app.history.undo(&mut app.doc);
+        }
+        assert_eq!(masked(&app), painted);
+        app.history.undo(&mut app.doc);
+        assert_eq!(masked(&app), 0);
+        // Shortcuts: Ctrl + A masks all, Ctrl + Shift + A clears.
+        assert!(app.mask_op(MaskOp::All));
+        assert_eq!(masked(&app), app.doc.mesh().vertex_count());
+        assert!(app.mask_op(MaskOp::Clear));
+        assert!(!app.mask_op(MaskOp::Clear), "clearing nothing is not an undo step");
+    }
+
+    #[test]
+    fn brushes_and_transpose_respect_the_mask() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        app.mask_op(MaskOp::All);
+        let before = app.doc.mesh().positions.clone();
+        // A Draw stroke on a fully masked model moves nothing.
+        drag(&mut app, c, c + Vec2::new(60.0, 0.0), ModifiersState::empty());
+        assert_eq!(app.doc.mesh().positions, before);
+        // Free the front, then move with Transpose: only the front moves.
+        app.brush.strength = 1.0;
+        drag(&mut app, c, c + Vec2::new(1.0, 5.0), ModifiersState::CONTROL | ModifiersState::ALT);
+        let front = app.doc.mesh().positions.iter().enumerate()
+            .max_by(|a, b| a.1.dot(app.camera.eye()).total_cmp(&b.1.dot(app.camera.eye()))).unwrap().0;
+        let back = app.doc.mesh().positions.iter().enumerate()
+            .min_by(|a, b| a.1.dot(app.camera.eye()).total_cmp(&b.1.dot(app.camera.eye()))).unwrap().0;
+        assert!(app.doc.mesh().mask[front] < 64 && app.doc.mesh().mask[back] == 255);
+        app.on_key(KeyCode::KeyW);
+        drag(&mut app, c, c + Vec2::new(200.0, 0.0), ModifiersState::empty());
+        let mid = app.project(app.action_line.unwrap().mid());
+        drag(&mut app, mid, mid + Vec2::new(0.0, -120.0), ModifiersState::empty());
+        let after = app.doc.mesh().positions.clone();
+        assert!((after[front] - before[front]).length() > 0.1, "the free front moved");
+        assert!((after[back] - before[back]).length() < 1e-5, "the masked back stayed");
+        // One undo step brings it back.
+        app.history.undo(&mut app.doc);
+        let worst = app.doc.mesh().positions.iter().zip(&before).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
+    }
+
+    #[test]
+    fn masking_polygroups_and_visibility_work_together() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let n = app.doc.mesh().vertex_count();
+        // Paint a mask, then Ctrl + W: the masked polygons become a group and the mask goes.
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ModifiersState::CONTROL);
+        let painted = masked(&app);
+        assert!(painted > 0);
+        app.modifiers = ModifiersState::CONTROL;
+        app.on_key(KeyCode::KeyW);
+        app.modifiers = ModifiersState::empty();
+        app.run_pending_vis();
+        assert_eq!(app.doc.mesh().group_count(), 2);
+        assert!(app.doc.mesh().mask.is_empty(), "Group Masked clears the mask");
+        // The new group sits where the mask was.
+        let mesh = app.doc.mesh();
+        let in_group = (0..mesh.triangle_count() as u32).filter(|&t| mesh.group(t) == 1).count();
+        assert!(in_group > 0 && in_group < mesh.triangle_count() / 2);
+        // One undo brings back both the mask and the single group.
+        app.history.undo(&mut app.doc);
+        assert_eq!(masked(&app), painted);
+        assert_eq!(app.doc.mesh().group_count(), 1);
+        app.history.redo(&mut app.doc);
+        assert_eq!(app.doc.mesh().group_count(), 2);
+        assert!(app.doc.mesh().mask.is_empty());
+
+        // Hide everything but the new group (Ctrl + Shift + click on it).
+        drag(&mut app, c, c, ModifiersState::CONTROL | ModifiersState::SHIFT);
+        let shown = app.doc.mesh().shown.clone();
+        assert!(!shown.is_empty());
+        let hidden_only: Vec<usize> = (0..n).filter(|&v| shown[v] == 0).collect();
+        assert!(!hidden_only.is_empty());
+        // Ctrl + A masks what is shown only; inverting leaves hidden vertices alone too.
+        assert!(app.mask_op(MaskOp::All));
+        assert!(hidden_only.iter().all(|&v| app.doc.mesh().mask[v] == 0));
+        assert!((0..n).filter(|&v| shown[v] != 0).all(|v| app.doc.mesh().mask[v] == 255));
+        app.mask_op(MaskOp::Clear);
+        // A mask stroke across the border does not reach hidden vertices.
+        drag(&mut app, c, c + Vec2::new(300.0, 0.0), ModifiersState::CONTROL);
+        assert!(hidden_only.iter().all(|&v| app.doc.mesh().mask.get(v).copied().unwrap_or(0) == 0));
+        app.mask_op(MaskOp::Clear);
+        // Transpose moves what is shown; hidden vertices stay.
+        let before = app.doc.mesh().positions.clone();
+        app.on_key(KeyCode::KeyW);
+        drag(&mut app, c, c + Vec2::new(150.0, 0.0), ModifiersState::empty());
+        let mid = app.project(app.action_line.unwrap().mid());
+        drag(&mut app, mid, mid + Vec2::new(0.0, -100.0), ModifiersState::empty());
+        let after = &app.doc.mesh().positions;
+        assert!(hidden_only.iter().all(|&v| after[v] == before[v]), "a hidden vertex moved");
+        assert!((0..n).any(|v| shown[v] != 0 && (after[v] - before[v]).length() > 0.05), "the shown part moved");
+        app.history.undo(&mut app.doc);
+        let worst = app.doc.mesh().positions.iter().zip(&before).map(|(p, q)| (*p - *q).length()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4);
+    }
+
+    #[test]
+    fn project_versions_1_2_and_3_all_open() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ModifiersState::CONTROL);
+        app.group_visible();
+        let centre = app.viewport() * 0.5;
+        drag(&mut app, centre - Vec2::splat(150.0), centre + Vec2::splat(150.0), ModifiersState::CONTROL | ModifiersState::SHIFT);
+        drag(&mut app, c, c + Vec2::new(60.0, 30.0), ModifiersState::CONTROL);
+        let mask = app.doc.mesh().mask.clone();
+        assert!(!mask.is_empty() && app.doc.mesh().hidden_count() > 0);
+        let marks = app.doc.marks();
+        let packed = app.doc.pack_copy();
+        for version in [1u32, 2, 3] {
+            let bytes = project::write_version(Vec::new(), &[("A", true, &packed)], 0, version).unwrap();
+            let p = project::read_from(&bytes[..], bytes.len() as u64).unwrap_or_else(|e| panic!("version {version}: {e}"));
+            let back = p.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+            assert_eq!(back.mesh().mask.is_empty(), version < 2, "version {version} mask");
+            if version >= 2 {
+                assert_eq!(back.mesh().mask, mask);
+            }
+            if version >= 3 {
+                assert_eq!(back.marks(), marks);
+            } else {
+                assert!(back.marks().iter().all(|m| m.hidden.is_empty() && m.groups.lens.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn projects_keep_the_mask() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        drag(&mut app, c, c + Vec2::new(80.0, 0.0), ModifiersState::CONTROL);
+        let mask = app.doc.mesh().mask.clone();
+        let path = std::env::temp_dir().join(format!("klay-mask-{}.klay", std::process::id()));
+        app.project_path = path.to_string_lossy().to_string();
+        app.save_project();
+        let mut other = App::new(4, false, 1000);
+        other.open_project(&app.project_path.clone());
+        assert!(other.status.starts_with("Opened"), "{}", other.status);
+        assert_eq!(other.doc.mesh().mask, mask);
+        let _ = std::fs::remove_file(&path);
     }
 }

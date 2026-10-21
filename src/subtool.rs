@@ -16,6 +16,7 @@
 use crate::mesh::Aabb;
 use crate::multires::Packed;
 use crate::sculpt::History;
+use crate::transform::Affine;
 
 /// Stand-ins of parked subtools use the highest level with at most this many vertices.
 pub const STAND_IN_VERTICES: usize = 2_000_000;
@@ -62,19 +63,19 @@ impl Deform {
     }
 }
 
-/// The map `p -> center + scale (p - center) + translate` for a deformation slider released
-/// at `value` (-100..100) on a subtool with these bounds. Offsets move by up to the
-/// subtool's largest extent; Size scales by 2^(value / 100) about the bounds centre.
-pub fn deform_map(kind: Deform, value: f32, bounds: Aabb) -> (glam::Vec3, f32, glam::Vec3) {
+/// The map for a deformation slider released at `value` (-100..100) on a subtool with
+/// these bounds. Offsets move by up to the subtool's largest extent; Size scales by
+/// 2^(value / 100) about the bounds centre.
+pub fn deform_map(kind: Deform, value: f32, bounds: Aabb) -> Affine {
     use glam::Vec3;
     let center = (bounds.min + bounds.max) * 0.5;
     let extent = (bounds.max - bounds.min).max_element().max(1e-6);
     let step = value / 100.0 * extent;
     match kind {
-        Deform::OffsetX => (center, 1.0, Vec3::X * step),
-        Deform::OffsetY => (center, 1.0, Vec3::Y * step),
-        Deform::OffsetZ => (center, 1.0, Vec3::Z * step),
-        Deform::Size => (center, (value / 100.0).exp2(), Vec3::ZERO),
+        Deform::OffsetX => Affine::translation(Vec3::X * step),
+        Deform::OffsetY => Affine::translation(Vec3::Y * step),
+        Deform::OffsetZ => Affine::translation(Vec3::Z * step),
+        Deform::Size => Affine::scaling(center, (value / 100.0).exp2()),
     }
 }
 
@@ -97,14 +98,13 @@ mod tests {
             min: Vec3::new(-1.0, -0.5, 0.0),
             max: Vec3::new(1.0, 0.5, 1.0),
         };
-        let (c, s, t) = deform_map(Deform::OffsetY, 50.0, b);
-        assert_eq!(c, Vec3::new(0.0, 0.0, 0.5));
-        assert_eq!(s, 1.0);
-        assert_eq!(t, Vec3::Y * 1.0);
-        let (_, s, t) = deform_map(Deform::Size, -100.0, b);
-        assert_eq!(s, 0.5);
-        assert_eq!(t, Vec3::ZERO);
-        let (_, s, _) = deform_map(Deform::Size, 100.0, b);
-        assert_eq!(s, 2.0);
+        let m = deform_map(Deform::OffsetY, 50.0, b);
+        assert!(m.is_translation());
+        assert_eq!(m.translate, Vec3::Y * 1.0);
+        let m = deform_map(Deform::Size, -100.0, b);
+        assert_eq!(m.center, Vec3::new(0.0, 0.0, 0.5));
+        assert_eq!(m.scale, 0.5);
+        assert_eq!(m.translate, Vec3::ZERO);
+        assert_eq!(deform_map(Deform::Size, 100.0, b).scale, 2.0);
     }
 }

@@ -24,6 +24,9 @@ use std::path::PathBuf;
 
 // ---------------------------------------------------------------- theme tokens
 pub const BACKGROUND: Color32 = Color32::from_rgb(14, 15, 16); // canvas
+/// Inset of the document frame drawn inside the canvas, in points. Like ZBrush, the margin
+/// between the frame and the canvas edge always navigates, even over the model.
+pub const FRAME_INSET: f32 = 16.0;
 const BG0: Color32 = Color32::from_rgb(18, 19, 20);
 const BG1: Color32 = Color32::from_rgb(28, 30, 32); // trays, palette bodies
 const BG2: Color32 = Color32::from_rgb(36, 39, 41); // menubar, headers, fields
@@ -419,6 +422,8 @@ pub struct Actions {
     pub move_subtool: i32,
     /// A Deformation slider was released at this value.
     pub deform: Option<(Deform, f32)>,
+    /// A Masking palette button (ZBrush: Masking > Invert, Clear, Mask All, Blur, Sharpen).
+    pub mask: Option<crate::mask::MaskOp>,
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
@@ -442,7 +447,8 @@ pub const MATERIALS: [(Color32, &str); 4] = [
     (Color32::from_rgb(184, 174, 152), "Polished bronze"),
 ];
 
-/// Top-shelf edit mode (ZBrush: Q / W / E / R). Only Draw sculpts today.
+/// Top-shelf edit mode (ZBrush: Q / W / E / R). Draw sculpts; Move, Scale and Rotate drive the
+/// Transpose action line (see `transform.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Draw,
@@ -495,6 +501,8 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Shade the mask: Ctrl + H (ZBrush: View Mask).
+    pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
     pub solo: bool,
     /// Polygroup colours on the active subtool (ZBrush: PolyF, Shift + F).
@@ -548,6 +556,7 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            show_mask: true,
             solo: false,
             polyframe: false,
             select_rect: None,
@@ -969,9 +978,9 @@ impl Workspace {
                     // mode buttons (Q / W / E / R)
                     for (glyph, label, mode, hint) in [
                         ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
-                        ("move", "Move", Mode::Move, "Move · W · not connected"),
-                        ("scale", "Scale", Mode::Scale, "Scale · E · not connected"),
-                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · not connected"),
+                        ("move", "Move", Mode::Move, "Move · W · drag the model for an action line, its middle circle moves"),
+                        ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle"),
+                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · drag the action line's end circle"),
                     ] {
                         if big_button(ui, glyph, label, vec2(46.0, 46.0), self.mode == mode, true)
                             .on_hover_text(hint)
@@ -1919,16 +1928,47 @@ impl Workspace {
                     id,
                     "mask",
                     "Mask",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        use crate::mask::MaskOp;
+                        ui.horizontal(|ui| {
+                            for (label, op, hint) in [
+                                ("Invert", MaskOp::Invert, "Ctrl + I · Ctrl + click the background"),
+                                ("Clear", MaskOp::Clear, "Ctrl + Shift + A · Ctrl + drag the background"),
+                                ("Mask all", MaskOp::All, "Ctrl + A"),
+                            ] {
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    a.mask = Some(op);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            for (label, op, hint) in [
+                                ("Blur", MaskOp::Blur, "Ctrl + click the model"),
+                                ("Sharpen", MaskOp::Sharpen, "Ctrl + Alt + click the model"),
+                            ] {
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    a.mask = Some(op);
+                                }
+                            }
+                        });
+                        ui.checkbox(&mut ws.show_mask, "View mask").on_hover_text("Ctrl + H");
+                        note(ui, "Ctrl + drag paints · Ctrl + Alt + drag erases");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "masktype",
+                    "Mask type",
                     Some(NC),
                     true,
                     false,
                     &mut |_, ui| {
                         seg(ui, &["Paint", "Rect", "Lasso"], 0, false);
-                        ui.horizontal(|ui| {
-                            for label in ["Invert", "Clear", "Blur"] {
-                                let _ = ui.button(label);
-                            }
-                        });
                     },
                 );
             }
@@ -2432,7 +2472,7 @@ impl Workspace {
                     &mut |_, ui| {
                         for (key, what) in [
                             ("Drag model", "sculpt · Alt: alternate · Shift: smooth"),
-                            ("Drag canvas", "rotate · Shift: snap to axis"),
+                            ("Drag canvas or border", "rotate · Shift: snap to axis"),
                             ("Alt + drag canvas", "move"),
                             ("Alt + click, release Alt", "zoom"),
                             ("Shift + click, release Shift", "roll"),
@@ -2440,19 +2480,27 @@ impl Workspace {
                             ("Scroll", "zoom to cursor · Ctrl: radius"),
                             ("Space (hold)", "quick menu · also: right-click tap"),
                             ("Alt + click subtool", "select subtool"),
+                            ("Ctrl + drag model", "mask · Alt: unmask"),
+                            ("Ctrl + click model", "blur mask · Alt: sharpen"),
+                            ("Ctrl + click / drag bg", "invert / clear mask"),
+                            ("Ctrl + I / A / Shift+A", "invert / mask all / clear"),
+                            ("Ctrl + H", "view mask"),
                             ("Ctrl + Shift + drag", "keep the rectangle visible · Alt: hide it"),
                             ("Ctrl + Shift + click group", "isolate the polygroup · Alt: hide it"),
-                            ("Ctrl + Shift + click canvas", "show all"),
-                            ("Ctrl + Shift + drag canvas", "invert visibility (a rectangle around nothing)"),
-                            ("Ctrl + W", "group visible: one new polygroup"),
+                            ("Ctrl + Shift + click bg", "show all"),
+                            ("Ctrl + Shift + drag bg", "invert visibility (a rectangle around nothing)"),
+                            ("Ctrl + W", "group masked, else visible: a new polygroup"),
                             ("Shift + F", "polygroup colours (PolyF)"),
-                            ("Ctrl + drag canvas", "re-wedge while Wedge is on"),
+                            ("Ctrl + drag bg, Wedge on", "re-wedge"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
                             ("Q W E R", "draw / move / scale / rotate"),
+                            ("W E R + drag model", "action line · Shift: 45°"),
+                            ("Drag circle", "middle: move · end: scale / rotate"),
+                            ("Drag ring / line", "move the action line"),
                             ("X", "symmetry"),
                             ("Ctrl + D", "divide (add a subdivision level)"),
                             ("D / Shift + D", "higher / lower subdivision level"),
@@ -2779,7 +2827,7 @@ impl Workspace {
         let painter = ui.painter().with_clip_rect(canvas);
         // document frame
         painter.rect_stroke(
-            canvas.shrink(16.0),
+            canvas.shrink(FRAME_INSET),
             0,
             Stroke::new(1.0, Color32::from_white_alpha(28)),
             StrokeKind::Inside,

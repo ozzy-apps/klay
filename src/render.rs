@@ -20,6 +20,14 @@ pub struct Uniforms {
     pub params: [f32; 4],
     pub viewport: [f32; 4],
     pub display: [f32; 4],
+    /// Map applied to the active subtool in the vertex shader, weighted per vertex by how
+    /// free it is of the mask: the live preview of a Transpose move / scale / rotate (see
+    /// `transform::Partial`). Centre (w: 1 while a preview is on); rotation axis and angle;
+    /// translation and scale.
+    /// Parked stand-ins ignore it.
+    pub xf_center: [f32; 4],
+    pub xf_rotation: [f32; 4],
+    pub xf_move: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -45,6 +53,14 @@ const NORMAL_CAP: f32 = (1u32 << 24) as f32;
 struct GrabParams {
     delta: [f32; 3],
     count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AffineParams {
+    model: [[f32; 4]; 4],
+    count: u32,
+    _pad: [u32; 3],
 }
 
 /// A grab stroke running on the GPU.
@@ -78,6 +94,9 @@ struct MeshBuffers {
     /// Flagged and listed chunks of the next normal passes.
     flagged: u32,
     listed: u32,
+    /// Mask, one byte per vertex (read by the vertex shader as packed words).
+    mask: wgpu::Buffer,
+    mask_bind_group: wgpu::BindGroup,
     /// GPU memory held by this level (with `draw` and `groups`).
     bytes: u64,
     /// Visible triangles only, drawn and picked instead of `indices` while some are hidden
@@ -143,6 +162,9 @@ pub struct Gfx {
     stand_ins: HashMap<u64, StandInBuffers>,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    mask_bgl: wgpu::BindGroupLayout,
+    /// Bound for stand-ins, which have no mask.
+    no_mask: wgpu::BindGroup,
     normal_own: wgpu::ComputePipeline,
     normal_border: wgpu::ComputePipeline,
     normal_normalize: wgpu::ComputePipeline,
@@ -151,6 +173,12 @@ pub struct Gfx {
     grab_bgl: wgpu::BindGroupLayout,
     grab_params: wgpu::Buffer,
     grab: Option<GpuGrab>,
+    affine_pipeline: wgpu::ComputePipeline,
+    affine_bgl: wgpu::BindGroupLayout,
+    affine_params: wgpu::Buffer,
+    /// Map queued for the positions of a level by [`Gfx::transform_level`], run at the start
+    /// of the next frame: (level, matrix).
+    pending_affine: Option<(usize, glam::Mat4)>,
     /// One entry per subdivision level, uploaded the first time the level is shown so
     /// stepping between levels is a pointer swap.
     levels: Vec<Option<MeshBuffers>>,
@@ -259,9 +287,42 @@ impl Gfx {
             }],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mesh layout"),
+            label: Some("uniform layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
+        });
+        // The mesh pipeline also reads the mask in the vertex shader.
+        let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mask bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&mask_bgl)],
+            immediate_size: 0,
+        });
+        let no_mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("no mask"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let no_mask = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("no mask bg"),
+            layout: &mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: no_mask_buf.as_entire_binding(),
+            }],
         });
 
         let pos_attr = [wgpu::VertexAttribute {
@@ -277,7 +338,7 @@ impl Gfx {
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh pipeline"),
-            layout: Some(&layout),
+            layout: Some(&mesh_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -353,7 +414,8 @@ impl Gfx {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("polygroup layout"),
-                bind_group_layouts: &[Some(&bgl), Some(&group_bgl)],
+                // The mesh pipeline's uniforms and mask, then the polygroups.
+                bind_group_layouts: &[Some(&bgl), Some(&mask_bgl), Some(&group_bgl)],
                 immediate_size: 0,
             });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -583,6 +645,46 @@ impl Gfx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // --- Affine map of a whole level (Transpose release) ------------------------------
+        let affine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("affine"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("affine.wgsl").into()),
+        });
+        let affine_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("affine bgl"),
+            entries: &[
+                storage(0, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let affine_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("affine layout"),
+            bind_group_layouts: &[Some(&affine_bgl)],
+            immediate_size: 0,
+        });
+        let affine_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("affine pipeline"),
+            layout: Some(&affine_layout),
+            module: &affine_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let affine_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("affine params"),
+            size: std::mem::size_of::<AffineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -610,6 +712,8 @@ impl Gfx {
             pick_readback,
             stand_ins: HashMap::new(),
             bind_group,
+            mask_bgl,
+            no_mask,
             normal_own,
             normal_border,
             normal_normalize,
@@ -618,6 +722,10 @@ impl Gfx {
             grab_bgl,
             grab_params,
             grab: None,
+            affine_pipeline,
+            affine_bgl,
+            affine_params,
+            pending_affine: None,
             levels: Vec::new(),
             active: 0,
             needs_normals: false,
@@ -805,11 +913,47 @@ impl Gfx {
         id
     }
 
+    /// Read the shown level's positions back from the GPU (self-tests).
+    pub fn read_positions(&self) -> Option<Vec<glam::Vec3>> {
+        let b = self.active_buffers()?;
+        self.read_buffer(&b.positions)
+    }
+
+    /// Read the shown level's mask back from the GPU, padded to whole words (self-tests).
+    pub fn read_mask(&self) -> Option<Vec<u8>> {
+        let b = self.active_buffers()?;
+        self.read_buffer(&b.mask)
+    }
+
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> Option<Vec<T>> {
+        let size = buffer.size();
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("positions readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let out = match readback.get_mapped_range(..) {
+            Ok(view) => bytemuck::pod_collect_to_vec(&view[..]),
+            Err(_) => return None,
+        };
+        readback.unmap();
+        Some(out)
+    }
+
     /// Forget every uploaded level (the document was replaced).
     pub fn clear_levels(&mut self) {
         self.levels.clear();
         self.active = 0;
         self.grab = None;
+        self.pending_affine = None;
     }
 
     /// Drop the GPU copies of levels at or above `count` (a level was removed).
@@ -900,6 +1044,9 @@ impl Gfx {
             self.levels.resize_with(level + 1, || None);
         }
         self.levels[level] = None;
+        if self.pending_affine.is_some_and(|(l, _)| l == level) {
+            self.pending_affine = None;
+        }
         self.active = level;
         self.trim_cache();
         for attempt in 0..2 {
@@ -914,6 +1061,7 @@ impl Gfx {
                     for ch in &mut mesh.chunks {
                         ch.dirty_pos = false;
                         ch.dirty_nrm = true;
+                        ch.dirty_mask = false;
                     }
                     return true;
                 }
@@ -932,7 +1080,8 @@ impl Gfx {
         let positions = self.upload(
             "positions",
             bytemuck::cast_slice(&mesh.positions),
-            U::VERTEX | U::STORAGE,
+            // COPY_SRC: read back by `--selftest-transpose`.
+            U::VERTEX | U::STORAGE | U::COPY_SRC,
         );
         let indices = self.upload(
             "indices",
@@ -970,7 +1119,17 @@ impl Gfx {
             std::mem::size_of::<NormalParams>(),
             U::UNIFORM | U::COPY_DST,
         );
+        // Padded to whole words; zero (nothing masked) unless the mesh has a mask.
+        let mask = if mesh.mask.is_empty() {
+            plain("mask", mesh.vertex_count().div_ceil(4) * 4, U::STORAGE | U::COPY_DST | U::COPY_SRC)
+        } else {
+            let mut padded = mesh.mask.clone();
+            padded.resize(mesh.vertex_count().div_ceil(4) * 4, 0);
+            // COPY_SRC: read back by `--selftest-mask`.
+            self.upload("mask", &padded, U::STORAGE | U::COPY_SRC)
+        };
         let bytes = [
+            &mask,
             &positions,
             &indices,
             &chunk_verts,
@@ -987,6 +1146,7 @@ impl Gfx {
         if let Some(e) = pollster::block_on(scope.pop()) {
             log::warn!("gpu: a level of {} MB did not fit: {e}", bytes / 1_000_000);
             drop((
+                mask,
                 positions,
                 indices,
                 chunk_verts,
@@ -1047,7 +1207,17 @@ impl Gfx {
                 },
             ],
         });
+        let mask_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask bg"),
+            layout: &self.mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mask.as_entire_binding(),
+            }],
+        });
         Some(MeshBuffers {
+            mask,
+            mask_bind_group,
             positions,
             normals,
             indices,
@@ -1184,6 +1354,40 @@ impl Gfx {
         self.grab = None;
     }
 
+    /// The CPU just mapped every level of the active subtool by `map`. Instead of uploading
+    /// the shown level again, map its GPU positions in place on the next frame and mark its
+    /// chunks clean; normals are recomputed only when the map turns them. `mesh` is the
+    /// shown level, and must have had no changes waiting for upload before the map (the
+    /// caller checks with [`SculptMesh`] chunk flags). Every cached level's normal
+    /// accumulator scale follows the change in face area.
+    pub fn transform_level(&mut self, mesh: &mut SculptMesh, map: &crate::transform::Affine) {
+        for b in self.levels.iter_mut().flatten() {
+            b.normal_scale /= map.scale * map.scale;
+        }
+        if self.active_buffers().is_none() {
+            return;
+        }
+        let level = self.active;
+        let m = map.matrix();
+        self.pending_affine = Some(match self.pending_affine.take() {
+            Some((l, earlier)) if l == level => (level, m * earlier),
+            _ => (level, m),
+        });
+        let turns = map.rotation != glam::Quat::IDENTITY;
+        for ch in &mut mesh.chunks {
+            ch.dirty_pos = false;
+            ch.dirty_nrm = turns;
+        }
+    }
+
+    /// Normal accumulator scale after a map that did not go through
+    /// [`transform_level`](Self::transform_level) (the shown level is uploaded again).
+    pub fn rescale_normals(&mut self, scale: f32) {
+        for b in self.levels.iter_mut().flatten() {
+            b.normal_scale /= scale * scale;
+        }
+    }
+
     pub fn gpu_grab_active(&self) -> bool {
         self.grab.is_some()
     }
@@ -1257,6 +1461,28 @@ impl Gfx {
                 bytes as f32 / 1e6,
                 runs.len()
             );
+        }
+        // Mask: runs of chunks whose values changed, widened to whole words.
+        let mut mask_runs: Vec<(usize, usize)> = Vec::new();
+        for ch in mesh.chunks.iter_mut() {
+            if std::mem::take(&mut ch.dirty_mask) {
+                let (s, e) = ch.range();
+                let (s, e) = (s / 4 * 4, e.div_ceil(4) * 4);
+                match mask_runs.last_mut() {
+                    Some(last) if last.1 >= s => last.1 = last.1.max(e),
+                    _ => mask_runs.push((s, e)),
+                }
+            }
+        }
+        let n = mesh.vertex_count();
+        for (s, e) in mask_runs {
+            let mut data = vec![0u8; e - s];
+            if !mesh.mask.is_empty() {
+                let end = e.min(n);
+                data[..end - s].copy_from_slice(&mesh.mask[s..end]);
+            }
+            self.queue.write_buffer(&buffers.mask, s as u64, &data);
+            bytes += data.len();
         }
         if let Some(g) = &self.grab {
             if g.pending.is_some() {
@@ -1343,6 +1569,44 @@ impl Gfx {
                 label: Some("frame"),
             });
 
+        // Transpose release: map the positions of a level in place.
+        if let Some((level, m)) = self.pending_affine.take() {
+            if let Some(b) = self.levels.get(level).and_then(Option::as_ref) {
+                let count = (b.positions.size() / 12) as u32;
+                self.queue.write_buffer(
+                    &self.affine_params,
+                    0,
+                    bytemuck::bytes_of(&AffineParams {
+                        model: m.to_cols_array_2d(),
+                        count,
+                        _pad: [0; 3],
+                    }),
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("affine bg"),
+                    layout: &self.affine_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: b.positions.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.affine_params.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("affine"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.affine_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                let groups = count.div_ceil(256);
+                pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+            }
+        }
+
         // GPU grab: move the selected vertices.
         if let Some(g) = self.grab.as_mut() {
             if let Some(delta) = g.pending.take() {
@@ -1425,18 +1689,21 @@ impl Gfx {
                 match (&self.group_pipeline, &m.groups, polyframe) {
                     (Some(pipeline), Some(g), true) => {
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(1, &g.bind_group, &[]);
+                        pass.set_bind_group(2, &g.bind_group, &[]);
                     }
                     _ => pass.set_pipeline(&self.pipeline),
                 }
                 let (indices, count) = m.drawn();
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, &m.mask_bind_group, &[]);
                 pass.set_vertex_buffer(0, m.positions.slice(..));
                 pass.set_vertex_buffer(1, m.normals.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..count, 0, 0..1);
             }
             pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.no_mask, &[]);
             for key in parked {
                 if let Some(s) = self.stand_ins.get(key) {
                     pass.set_vertex_buffer(0, s.positions.slice(..));

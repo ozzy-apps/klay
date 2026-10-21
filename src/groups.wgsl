@@ -2,7 +2,8 @@
 // when the GPU supports it. The colour of each drawn triangle comes from its polygroup, two
 // 16-bit ids per word in draw order.
 
-@group(1) @binding(0) var<storage, read> drawn_groups: array<u32>;
+// Group 1 is the mask (shader.wgsl).
+@group(2) @binding(0) var<storage, read> drawn_groups: array<u32>;
 
 // Spread around the hue circle in golden-ratio steps; matches `polygroup::group_color`.
 fn group_color(g: u32) -> vec3<f32> {
