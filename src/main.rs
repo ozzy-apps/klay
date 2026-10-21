@@ -7,6 +7,7 @@ mod project;
 mod render;
 mod sculpt;
 mod subtool;
+mod wedge;
 mod workspace;
 
 use camera::Camera;
@@ -112,6 +113,17 @@ enum VisOp {
     Invert,
 }
 
+/// Geometry operations queued by the interface or a gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeoOp {
+    /// Turn Wedge on (and remesh) or off.
+    WedgeToggle,
+    /// Remesh with Wedge (the button while on, or Ctrl + drag on the background).
+    Wedge,
+    DelHigher,
+    DelLower,
+}
+
 /// SubTool operations queued by the interface.
 #[derive(Clone, Copy, Debug)]
 enum SubToolOp {
@@ -167,6 +179,14 @@ struct App {
     nav: Option<NavDrag>,
     /// Ctrl + Shift selection in progress.
     select: Option<SelectDrag>,
+    /// A Ctrl press on the background in progress (ZBrush: with DynaMesh on, a Ctrl drag
+    /// there remeshes), and where it started.
+    ctrl_background: Option<Vec2>,
+    /// Wedge settings (ZBrush: Tool > Geometry > DynaMesh).
+    wedge: wedge::Settings,
+    /// For the Wedge section: whether the shown mesh is closed and its area, kept for the
+    /// stack generation and level they were measured on (both cost a pass over the mesh).
+    wedge_info: Option<(u64, usize, bool, f32)>,
     hover: Option<Vec3>,
 
     // UI state.
@@ -184,6 +204,10 @@ struct App {
     pending_level: Option<usize>,
     /// Polygroup / visibility operation from the interface or a key, run outside the egui pass.
     pending_vis: Option<VisOp>,
+    /// Geometry operation (Wedge, Del Higher / Lower), run outside the egui pass.
+    pending_geo: Option<GeoOp>,
+    /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
+    selftest_wedge: Option<(u8, u32)>,
     /// SubTool list operation from the interface, run outside the egui pass.
     pending_subtool: Option<SubToolOp>,
     /// Frames left in `--frames` mode (plain frame timing at the active level) and the
@@ -235,6 +259,7 @@ impl App {
                 name: format!("{} 1", settings.kind.short()),
                 visible: true,
                 bounds: mesh.bounds(),
+                wedge: false,
                 parked: None,
             }],
             active_tool: 0,
@@ -260,6 +285,9 @@ impl App {
             modifiers: ModifiersState::empty(),
             nav: None,
             select: None,
+            ctrl_background: None,
+            wedge: wedge::Settings::default(),
+            wedge_info: None,
             hover: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
@@ -273,6 +301,8 @@ impl App {
             pending_divide: false,
             pending_level: None,
             pending_vis: None,
+            pending_geo: None,
+            selftest_wedge: None,
             pending_subtool: None,
             measure: None,
             quit: false,
@@ -405,6 +435,7 @@ impl App {
             name: name.clone(),
             visible: true,
             bounds: self.doc.bounds(),
+            wedge: false,
             parked: None,
         });
         self.active_tool = self.subtools.len() - 1;
@@ -434,6 +465,7 @@ impl App {
             }
         }
         let name = format!("{} copy", self.subtools[self.active_tool].name);
+        let wedge = self.subtools[self.active_tool].wedge;
         self.subtools.insert(
             self.active_tool + 1,
             SubTool {
@@ -441,6 +473,7 @@ impl App {
                 name: name.clone(),
                 visible: true,
                 bounds: stand_in.bounds,
+                wedge,
                 parked: Some(Box::new(Parked {
                     packed,
                     history: History::new(32),
@@ -621,6 +654,7 @@ impl App {
                     name: saved.name,
                     visible: true,
                     bounds: doc.bounds(),
+                    wedge: false,
                     parked: None,
                 });
                 active_doc = Some(doc);
@@ -637,6 +671,7 @@ impl App {
                     name: saved.name,
                     visible: saved.visible,
                     bounds: stand_in.bounds,
+                    wedge: false,
                     parked: Some(Box::new(Parked {
                         packed: doc.pack(),
                         history: History::new(32),
@@ -689,6 +724,7 @@ impl App {
             name: format!("{} {id}", self.primitive.kind.short()),
             visible: true,
             bounds: self.doc.bounds(),
+            wedge: false,
             parked: None,
         }];
         self.active_tool = 0;
@@ -955,7 +991,11 @@ impl App {
                 self.mesh().raycast(o, d)
             };
             log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
-            if hit.is_none() {
+            if hit.is_none() && self.modifiers.control_key() {
+                // ZBrush: a Ctrl drag on the background does not rotate; with DynaMesh
+                // (here Wedge) on it remeshes when released.
+                self.ctrl_background = Some(self.cursor);
+            } else if hit.is_none() {
                 self.begin_nav(MouseButton::Left);
             } else if self.modifiers.control_key() {
                 self.workspace.notify("Masking is not connected yet");
@@ -972,6 +1012,17 @@ impl App {
 
     /// Left button released.
     fn left_release(&mut self) {
+        if let Some(start) = self.ctrl_background.take() {
+            if (self.cursor - start).length() >= CLICK_SLOP {
+                if self.subtools[self.active_tool].wedge {
+                    self.pending_geo = Some(GeoOp::Wedge);
+                    self.run_pending_geo();
+                } else {
+                    self.workspace.notify("Ctrl + drag on the background re-wedges while Wedge is on (Mesh: Wedge)");
+                }
+            }
+            return;
+        }
         if let Some(sel) = self.select.take() {
             self.workspace.select_rect = None;
             let alt = self.modifiers.alt_key();
@@ -1012,6 +1063,118 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ Wedge, Del Higher / Lower
+
+    /// Run a queued geometry operation (not during a stroke or a selection).
+    fn run_pending_geo(&mut self) {
+        if self.stroke.is_some() || self.select.is_some() {
+            return;
+        }
+        match self.pending_geo.take() {
+            Some(GeoOp::WedgeToggle) => {
+                let tool = &mut self.subtools[self.active_tool];
+                if tool.wedge {
+                    tool.wedge = false;
+                    self.workspace.notify("Wedge off");
+                } else if self.wedge_now() {
+                    self.subtools[self.active_tool].wedge = true;
+                }
+            }
+            Some(GeoOp::Wedge) => {
+                self.wedge_now();
+            }
+            Some(GeoOp::DelHigher) => self.delete_levels(true),
+            Some(GeoOp::DelLower) => self.delete_levels(false),
+            None => {}
+        }
+    }
+
+    /// Whether the shown mesh is closed, and its area, measured once per stack and level.
+    fn wedge_info(&mut self) -> (bool, f32) {
+        let key = (self.doc.generation, self.doc.active());
+        match self.wedge_info {
+            Some((g, l, closed, area)) if (g, l) == key => (closed, area),
+            _ => {
+                let (closed, area) = (wedge::closed(self.doc.mesh()), wedge::area(self.doc.mesh()));
+                self.wedge_info = Some((key.0, key.1, closed, area));
+                (closed, area)
+            }
+        }
+    }
+
+    /// Why Wedge cannot run on the active subtool now, if it cannot.
+    fn wedge_refusal(&mut self) -> Option<String> {
+        if self.doc.count() > 1 {
+            return Some("Wedge needs a subtool without subdivision levels · Geometry: Del Higher / Del Lower".into());
+        }
+        if !self.wedge_info().0 {
+            return Some("Wedge needs a closed surface (this one has a border)".into());
+        }
+        None
+    }
+
+    /// Remesh the active subtool with the Wedge settings, undoably. Returns whether it ran.
+    fn wedge_now(&mut self) -> bool {
+        if let Some(why) = self.wedge_refusal() {
+            self.workspace.notify(why.clone());
+            self.status = why;
+            return false;
+        }
+        let t = Instant::now();
+        let out = match wedge::remesh(self.doc.mesh(), &self.wedge) {
+            Ok(out) => out,
+            Err(e) => {
+                self.status = format!("Wedge: {e}");
+                self.workspace.notify(self.status.clone());
+                return false;
+            }
+        };
+        let remesh_ms = t.elapsed().as_secs_f32() * 1000.0;
+        let before = self.doc.mesh().vertex_count();
+        let t2 = Instant::now();
+        let mesh = SculptMesh::from_raw_with_groups(out.positions, out.indices, out.groups);
+        let budget = self.doc.budget;
+        let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
+        self.history.push(UndoStep::Replace(Box::new(old.pack())));
+        let build_ms = t2.elapsed().as_secs_f32() * 1000.0;
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.show_active_level();
+        let st = &out.stats;
+        self.status = format!(
+            "Wedge at {}: {} → {} vertices in {:.0} ms (remesh {remesh_ms:.0}, chunks {build_ms:.0}; grid {}×{}×{}, {} corners turned)",
+            self.wedge.resolution,
+            fmt_count(before),
+            fmt_count(self.mesh().vertex_count()),
+            t.elapsed().as_secs_f32() * 1000.0,
+            st.grid[0],
+            st.grid[1],
+            st.grid[2],
+            st.flips
+        );
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+        true
+    }
+
+    /// Delete the levels above (`higher`) or below the shown one (ZBrush: Del Higher, Del
+    /// Lower). Not undoable: the undo list, whose steps name levels, is cleared.
+    fn delete_levels(&mut self, higher: bool) {
+        let n = if higher { self.doc.delete_higher() } else { self.doc.delete_lower() };
+        if n == 0 {
+            self.workspace.notify(if higher { "No levels above this one" } else { "No levels below this one" });
+            return;
+        }
+        self.history.clear();
+        self.show_active_level();
+        self.status = format!(
+            "{}: {n} level{} deleted, {} vertices at the base · undo history cleared",
+            if higher { "Del Higher" } else { "Del Lower" },
+            if n == 1 { "" } else { "s" },
+            fmt_count(self.doc.vertex_counts()[0])
+        );
+        self.workspace.notify(self.status.clone());
+    }
+
     /// Press the left button at `from` with `mods`, drag to `to` and release, through the
     /// handlers the window uses (self-tests and tests).
     fn gesture(&mut self, mods: ModifiersState, from: Vec2, to: Vec2) {
@@ -1023,6 +1186,73 @@ impl App {
         self.cursor_moved(to, false);
         self.left_release();
         self.modifiers = saved;
+    }
+
+    /// `--selftest-wedge`, one phase per call, a few frames apart: Wedge on, then the GPU
+    /// draws what it made; Ctrl + drag on the background re-wedges at a finer resolution;
+    /// two undos bring back the original mesh, also on the GPU. Logs every check and its
+    /// time; returns the next phase, or `None` when done.
+    fn selftest_wedge_phase(&mut self, phase: u8) -> Option<u8> {
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_groups_state.1 &= pass;
+            log::info!("selftest: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let drawn = |app: &Self| app.gfx.as_ref().map_or(0, Gfx::drawn_triangles);
+        let solid = |app: &Self| {
+            let m = app.mesh();
+            let euler = m.vertex_count() as i64 - m.edge_count() as i64 + m.triangle_count() as i64;
+            wedge::closed(m) && !m.edges_over_two_triangles() && euler % 2 == 0
+        };
+        match phase {
+            0 => {
+                self.selftest_groups_state = (self.mesh().vertex_count(), true);
+                let before = self.mesh().vertex_count();
+                let t = Instant::now();
+                self.pending_geo = Some(GeoOp::WedgeToggle);
+                self.run_pending_geo();
+                let ms = t.elapsed().as_secs_f32() * 1000.0;
+                let on = self.subtools[self.active_tool].wedge;
+                let after = self.mesh().vertex_count();
+                check(self, &format!("Wedge on at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), on && after > 0);
+                let ok = solid(self);
+                check(self, "the result is closed and manifold", ok);
+                Some(1)
+            }
+            1 => {
+                let (d, t) = (drawn(self), self.mesh().triangle_count());
+                check(self, &format!("GPU draws the {} new triangles", fmt_count(d)), d == t);
+                let before = self.mesh().vertex_count();
+                self.wedge.resolution = self.wedge.resolution * 3 / 2;
+                let corner = self.canvas_origin() + Vec2::splat(30.0);
+                let t = Instant::now();
+                self.gesture(ModifiersState::CONTROL, corner, corner + Vec2::new(60.0, 40.0));
+                let ms = t.elapsed().as_secs_f32() * 1000.0;
+                let after = self.mesh().vertex_count();
+                check(self, &format!("Ctrl + drag on the background re-wedged at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), after > before);
+                let ok = solid(self);
+                check(self, "still closed and manifold", ok);
+                Some(2)
+            }
+            2 => {
+                let (d, t) = (drawn(self), self.mesh().triangle_count());
+                check(self, &format!("GPU draws the {} re-wedged triangles", fmt_count(d)), d == t);
+                let t = Instant::now();
+                self.history.undo(&mut self.doc);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                let ms = t.elapsed().as_secs_f32() * 1000.0;
+                let back = self.mesh().vertex_count() == self.selftest_groups_state.0;
+                check(self, &format!("two undos brought back the original {} vertices in {ms:.0} ms", fmt_count(self.mesh().vertex_count())), back);
+                Some(3)
+            }
+            _ => {
+                let (d, t) = (drawn(self), self.mesh().triangle_count());
+                check(self, &format!("GPU draws the original {} triangles again", fmt_count(d)), d == t);
+                let ok = self.selftest_groups_state.1;
+                log::info!("selftest: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
     }
 
     /// `--selftest-groups`, one phase per call, a few frames apart: Ctrl + Shift rectangle
@@ -1234,6 +1464,11 @@ impl App {
     fn show_active_level(&mut self) {
         let wanted = self.doc.active();
         if let Some(gfx) = self.gfx.as_mut() {
+            // A stack built afresh (Wedge, its undo, Del Lower) has none of the cached levels.
+            if gfx.generation != self.doc.generation {
+                gfx.clear_levels();
+                gfx.generation = self.doc.generation;
+            }
             gfx.truncate_levels(self.doc.count());
             if !gfx.show_level(self.doc.mesh_mut(), wanted) {
                 let mut level = wanted;
@@ -1629,6 +1864,10 @@ impl App {
             .collect();
         let parked_bytes = rows.iter().filter(|r| !r.active).map(|r| r.bytes).sum();
         let (groups, hidden) = (self.doc.mesh().group_count(), self.doc.mesh().hidden_count());
+        let wedge_refusal = self.wedge_refusal();
+        let area = self.wedge_info().1;
+        let wedge_estimate = self.wedge.estimate(area);
+        let wedge_on = self.subtools[self.active_tool].wedge;
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -1669,6 +1908,10 @@ impl App {
                 groups,
                 hidden,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
+                wedge: &mut self.wedge,
+                wedge_on,
+                wedge_refusal: wedge_refusal.as_deref(),
+                wedge_estimate,
             },
         );
         if actions.new_project {
@@ -1697,6 +1940,18 @@ impl App {
         }
         if actions.group_visible {
             self.pending_vis = Some(VisOp::GroupVisible);
+        }
+        if actions.wedge_toggle {
+            self.pending_geo = Some(GeoOp::WedgeToggle);
+        }
+        if actions.wedge_now {
+            self.pending_geo = Some(GeoOp::Wedge);
+        }
+        if actions.del_higher {
+            self.pending_geo = Some(GeoOp::DelHigher);
+        }
+        if actions.del_lower {
+            self.pending_geo = Some(GeoOp::DelLower);
         }
         if actions.show_all {
             self.pending_vis = Some(VisOp::ShowAll);
@@ -1784,6 +2039,7 @@ impl App {
             self.set_level(level);
         }
         self.run_pending_vis();
+        self.run_pending_geo();
         match self.pending_doc.take() {
             Some(DocOp::New) => self.new_project(),
             Some(DocOp::Open) => {
@@ -1844,6 +2100,16 @@ impl App {
         if self.stroke_pending {
             self.stroke_pending = false;
             self.apply_stroke();
+        }
+        if let Some((phase, left)) = self.selftest_wedge {
+            if left == 0 {
+                self.selftest_wedge = self.selftest_wedge_phase(phase).map(|next| (next, 10));
+                if self.selftest_wedge.is_none() {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_wedge = Some((phase, left - 1));
+            }
         }
         if let Some((phase, left)) = self.selftest_groups {
             if left == 0 {
@@ -2181,6 +2447,10 @@ fn bench(settings: primitive::Settings, divide: u32, budget: usize) {
         bench_multires(&mut app, divide);
     }
     bench_groups(&mut app);
+    bench_wedge(app.doc.level_mesh(0), "level 0");
+    if app.doc.top() > 0 {
+        bench_wedge(app.doc.level_mesh(app.doc.top()), "the top level");
+    }
     bench_subtool(&mut app);
     let t = Instant::now();
     let hit = app.mesh().raycast(app.camera.eye(), app.camera.forward());
@@ -2398,6 +2668,46 @@ fn bench_groups(app: &mut App) {
     );
 }
 
+/// Wedge of `mesh` at the resolution that gives about a million vertices, then the same
+/// with Project; timings per phase and for building the chunked mesh.
+fn bench_wedge(mesh: &SculptMesh, what: &str) {
+    let area = wedge::area(mesh);
+    let resolution = (2.0 / (1.5 * area / 1.0e6).sqrt()).round() as u32;
+    for project in [false, true] {
+        let s = wedge::Settings { resolution, blur: 2, project };
+        let t = Instant::now();
+        let out = match wedge::remesh(mesh, &s) {
+            Ok(out) => out,
+            Err(e) => {
+                println!("wedge: {e}");
+                return;
+            }
+        };
+        let remesh_ms = t.elapsed().as_secs_f32() * 1000.0;
+        let st = out.stats.clone();
+        let n = out.positions.len();
+        let t = Instant::now();
+        let built = SculptMesh::from_raw_with_groups(out.positions, out.indices, out.groups);
+        let build_ms = t.elapsed().as_secs_f32() * 1000.0;
+        println!(
+            "wedge {what} ({} vertices) at resolution {resolution}{}: {} vertices in {remesh_ms:.0} ms + {build_ms:.0} ms to chunk \
+             (grid {:?}, {} crossings, {} cells, {} corners turned; scan {:.0}, cells {:.0}, surface {:.0}, blur + project {:.0} ms)",
+            fmt_count(mesh.vertex_count()),
+            if project { " with Project" } else { "" },
+            fmt_count(n),
+            st.grid,
+            fmt_count(st.crossings),
+            fmt_count(st.cells),
+            st.flips,
+            st.scan_ms,
+            st.cells_ms,
+            st.surface_ms,
+            st.project_ms
+        );
+        assert!(!built.edges_over_two_triangles());
+    }
+}
+
 /// Parking and re-activating the active subtool: memory before and after, and the times.
 fn bench_subtool(app: &mut App) {
     let levels = app.doc.vertex_counts();
@@ -2487,6 +2797,12 @@ fn main() {
     app.initial_subtools = subtools.saturating_sub(1);
     if args.iter().any(|a| a == "--selftest-subtools") {
         app.selftest = Some(20);
+    }
+    if args.iter().any(|a| a == "--selftest-wedge") {
+        app.selftest_wedge = Some((0, 20));
+    }
+    if let Some(r) = flag("--wedge-resolution").and_then(|s| s.parse().ok()) {
+        app.wedge.resolution = r;
     }
     if args.iter().any(|a| a == "--selftest-groups") {
         app.selftest_groups = Some((0, 20));
@@ -2837,5 +3153,100 @@ mod subtool_tests {
         }
         assert_eq!(app.doc.top(), 1);
         assert!(app.doc.marks().iter().all(|m| m.groups.lens.is_empty() && m.hidden.is_empty()));
+    }
+
+    #[test]
+    fn wedge_remeshes_rewedges_on_ctrl_drag_and_undoes() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.wedge.resolution = 48;
+        let original = app.doc.mesh().positions.clone();
+        let corner = Vec2::new(8.0, 8.0);
+
+        // Ctrl + drag on the background does nothing while Wedge is off (and never rotates).
+        let yaw = app.camera.yaw;
+        drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
+        assert_eq!(app.doc.mesh().positions, original);
+        assert_eq!(app.camera.yaw, yaw);
+
+        // Polygroups made before Wedge ride along.
+        let centre = app.viewport() * 0.5;
+        drag(&mut app, ctrl_shift(), centre - Vec2::splat(120.0), centre + Vec2::splat(120.0));
+        app.group_visible();
+        drag(&mut app, ctrl_shift(), corner, corner);
+
+        // Wedge on: an even, closed mesh replaces the sphere.
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(app.subtools[0].wedge);
+        let first = app.doc.mesh().vertex_count();
+        assert!(first > 5 * original.len(), "{first} vertices");
+        assert!(wedge::closed(app.doc.mesh()));
+        assert_eq!(app.doc.mesh().group_count(), 2, "polygroups carried over");
+        assert_eq!(app.doc.mesh().hidden_count(), 0);
+
+        // Ctrl + drag on the background re-wedges at the current resolution.
+        app.wedge.resolution = 64;
+        drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
+        let second = app.doc.mesh().vertex_count();
+        assert!(second > first, "{second} after {first}");
+        // A Ctrl click (no drag) does not.
+        drag(&mut app, ModifiersState::CONTROL, corner, corner);
+        assert_eq!(app.doc.mesh().vertex_count(), second);
+
+        // Undo twice: the sphere exactly as it was, with its groups.
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().vertex_count(), first);
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().positions, original);
+        assert_eq!(app.doc.mesh().group_count(), 2);
+        app.history.redo(&mut app.doc);
+        assert_eq!(app.doc.mesh().vertex_count(), first);
+
+        // Wedge off: Ctrl + drag is inert again.
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(!app.subtools[0].wedge);
+        drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
+        assert_eq!(app.doc.mesh().vertex_count(), first);
+    }
+
+    #[test]
+    fn wedge_refuses_levels_and_open_surfaces_and_del_lower_makes_room() {
+        let mut app = App::new(12, false, usize::MAX);
+        app.wedge.resolution = 40;
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        let shown = app.doc.mesh().positions.clone();
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(!app.subtools[0].wedge, "refused with subdivision levels");
+        assert!(app.status.contains("subdivision levels"), "{}", app.status);
+
+        // Del Lower: the shown level becomes the base, sculpting and all.
+        app.pending_geo = Some(GeoOp::DelLower);
+        app.run_pending_geo();
+        assert_eq!(app.doc.count(), 1);
+        assert_eq!(app.doc.mesh().positions, shown);
+        assert!(!app.history.can_undo(), "Del Lower clears the undo list");
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(app.subtools[0].wedge);
+
+        // Del Higher drops the levels above the shown one.
+        assert!(app.doc.divide() && app.doc.divide());
+        app.set_level(0);
+        app.pending_geo = Some(GeoOp::DelHigher);
+        app.run_pending_geo();
+        assert_eq!(app.doc.count(), 1);
+
+        // An open surface (Plane3D) is refused.
+        app.primitive.kind = Primitive::Plane;
+        app.primitive.set_current(16);
+        app.rebuild();
+        app.subtools[0].wedge = false;
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(!app.subtools[0].wedge);
+        assert!(app.status.contains("closed"), "{}", app.status);
     }
 }

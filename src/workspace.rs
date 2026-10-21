@@ -372,6 +372,12 @@ pub struct Model<'a> {
     pub hidden: usize,
     /// The GPU can show polygroup colours.
     pub polyframe_supported: bool,
+    /// Wedge settings, whether Wedge is on for the active subtool, why it cannot run (if
+    /// it cannot), and about how many vertices it would make.
+    pub wedge: &'a mut crate::wedge::Settings,
+    pub wedge_on: bool,
+    pub wedge_refusal: Option<&'a str>,
+    pub wedge_estimate: usize,
 }
 
 /// One line of the SubTool list.
@@ -421,6 +427,12 @@ pub struct Actions {
     /// Visibility: show everything / swap hidden and visible.
     pub show_all: bool,
     pub invert_visibility: bool,
+    /// Wedge: turn on (remeshing) or off / remesh now.
+    pub wedge_toggle: bool,
+    pub wedge_now: bool,
+    /// Geometry: Del Higher / Del Lower.
+    pub del_higher: bool,
+    pub del_lower: bool,
 }
 
 pub const MATERIALS: [(Color32, &str); 4] = [
@@ -2110,7 +2122,83 @@ impl Workspace {
                         if top > 0 {
                             kv(ui, "Levels in memory", &format!("{} MB", m.levels_bytes / 1_000_000));
                         }
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            ui.add_enabled_ui(m.level > 0, |ui| {
+                                if ui
+                                    .add(egui::Button::new("Del Lower").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Make this level the base, deleting the ones below · clears undo")
+                                    .clicked()
+                                {
+                                    a.del_lower = true;
+                                }
+                            });
+                            ui.add_enabled_ui(m.level < top, |ui| {
+                                if ui
+                                    .add(egui::Button::new("Del Higher").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Delete the levels above this one · clears undo")
+                                    .clicked()
+                                {
+                                    a.del_higher = true;
+                                }
+                            });
+                        });
                         note(ui, "D / Shift + D: higher / lower level");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "wedge",
+                    "Wedge",
+                    None,
+                    true,
+                    true,
+                    &mut |_, ui| {
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            let can = m.wedge_refusal.is_none() || m.wedge_on;
+                            ui.add_enabled_ui(can, |ui| {
+                                let r = ui
+                                    .add(egui::Button::new("Wedge").selected(m.wedge_on).min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Remesh into an even, closed surface and keep Wedge on (ZBrush: DynaMesh)");
+                                let r = match m.wedge_refusal {
+                                    Some(why) => r.on_disabled_hover_text(why),
+                                    None => r,
+                                };
+                                if r.clicked() {
+                                    a.wedge_toggle = true;
+                                }
+                            });
+                            ui.add_enabled_ui(m.wedge_on && m.wedge_refusal.is_none(), |ui| {
+                                if ui
+                                    .add(egui::Button::new("Remesh").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Wedge again now · Ctrl + drag on the background")
+                                    .clicked()
+                                {
+                                    a.wedge_now = true;
+                                }
+                            });
+                        });
+                        let mut r = m.wedge.resolution as f32;
+                        if zslider(ui, "Resolution", &mut r, 8.0..=crate::wedge::MAX_RESOLUTION as f32, true, false, 0) {
+                            m.wedge.resolution = r.round() as u32;
+                        }
+                        let mut b = m.wedge.blur as f32;
+                        ui.add_enabled_ui(m.wedge.project, |ui| {
+                            if zslider(ui, "Blur", &mut b, 0.0..=20.0, false, false, 0) {
+                                m.wedge.blur = b.round() as u32;
+                            }
+                        });
+                        ui.checkbox(&mut m.wedge.project, "Project")
+                            .on_hover_text("Put the new surface on the old one: keeps detail down to the voxel size");
+                        kv(ui, "About", &format!("{} vertices", crate::fmt_count(m.wedge_estimate)));
+                        if let Some(why) = m.wedge_refusal {
+                            note(ui, why);
+                        } else {
+                            note(ui, "Overlapping parts merge. Ctrl + drag on the background re-wedges while on.");
+                        }
                     },
                 );
                 self.sec(
@@ -2358,6 +2446,7 @@ impl Workspace {
                             ("Ctrl + Shift + drag canvas", "invert visibility (a rectangle around nothing)"),
                             ("Ctrl + W", "group visible: one new polygroup"),
                             ("Shift + F", "polygroup colours (PolyF)"),
+                            ("Ctrl + drag canvas", "re-wedge while Wedge is on"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "Rgb intensity / focal shift"),
@@ -4018,6 +4107,10 @@ mod tests {
                         groups: 1,
                         hidden: 0,
                         polyframe_supported: true,
+                        wedge: &mut crate::wedge::Settings::default(),
+                        wedge_on: false,
+                        wedge_refusal: None,
+                        wedge_estimate: 75_000,
                     },
                 );
             },
@@ -4344,6 +4437,33 @@ mod tests {
         let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
         let a = click(&mut workspace, &mut settings, text_position(&out, "Rebuild") + vec2(4.0, 4.0));
         assert!(a.rebuild);
+        let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn wedge_section_turns_wedge_on_and_shows_the_estimate() {
+        let (mut workspace, ctx) = test_workspace("wedge");
+        let size = vec2(1600.0, 3000.0);
+        let rows = [row("Sphere 1", true)];
+        let mut settings = crate::primitive::Settings::default();
+        let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
+        assert_eq!(text_count(&out, "75 000 vertices"), 1, "the estimate is shown");
+        // The section title reads "Wedge" too; the button is the one just above the slider.
+        let slider = text_position(&out, "Resolution").y;
+        let at = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Wedge" => Some(t.pos),
+                _ => None,
+            })
+            .min_by(|a, b| (a.y - slider).abs().total_cmp(&(b.y - slider).abs()))
+            .unwrap()
+            + vec2(4.0, 4.0);
+        frame_full(&mut workspace, &ctx, size, vec![egui::Event::PointerMoved(at)], &rows, &mut settings);
+        frame_full(&mut workspace, &ctx, size, vec![pointer(at, true)], &rows, &mut settings);
+        let (_, a) = frame_full(&mut workspace, &ctx, size, vec![pointer(at, false)], &rows, &mut settings);
+        assert!(a.wedge_toggle);
         let _ = std::fs::remove_file(&workspace.persistence_path);
     }
 }

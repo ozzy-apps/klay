@@ -22,6 +22,8 @@ cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtool
 cargo run --release -- --open model.klay                    # open a saved project
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-project    # save, re-open, check byte-identical, log, exit
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
+cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
+cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
 ```
 
 `--segments N` sets the resolution of the starting primitive (`--primitive NAME`, Sphere by
@@ -79,7 +81,8 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
   Older `v1` layout files are ignored and replaced.
 
 The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
-presets, primitives (Mesh → Initialize), polygroups and visibility (Mesh → Visibility and
+presets, primitives (Mesh → Initialize), Wedge remeshing and Del Higher / Del Lower (Mesh →
+Wedge, Geometry), polygroups and visibility (Mesh → Visibility and
 Polygroups, Ctrl + Shift gestures, Ctrl + W, PolyF), subdivision levels (Mesh → Geometry: Divide, SDiv slider, vertex counts,
 vertex budget), undo/redo, OBJ export and live statistics are connected to the engine.
 Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, masking, transform, symmetry and
@@ -112,6 +115,7 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Alt + left drag on the model | Alternate brush (carve), like ZBrush's ZSub |
 | Shift + left drag | Smooth |
 | Ctrl + left drag | Reserved for masking (not connected yet) |
+| Ctrl + left drag on empty canvas | With Wedge on: Wedge again on release (ZBrush: re-DynaMesh); it no longer rotates |
 | Ctrl + Shift + drag | Keep what the rectangle covers visible, hide the rest (ZBrush SelectRect); hold Alt during the drag to hide what it covers instead (the rectangle turns red) |
 | Ctrl + Shift + click on the model | Isolate the polygroup under the cursor (Alt: hide it) |
 | Ctrl + Shift + click on empty canvas | Show everything |
@@ -203,6 +207,26 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   of every level run-length coded; parked subtools and project files keep them the same way,
   and stand-ins of parked subtools leave hidden triangles out. OBJ export writes polygroups
   as OBJ groups.
+- `wedge.rs`: Wedge, a DynaMesh-style remesher. Every triangle is rasterised onto the lines of
+  a regular grid along x, y and z with exact, watertight edge tests (a shared edge is
+  evaluated the same way from both sides, ties broken by one fixed rule), giving where each
+  line crosses the surface; summing the crossing signs along a line is the winding number,
+  so overlapping or self-intersecting parts merge into their union. Only the changes between
+  outside and inside are kept, per line, so memory follows the surface, not the volume.
+  Walking the crossings of four neighbouring z lines together lists every cell the surface
+  passes through with its corner pattern, column by column. Cell faces whose corners
+  alternate (the ambiguous case) get one outside corner turned inside until none is left,
+  which makes the result provably manifold. Each cell holds one vertex per patch of surface
+  through it (dual marching cubes), at the mean of its edge crossings, which lie exactly on
+  the old surface, then slid along its normal to fit the old triangles' tangent planes; every
+  crossed grid edge gives a quad, split along its shorter diagonal. Quads take the polygroup
+  of the old triangle their edge crossed, and vertices on a group border move onto the old
+  border, so groups keep clean borders. Project (with Blur passes first) moves every vertex
+  to the closest point of the old surface by walking the old mesh. The result replaces the
+  subtool's stack as a new base level; the old stack is kept packed for undo. Wedge refuses
+  subtools with subdivision levels (as ZBrush does for DynaMesh; Geometry has Del Higher and
+  Del Lower now) and open surfaces (Plane3D). Hidden triangles are remeshed too and the result
+  is all visible.
 - `project.rs`: `.klay` project files hold every subtool in the same packed form parked
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
@@ -292,6 +316,40 @@ visible index buffer, and 2 bytes per drawn triangle while PolyF is on. A plain 
 the A/B run on software rendering (llvmpipe, 960k vertices, `--novsync --frames`) was within
 the noise of `main`. In-window checks at 15.4M vertices were not possible on that VM, whose
 software GPU caps a buffer binding at 128 MB.
+
+### Wedge (same 4-core VM, `--bench 400 --divide 2`)
+
+Resolution chosen for about a million output vertices (460 voxels across two units);
+"chunk" is building the chunked mesh (`SculptMesh::from_raw`) from the result.
+
+| Input | Wedge | + Project (Blur 2) | Chunk |
+| --- | --- | --- | --- |
+| 960k-vertex sphere (sculpted) → 997k vertices | 0.31 s (scan 0.13, cells 0.03, surface 0.15) | 0.44 s | 0.16–0.21 s |
+| 15.4M-vertex level → 1.0M vertices | 0.67 s (scan 0.4, surface 0.2) | 1.1 s | 0.19–0.24 s |
+
+In the window (`--selftest-wedge`, software GPU): a 4k-vertex primitive wedges at the default
+resolution 128 to 77k (sphere) or 98k (cube) vertices in 45–50 ms, re-wedging at 192 takes
+90–120 ms, and undoing both takes about 10 ms. Twice the resolution gives about four times
+the vertices; the output is closed and manifold (tested on primitives, overlapping shells and
+a sphere folded through itself), keeps the volume to within a voxel, and divides like any
+mesh.
+
+ZBrush's DynaMesh decisions and what Wedge does:
+
+- **Resolution** (default 128) is relative to two world units, the size of a new primitive,
+  so like ZBrush a bigger model gets more polygons at the same value. The section shows an
+  estimate from the surface area.
+- **Blur** (default 2) and **Project** (off): as in ZBrush, Blur only acts with Project.
+- **Groups**: polygroups are always carried over with clean borders. ZBrush's Groups button,
+  which splits the result into separate pieces at group borders, is not implemented.
+- **Re-wedge gesture**: in ZBrush, Ctrl + drag on the background clears the mask, and while
+  DynaMesh is on it remeshes. Klay follows ZBrush: while Wedge is on, Ctrl + drag on the
+  background re-wedges (a Ctrl click does not); with Wedge off it does nothing, where it used
+  to rotate. This base has no masking yet; when it is merged with the masking branch, the
+  same gesture should clear the mask with Wedge off and re-wedge with Wedge on.
+- **Merge of overlapping subtools and Alt carving** (subtractive inserts) are not done: they
+  need a SubTool Merge first. Within one subtool, overlapping parts already merge.
+- The Wedge on/off state is per subtool and not saved in project files.
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of

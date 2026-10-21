@@ -158,6 +158,8 @@ pub struct Gfx {
     needs_normals: bool,
     pub egui_renderer: egui_wgpu::Renderer,
     pub adapter_name: String,
+    /// `Multires::generation` of the stack whose levels are uploaded.
+    pub generation: u64,
     /// Bytes uploaded by the last `upload_dirty`.
     pub last_upload_bytes: usize,
     pub last_upload_chunks: usize,
@@ -621,6 +623,7 @@ impl Gfx {
             needs_normals: false,
             egui_renderer,
             adapter_name,
+            generation: 0,
             last_upload_bytes: 0,
             last_upload_chunks: 0,
             last_normal_chunks: 0,

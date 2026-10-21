@@ -247,6 +247,12 @@ impl SculptMesh {
 
     /// Build a chunked mesh from raw positions and triangle indices.
     pub fn from_raw(positions: Vec<Vec3>, indices: Vec<u32>) -> Self {
+        Self::from_raw_with_groups(positions, indices, Vec::new())
+    }
+
+    /// [`from_raw`](Self::from_raw) with a polygroup per triangle (or none), kept with its
+    /// triangle when they are regrouped by chunk.
+    pub fn from_raw_with_groups(positions: Vec<Vec3>, indices: Vec<u32>, mut tri_groups: Vec<u16>) -> Self {
         let n = positions.len();
 
         // 1. Partition vertices into spatial chunks by recursive median split.
@@ -270,10 +276,14 @@ impl SculptMesh {
         let indices: Vec<u32> = indices.into_par_iter().map(|i| remap[i as usize]).collect();
 
         // 3. Group the triangles by the chunk owning their first vertex, border ones first.
-        let indices = group_triangles(indices, &mut chunks);
+        let indices = group_triangles(indices, &mut chunks, &mut tri_groups);
 
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
-        Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+        let mut mesh = Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris);
+        if !tri_groups.is_empty() {
+            mesh.set_groups(tri_groups);
+        }
+        mesh
     }
 
     /// Whether some edge is shared by more than two triangles (subdivision needs a
@@ -907,8 +917,9 @@ pub(crate) fn crosses_chunk(tri: &[u32], vert_start: u32, vert_end: u32) -> bool
 
 /// Reorder `indices` so the triangles whose first vertex lies in chunk `c` form one
 /// contiguous range with the ones that cross into another chunk first, keeping the input
-/// order within each part, and record the ranges in `chunks[c]`.
-fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk]) -> Vec<u32> {
+/// order within each part, and record the ranges in `chunks[c]`. `groups` (one per
+/// triangle, or empty) is reordered the same way.
+fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16>) -> Vec<u32> {
     // Chunk and border flag per triangle, then counting sort by (chunk, !border).
     let owner: Vec<(u32, bool)> = indices
         .par_chunks_exact(3)
@@ -927,12 +938,17 @@ fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk]) -> Vec<u32> {
     }
     let mut fill = start.clone();
     let mut out = vec![0u32; indices.len()];
-    for (tri, &(c, border)) in indices.chunks_exact(3).zip(&owner) {
+    let mut out_groups = vec![0u16; groups.len()];
+    for (t, (tri, &(c, border))) in indices.chunks_exact(3).zip(&owner).enumerate() {
         let slot = &mut fill[2 * c as usize + !border as usize];
         let at = 3 * *slot as usize;
         out[at..at + 3].copy_from_slice(tri);
+        if !groups.is_empty() {
+            out_groups[*slot as usize] = groups[t];
+        }
         *slot += 1;
     }
+    *groups = out_groups;
     for (c, ch) in chunks.iter_mut().enumerate() {
         ch.tri_start = start[2 * c];
         ch.tri_border = start[2 * c + 1];

@@ -29,6 +29,8 @@ pub struct SubTool {
     pub bounds: Aabb,
     /// `None` for the active subtool, whose stack is `App::doc`.
     pub parked: Option<Box<Parked>>,
+    /// Wedge is on (ZBrush: the DynaMesh button): Ctrl + drag on the background re-wedges.
+    pub wedge: bool,
 }
 
 pub struct Parked {

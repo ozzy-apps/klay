@@ -74,6 +74,8 @@ pub enum UndoStep {
     Visibility(Vec<Vec<u32>>),
     /// Polygroups of every level before a group change (run-length coded).
     Groups(Vec<crate::polygroup::GroupRuns>),
+    /// The whole stack before it was replaced (Wedge), packed.
+    Replace(Box<crate::multires::Packed>),
 }
 
 pub struct History {
@@ -144,6 +146,7 @@ impl History {
                 UndoStep::Transform { .. } => 0,
                 UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
                 UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
+                UndoStep::Replace(packed) => packed.bytes(),
             })
             .sum()
     }
@@ -176,6 +179,12 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
         }
         UndoStep::Visibility(runs) => UndoStep::Visibility(doc.restore_visibility(runs)),
         UndoStep::Groups(runs) => UndoStep::Groups(doc.restore_groups(runs)),
+        UndoStep::Replace(packed) => {
+            let budget = doc.budget;
+            let now = std::mem::replace(doc, packed.unpack());
+            doc.budget = budget;
+            UndoStep::Replace(Box::new(now.pack()))
+        }
     }
 }
 

@@ -960,6 +960,7 @@ impl Packed {
             levels,
             active,
             budget,
+            generation: next_generation(),
         })
     }
 }
@@ -1055,6 +1056,14 @@ pub struct Multires {
     active: usize,
     /// Divide is refused when the next level would have more vertices than this.
     pub budget: usize,
+    /// Unique per stack whose levels were built afresh (new, rebuilt, unpacked, or with
+    /// levels deleted below), so the renderer knows its cached levels are someone else's.
+    pub generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Relaxed)
 }
 
 impl Multires {
@@ -1063,7 +1072,33 @@ impl Multires {
             levels: vec![Level::base(mesh)],
             active: 0,
             budget,
+            generation: next_generation(),
         }
+    }
+
+    /// Delete the levels above the shown one (ZBrush: Del Higher). Returns how many went.
+    pub fn delete_higher(&mut self) -> usize {
+        let n = self.levels.len() - 1 - self.active;
+        self.levels.truncate(self.active + 1);
+        n
+    }
+
+    /// Make the shown level the base, deleting the levels below it (ZBrush: Del Lower). Its
+    /// sculpting is kept as plain positions. Returns how many went.
+    pub fn delete_lower(&mut self) -> usize {
+        let n = self.active;
+        if n == 0 {
+            return 0;
+        }
+        self.sync_to(self.active);
+        let lvl = self.levels.drain(..n + 1).last().expect("the shown level exists");
+        // Chunks edited here but not yet carried up stay marked.
+        let mut base = Level::base(lvl.mesh);
+        base.stale = lvl.stale;
+        self.levels.insert(0, base);
+        self.active = 0;
+        self.generation = next_generation();
+        n
     }
 
     pub fn active(&self) -> usize {
@@ -1087,7 +1122,6 @@ impl Multires {
         &mut self.levels[self.active].mesh
     }
 
-    #[cfg(test)]
     pub fn level_mesh(&self, level: usize) -> &SculptMesh {
         &self.levels[level].mesh
     }
@@ -1334,6 +1368,7 @@ impl Multires {
             levels,
             active,
             budget,
+            ..
         } = self;
         let mut it = levels.into_iter();
         let base = it.next().expect("a stack has a base level").mesh;
