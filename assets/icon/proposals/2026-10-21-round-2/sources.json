@@ -1,0 +1,39 @@
+[
+  {
+    "number": 1,
+    "name": "Gouge",
+    "slug": "01-gouge",
+    "source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-ae541165-e31b-4eaf-bdb7-b79319b2d7a0.png",
+    "file": "01-gouge.png"
+  },
+  {
+    "number": 2,
+    "name": "Gesture",
+    "slug": "02-gesture",
+    "source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-25b36136-741a-4cad-82b6-a8bcb584a58d.png",
+    "file": "02-gesture.png"
+  },
+  {
+    "number": 3,
+    "name": "Study",
+    "slug": "03-study",
+    "source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-c1ba14cb-3cb7-448f-9142-21844bb7585f.png",
+    "file": "03-study.png"
+  },
+  {
+    "number": 4,
+    "name": "Pull",
+    "slug": "04-pull",
+    "source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-ce166a2f-315b-4376-9fef-dc60acb3a5cd.png",
+    "file": "04-pull.png"
+  },
+  {
+    "number": 5,
+    "name": "Loop",
+    "slug": "05-loop",
+    "source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-80296864-0984-4294-8a3e-f28597168a82.png",
+    "file": "05-loop-v2.png",
+    "initial_source": "/home/ozzy/.codex/generated_images/01a14dba-4546-7381-a905-38676e692def/exec-0dd59e61-abbb-4b63-b3e5-d5dbb5518968.png",
+    "initial_file": "05-loop.png"
+  }
+]

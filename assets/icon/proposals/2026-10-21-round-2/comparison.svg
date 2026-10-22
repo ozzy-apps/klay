@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="740" viewBox="0 0 1800 740">
+<rect width="1800" height="740" fill="#161a1d"/>
+<g font-family="DejaVu Sans, sans-serif">
+<text x="40" y="61" fill="#f0eae1" font-size="29" font-weight="bold">Klay</text>
+<text x="132" y="60" fill="#a2acae" font-size="17">/ Sculpting app icons</text>
+<text x="1760" y="59" fill="#7f8b90" font-size="12" text-anchor="end" letter-spacing="1.8">ROUND 02</text>
+
+      <defs>
+        <clipPath id="large-0"><rect x="60" y="156" width="288" height="288" rx="57"/></clipPath>
+        <clipPath id="medium-0"><rect x="108" y="559" width="64" height="64" rx="13"/></clipPath>
+        <clipPath id="small-0"><rect x="248" y="575" width="32" height="32" rx="6.5"/></clipPath>
+      </defs>
+      <rect x="40" y="108" width="328" height="568" rx="24" fill="#20262b" stroke="#343e43"/>
+      <text x="62" y="145" fill="#93a0a6" font-size="12" letter-spacing="1">01</text>
+      <image href="01-gouge.png" x="60" y="156" width="288" height="288" clip-path="url(#large-0)"/>
+      <text x="204" y="483" text-anchor="middle" fill="#f0eae1" font-size="21" font-weight="bold">Gouge</text>
+      <text x="204" y="511" text-anchor="middle" fill="#a0acb2" font-size="13">Carved clay</text>
+      <path d="M62 539H346" stroke="#3b454b"/>
+      <image href="01-gouge.png" x="108" y="559" width="64" height="64" clip-path="url(#medium-0)"/>
+      <image href="01-gouge.png" x="248" y="575" width="32" height="32" clip-path="url(#small-0)"/>
+      <text x="140" y="650" text-anchor="middle" fill="#8b999f" font-size="11">64 px</text>
+      <text x="264" y="650" text-anchor="middle" fill="#8b999f" font-size="11">32 px</text>
+    
+      <defs>
+        <clipPath id="large-1"><rect x="408" y="156" width="288" height="288" rx="57"/></clipPath>
+        <clipPath id="medium-1"><rect x="456" y="559" width="64" height="64" rx="13"/></clipPath>
+        <clipPath id="small-1"><rect x="596" y="575" width="32" height="32" rx="6.5"/></clipPath>
+      </defs>
+      <rect x="388" y="108" width="328" height="568" rx="24" fill="#20262b" stroke="#343e43"/>
+      <text x="410" y="145" fill="#93a0a6" font-size="12" letter-spacing="1">02</text>
+      <image href="02-gesture.png" x="408" y="156" width="288" height="288" clip-path="url(#large-1)"/>
+      <text x="552" y="483" text-anchor="middle" fill="#f0eae1" font-size="21" font-weight="bold">Gesture</text>
+      <text x="552" y="511" text-anchor="middle" fill="#a0acb2" font-size="13">Abstract sculpture</text>
+      <path d="M410 539H694" stroke="#3b454b"/>
+      <image href="02-gesture.png" x="456" y="559" width="64" height="64" clip-path="url(#medium-1)"/>
+      <image href="02-gesture.png" x="596" y="575" width="32" height="32" clip-path="url(#small-1)"/>
+      <text x="488" y="650" text-anchor="middle" fill="#8b999f" font-size="11">64 px</text>
+      <text x="612" y="650" text-anchor="middle" fill="#8b999f" font-size="11">32 px</text>
+    
+      <defs>
+        <clipPath id="large-2"><rect x="756" y="156" width="288" height="288" rx="57"/></clipPath>
+        <clipPath id="medium-2"><rect x="804" y="559" width="64" height="64" rx="13"/></clipPath>
+        <clipPath id="small-2"><rect x="944" y="575" width="32" height="32" rx="6.5"/></clipPath>
+      </defs>
+      <rect x="736" y="108" width="328" height="568" rx="24" fill="#20262b" stroke="#343e43"/>
+      <text x="758" y="145" fill="#93a0a6" font-size="12" letter-spacing="1">03</text>
+      <image href="03-study.png" x="756" y="156" width="288" height="288" clip-path="url(#large-2)"/>
+      <text x="900" y="483" text-anchor="middle" fill="#f0eae1" font-size="21" font-weight="bold">Study</text>
+      <text x="900" y="511" text-anchor="middle" fill="#a0acb2" font-size="13">Head study</text>
+      <path d="M758 539H1042" stroke="#3b454b"/>
+      <image href="03-study.png" x="804" y="559" width="64" height="64" clip-path="url(#medium-2)"/>
+      <image href="03-study.png" x="944" y="575" width="32" height="32" clip-path="url(#small-2)"/>
+      <text x="836" y="650" text-anchor="middle" fill="#8b999f" font-size="11">64 px</text>
+      <text x="960" y="650" text-anchor="middle" fill="#8b999f" font-size="11">32 px</text>
+    
+      <defs>
+        <clipPath id="large-3"><rect x="1104" y="156" width="288" height="288" rx="57"/></clipPath>
+        <clipPath id="medium-3"><rect x="1152" y="559" width="64" height="64" rx="13"/></clipPath>
+        <clipPath id="small-3"><rect x="1292" y="575" width="32" height="32" rx="6.5"/></clipPath>
+      </defs>
+      <rect x="1084" y="108" width="328" height="568" rx="24" fill="#20262b" stroke="#343e43"/>
+      <text x="1106" y="145" fill="#93a0a6" font-size="12" letter-spacing="1">04</text>
+      <image href="04-pull.png" x="1104" y="156" width="288" height="288" clip-path="url(#large-3)"/>
+      <text x="1248" y="483" text-anchor="middle" fill="#f0eae1" font-size="21" font-weight="bold">Pull</text>
+      <text x="1248" y="511" text-anchor="middle" fill="#a0acb2" font-size="13">Brush deformation</text>
+      <path d="M1106 539H1390" stroke="#3b454b"/>
+      <image href="04-pull.png" x="1152" y="559" width="64" height="64" clip-path="url(#medium-3)"/>
+      <image href="04-pull.png" x="1292" y="575" width="32" height="32" clip-path="url(#small-3)"/>
+      <text x="1184" y="650" text-anchor="middle" fill="#8b999f" font-size="11">64 px</text>
+      <text x="1308" y="650" text-anchor="middle" fill="#8b999f" font-size="11">32 px</text>
+    
+      <defs>
+        <clipPath id="large-4"><rect x="1452" y="156" width="288" height="288" rx="57"/></clipPath>
+        <clipPath id="medium-4"><rect x="1500" y="559" width="64" height="64" rx="13"/></clipPath>
+        <clipPath id="small-4"><rect x="1640" y="575" width="32" height="32" rx="6.5"/></clipPath>
+      </defs>
+      <rect x="1432" y="108" width="328" height="568" rx="24" fill="#20262b" stroke="#343e43"/>
+      <text x="1454" y="145" fill="#93a0a6" font-size="12" letter-spacing="1">05</text>
+      <image href="05-loop-v2.png" x="1452" y="156" width="288" height="288" clip-path="url(#large-4)"/>
+      <text x="1596" y="483" text-anchor="middle" fill="#f0eae1" font-size="21" font-weight="bold">Loop</text>
+      <text x="1596" y="511" text-anchor="middle" fill="#a0acb2" font-size="13">Loop-tool carving</text>
+      <path d="M1454 539H1738" stroke="#3b454b"/>
+      <image href="05-loop-v2.png" x="1500" y="559" width="64" height="64" clip-path="url(#medium-4)"/>
+      <image href="05-loop-v2.png" x="1640" y="575" width="32" height="32" clip-path="url(#small-4)"/>
+      <text x="1532" y="650" text-anchor="middle" fill="#8b999f" font-size="11">64 px</text>
+      <text x="1656" y="650" text-anchor="middle" fill="#8b999f" font-size="11">32 px</text>
+    </g></svg>

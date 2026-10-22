@@ -1,0 +1,48 @@
+<div id="klay-non-material-comparison">
+  <style>
+    #klay-non-material-comparison { font: 13px/1.4 Inter, system-ui, sans-serif; }
+    #klay-non-material-comparison * { box-sizing: border-box; }
+    #klay-non-material-comparison .klay-nm-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-bottom: 12px; }
+    #klay-non-material-comparison .klay-nm-nav button { padding: 9px 13px; border: 1px solid #655d53; border-radius: 0; font: inherit; color: #eee8df; background: #292623; cursor: pointer; }
+    #klay-non-material-comparison .klay-nm-nav button[aria-pressed="true"] { border-bottom: 3px solid #edac71; padding-bottom: 7px; color: #ffd6ad; }
+    #klay-non-material-comparison .klay-nm-nav button[data-action] { margin-left: auto; }
+    #klay-non-material-comparison .klay-nm-preview { overflow: auto; width: 100%; max-height: 1000px; background: #191b1d; }
+    #klay-non-material-comparison .klay-nm-design { display: block; width: 100%; height: auto; }
+    #klay-non-material-comparison .klay-nm-design[hidden] { display: none; }
+    #klay-non-material-comparison .klay-nm-preview.klay-nm-actual { max-height: 840px; }
+    #klay-non-material-comparison .klay-nm-actual .klay-nm-design { width: 1600px; height: 1000px; max-width: none; }
+  </style>
+  <div class="klay-nm-nav" role="group" aria-label="Mockup selection">
+    <button type="button" aria-pressed="true" data-choice="01-classic">1 · Classic</button>
+    <button type="button" aria-pressed="false" data-choice="02-precision">2 · Precision</button>
+    <button type="button" aria-pressed="false" data-choice="03-atelier">3 · Atelier</button>
+    <button type="button" aria-pressed="false" data-action="zoom">View at 100%</button>
+  </div>
+  <!--KLAY_SHARED_DEFS-->
+  <div class="klay-nm-preview" role="region" aria-label="Selected Klay mockup">
+    <!--KLAY_MOCKUPS-->
+  </div>
+  <script>
+    (() => {
+      const root = document.getElementById('klay-non-material-comparison');
+      const choices = Array.from(root.querySelectorAll('[data-choice]'));
+      const designs = Array.from(root.querySelectorAll('[data-concept]'));
+      const preview = root.querySelector('.klay-nm-preview');
+      const zoom = root.querySelector('[data-action="zoom"]');
+      choices.forEach(choice => {
+        choice.addEventListener('click', () => {
+          choices.forEach(item => item.setAttribute('aria-pressed', String(item === choice)));
+          designs.forEach(design => {
+            if (design.dataset.concept === choice.dataset.choice) design.removeAttribute('hidden');
+            else design.setAttribute('hidden', 'hidden');
+          });
+        });
+      });
+      zoom.addEventListener('click', () => {
+        const actual = preview.classList.toggle('klay-nm-actual');
+        zoom.setAttribute('aria-pressed', String(actual));
+        zoom.textContent = actual ? 'Fit workspace' : 'View at 100%';
+      });
+    })();
+  </script>
+</div>

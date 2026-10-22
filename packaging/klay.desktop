@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Klay
+Comment=3D sculpting
+Exec=klay
+Icon=klay
+Terminal=false
+Categories=Graphics;3DGraphics;
+StartupWMClass=klay

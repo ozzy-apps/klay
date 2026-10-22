@@ -74,11 +74,13 @@ struct GpuGrab {
     _buffers: [wgpu::Buffer; 3],
 }
 
-/// GPU copy of one subdivision level: 52 bytes per vertex (positions 12, packed normals 4,
+/// GPU copy of one subdivision level, plus a four-byte paint buffer per vertex.
+/// Base geometry uses 52 bytes per vertex (positions 12, packed normals 4,
 /// indices 24, normal accumulators 12) plus a few words per chunk.
 struct MeshBuffers {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
+    colors: wgpu::Buffer,
     indices: wgpu::Buffer,
     /// Per-chunk flags for the normal passes (1 = recompute).
     chunk_flag: wgpu::Buffer,
@@ -117,11 +119,13 @@ struct GroupBuffers {
     _buffer: wgpu::Buffer,
 }
 
-/// Draw-only GPU copy of a parked subtool: 40 bytes per vertex (positions 12, baked
+/// Draw-only GPU copy of a parked subtool, plus four-byte vertex paint.
+/// Base geometry uses 40 bytes per vertex (positions 12, baked
 /// normals 4, indices 24), no normal pass, no chunk tables.
 struct StandInBuffers {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
+    colors: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
     bytes: u64,
@@ -336,6 +340,11 @@ impl Gfx {
             offset: 0,
             shader_location: 1,
         }];
+        let color_attr = [wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Unorm8x4,
+            offset: 0,
+            shader_location: 2,
+        }];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh pipeline"),
@@ -354,6 +363,11 @@ impl Gfx {
                         array_stride: 4,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &nrm_attr,
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &color_attr,
                     }),
                 ],
             },
@@ -439,6 +453,11 @@ impl Gfx {
                             array_stride: 4,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &nrm_attr,
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 4,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &color_attr,
                         }),
                     ],
                 },
@@ -760,8 +779,14 @@ impl Gfx {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let positions = self.upload("stand-in positions", bytemuck::cast_slice(&s.positions), U::VERTEX);
         let normals = self.upload("stand-in normals", bytemuck::cast_slice(&s.normals), U::VERTEX);
+        let colors = if s.colors.is_empty() {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("unpainted stand-in"),size:(s.positions.len()*4).max(4) as u64,
+                usage:U::VERTEX,mapped_at_creation:false,
+            })
+        } else {self.upload("stand-in paint",bytemuck::cast_slice(&s.colors),U::VERTEX)};
         let indices = self.upload("stand-in indices", bytemuck::cast_slice(&s.indices), U::INDEX);
-        let bytes = positions.size() + normals.size() + indices.size();
+        let bytes = positions.size() + normals.size() + colors.size() + indices.size();
         if let Some(e) = pollster::block_on(scope.pop()) {
             log::warn!("gpu: a stand-in of {} MB did not fit: {e}", bytes / 1_000_000);
             return false;
@@ -771,6 +796,7 @@ impl Gfx {
             StandInBuffers {
                 positions,
                 normals,
+                colors,
                 indices,
                 index_count: s.indices.len() as u32,
                 bytes,
@@ -929,6 +955,11 @@ impl Gfx {
         self.read_buffer(&b.mask)
     }
 
+    /// Read premultiplied vertex paint for native pipeline verification.
+    pub fn read_colors(&self) -> Option<Vec<[u8; 4]>> {
+        self.read_buffer(&self.active_buffers()?.colors)
+    }
+
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> Option<Vec<T>> {
         let size = buffer.size();
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1066,6 +1097,7 @@ impl Gfx {
                         ch.dirty_pos = false;
                         ch.dirty_nrm = true;
                         ch.dirty_mask = false;
+                        ch.dirty_color = false;
                     }
                     return true;
                 }
@@ -1115,6 +1147,9 @@ impl Gfx {
             })
         };
         let normals = plain("normals", mesh.vertex_count() * 4, U::VERTEX | U::STORAGE);
+        let colors=if mesh.colors.is_empty() {
+            plain("paint",mesh.vertex_count()*4,U::VERTEX|U::COPY_DST|U::COPY_SRC)
+        } else {self.upload("paint",bytemuck::cast_slice(&mesh.colors),U::VERTEX|U::COPY_SRC)};
         let acc = plain("normal accumulators", mesh.vertex_count() * 12, U::STORAGE);
         let chunk_flag = plain("chunk_flag", chunk_count * 4, U::STORAGE | U::COPY_DST);
         let work = plain("normal work list", chunk_count * 4, U::STORAGE | U::COPY_DST);
@@ -1134,6 +1169,7 @@ impl Gfx {
         };
         let bytes = [
             &mask,
+            &colors,
             &positions,
             &indices,
             &chunk_verts,
@@ -1157,6 +1193,7 @@ impl Gfx {
                 chunk_tris,
                 chunk_border,
                 normals,
+                colors,
                 acc,
                 chunk_flag,
                 work,
@@ -1224,6 +1261,7 @@ impl Gfx {
             mask_bind_group,
             positions,
             normals,
+            colors,
             indices,
             chunk_flag,
             work,
@@ -1422,6 +1460,14 @@ impl Gfx {
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut normal_chunks = 0;
         for (i, ch) in mesh.chunks.iter_mut().enumerate() {
+            if std::mem::take(&mut ch.dirty_color) {
+                let (a,b)=ch.range();
+                if mesh.colors.is_empty() {
+                    self.queue.write_buffer(&buffers.colors,(a*4) as u64,&vec![0;(b-a)*4]);
+                } else {
+                    self.queue.write_buffer(&buffers.colors,(a*4) as u64,bytemuck::cast_slice(&mesh.colors[a..b]));
+                }
+            }
             let nrm = std::mem::take(&mut ch.dirty_nrm);
             buffers.dirty_flags[i] = nrm as u32;
             normal_chunks += nrm as usize;
@@ -1716,6 +1762,7 @@ impl Gfx {
                 pass.set_bind_group(1, &m.mask_bind_group, &[]);
                 pass.set_vertex_buffer(0, m.positions.slice(..));
                 pass.set_vertex_buffer(1, m.normals.slice(..));
+                pass.set_vertex_buffer(2, m.colors.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..count, 0, 0..1);
             }
@@ -1726,6 +1773,7 @@ impl Gfx {
                 if let Some(s) = self.stand_ins.get(key) {
                     pass.set_vertex_buffer(0, s.positions.slice(..));
                     pass.set_vertex_buffer(1, s.normals.slice(..));
+                    pass.set_vertex_buffer(2, s.colors.slice(..));
                     pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
                     // Instance 1 marks a parked subtool for the shader.
                     pass.draw_indexed(0..s.index_count, 0, 1..2);

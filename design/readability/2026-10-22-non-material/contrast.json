@@ -1,0 +1,20 @@
+[
+  {
+    "concept": "Classic",
+    "primary": 12.81,
+    "secondary": 8.11,
+    "selected": 8.87
+  },
+  {
+    "concept": "Precision",
+    "primary": 14.67,
+    "secondary": 9.94,
+    "selected": 9.38
+  },
+  {
+    "concept": "Atelier",
+    "primary": 12.02,
+    "secondary": 7.92,
+    "selected": 8.58
+  }
+]

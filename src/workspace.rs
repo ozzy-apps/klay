@@ -21,6 +21,8 @@ use egui::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+#[path = "brush_ui.rs"]
+mod brush_ui;
 
 // ---------------------------------------------------------------- theme tokens
 pub const BACKGROUND: Color32 = Color32::from_rgb(14, 15, 16); // canvas
@@ -33,24 +35,24 @@ const BG2: Color32 = Color32::from_rgb(36, 39, 41); // menubar, headers, fields
 const BG3: Color32 = Color32::from_rgb(45, 49, 52); // buttons
 const BG4: Color32 = Color32::from_rgb(56, 61, 65); // hover
 const LINE: Color32 = Color32::from_rgb(11, 12, 13);
-const LINE2: Color32 = Color32::from_rgb(42, 46, 49);
+const LINE2: Color32 = Color32::from_rgb(57, 62, 67);
 const HI: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 15);
-const FG: Color32 = Color32::from_rgb(216, 218, 221);
-const FG2: Color32 = Color32::from_rgb(155, 160, 166);
-const FG3: Color32 = Color32::from_rgb(103, 109, 116);
+const FG: Color32 = Color32::from_rgb(232, 234, 237);
+const FG2: Color32 = Color32::from_rgb(184, 189, 196);
+const FG3: Color32 = Color32::from_rgb(139, 145, 153);
 const ACC: Color32 = Color32::from_rgb(227, 131, 79);
 const ACC_FG: Color32 = Color32::from_rgb(27, 18, 12);
 const ACC_DIM: Color32 = Color32::from_rgba_premultiplied(54, 31, 19, 61);
 const ACC_LINE: Color32 = Color32::from_rgba_premultiplied(159, 92, 55, 179);
 
-const MENUBAR_H: f32 = 26.0;
-const SHELF_H: f32 = 58.0;
-const STATUS_H: f32 = 20.0;
+const MENUBAR_H: f32 = 28.0;
+const SHELF_H: f32 = 62.0;
+const STATUS_H: f32 = 22.0;
 const LEFT_SHELF_W: f32 = 100.0;
 const RIGHT_SHELF_W: f32 = 54.0;
 const DIVIDER_W: f32 = 7.0;
-const HEADER_H: f32 = 26.0;
-const SECTION_H: f32 = 22.0;
+const HEADER_H: f32 = 28.0;
+const SECTION_H: f32 = 24.0;
 const SECTION_W: f32 = 230.0; // section width in horizontal trays
 const DROPDOWN_W: f32 = 330.0;
 const NC: &str = "Not connected";
@@ -118,6 +120,7 @@ pub enum PaletteId {
     Preferences,
     Stroke,
     Symmetry,
+    Texture,
     Transform,
     View,
     Workspace,
@@ -125,7 +128,7 @@ pub enum PaletteId {
 
 impl PaletteId {
     /// Alphabetical, which is also the menu bar order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Alpha,
         Self::Brush,
         Self::Document,
@@ -137,6 +140,7 @@ impl PaletteId {
         Self::Preferences,
         Self::Stroke,
         Self::Symmetry,
+        Self::Texture,
         Self::Transform,
         Self::View,
         Self::Workspace,
@@ -154,6 +158,7 @@ impl PaletteId {
             Self::Preferences => "Preferences",
             Self::Stroke => "Stroke",
             Self::Symmetry => "Symmetry",
+            Self::Texture => "Texture",
             Self::Transform => "Transform",
             Self::View => "View",
             Self::Workspace => "Workspace",
@@ -488,7 +493,7 @@ impl QuickPopup {
         match self {
             Self::Size => "Draw Size",
             Self::Intensity => "Z Intensity",
-            Self::Rgb => "Rgb Intensity",
+            Self::Rgb => "RGB Intensity",
             Self::Focal => "Focal Shift",
         }
     }
@@ -498,6 +503,9 @@ pub struct Workspace {
     pub layout: DockLayout,
     pub canvas: Rect,
     pub focus: bool,
+    /// A true modal: the app also uses this to suspend canvas input and shortcuts.
+    pub about_open: bool,
+    logo: Option<TextureHandle>,
     pub subtract: bool,
     pub material: usize,
     /// Surface detail shading (the shader's reserved toggle).
@@ -519,6 +527,8 @@ pub struct Workspace {
     /// Ctrl + Shift selection rectangle being dragged (logical pixels), and whether it
     /// hides (Alt, red) rather than keeps (green) what it covers.
     pub select_rect: Option<(Rect, bool)>,
+    pub gesture_preview: Option<crate::surface_tools::Gesture>,
+    pub mask_brush: BrushKind,
     /// Deformation slider being dragged, and its value.
     deform_drag: Option<(Deform, f32)>,
     pub mode: Mode,
@@ -529,6 +539,8 @@ pub struct Workspace {
     pub quick_menu: Option<(Pos2, bool)>,
     pub color: Hsva,
     pub color2: Hsva,
+    pub assets: crate::sculpt::StampSettings,
+    brush_ui: brush_ui::BrushUi,
     dynamic: bool,
     dropdown: Option<PaletteId>,
     dropdown_anchor: Rect,
@@ -555,10 +567,14 @@ impl Workspace {
             .map(|s| DockLayout::decode(&s))
             .unwrap_or_default();
         let saved = layout.encode();
+        let brush_ui=brush_ui::BrushUi::new(root.join("klay/brush-assets.v1"));
+        let assets=brush_ui.settings();
         Self {
             layout,
             canvas: Rect::NOTHING,
             focus: false,
+            about_open: false,
+            logo: None,
             subtract: false,
             material: 0,
             wireframe: false,
@@ -571,12 +587,16 @@ impl Workspace {
             solo: false,
             polyframe: false,
             select_rect: None,
+            gesture_preview: None,
+            mask_brush: BrushKind::MaskPen,
             deform_drag: None,
             mode: Mode::Draw,
             popup: None,
             quick_menu: None,
             color: Hsva::new(0.06, 0.55, 0.88, 1.0),
             color2: Hsva::new(0.0, 0.0, 1.0, 1.0),
+            assets,
+            brush_ui,
             dynamic: true,
             dropdown: None,
             dropdown_anchor: Rect::NOTHING,
@@ -594,10 +614,12 @@ impl Workspace {
 
     pub fn show(&mut self, ui: &mut Ui, m: &mut Model<'_>) -> Actions {
         let mut a = Actions::default();
+        self.brush_assets_frame(ui.ctx());
         if let Some(text) = self.pending_notice.take() {
             self.flash(ui.ctx(), text);
         }
-        if !ui.ctx().egui_wants_keyboard_input()
+        if !self.about_open && !self.brush_catalog_open()
+            && !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
             self.set_focus(!self.focus);
@@ -630,6 +652,8 @@ impl Workspace {
         self.quick_popup(ui, m);
         self.quick_menu_ui(ui, m);
         self.dropdown(ui, m, &mut a);
+        self.brush_catalog_ui(ui,m);
+        self.import_path_ui(ui);
         self.drop_targets(ui);
         if let Some((id, place, before)) = self.pending_move.take() {
             self.layout.move_palette(id, place, before);
@@ -656,6 +680,9 @@ impl Workspace {
                 .map(|e| format!("Workspace could not be saved: {e}"));
             self.saved = encoded;
         }
+        self.about_dialog(ui.ctx());
+        m.brush.color=self.color.to_srgb();
+        self.save_brush_assets();
         a
     }
 
@@ -673,63 +700,7 @@ impl Workspace {
     /// The brush row, Zadd/Zsub, the two live sliders and the mode row, like ZBrush's
     /// Space menu. Sliders start under the cursor so a small move adjusts them.
     fn quick_menu_ui(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
-        let Some((pos, held)) = self.quick_menu else { return };
-        let ctx = ui.ctx().clone();
-        if !held && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.quick_menu = None;
-            return;
-        }
-        let width = 300.0;
-        let area = egui::Area::new(Id::unique("quick-menu"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos - vec2(30.0, 20.0))
-            .show(&ctx, |ui| {
-                popup_frame().show(ui, |ui| {
-                    ui.set_width(width);
-                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                    let cols = BrushKind::ALL.len();
-                    let tile = (width - 4.0 * (cols as f32 - 1.0)) / cols as f32;
-                    ui.horizontal(|ui| {
-                        for (i, kind) in BrushKind::ALL.iter().enumerate() {
-                            let tex = self.texture(ui.ctx(), Some(*kind), self.subtract);
-                            if brush_tile(ui, tex, kind.name(), i + 1, m.brush.kind == *kind, tile)
-                                .clicked()
-                            {
-                                m.brush.kind = *kind;
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.scope(|ui| {
-                            ui.set_width(96.0);
-                            if let Some(i) = seg(ui, &["Zadd", "Zsub"], self.subtract as usize, false) {
-                                self.subtract = i == 1;
-                            }
-                        });
-                        let modes = [Mode::Draw, Mode::Move, Mode::Scale, Mode::Rotate];
-                        let current = modes.iter().position(|x| *x == self.mode).unwrap_or(0);
-                        if let Some(i) = seg(ui, &["Draw", "Move", "Scale", "Rotate"], current, false) {
-                            self.mode = modes[i];
-                        }
-                    });
-                    zslider(ui, "Z Intensity", &mut m.brush.strength, 0.0..=1.0, false, true, 2);
-                    zslider(ui, "Draw Size", &mut m.brush.radius, 0.01..=2.0, true, true, 2);
-                    ui.add_enabled_ui(false, |ui| {
-                        let (mut rgb, mut focal) = (1.0, 0.5);
-                        zslider(ui, "Rgb Intensity", &mut rgb, 0.0..=1.0, false, true, 2);
-                        zslider(ui, "Focal Shift", &mut focal, 0.0..=1.0, false, true, 2);
-                    });
-                });
-            });
-        if !held {
-            let outside = ctx.input(|i| {
-                i.pointer.any_pressed()
-                    && i.pointer.latest_pos().is_none_or(|p| !area.response.rect.contains(p))
-            });
-            if outside {
-                self.quick_menu = None;
-            }
-        }
+        self.draw_quick_menu(ui, m);
     }
 
     /// Open a hotkey popup at `pos`; the same key again closes it.
@@ -762,13 +733,8 @@ impl Workspace {
                         QuickPopup::Intensity => {
                             zslider(ui, kind.label(), &mut m.brush.strength, 0.0..=1.0, false, true, 2);
                         }
-                        QuickPopup::Rgb | QuickPopup::Focal => {
-                            ui.add_enabled_ui(false, |ui| {
-                                let mut v = if kind == QuickPopup::Rgb { 1.0 } else { 0.5 };
-                                zslider(ui, kind.label(), &mut v, 0.0..=1.0, false, true, 2);
-                            });
-                            note(ui, NC);
-                        }
+                        QuickPopup::Rgb => {zslider(ui,kind.label(),&mut m.brush.rgb_intensity,0.0..=1.0,false,true,2);}
+                        QuickPopup::Focal => {zslider(ui,kind.label(),&mut m.brush.focal_shift,-100.0..=100.0,false,true,0);}
                     }
                 });
             });
@@ -807,28 +773,40 @@ impl Workspace {
                 );
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let (logo, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                    ui.painter().rect_filled(logo, 2, ACC);
-                    ui.painter().text(
-                        logo.center(),
-                        Align2::CENTER_CENTER,
-                        "k",
-                        FontId::monospace(11.0),
-                        ACC_FG,
-                    );
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("klay").size(12.5).strong());
-                    ui.add_space(12.0);
+                    let logo = self.logo_texture(ui.ctx());
+                    let brand = ui
+                        .scope(|ui| {
+                            ui.spacing_mut().button_padding = vec2(3.0, 1.0);
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.add(
+                                egui::Button::new((
+                                    egui::Image::new((logo, vec2(22.0, 22.0))),
+                                    RichText::new("Klay").size(13.5).strong(),
+                                ))
+                                .frame_when_inactive(false)
+                                .corner_radius(5),
+                            )
+                            .on_hover_text("About Klay")
+                        })
+                        .inner;
+                    if brand.clicked() {
+                        self.about_open = true;
+                        self.dropdown = None;
+                        self.popup = None;
+                        self.quick_menu = None;
+                    }
+                    ui.add_space(8.0);
                     for id in PaletteId::ALL {
                         let docked = self.layout.palette(id).place != Place::Menu;
                         let on = self.dropdown == Some(id);
                         let galley = ui.painter().layout_no_wrap(
                             id.name().to_string(),
-                            FontId::proportional(11.5),
+                            FontId::proportional(12.5),
                             FG,
                         );
-                        let width = galley.size().x + 14.0 + if docked { 9.0 } else { 0.0 };
-                        let (r, resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click());
+                        let padding=if ui.max_rect().width()<1100.0 {8.0}else{12.0};
+                        let width = galley.size().x + padding + if docked { 9.0 } else { 0.0 };
+                        let (r, resp) = ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
                         if on {
                             ui.painter().rect_filled(r, 2, ACC);
                         } else if resp.hovered() {
@@ -841,8 +819,8 @@ impl Workspace {
                         } else {
                             FG
                         };
-                        ui.painter().galley(
-                            r.left_center() + vec2(7.0, -galley.size().y * 0.5),
+                        ui.painter().galley_with_override_text_color(
+                            r.left_center() + vec2(padding*0.5, -galley.size().y * 0.5),
                             galley,
                             color,
                         );
@@ -863,12 +841,62 @@ impl Workspace {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(title).size(11.0).color(FG3));
+                        ui.add(egui::Label::new(RichText::new(title).size(13.0).color(FG2)).truncate());
                     });
                 });
             })
             .response;
         self.menubar_rect = response.rect;
+    }
+
+    fn logo_texture(&mut self, ctx: &Context) -> TextureId {
+        self.logo
+            .get_or_insert_with(|| crate::branding::texture(ctx))
+            .id()
+    }
+
+    fn about_dialog(&mut self, ctx: &Context) {
+        if !self.about_open {
+            return;
+        }
+        let logo = self.logo_texture(ctx);
+        let response = egui::Modal::new(Id::unique("about-klay"))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .frame(
+                Frame::NONE
+                    .fill(BG1)
+                    .stroke(Stroke::new(1.0, BG4))
+                    .corner_radius(16)
+                    .inner_margin(28),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("About Klay").size(18.0).strong());
+                    ui.add_space(6.0);
+                    ui.add(egui::Image::new((logo, vec2(160.0, 160.0))));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("Version {}", crate::branding::VERSION)).size(14.0),
+                    );
+                    ui.label(
+                        RichText::new(format!("Built with {}", crate::branding::LANGUAGE)).color(FG2),
+                    );
+                    ui.hyperlink_to("GitHub repository", crate::branding::REPOSITORY)
+                        .on_hover_text(crate::branding::REPOSITORY);
+                    ui.add_space(10.0);
+                    ui.add_sized(
+                        vec2(104.0, 32.0),
+                        egui::Button::new("Close").corner_radius(8),
+                    )
+                    .clicked()
+                })
+                .inner
+            });
+        if response.inner || response.should_close() {
+            self.about_open = false;
+        }
     }
 
     fn dropdown(&mut self, ui: &mut Ui, m: &mut Model<'_>, a: &mut Actions) {
@@ -942,7 +970,7 @@ impl Workspace {
                     let (r, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
                     ui.painter()
                         .circle_filled(r.center(), 3.5, Color32::from_rgb(127, 191, 95));
-                    ui.label(RichText::new(message).size(11.0).color(FG2));
+                    ui.label(RichText::new(message).size(12.0).color(FG2));
                     ui.label(
                         RichText::new(format!(
                             "{} vertices · {} triangles · {} chunks",
@@ -950,21 +978,22 @@ impl Workspace {
                             crate::fmt_count(m.triangles),
                             m.chunks
                         ))
-                        .font(FontId::monospace(10.5))
+                        .font(FontId::monospace(11.5))
                         .color(FG2),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{:.1} ms · {:.0} fps", m.frame_ms, m.fps))
-                                .font(FontId::monospace(10.5))
+                                .font(FontId::monospace(11.5))
                                 .color(FG2),
                         );
-                        ui.label(
-                            RichText::new(
-                                "Click a menu name to open its palette · its dock button moves it to a tray · drag empty tray space to scroll · Tab hides the interface",
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Drag tray space to scroll · Tab hides the interface")
+                                    .size(11.5)
+                                    .color(FG3),
                             )
-                            .size(11.0)
-                            .color(FG3),
+                            .truncate(),
                         );
                     });
                 });
@@ -1001,15 +1030,12 @@ impl Workspace {
                         }
                     }
                     shelf_separator(ui);
-                    // paint (not connected)
+                    // Sculpt / polypaint modes and live RGB intensity.
                     ui.vertical(|ui| {
                         ui.set_width(170.0);
                         ui.add_space(6.0);
-                        ui.add_enabled_ui(false, |ui| {
-                            seg(ui, &["Mrgb", "Rgb", "M"], 2, false);
-                            let mut rgb = 1.0;
-                            zslider(ui, "Rgb Intensity", &mut rgb, 0.0..=1.0, false, true, 2);
-                        });
+                        self.paint_modes(ui,m);
+                        zslider(ui,"RGB Intensity",&mut m.brush.rgb_intensity,0.0..=1.0,false,true,2);
                     });
                     shelf_separator(ui);
                     // Zadd / Zsub + intensity
@@ -1029,7 +1055,7 @@ impl Workspace {
                             });
                             ui.add_enabled(
                                 false,
-                                egui::Button::new("Zcut").min_size(vec2(44.0, 20.0)),
+                                egui::Button::new("Zcut").min_size(vec2(44.0, 22.0)),
                             );
                         });
                         zslider(
@@ -1047,10 +1073,7 @@ impl Workspace {
                     ui.vertical(|ui| {
                         ui.set_width(190.0);
                         ui.add_space(6.0);
-                        ui.add_enabled_ui(false, |ui| {
-                            let mut focal = 0.5;
-                            zslider(ui, "Focal Shift", &mut focal, 0.0..=1.0, false, true, 2);
-                        });
+                        zslider(ui,"Focal Shift",&mut m.brush.focal_shift,-100.0..=100.0,false,true,0);
                         ui.horizontal(|ui| {
                             ui.set_width(190.0);
                             let w = ui.available_width() - 40.0;
@@ -1066,7 +1089,7 @@ impl Workspace {
                                     2,
                                 );
                             });
-                            if small_toggle(ui, "Dyn", self.dynamic, vec2(36.0, 20.0))
+                            if small_toggle(ui, "Dyn", self.dynamic, vec2(36.0, 22.0))
                                 .on_hover_text("Radius follows zoom")
                                 .clicked()
                             {
@@ -1109,46 +1132,11 @@ impl Workspace {
                         // brush
                         let tex = self.texture(ui.ctx(), Some(m.brush.kind), self.subtract);
                         let resp = thumb(ui, Thumb::Texture(tex), m.brush.kind.name(), true, false);
-                        let picker = egui::Popup::from_toggle_button_response(&resp)
-                            .align(egui::RectAlign::RIGHT_START)
-                            .gap(6.0)
-                            .frame(popup_frame());
-                        picker.show(|ui| {
-                            ui.label(RichText::new("BRUSH · 1–5").size(10.0).color(FG3));
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for (i, kind) in BrushKind::ALL.into_iter().enumerate() {
-                                    let tex = self.texture(ui.ctx(), Some(kind), self.subtract);
-                                    if brush_tile(
-                                        ui,
-                                        tex,
-                                        kind.name(),
-                                        i + 1,
-                                        m.brush.kind == kind,
-                                        88.0,
-                                    )
-                                    .clicked()
-                                    {
-                                        m.brush.kind = kind;
-                                    }
-                                }
-                            });
-                            ui.add_enabled_ui(false, |ui| {
-                                ui.horizontal(|ui| {
-                                    for label in ["Load Brush", "Save As", "Clone", "Reset All"] {
-                                        let _ = ui.add(
-                                            egui::Button::new(label).min_size(vec2(108.0, 20.0)),
-                                        );
-                                    }
-                                });
-                            });
-                        });
+                        if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
                         thumb(ui, Thumb::Glyph("stroke"), "Freehand", false, false)
                             .on_hover_text("Stroke types are not connected yet");
-                        thumb(ui, Thumb::Glyph("alpha"), "Alpha Off", false, true)
-                            .on_hover_text("Alphas are not connected yet");
-                        thumb(ui, Thumb::Glyph("texture"), "Texture Off", false, true)
-                            .on_hover_text("Textures are not connected yet");
+                        self.asset_shelf(ui,false);
+                        self.asset_shelf(ui,true);
                         // material
                         let tex = self.texture(ui.ctx(), None, false);
                         let resp = thumb(
@@ -1163,20 +1151,20 @@ impl Workspace {
                             .gap(6.0)
                             .frame(popup_frame())
                             .show(|ui| {
-                                ui.label(RichText::new("MATERIAL").size(10.0).color(FG3));
+                                ui.label(RichText::new("MATERIAL").size(11.0).color(FG3));
                                 self.material_swatches(ui);
                             });
                         // colour
                         ui.add_space(3.0);
                         color_picker(ui, &mut self.color);
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             let (r, resp) =
-                                ui.allocate_exact_size(vec2(40.0, 32.0), Sense::click());
+                                ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
                             let p = ui.painter();
                             let back =
-                                Rect::from_min_size(r.min + vec2(16.0, 10.0), vec2(24.0, 22.0));
-                            let front = Rect::from_min_size(r.min, vec2(24.0, 22.0));
+                                Rect::from_min_size(r.min + vec2(14.0, 10.0), vec2(22.0, 22.0));
+                            let front = Rect::from_min_size(r.min, vec2(22.0, 22.0));
                             for (rect, c) in [(back, self.color2), (front, self.color)] {
                                 p.rect_filled(rect, 0, Color32::from(c));
                                 p.rect_stroke(rect, 0, Stroke::new(1.0, LINE), StrokeKind::Inside);
@@ -1193,7 +1181,7 @@ impl Workspace {
                             let [cr, cg, cb] = self.color.to_srgb();
                             ui.label(
                                 RichText::new(format!("#{cr:02x}{cg:02x}{cb:02x}"))
-                                    .font(FontId::monospace(10.0))
+                                    .font(FontId::monospace(11.0))
                                     .color(FG2),
                             );
                         });
@@ -1220,7 +1208,7 @@ impl Workspace {
                 ui.painter()
                     .vline(rect.left() + 0.5, rect.y_range(), (1.0, LINE));
                 ui.spacing_mut().item_spacing.y = 4.0;
-                let size = vec2(46.0, 40.0);
+                let size = vec2(46.0, 42.0);
                 if big_button(ui, "frame", "Frame", size, false, true)
                     .on_hover_text("Frame mesh · F")
                     .clicked()
@@ -1374,7 +1362,7 @@ impl Workspace {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("Drop a palette here,\nor dock one from its dock button")
-                                .size(11.0)
+                                .size(12.0)
                                 .color(FG3),
                         );
                     });
@@ -1494,7 +1482,7 @@ impl Workspace {
                         pos2(x + 2.0, hr.center().y),
                         Align2::LEFT_CENTER,
                         id.name(),
-                        FontId::proportional(12.0),
+                        FontId::proportional(13.0),
                         FG,
                     );
                     if floating {
@@ -1572,7 +1560,7 @@ impl Workspace {
                 ui.set_min_width(150.0);
                 ui.label(
                     RichText::new(id.name().to_uppercase())
-                        .size(10.0)
+                        .size(11.0)
                         .color(FG3),
                 );
                 for side in Side::ALL {
@@ -1615,7 +1603,7 @@ impl Workspace {
             r.left_center() + vec2(22.0, 0.0),
             Align2::LEFT_CENTER,
             title,
-            FontId::proportional(11.5),
+            FontId::proportional(12.5),
             FG,
         );
         if let Some(t) = tag_text {
@@ -1656,7 +1644,7 @@ impl Workspace {
                         bottom: 7,
                     })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.spacing_mut().item_spacing.y = 4.0;
                         ui.set_width(ui.available_width());
                         ui.add_enabled_ui(enabled, |ui| body(ws, ui));
                     });
@@ -1691,20 +1679,10 @@ impl Workspace {
     ) {
         match id {
             PaletteId::Alpha => {
-                self.sec(
-                    ui,
-                    h,
-                    id,
-                    "alpha",
-                    "Alpha",
-                    Some(NC),
-                    true,
-                    false,
-                    &mut |_, ui| {
-                        note(ui, "No alpha selected.");
-                        full_button(ui, "Load alpha…");
-                    },
-                );
+                self.sec(ui,h,id,"alpha","Alphas",None,true,true,&mut |ws,ui|ws.asset_grid(ui,false));
+            }
+            PaletteId::Texture => {
+                self.sec(ui,h,id,"textures","Textures",None,true,true,&mut |ws,ui|ws.asset_grid(ui,true));
             }
             PaletteId::Brush => {
                 self.sec(
@@ -1717,31 +1695,7 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
-                        let cols = ((ui.available_width() + 4.0) / 78.0).floor().max(1.0) as usize;
-                        let tile = (ui.available_width() - 4.0 * (cols as f32 - 1.0)) / cols as f32;
-                        for row in BrushKind::ALL.chunks(cols) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for kind in row {
-                                    let i =
-                                        BrushKind::ALL.iter().position(|k| k == kind).unwrap() + 1;
-                                    let tex = ws.texture(ui.ctx(), Some(*kind), ws.subtract);
-                                    if brush_tile(
-                                        ui,
-                                        tex,
-                                        kind.name(),
-                                        i,
-                                        m.brush.kind == *kind,
-                                        tile,
-                                    )
-                                    .clicked()
-                                    {
-                                        m.brush.kind = *kind;
-                                    }
-                                }
-                            });
-                        }
-                        note(ui, "Alt inverts · Shift smooths · 1–5 selects");
+                        ws.brush_palette(ui,m);
                     },
                 );
                 self.sec(
@@ -1776,10 +1730,7 @@ impl Workspace {
                         {
                             ws.subtract = i == 1;
                         }
-                        ui.add_enabled_ui(false, |ui| {
-                            let mut falloff = 0.5;
-                            zslider(ui, "Falloff", &mut falloff, 0.0..=1.0, false, false, 2);
-                        });
+                        zslider(ui,"Focal Shift",&mut m.brush.focal_shift,-100.0..=100.0,false,false,0);
                     },
                 );
                 self.sec(
@@ -1847,7 +1798,7 @@ impl Workspace {
                         ui.add(
                             egui::TextEdit::singleline(m.project_path)
                                 .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(11.0)),
+                                .font(FontId::monospace(12.0)),
                         );
                         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
                         let w = (r.width() - 6.0) / 3.0;
@@ -1884,7 +1835,7 @@ impl Workspace {
                         ui.add(
                             egui::TextEdit::singleline(m.export_path)
                                 .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(11.0)),
+                                .font(FontId::monospace(12.0)),
                         );
                         if ui
                             .add_sized(
@@ -2005,11 +1956,11 @@ impl Workspace {
                     id,
                     "masktype",
                     "Mask type",
-                    Some(NC),
+                    None,
                     true,
-                    false,
-                    &mut |_, ui| {
-                        seg(ui, &["Paint", "Rect", "Lasso"], 0, false);
+                    true,
+                    &mut |ws, ui| {
+                        ws.mask_picker(ui,m);
                     },
                 );
             }
@@ -2093,7 +2044,7 @@ impl Workspace {
                                 clicked[k] = child
                                     .put(
                                         cell,
-                                        egui::Button::new(RichText::new(label).size(11.0))
+                                        egui::Button::new(RichText::new(label).size(12.0))
                                             .truncate()
                                             .selected(selected),
                                     )
@@ -2331,9 +2282,13 @@ impl Workspace {
                     &mut |ws, ui| {
                         kv(ui, "Polygroups", &crate::fmt_count(m.groups));
                         ui.horizontal(|ui| {
-                            let w = (ui.available_width() - 4.0) * 0.5;
+                            let width = ui.available_width() - ui.spacing().item_spacing.x;
+                            let group_width = width * 0.6;
                             if ui
-                                .add(egui::Button::new("Group Visible").min_size(vec2(w, 20.0)))
+                                .add_sized(
+                                    [group_width, 22.0],
+                                    egui::Button::new("Group Visible").truncate(),
+                                )
                                 .on_hover_text("One new polygroup of the visible polygons · Ctrl + W")
                                 .clicked()
                             {
@@ -2341,7 +2296,10 @@ impl Workspace {
                             }
                             ui.add_enabled_ui(m.polyframe_supported, |ui| {
                                 if ui
-                                    .add(egui::Button::new("PolyF").selected(ws.polyframe).min_size(vec2(w, 20.0)))
+                                    .add_sized(
+                                        [width - group_width, 22.0],
+                                        egui::Button::new("PolyF").selected(ws.polyframe).truncate(),
+                                    )
                                     .on_hover_text("Polygroup colours · Shift + F")
                                     .on_disabled_hover_text("Needs a GPU with primitive-index support")
                                     .clicked()
@@ -2535,7 +2493,7 @@ impl Workspace {
                             ("Ctrl + drag bg, Wedge on", "re-wedge"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
-                            ("I / O", "Rgb intensity / focal shift"),
+                            ("I / O", "RGB intensity / focal shift"),
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
                             ("Q W E R", "draw / move / scale / rotate"),
@@ -2794,7 +2752,7 @@ impl Workspace {
                                 r.left_center() + vec2(20.0, 0.0),
                                 Align2::LEFT_CENTER,
                                 pid.name(),
-                                FontId::proportional(12.0),
+                                FontId::proportional(13.0),
                                 FG,
                             );
                             tag_colored(
@@ -2852,6 +2810,26 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if let Some(g)=&self.gesture_preview {
+            let p=ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground,Id::unique("brush-gesture"))).with_clip_rect(self.canvas);
+            let start=pos2(g.start.x,g.start.y);let end=pos2(g.end.x,g.end.y);
+            let color=if g.alternate {Color32::from_rgb(235,95,75)}else{ACC};
+            let stroke=Stroke::new(1.5,color);let rect=Rect::from_two_pos(start,end);
+            match g.kind {
+                BrushKind::MaskRect=>{p.rect_filled(rect,0,color.gamma_multiply(0.12));p.rect_stroke(rect,0,stroke,StrokeKind::Inside);},
+                BrushKind::MaskCircle=>{
+                    let points:Vec<_>=(0..64).map(|i|{let angle=i as f32/64.0*std::f32::consts::TAU;rect.center()+vec2(angle.cos(),angle.sin())*rect.size()*0.5}).collect();
+                    p.add(egui::Shape::convex_polygon(points,color.gamma_multiply(0.12),stroke));
+                },
+                BrushKind::MaskLasso=>{p.add(egui::Shape::closed_line(g.points.iter().map(|p|pos2(p.x,p.y)).collect(),stroke));},
+                _=>{
+                    p.line_segment([start,end],stroke);let d=(end-start).normalized();
+                    let normal=vec2(d.y,-d.x)*if g.kind==BrushKind::ClipLine&&g.alternate{-1.0}else{1.0};
+                    if start.distance(end)>4.0 {p.arrow(start.lerp(end,0.5),normal*22.0,stroke);}
+                },
+            }
+            p.text(end+vec2(8.0,8.0),Align2::LEFT_TOP,g.kind.name(),FontId::proportional(12.0),color);
+        }
         if let Some((r, hide)) = self.select_rect {
             // ZBrush SelectRect: green keeps what it covers, red (Alt) hides it.
             let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("select-rect")));
@@ -2884,7 +2862,7 @@ impl Workspace {
                         "Orthographic"
                     };
                     let resp = ui.add(
-                        egui::Button::new(RichText::new(projection).size(11.0).color(FG2))
+                        egui::Button::new(RichText::new(projection).size(12.0).color(FG2))
                             .min_size(vec2(0.0, 18.0)),
                     );
                     egui::Popup::menu(&resp).frame(popup_frame()).show(|ui| {
@@ -2900,7 +2878,7 @@ impl Workspace {
                         }
                     });
                     let active = m.subtools.iter().find(|r| r.active).map_or("", |r| r.name.as_str());
-                    ui.label(RichText::new(format!("/  {active}")).size(11.0).color(FG3));
+                    ui.label(RichText::new(format!("/  {active}")).size(12.0).color(FG3));
                 });
             });
         if !self.focus {
@@ -2932,7 +2910,7 @@ impl Workspace {
                             label_pos,
                             Align2::CENTER_CENTER,
                             label,
-                            FontId::monospace(10.0),
+                            FontId::monospace(11.0),
                             color.gamma_multiply(dim),
                         );
                         if ui
@@ -2957,7 +2935,7 @@ impl Workspace {
                 m.brush.radius,
                 m.brush.strength
             ),
-            FontId::proportional(11.0),
+            FontId::proportional(12.0),
             FG3,
         );
         if self.focus {
@@ -2965,7 +2943,7 @@ impl Workspace {
                 pos2(canvas.right() - 10.0, canvas.top() + 14.0),
                 Align2::RIGHT_CENTER,
                 "Tab or Esc restores the interface",
-                FontId::proportional(11.0),
+                FontId::proportional(12.0),
                 FG3,
             );
         }
@@ -2974,7 +2952,7 @@ impl Workspace {
                 canvas.center_top() + vec2(0.0, 40.0),
                 Align2::CENTER_TOP,
                 error,
-                FontId::proportional(11.0),
+                FontId::proportional(12.0),
                 ACC,
             );
         }
@@ -3018,7 +2996,7 @@ impl Workspace {
                 zone.center(),
                 Align2::CENTER_CENTER,
                 format!("DOCK {}", side.name().to_uppercase()),
-                FontId::proportional(10.5),
+                FontId::proportional(11.5),
                 ACC,
             );
             if hovered && ui.input(|i| i.pointer.any_released()) {
@@ -3028,7 +3006,7 @@ impl Workspace {
         }
         if let Some(pos) = pointer {
             let galley =
-                painter.layout_no_wrap(id.name().to_string(), FontId::proportional(12.0), FG);
+                painter.layout_no_wrap(id.name().to_string(), FontId::proportional(13.0), FG);
             let rect =
                 Rect::from_min_size(pos + vec2(10.0, -12.0), galley.size() + vec2(16.0, 8.0));
             painter.rect_filled(rect, 2, BG3);
@@ -3042,7 +3020,7 @@ impl Workspace {
         let kind_index = kind
             .map(|k| BrushKind::ALL.iter().position(|x| *x == k).unwrap())
             .unwrap_or(usize::MAX);
-        let flips = matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate));
+        let flips = matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate | BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Blob | BrushKind::Layer | BrushKind::Nudge | BrushKind::Sharpen | BrushKind::FormSoft | BrushKind::FormHard | BrushKind::Zipper | BrushKind::Stitch | BrushKind::Rake));
         let key = (kind_index, self.material, sub && flips);
         let material = self.material;
         self.textures
@@ -3075,121 +3053,12 @@ impl Workspace {
 /// A sphere in `material` with one stroke of `kind` on it (none = plain sphere).
 /// Matches the renderer's clay look closely enough to read as "what this brush does".
 pub fn sphere_image(kind: Option<BrushKind>, material: usize, sub: bool) -> ColorImage {
-    use std::f32::consts::PI;
-    let n = 96usize;
-    let rs = 0.86f32;
-    let (color, _) = MATERIALS[material % MATERIALS.len()];
-    let base = [
-        color.r() as f32 / 255.0 * 1.02,
-        color.g() as f32 / 255.0 * 1.02,
-        color.b() as f32 / 255.0 * 1.02,
-    ];
-    let spec_k = if material == 1 || material == 3 {
-        0.9
-    } else {
-        0.35
-    };
-    let sgn = if sub { -1.0 } else { 1.0 };
-    let path: Vec<(f32, f32)> = (0..=40)
-        .map(|i| {
-            let t = i as f32 / 40.0;
-            (-0.46 + 0.92 * t, 0.26 - 0.5 * t + 0.14 * (t * PI).sin())
-        })
-        .collect();
-    let noise = |x: f32, y: f32| {
-        0.55 * ((x * 9.1 + 1.3).sin() * (y * 8.7 + 0.4).sin()
-            + 0.6 * (x * 17.0 + y * 13.0 + 2.0).sin() * (y * 15.0 - x * 7.0).sin()
-            + 0.4 * ((x + y) * 23.0).sin() * ((x - y) * 19.0).sin())
-    };
-    let mut d = vec![0f32; n * n];
-    if let Some(kind) = kind {
-        for py in 0..n {
-            for px in 0..n {
-                let x = (px as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-                let y = (py as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-                let r2 = x * x + y * y;
-                if r2 >= rs * rs {
-                    continue;
-                }
-                let nz = (rs * rs - r2).sqrt() / rs;
-                let dist = path
-                    .iter()
-                    .map(|(ax, ay)| ((x - ax).powi(2) + (y - ay).powi(2)).sqrt())
-                    .fold(9.0f32, f32::min);
-                let rr = if kind == BrushKind::Inflate {
-                    0.34
-                } else {
-                    0.21
-                };
-                let f = (1.0 - dist / rr).max(0.0);
-                let f = f * f * (3.0 - 2.0 * f);
-                let h = match kind {
-                    BrushKind::Draw => f * 0.16 * sgn,
-                    BrushKind::Inflate => f.powf(0.7) * 0.2 * sgn,
-                    BrushKind::Smooth => noise(x, y) * 0.11 * (1.0 - f * 0.97),
-                    BrushKind::Flatten => noise(x, y) * 0.11 * (1.0 - f) - f * 0.03,
-                    BrushKind::Grab => {
-                        let (dx, dy) = (x - 0.02, y + 0.02);
-                        let a = if dx > 0.0 { 0.5 } else { 0.24 };
-                        0.22 * (-1.4 * (dx * dx / (a * a) + dy * dy / (0.26 * 0.26))).exp()
-                    }
-                };
-                d[py * n + px] = h * nz;
-            }
-        }
-    }
-    let light = {
-        let l = [-0.42f32, -0.5, 0.76];
-        let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
-        [l[0] / len, l[1] / len, l[2] / len]
-    };
-    let half = {
-        let h = [light[0], light[1], light[2] + 1.0];
-        let len = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
-        [h[0] / len, h[1] / len, h[2] / len]
-    };
-    let at = |x: isize, y: isize| {
-        d[(y.clamp(0, n as isize - 1) as usize) * n + x.clamp(0, n as isize - 1) as usize]
-    };
-    let mut rgba = vec![0u8; n * n * 4];
-    for py in 0..n {
-        for px in 0..n {
-            let x = (px as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-            let y = (py as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-            let r = (x * x + y * y).sqrt();
-            let edge = (rs - r) * n as f32 / 2.0 + 0.5;
-            let o = (py * n + px) * 4;
-            if edge <= 0.0 {
-                continue;
-            }
-            let rc = r.min(rs - 0.001);
-            let z = (rs * rs - rc * rc).sqrt();
-            let (ix, iy) = (px as isize, py as isize);
-            let gx = (at(ix + 1, iy) - at(ix - 1, iy)) * n as f32 * 0.5;
-            let gy = (at(ix, iy + 1) - at(ix, iy - 1)) * n as f32 * 0.5;
-            let (mut nx, mut ny, mut nz) = (x / rs - gx * 0.5, y / rs - gy * 0.5, z / rs);
-            let len = (nx * nx + ny * ny + nz * nz).sqrt();
-            nx /= len;
-            ny /= len;
-            nz /= len;
-            let diff = (nx * light[0] + ny * light[1] + nz * light[2]).max(0.0);
-            let spec = (nx * half[0] + ny * half[1] + nz * half[2])
-                .max(0.0)
-                .powf(36.0)
-                * spec_k;
-            let fill = 0.16 + 0.1 * (-ny).max(0.0);
-            for k in 0..3 {
-                rgba[o + k] = (255.0 * (base[k] * (fill + 0.9 * diff) + spec)).min(255.0) as u8;
-            }
-            rgba[o + 3] = (255.0 * edge.min(1.0)).round() as u8;
-        }
-    }
-    ColorImage::from_rgba_unmultiplied([n, n], &rgba)
+    crate::brush_preview::image(kind, material, sub)
 }
 
 // ---------------------------------------------------------------- widgets
-/// ZBrush-style slider: the label and value sit inside the bar. `line` draws the
-/// shelf variant (dark field with a thin value line underneath).
+/// ZBrush-style slider: label inside the bar, value on a neutral field at the
+/// right. `line` draws the shelf variant with a thin value line underneath.
 pub fn zslider(
     ui: &mut Ui,
     label: &str,
@@ -3201,7 +3070,7 @@ pub fn zslider(
 ) -> bool {
     let (min, max) = (*range.start(), *range.end());
     let (r, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click_and_drag());
+        ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
     let mut changed = false;
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
@@ -3222,10 +3091,9 @@ pub fn zslider(
     } else {
         ((*value - min) / (max - min)).clamp(0.0, 1.0)
     };
-    let enabled = ui.is_enabled();
-    let alpha = if enabled { 1.0 } else { 0.42 };
     let p = ui.painter();
-    p.rect_filled(r, 2, (if line { BG2 } else { BG3 }).gamma_multiply(alpha));
+    // Disabled UIs already apply the theme opacity to their painter.
+    p.rect_filled(r, 2, if line { BG2 } else { BG3 });
     if !line {
         p.hline(r.x_range(), r.top() + 1.5, (1.0, HI));
     }
@@ -3235,17 +3103,17 @@ pub fn zslider(
             pos2(r.left() + 1.0, r.bottom() - 4.0),
             pos2(r.left() + 1.0 + frac * (r.width() - 2.0), r.bottom() - 1.0),
         );
-        p.rect_filled(fill, 0, ACC.gamma_multiply(alpha));
+        p.rect_filled(fill, 0, ACC);
     } else {
         let fill = Rect::from_min_max(
             r.min + vec2(1.0, 1.0),
             pos2(r.left() + 1.0 + frac * (r.width() - 2.0), r.bottom() - 1.0),
         );
-        p.rect_filled(fill, 0, ACC_DIM.gamma_multiply(alpha));
+        p.rect_filled(fill, 0, ACC_DIM);
         p.vline(
             fill.right(),
             fill.y_range(),
-            (1.0, ACC_LINE.gamma_multiply(alpha)),
+            (1.0, ACC_LINE),
         );
     }
     let ty = if line {
@@ -3253,29 +3121,53 @@ pub fn zslider(
     } else {
         r.center().y
     };
-    p.text(
+    // Keep numbers on a neutral surface instead of over the varying bar fill.
+    // The full bar retains its original click/drag range.
+    let value_text = format!("{:.*}", decimals, *value);
+    let value_galley = p.layout_no_wrap(
+        value_text,
+        FontId::monospace(12.0),
+        FG,
+    );
+    let value_width = (value_galley.size().x + 12.0)
+        .max(42.0)
+        .min(r.width() * 0.5);
+    let value_rect = Rect::from_min_max(
+        pos2(r.right() - value_width, r.top() + 1.0),
+        pos2(
+            r.right() - 1.0,
+            if line { r.bottom() - 4.0 } else { r.bottom() - 1.0 },
+        ),
+    );
+    p.rect_filled(value_rect, 0, BG2);
+    p.vline(value_rect.left(), value_rect.y_range(), (1.0, LINE2));
+    let label_painter = p.with_clip_rect(
+        Rect::from_min_max(r.min, pos2(value_rect.left() - 4.0, r.bottom()))
+            .intersect(p.clip_rect()),
+    );
+    label_painter.text(
         pos2(r.left() + 6.0, ty),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.0),
-        FG.gamma_multiply(alpha),
+        FontId::proportional(13.0),
+        FG,
     );
-    p.text(
-        pos2(r.right() - 6.0, ty),
-        Align2::RIGHT_CENTER,
-        format!("{:.*}", decimals, *value),
-        FontId::monospace(11.0),
-        (if line || resp.hovered() { FG } else { FG2 }).gamma_multiply(alpha),
+    p.galley(
+        pos2(
+            r.right() - 6.0 - value_galley.size().x,
+            ty - value_galley.size().y * 0.5,
+        ),
+        value_galley,
+        FG,
     );
     changed
 }
 
 /// Segmented buttons. Returns the index clicked this frame.
 fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usize> {
-    let h = if tall { 30.0 } else { 20.0 };
+    let h = if tall { 32.0 } else { 22.0 };
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let enabled = ui.is_enabled();
-    let alpha = if enabled { 1.0 } else { 0.42 };
     let w = r.width() / labels.len() as f32;
     let mut clicked = None;
     for (i, label) in labels.iter().enumerate() {
@@ -3283,14 +3175,16 @@ fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usiz
         let resp = ui.interact(cell, ui.scope_id().with(("seg", label, i)), Sense::click());
         let on = i == selected;
         let p = ui.painter();
-        let fill = if on {
+        let fill = if on && enabled {
             ACC
+        } else if on {
+            BG4
         } else if resp.hovered() {
             BG4
         } else {
             BG3
         };
-        p.rect_filled(cell, 0, fill.gamma_multiply(alpha));
+        p.rect_filled(cell, 0, fill);
         if !on {
             p.hline(cell.x_range(), cell.top() + 0.5, (1.0, HI));
         }
@@ -3298,8 +3192,8 @@ fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usiz
             cell.center(),
             Align2::CENTER_CENTER,
             *label,
-            FontId::proportional(12.0),
-            (if on && enabled { ACC_FG } else { FG }).gamma_multiply(alpha),
+            FontId::proportional(13.0),
+            if on && enabled { ACC_FG } else { FG },
         );
         if resp.clicked() {
             clicked = Some(i);
@@ -3337,7 +3231,7 @@ fn small_toggle(ui: &mut Ui, label: &str, on: bool, size: Vec2) -> egui::Respons
         r.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(10.0),
+        FontId::proportional(11.0),
         FG,
     );
     resp
@@ -3360,7 +3254,7 @@ fn big_button(
             Sense::hover()
         },
     );
-    let alpha = if enabled { 1.0 } else { 0.4 };
+    let alpha = if enabled { 1.0 } else { 0.6 };
     let p = ui.painter();
     let fill = if on && size.y > 42.0 {
         ACC
@@ -3382,20 +3276,21 @@ fn big_button(
     if !(on && size.y > 42.0) {
         p.hline(r.x_range().shrink(1.0), r.top() + 1.5, (1.0, HI));
     }
-    let color = if on && size.y > 42.0 {
+    let color = if !enabled {
+        FG3
+    } else if on && size.y > 42.0 {
         ACC_FG
     } else if on || (resp.hovered() && enabled) {
         FG
     } else {
         FG2
-    }
-    .gamma_multiply(alpha);
+    };
     glyph(p, r.center() - vec2(0.0, 7.0), icon, color);
     p.text(
         r.center_bottom() - vec2(0.0, 9.0),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(if size.y > 42.0 { 10.0 } else { 9.5 }),
+        FontId::proportional(12.0),
         color,
     );
     resp
@@ -3438,73 +3333,36 @@ fn thumb(ui: &mut Ui, content: Thumb, label: &str, on: bool, dim: bool) -> egui:
             StrokeKind::Outside,
         );
     }
-    p.text(
-        pos2(r.center().x, r.bottom() - 7.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(10.5),
-        if dim {
+    let color = if dim {
             FG3
         } else if resp.hovered() {
             FG
         } else {
             FG2
-        },
-    );
-    resp
+        };
+    let mut job = egui::text::LayoutJob::simple(label.to_owned(), FontId::proportional(11.5), color, 84.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = p.layout_job(job);
+    p.galley(pos2(r.center().x-galley.size().x*0.5,r.bottom()-7.0-galley.size().y*0.5), galley, color);
+    resp.on_hover_text(label)
 }
 
 fn brush_tile(
-    ui: &mut Ui,
-    tex: TextureId,
-    name: &str,
-    key: usize,
-    on: bool,
-    width: f32,
+    ui: &mut Ui, tex: TextureId, name: &str, key: usize, on: bool, width: f32,
 ) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(vec2(width, width + 18.0), Sense::click());
-    let p = ui.painter();
-    p.rect_filled(
-        r,
-        3,
-        if on {
-            ACC_DIM
-        } else if resp.hovered() {
-            BG4
-        } else {
-            BG3
-        },
-    );
-    p.rect_stroke(
-        r,
-        3,
-        Stroke::new(1.0, if on { ACC_LINE } else { LINE }),
-        StrokeKind::Inside,
-    );
-    let im = Rect::from_min_size(r.min + vec2(3.0, 3.0), vec2(width - 6.0, width - 6.0));
-    p.rect_filled(im, 2, BG2);
-    p.image(
-        tex,
-        im,
-        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-    p.rect_stroke(im, 2, Stroke::new(1.0, LINE), StrokeKind::Inside);
-    p.text(
-        im.right_top() + vec2(-5.0, 4.0),
-        Align2::RIGHT_TOP,
-        key.to_string(),
-        FontId::monospace(10.0),
-        Color32::WHITE,
-    );
-    p.text(
-        pos2(r.center().x, r.bottom() - 9.0),
-        Align2::CENTER_CENTER,
-        name,
-        FontId::proportional(11.0),
-        if on || resp.hovered() { FG } else { FG2 },
-    );
-    resp.on_hover_text(format!("{name} · {key}"))
+    let label=ui.painter().layout(name.to_owned(),FontId::proportional(11.5),if on{FG}else{FG2},width-8.0);
+    let height=width+label.size().y.max(28.0)+5.0;
+    let (r,resp)=ui.allocate_exact_size(vec2(width,height),Sense::click());
+    let p=ui.painter();p.rect_filled(r,3,if on{ACC_DIM}else if resp.hovered(){BG4}else{BG3});
+    p.rect_stroke(r,3,Stroke::new(1.0,if on{ACC_LINE}else{LINE}),StrokeKind::Inside);
+    let im=Rect::from_min_size(r.min+vec2(3.0,3.0),vec2(width-6.0,width-6.0));
+    p.image(tex,im,Rect::from_min_max(Pos2::ZERO,pos2(1.0,1.0)),Color32::WHITE);
+    if (1..=9).contains(&key) {
+        p.text(im.right_top()+vec2(-4.0,3.0),Align2::RIGHT_TOP,key.to_string(),FontId::monospace(10.5),FG);
+    }
+    p.galley(pos2(r.center().x-label.size().x*0.5,r.top()+width),label,FG);
+    resp.on_hover_text(if (1..=9).contains(&key){format!("{name} · {key}")}else{name.to_owned()})
 }
 
 /// HSV picker: saturation/value square plus a hue strip.
@@ -3593,7 +3451,7 @@ fn menu_item(ui: &mut Ui, label: &str, marked: bool) -> egui::Response {
         r.left_center() + vec2(22.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.0),
+        FontId::proportional(13.0),
         color,
     );
     resp
@@ -3630,7 +3488,7 @@ fn tag(p: &egui::Painter, right_center: Pos2, text: &str) {
 }
 
 fn tag_colored(p: &egui::Painter, right_center: Pos2, text: &str, accent: bool) {
-    let galley = p.layout_no_wrap(text.to_uppercase(), FontId::proportional(9.5), FG3);
+    let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(11.0), FG3);
     let rect = Rect::from_min_max(
         right_center - vec2(galley.size().x + 10.0, 8.0),
         right_center + vec2(0.0, 8.0),
@@ -3650,23 +3508,45 @@ fn tag_colored(p: &egui::Painter, right_center: Pos2, text: &str, accent: bool) 
 }
 
 fn note(ui: &mut Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.0).color(FG3)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(FG3)).wrap());
 }
 
 fn kv(ui: &mut Ui, key: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.set_height(16.0);
-        ui.label(RichText::new(key).size(12.0).color(FG2));
+    let key_font = FontId::proportional(13.0);
+    let value_font = FontId::monospace(12.0);
+    let key_width = ui
+        .painter()
+        .layout_no_wrap(key.to_owned(), key_font.clone(), FG2)
+        .size()
+        .x;
+    let value_width = ui
+        .painter()
+        .layout_no_wrap(value.to_owned(), value_font.clone(), FG)
+        .size()
+        .x;
+    let key_text = RichText::new(key).font(key_font).color(FG2);
+    let value_text = RichText::new(value).font(value_font).color(FG);
+    if key_width + value_width + ui.spacing().item_spacing.x > ui.available_width() {
+        // Long counts and units wrap within the saved tray width.
+        ui.label(key_text);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).font(FontId::monospace(11.0)).color(FG));
+            ui.add(egui::Label::new(value_text).wrap());
         });
-    });
+    } else {
+        ui.horizontal(|ui| {
+            ui.set_height(18.0);
+            ui.label(key_text);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(value_text);
+            });
+        });
+    }
 }
 
 /// A SubTool list line: name and size, highlighted when active, with an eye toggle on the
 /// right. Returns (row clicked, eye clicked).
 fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     let eye_rect = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(22.0, 22.0));
     let eye = ui.interact(eye_rect, Id::unique(("subtool-eye", index)), Sense::click());
     let p = ui.painter();
@@ -3692,7 +3572,7 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
         pos2(r.left() + 8.0, r.top() + 10.0),
         Align2::LEFT_CENTER,
         &row.name,
-        FontId::proportional(12.0),
+        FontId::proportional(13.0),
         text,
     );
     let detail = if !row.drawn {
@@ -3712,7 +3592,7 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
         pos2(r.left() + 8.0, r.bottom() - 9.0),
         Align2::LEFT_CENTER,
         detail,
-        FontId::monospace(10.0),
+        FontId::monospace(11.0),
         FG3,
     );
     // Eye: an outline with a pupil, crossed out when hidden.
@@ -3749,7 +3629,7 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
 /// ZBrush-style deformation slider: drag sets a value in -100..100 from the centre, release
 /// returns it and the slider springs back to 0.
 fn spring_slider(ui: &mut Ui, kind: Deform, drag: &mut Option<(Deform, f32)>) -> Option<f32> {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::drag());
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::drag());
     let value_at = |p: Pos2| ((p.x - r.center().x) / (r.width() * 0.5) * 100.0).clamp(-100.0, 100.0);
     let mut released = None;
     if resp.drag_started() || resp.dragged() {
@@ -3784,21 +3664,21 @@ fn spring_slider(ui: &mut Ui, kind: Deform, drag: &mut Option<(Deform, f32)>) ->
         pos2(r.left() + 6.0, r.center().y),
         Align2::LEFT_CENTER,
         kind.label(),
-        FontId::proportional(11.5),
+        FontId::proportional(12.5),
         FG,
     );
     p.text(
         pos2(r.right() - 6.0, r.center().y),
         Align2::RIGHT_CENTER,
         format!("{value:+.0}"),
-        FontId::monospace(11.0),
+        FontId::monospace(12.0),
         if value != 0.0 { ACC } else { FG3 },
     );
     released
 }
 
 fn full_button(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.add_sized([ui.available_width(), 20.0], egui::Button::new(label))
+    ui.add_sized([ui.available_width(), 22.0], egui::Button::new(label))
 }
 
 fn chevron(p: &egui::Painter, center: Pos2, open: bool, color: Color32) {
@@ -4044,6 +3924,7 @@ pub fn theme(ctx: &egui::Context) {
     style.visuals.faint_bg_color = BG2;
     style.visuals.override_text_color = Some(FG);
     style.visuals.weak_text_color = Some(FG2);
+    style.visuals.disabled_alpha = 0.6;
     style.visuals.selection.bg_fill = ACC_DIM;
     style.visuals.selection.stroke = Stroke::new(1.0, ACC);
     style.visuals.window_stroke = Stroke::new(1.0, LINE);
@@ -4072,24 +3953,24 @@ pub fn theme(ctx: &egui::Context) {
     style.visuals.widgets.open.weak_bg_fill = BG4;
     style.spacing.item_spacing = vec2(3.0, 3.0);
     style.spacing.button_padding = vec2(9.0, 3.0);
-    style.spacing.interact_size = vec2(20.0, 20.0);
-    style.spacing.icon_width = 12.0;
-    style.spacing.icon_width_inner = 8.0;
+    style.spacing.interact_size = vec2(22.0, 22.0);
+    style.spacing.icon_width = 14.0;
+    style.spacing.icon_width_inner = 9.0;
     style.spacing.icon_spacing = 7.0;
     style.spacing.menu_margin = Margin::same(3);
     style.spacing.scroll = egui::style::ScrollStyle::thin();
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(12.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(13.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(12.0));
+        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(10.0));
+        .insert(egui::TextStyle::Small, FontId::proportional(11.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Monospace, FontId::monospace(11.0));
+        .insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style);
 }
@@ -4236,6 +4117,84 @@ mod tests {
             .iter()
             .filter(|shape| matches!(&shape.shape, egui::Shape::Text(s) if s.galley.job.text == text))
             .count()
+    }
+
+    fn click(workspace: &mut Workspace, ctx: &Context, size: Vec2, pos: Pos2) -> egui::FullOutput {
+        frame(workspace, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        frame(workspace, ctx, size, vec![pointer(pos, true)]);
+        frame(workspace, ctx, size, vec![pointer(pos, false)])
+    }
+
+    #[test]
+    fn both_logo_and_wordmark_open_the_same_about_modal() {
+        for (tag, wordmark) in [("about-logo", false), ("about-wordmark", true)] {
+            let (mut workspace, ctx) = test_workspace(tag);
+            let size = vec2(1600.0, 1000.0);
+            let output = frame(&mut workspace, &ctx, size, vec![]);
+            let pos = if wordmark {
+                text_position(&output, "Klay") + vec2(3.0, 3.0)
+            } else {
+                pos2(18.0, MENUBAR_H * 0.5)
+            };
+            click(&mut workspace, &ctx, size, pos);
+            assert!(workspace.about_open);
+            frame(&mut workspace, &ctx, size, vec![]);
+            let output = frame(&mut workspace, &ctx, size, vec![]);
+            assert_eq!(text_count(&output, "About Klay"), 1);
+            assert_eq!(text_count(&output, &format!("Version {}", crate::branding::VERSION)), 1);
+            assert_eq!(text_count(&output, "Built with Rust"), 1);
+            assert_eq!(text_count(&output, "GitHub repository"), 1);
+            assert_eq!(text_count(&output, "Close"), 1);
+        }
+    }
+
+    #[test]
+    fn about_closes_with_button_escape_or_backdrop_without_activating_a_palette() {
+        let size = vec2(960.0, 640.0);
+        for method in ["close", "escape", "backdrop"] {
+            let (mut workspace, ctx) = test_workspace(method);
+            workspace.about_open = true;
+            frame(&mut workspace, &ctx, size, vec![]);
+            frame(&mut workspace, &ctx, size, vec![]);
+            let output = frame(&mut workspace, &ctx, size, vec![]);
+            match method {
+                "close" => {
+                    let pos = text_position(&output, "Close") + vec2(3.0, 3.0);
+                    click(&mut workspace, &ctx, size, pos);
+                }
+                "escape" => {
+                    frame(&mut workspace, &ctx, size, vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+                _ => {
+                    let pos = text_position(&output, "Alpha") + vec2(3.0, 3.0);
+                    click(&mut workspace, &ctx, size, pos);
+                    assert_eq!(workspace.dropdown, None);
+                }
+            }
+            assert!(!workspace.about_open, "{method} did not close the modal");
+        }
+    }
+
+    #[test]
+    fn about_repository_link_opens_the_package_repository() {
+        let (mut workspace, ctx) = test_workspace("about-repository");
+        let size = vec2(1600.0, 1000.0);
+        workspace.about_open = true;
+        frame(&mut workspace, &ctx, size, vec![]);
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        let pos = text_position(&output, "GitHub repository") + vec2(3.0, 3.0);
+        let output = click(&mut workspace, &ctx, size, pos);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://github.com/ozzy-apps/klay")
+        }));
+        assert!(workspace.about_open);
     }
 
     #[test]
@@ -4474,9 +4433,9 @@ mod tests {
     fn brush_previews_are_opaque_spheres_with_transparent_corners() {
         for kind in BrushKind::ALL.into_iter().map(Some).chain([None]) {
             let image = sphere_image(kind, 0, false);
-            assert_eq!(image.size, [96, 96]);
+            assert_eq!(image.size, [160, 160]);
             assert_eq!(image[(0, 0)].a(), 0, "corner should be transparent");
-            assert_eq!(image[(48, 48)].a(), 255, "centre should be opaque");
+            assert_eq!(image[(80, 80)].a(), 255, "centre should be opaque");
         }
         let add = sphere_image(Some(BrushKind::Draw), 0, false);
         let sub = sphere_image(Some(BrushKind::Draw), 0, true);
