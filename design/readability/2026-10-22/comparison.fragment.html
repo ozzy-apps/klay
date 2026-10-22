@@ -1,0 +1,55 @@
+<div id="klay-readability-comparison">
+  <style>
+    #klay-readability-comparison { font: 13px/1.4 Inter, system-ui, sans-serif; color: #ebe5e0; }
+    #klay-readability-comparison * { box-sizing: border-box; }
+    #klay-readability-comparison .klay-comparison-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 0 12px; }
+    #klay-readability-comparison .klay-comparison-nav button { font: inherit; padding: 9px 13px; border: 1px solid #61534e; border-radius: 8px; background: #25272b; color: #e6e1dd; cursor: pointer; }
+    #klay-readability-comparison .klay-comparison-nav button[aria-selected="true"] { color: #ffdbc9; background: #604237; border-color: #ffb59d; }
+    #klay-readability-comparison .klay-comparison-nav button:focus-visible { outline: 3px solid #ffb59d; outline-offset: 3px; }
+    #klay-readability-comparison .klay-comparison-nav button[data-action] { margin-left: auto; }
+    #klay-readability-comparison .klay-preview { overflow: auto; max-height: 1000px; width: 100%; background: #1c1e21; }
+    #klay-readability-comparison .klay-design { display: block; width: 100%; height: auto; }
+    #klay-readability-comparison .klay-design[hidden] { display: none; }
+    #klay-readability-comparison .klay-preview.klay-actual { max-height: 840px; }
+    #klay-readability-comparison .klay-actual .klay-design { width: 1600px; height: 1000px; max-width: none; }
+  </style>
+  <div class="klay-comparison-nav" role="tablist" aria-label="Readability mockups">
+    <button type="button" role="tab" aria-selected="true" data-choice="01-graphite">1 · Graphite</button>
+    <button type="button" role="tab" aria-selected="false" data-choice="02-slate">2 · Slate</button>
+    <button type="button" role="tab" aria-selected="false" data-choice="03-light-studio">3 · Light Studio</button>
+    <button type="button" data-action="zoom" aria-pressed="false">View at 100%</button>
+  </div>
+  <!--KLAY_SHARED_DEFS-->
+  <div class="klay-preview" tabindex="0" aria-label="Selected mockup. At 100 percent, scroll to inspect controls.">
+    <!--KLAY_MOCKUPS-->
+  </div>
+  <script>
+    (() => {
+      const root = document.getElementById('klay-readability-comparison');
+      const tabs = Array.from(root.querySelectorAll('[data-choice]'));
+      const designs = Array.from(root.querySelectorAll('[data-concept]'));
+      const preview = root.querySelector('.klay-preview');
+      const zoom = root.querySelector('[data-action="zoom"]');
+      tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => {
+          tabs.forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+          designs.forEach(item => {
+            if (item.dataset.concept === tab.dataset.choice) item.removeAttribute('hidden');
+            else item.setAttribute('hidden', 'hidden');
+          });
+        });
+        tab.addEventListener('keydown', event => {
+          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+          tabs[next].focus(); tabs[next].click();
+        });
+      });
+      zoom.addEventListener('click', () => {
+        const actual = preview.classList.toggle('klay-actual');
+        zoom.setAttribute('aria-pressed', String(actual));
+        zoom.textContent = actual ? 'Fit workspace' : 'View at 100%';
+      });
+    })();
+  </script>
+</div>

@@ -1,5 +1,13 @@
+mod branding;
+mod brush_asset;
+mod asset_library;
+mod brush_preview;
+mod paint;
 mod camera;
 mod mask;
+mod surface_tools;
+mod detail_brush;
+mod native_tests;
 mod mesh;
 mod multires;
 mod polygroup;
@@ -144,6 +152,9 @@ struct MaskPress {
     /// Alt at the press: erase instead of paint, sharpen instead of blur.
     alt: bool,
     moved: bool,
+    kind: BrushKind,
+    direct: bool,
+    normal: Vec3,
 }
 
 /// State of `--selftest-mask`: masking through the same handlers the window events call,
@@ -163,6 +174,22 @@ struct MaskTest {
     /// Named costs in ms, logged at the end.
     costs: Vec<(&'static str, f32)>,
     ok: bool,
+}
+
+#[derive(Default)]
+struct PaintTest {
+    frame: u32,
+    original: Vec<Vec3>,
+    painted: Vec<[u8; 4]>,
+    ok: bool,
+}
+
+#[derive(Default)]
+struct BrushTest {
+    frame: u32,
+    index: usize,
+    original: Vec<Vec3>,
+    edited: Vec<Vec3>,
 }
 
 /// State of `--selftest-transpose`: a scripted Move, Scale and Rotate through the same press /
@@ -243,6 +270,9 @@ struct App {
     selftest_transpose: Option<TransposeTest>,
     /// `--selftest-mask`: the scripted masking session.
     selftest_mask: Option<MaskTest>,
+    selftest_paint: Option<PaintTest>,
+    selftest_brushes: Option<BrushTest>,
+    selftest_surface: Option<native_tests::SurfaceTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// `--open PATH`: project to open once the window exists.
@@ -275,6 +305,7 @@ struct App {
     transpose: Option<TransposeDrag>,
     mask_press: Option<MaskPress>,
     mask_stroke: Option<mask::MaskStroke>,
+    gesture: Option<surface_tools::Gesture>,
 
     // UI state.
     workspace: workspace::Workspace,
@@ -360,6 +391,9 @@ impl App {
             selftest_groups_state: (0, true, 1),
             selftest_transpose: None,
             selftest_mask: None,
+            selftest_paint: None,
+            selftest_brushes: None,
+            selftest_surface: None,
             project_path: "untitled.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
@@ -383,6 +417,7 @@ impl App {
             transpose: None,
             mask_press: None,
             mask_stroke: None,
+            gesture: None,
             workspace: workspace::Workspace::new(),
             canvas_rect: egui::Rect::NOTHING,
             primitive: settings,
@@ -429,6 +464,7 @@ impl App {
             || self.transpose.is_some()
             || self.mask_press.is_some()
             || self.mask_stroke.is_some()
+            || self.gesture.is_some()
             || self.select.is_some()
     }
 
@@ -1386,7 +1422,7 @@ impl App {
         let remesh_ms = t.elapsed().as_secs_f32() * 1000.0;
         let before = self.doc.mesh().vertex_count();
         let t2 = Instant::now();
-        let mesh = SculptMesh::from_raw_with_groups(out.positions, out.indices, out.groups);
+        let mesh = SculptMesh::from_raw_painted(out.positions, out.indices, out.groups, out.colors);
         let budget = self.doc.budget;
         let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
         self.history.push(UndoStep::Replace(Box::new(old.pack())));
@@ -1826,6 +1862,142 @@ impl App {
         false
     }
 
+    /// Test new brushes through canvas input, GPU upload/compute, undo and redo.
+    fn selftest_brushes_frame(&mut self, t: &mut BrushTest) -> bool {
+        let kinds = [
+            BrushKind::Blob,
+            BrushKind::Layer,
+            BrushKind::Fill,
+            BrushKind::Scrape,
+            BrushKind::Nudge,
+            BrushKind::Sharpen,
+            BrushKind::Elastic,
+            BrushKind::SnakeHook,
+            BrushKind::FormSoft,
+            BrushKind::FormHard,
+            BrushKind::Zipper,
+            BrushKind::Stitch,
+            BrushKind::Rake,
+        ];
+        let kind = kinds[t.index];
+        let frame = t.frame;
+        t.frame += 1;
+        let centre = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+        let check_gpu = |app: &App| {
+            let gpu = app
+                .gfx
+                .as_ref()
+                .and_then(Gfx::read_positions)
+                .unwrap_or_default();
+            let cpu = &app.mesh().positions;
+            assert_eq!(gpu.len(), cpu.len(), "{kind:?} GPU vertex count");
+            let error = gpu
+                .iter()
+                .zip(cpu)
+                .map(|(a, b)| a.distance(*b))
+                .fold(0.0f32, f32::max);
+            assert!(error < 1e-5, "{kind:?} CPU/GPU error {error}");
+        };
+        match frame {
+            20 => {
+                t.original = self.mesh().positions.clone();
+                self.workspace.select_brush(&mut self.brush, kind);
+                self.brush.radius = 0.4;
+                self.brush.strength = 0.7;
+                self.on_key(KeyCode::KeyQ);
+                self.cursor_moved(centre, false);
+                self.left_press(false, false);
+            }
+            21..=27 => self.cursor_moved(centre + Vec2::new((frame - 20) as f32 * 8.0, 0.0), false),
+            28 => self.left_release(),
+            34 => {
+                t.edited = self.mesh().positions.clone();
+                assert!(
+                    t.original != t.edited,
+                    "{kind:?} must sculpt through canvas input"
+                );
+                assert!(t.edited.iter().all(|p| p.is_finite()));
+                check_gpu(self);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+            }
+            40 => {
+                assert!(self.mesh().positions == t.original, "{kind:?} undo");
+                check_gpu(self);
+                self.history.redo(&mut self.doc);
+                self.show_active_level();
+            }
+            46 => {
+                assert!(
+                    self.mesh()
+                        .positions
+                        .iter()
+                        .zip(&t.edited)
+                        .all(|(a, b)| a.distance(*b) < 1e-6),
+                    "{kind:?} redo"
+                );
+                check_gpu(self);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                log::info!(
+                    "selftest-brushes: {} canvas, GPU, undo and redo (ok)",
+                    kind.name()
+                );
+                t.index += 1;
+                if t.index == kinds.len() {
+                    log::info!("selftest-brushes: all passed");
+                    return true;
+                }
+                t.frame = 18;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Real input handlers, rendered frames and GPU readback for RGB texture painting.
+    fn selftest_paint_frame(&mut self, t: &mut PaintTest) -> bool {
+        let k=t.frame; t.frame+=1;
+        let check=|t:&mut PaintTest,what:&str,pass:bool| {
+            t.ok &= pass;
+            log::info!("selftest-paint: {what} ({})",if pass{"ok"}else{"FAIL"});
+        };
+        let centre=self.project((self.doc.bounds().min+self.doc.bounds().max)*0.5);
+        match k {
+            20=>{
+                t.ok=true;t.original=self.mesh().positions.clone();
+                self.workspace.select_brush(&mut self.brush,BrushKind::Paint);
+                self.brush.color=[215,72,39];self.brush.radius=0.4;
+                self.workspace.assets.texture=brush_asset::Pattern::Marble;
+                self.on_key(KeyCode::KeyQ);
+                self.cursor_moved(centre,false);self.left_press(false,false);
+            },
+            21..=27=>self.cursor_moved(centre+Vec2::new((k-20) as f32*8.0,0.0),false),
+            28=>self.left_release(),
+            35=>{
+                t.painted=self.mesh().colors.clone();
+                check(t,"texture painted through canvas input",t.painted.iter().any(|c|c[3]>0));
+                check(t,"RGB mode preserves positions",self.mesh().positions==t.original);
+                let gpu=self.gfx.as_ref().and_then(Gfx::read_colors).unwrap_or_default();
+                check(t,"GPU paint matches CPU",gpu==t.painted);
+                self.history.undo(&mut self.doc);self.show_active_level();
+            },
+            42=>{
+                let gpu=self.gfx.as_ref().and_then(Gfx::read_colors).unwrap_or_default();
+                check(t,"undo clears CPU and GPU paint",self.mesh().colors.iter().all(|c|c[3]==0)&&gpu.iter().all(|c|c[3]==0)&&gpu.len()==t.original.len());
+                self.history.redo(&mut self.doc);self.show_active_level();
+            },
+            49=>{
+                let gpu=self.gfx.as_ref().and_then(Gfx::read_colors).unwrap_or_default();
+                check(t,"redo restores exact CPU and GPU paint",self.mesh().colors==t.painted&&gpu==t.painted);
+                assert!(t.ok,"native RGB painting self-test failed");
+                log::info!("selftest-paint: all passed");return true;
+            },
+            _=>{},
+        }
+        false
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -2159,8 +2331,7 @@ impl App {
             self.brush = Brush {
                 kind,
                 radius,
-                strength,
-            };
+                strength, ..Brush::default() };
             self.modifiers = if invert {
                 ModifiersState::ALT
             } else {
@@ -2220,20 +2391,24 @@ impl App {
 
     fn effective_brush(&self) -> Brush {
         let mut b = self.brush;
+        if !b.sculpt || b.kind==BrushKind::Paint {
+            b.kind=BrushKind::Paint;b.sculpt=false;
+        }
         if self.modifiers.shift_key() {
             b.kind = BrushKind::Smooth;
+            b.sculpt=true;b.paint=false;
         }
         b
     }
 
     fn begin_stroke(&mut self) {
         self.stroke_brush = self.effective_brush();
-        let gpu = self.gfx.is_some() && self.stroke_brush.kind == BrushKind::Grab;
+        let gpu = self.gfx.is_some() && self.stroke_brush.kind.gpu_drag();
         // Alt is ZBrush's alternate (ZSub) modifier.
         let invert = self.modifiers.alt_key() ^ self.workspace.subtract;
         let symmetry = self.workspace.symmetry;
         log::trace!("stroke {:?} invert={invert} symmetry={symmetry}", self.stroke_brush.kind);
-        self.stroke = Some(Stroke::begin(invert, gpu, symmetry));
+        self.stroke = Some(Stroke::begin(invert, gpu, symmetry).with_assets(self.workspace.assets.clone()));
         self.apply_stroke();
     }
 
@@ -2287,11 +2462,18 @@ impl App {
             self.stroke_pending = false;
             self.apply_stroke();
         }
-        if let Some(stroke) = self.stroke.take() {
+        if let Some(mut stroke) = self.stroke.take() {
             let level = self.doc.active();
+            let paint=stroke.take_paint();
+            let mut steps=Vec::new();
             if let Some(snapshot) = stroke.end(self.doc.mesh_mut()) {
                 let chunks = self.doc.finish_stroke(level, snapshot);
-                self.history.push(UndoStep::Stroke { level, chunks });
+                steps.push(UndoStep::Stroke { level, chunks });
+            }
+            if !paint.is_empty() {steps.push(UndoStep::Paint(self.doc.finish_paint(level,paint)));}
+            match steps.len() {
+                0=>{},1=>self.history.push(steps.pop().unwrap()),
+                _=>self.history.push(UndoStep::Steps(steps.into_iter().rev().collect())),
             }
         }
         if let Some(gfx) = self.gfx.as_mut() {
@@ -2407,19 +2589,66 @@ impl App {
         true
     }
 
+    fn surface_screen(&self) -> surface_tools::Screen {
+        surface_tools::Screen {matrix:self.camera.view_proj(),size:self.viewport()}
+    }
+
+    fn begin_gesture(&mut self,kind:BrushKind) {
+        self.gesture=Some(surface_tools::Gesture::new(kind,self.cursor-self.canvas_origin(),self.modifiers.alt_key()));
+        self.gesture.as_mut().unwrap().ctrl=self.modifiers.control_key();
+        self.update_gesture();self.hover=None;
+    }
+
+    fn update_gesture(&mut self) {
+        let origin=self.canvas_origin();
+        if let Some(g)=self.gesture.as_mut() {
+            g.update(self.cursor-origin,self.modifiers.shift_key(),self.modifiers.alt_key());
+            let mut preview=g.clone();
+            preview.start=(preview.start+origin)/self.scale;
+            preview.end=(preview.end+origin)/self.scale;
+            for p in &mut preview.points {*p=(*p+origin)/self.scale;}
+            self.workspace.gesture_preview=Some(preview);
+        }
+    }
+
+    fn end_gesture(&mut self)->bool {
+        let Some(g)=self.gesture.take() else{return false;};
+        self.workspace.gesture_preview=None;
+        if g.ctrl && g.kind.is_mask() && g.start.distance(g.end)<CLICK_SLOP && g.points.len()<3 {
+            let surface=!self.in_canvas_border() && self.mesh().raycast(self.cursor_ray().0,self.cursor_ray().1).is_some();
+            self.mask_op(if surface {if g.alternate{MaskOp::Sharpen}else{MaskOp::Blur}}else{MaskOp::Invert});
+            return true;
+        }
+        let screen=self.surface_screen();let level=self.doc.active();
+        if g.kind==BrushKind::ClipLine {
+            if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,self.workspace.symmetry) {
+                let chunks=self.doc.finish_stroke(level,before);
+                self.history.push(UndoStep::Stroke {level,chunks});
+                self.subtools[self.active_tool].bounds=self.doc.bounds();
+            }
+        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.brush.strength,self.workspace.symmetry) {
+            let old=mask::replace(self.doc.mesh_mut(),new);
+            self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
+        }
+        self.update_hover();true
+    }
+
     /// Ctrl + left press (ZBrush masking): decided on the first move or on release.
     fn begin_mask_press(&mut self, border: bool) {
-        let hit = if border {
+        let surface = if border {
             None
         } else {
             let (o, d) = self.cursor_ray();
-            self.mesh().raycast(o, d).map(|h| h.point)
+            self.mesh().raycast(o, d)
         };
         self.mask_press = Some(MaskPress {
             at: self.cursor,
-            hit,
+            hit: surface.as_ref().map(|h|h.point),
             alt: self.modifiers.alt_key(),
             moved: false,
+            kind: self.workspace.mask_brush,
+            direct: self.brush.kind.is_mask() && !self.modifiers.control_key(),
+            normal: surface.map_or(Vec3::Z,|h|h.normal),
         });
         self.hover = None;
     }
@@ -2428,14 +2657,14 @@ impl App {
     fn mask_dab(&mut self) {
         let t = Instant::now();
         let (o, d) = self.cursor_ray();
-        let Some(hit) = self.mesh().raycast(o, d).map(|h| h.point) else {
+        let Some(hit) = self.mesh().raycast(o, d) else {
             return;
         };
         let brush = self.brush;
         if let Some(stroke) = self.mask_stroke.as_mut() {
-            stroke.dab(self.doc.mesh_mut(), &brush, hit);
+            stroke.dab_normal(self.doc.mesh_mut(), &brush, hit.point, hit.normal);
         }
-        self.hover = Some(hit);
+        self.hover = Some(hit.point);
         self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
     }
 
@@ -2461,9 +2690,10 @@ impl App {
         }
         // A drag on the model: paint from the press point on.
         self.mask_press = None;
-        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry);
+        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry)
+            .with_brush(press.kind,self.workspace.assets.clone());
         let brush = self.brush;
-        stroke.dab(self.doc.mesh_mut(), &brush, hit);
+        stroke.dab_normal(self.doc.mesh_mut(), &brush, hit, press.normal);
         self.mask_stroke = Some(stroke);
         self.mask_dab();
     }
@@ -2480,6 +2710,15 @@ impl App {
         let Some(press) = self.mask_press.take() else {
             return;
         };
+        if press.direct && !press.moved {
+            if let Some(hit)=press.hit {
+                let mut stroke=mask::MaskStroke::begin(press.alt,self.workspace.symmetry)
+                    .with_brush(press.kind,self.workspace.assets.clone());
+                stroke.dab_normal(self.doc.mesh_mut(),&self.brush,hit,press.normal);
+                if let Some(chunks)=stroke.end() {self.history.push(UndoStep::Mask {level:self.doc.active(),data:MaskData::Chunks(chunks)});}
+            }
+            return;
+        }
         if press.hit.is_none() && press.moved && self.subtools[self.active_tool].wedge {
             // ZBrush: while DynaMesh is on, Ctrl + drag on the background remeshes; the new
             // surface starts without a mask (undo brings back the old one with its mask).
@@ -2503,8 +2742,14 @@ impl App {
     fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
         self.last_cursor = self.cursor;
         self.cursor = pos;
+        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+            self.hover = None;
+            return;
+        }
         let delta = self.cursor - self.last_cursor;
-        if let Some(drag) = self.nav {
+        if self.gesture.is_some() {
+            self.update_gesture();
+        } else if let Some(drag) = self.nav {
             self.nav_move(drag, delta);
         } else if self.select.is_some() {
             self.show_select_rect();
@@ -2513,7 +2758,7 @@ impl App {
         } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
             self.mask_move();
         } else if self.stroke.is_some() {
-            if self.stroke_brush.kind == BrushKind::Grab {
+            if self.stroke_brush.kind.is_drag() {
                 self.stroke_pending = true;
             } else {
                 self.apply_stroke();
@@ -2528,11 +2773,19 @@ impl App {
     /// Left button pressed. `consumed`: egui took the event; `over_ui`: the cursor is off
     /// the canvas.
     fn left_press(&mut self, consumed: bool, over_ui: bool) {
+        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+            return;
+        }
         let border = self.in_canvas_border();
         let free = !consumed && !over_ui && self.nav.is_none() && !self.busy();
         if self.workspace.popup.is_some() || self.workspace.quick_menu.is_some() {
             // The press that closes a popup or menu does nothing else.
             return;
+        }
+        let tool=if self.brush.kind==BrushKind::ClipLine && (!self.modifiers.control_key()||self.modifiers.shift_key()) {BrushKind::ClipLine}
+            else if self.modifiers.control_key() {self.workspace.mask_brush}else{self.brush.kind};
+        if free && tool.is_shape() && (!self.modifiers.shift_key() || !self.modifiers.control_key() || tool==BrushKind::ClipLine) {
+            self.begin_gesture(tool);return;
         }
         if self.modifiers.control_key() && self.modifiers.shift_key() {
             // ZBrush: Ctrl + Shift selects (SelectRect) on the model or on the background;
@@ -2563,7 +2816,10 @@ impl App {
             // action line; on empty canvas it rotates, with Alt it moves, and releasing Alt
             // turns it into a zoom. The border outside the document frame is always canvas.
             // Ctrl masks (see `begin_mask_press`).
-            if self.modifiers.control_key() {
+            if self.modifiers.control_key() || self.brush.kind.is_mask() {
+                if !self.modifiers.control_key() && (border || self.mesh().raycast(self.cursor_ray().0,self.cursor_ray().1).is_none()) {
+                    self.begin_nav(MouseButton::Left);return;
+                }
                 self.begin_mask_press(border);
                 return;
             }
@@ -2587,6 +2843,7 @@ impl App {
 
     /// Left button released.
     fn left_release(&mut self) {
+        if self.end_gesture() {return;}
         if let Some(sel) = self.select.take() {
             self.workspace.select_rect = None;
             let alt = self.modifiers.alt_key();
@@ -2645,6 +2902,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode) {
+        if key==KeyCode::Escape && self.gesture.is_some() {
+            self.gesture=None;self.workspace.gesture_preview=None;return;
+        }
+        if self.gesture.is_some() {return;}
+        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+            return;
+        }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         match key {
@@ -2674,11 +2938,16 @@ impl App {
             KeyCode::Home => self.home_camera(),
             KeyCode::KeyP if shift => self.workspace.grid = !self.workspace.grid,
             KeyCode::KeyP => self.workspace.perspective = !self.workspace.perspective,
-            KeyCode::Digit1 => self.brush.kind = BrushKind::Draw,
-            KeyCode::Digit2 => self.brush.kind = BrushKind::Smooth,
-            KeyCode::Digit3 => self.brush.kind = BrushKind::Grab,
-            KeyCode::Digit4 => self.brush.kind = BrushKind::Flatten,
-            KeyCode::Digit5 => self.brush.kind = BrushKind::Inflate,
+            KeyCode::KeyB => self.workspace.open_brush_catalog(self.cursor_pos()),
+            KeyCode::Digit1 => self.workspace.select_brush(&mut self.brush,BrushKind::Draw),
+            KeyCode::Digit2 => self.workspace.select_brush(&mut self.brush,BrushKind::Smooth),
+            KeyCode::Digit3 => self.workspace.select_brush(&mut self.brush,BrushKind::Grab),
+            KeyCode::Digit4 => self.workspace.select_brush(&mut self.brush,BrushKind::Flatten),
+            KeyCode::Digit5 => self.workspace.select_brush(&mut self.brush,BrushKind::Inflate),
+            KeyCode::Digit6 => self.workspace.select_brush(&mut self.brush,BrushKind::DamStandard),
+            KeyCode::Digit7 => self.workspace.select_brush(&mut self.brush,BrushKind::Pinch),
+            KeyCode::Digit8 => self.workspace.select_brush(&mut self.brush,BrushKind::Clay),
+            KeyCode::Digit9 => self.workspace.select_brush(&mut self.brush,BrushKind::ClayBuildup),
             KeyCode::KeyQ => self.workspace.mode = Mode::Draw,
             KeyCode::KeyW => self.workspace.mode = Mode::Move,
             KeyCode::KeyE => self.workspace.mode = Mode::Scale,
@@ -2955,8 +3224,7 @@ impl App {
                 self.brush = Brush {
                     kind: BrushKind::Grab,
                     radius: 1.2,
-                    strength: 0.5,
-                };
+                    strength: 0.5, ..Brush::default() };
                 self.cursor = c + Vec2::new(0.3, -0.3) * vp.y * 0.33;
                 self.begin_stroke();
             } else if left == 0 {
@@ -3014,6 +3282,18 @@ impl App {
             } else {
                 self.selftest_project = Some(left - 1);
             }
+        }
+        if let Some(mut t) = self.selftest_surface.take() {
+            if self.selftest_surface_frame(&mut t) {self.quit=true;}
+            else{self.selftest_surface=Some(t);}
+        }
+        if let Some(mut t) = self.selftest_brushes.take() {
+            if self.selftest_brushes_frame(&mut t) { self.quit = true; }
+            else { self.selftest_brushes = Some(t); }
+        }
+        if let Some(mut t) = self.selftest_paint.take() {
+            if self.selftest_paint_frame(&mut t) { self.quit=true; }
+            else { self.selftest_paint=Some(t); }
         }
         if let Some(mut t) = self.selftest_mask.take() {
             if self.selftest_mask_frame(&mut t, dt * 1000.0) {
@@ -3125,14 +3405,18 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        let attributes=Window::default_attributes()
+                        .with_title("Klay")
+                        .with_window_icon(Some(branding::window_icon()))
+                        .with_min_inner_size(LogicalSize::new(960.0, 640.0))
+                        .with_inner_size(PhysicalSize::new(1600, 1000));
+        #[cfg(target_os="linux")]
+        let attributes=winit::platform::x11::WindowAttributesExtX11::with_name(attributes,"klay","Klay");
+        #[cfg(target_os="linux")]
+        let attributes=winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes,"klay","Klay");
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Klay")
-                        .with_min_inner_size(LogicalSize::new(960.0, 640.0))
-                        .with_inner_size(PhysicalSize::new(1600, 1000)),
-                )
+                .create_window(attributes)
                 .expect("create window"),
         );
         workspace::theme(&self.egui_ctx);
@@ -3180,7 +3464,8 @@ impl ApplicationHandler for App {
             Some(state) => state.on_window_event(&window, &event).consumed,
             None => false,
         };
-        let over_ui = self.egui_ctx.is_pointer_over_egui()
+        let over_ui = self.workspace.about_open || self.workspace.brush_catalog_open()
+            || self.egui_ctx.is_pointer_over_egui()
             || (self.canvas_rect.is_positive()
                 && !self
                     .canvas_rect
@@ -3197,6 +3482,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                if self.gesture.is_some() {self.update_gesture();}
                 // Alt during a Ctrl + Shift drag turns the rectangle into a hide (red) one.
                 if self.select.is_some() {
                     self.show_select_rect();
@@ -3265,7 +3551,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let typing = self.egui_ctx.egui_wants_keyboard_input();
+                let typing = self.egui_ctx.egui_wants_keyboard_input() || self.workspace.about_open || self.workspace.brush_catalog_open();
                 if let PhysicalKey::Code(KeyCode::Space) = event.physical_key {
                     // ZBrush quick menu: shown while Space is held.
                     match event.state {
@@ -3469,8 +3755,7 @@ fn bench_multires(app: &mut App, times: u32) {
     app.brush = Brush {
         kind: BrushKind::Draw,
         radius: 0.18,
-        strength: 0.8,
-    };
+        strength: 0.8, ..Brush::default() };
     let t = Instant::now();
     for (i, p) in arc(0.2, 1.4, 0.55, 60).iter().enumerate() {
         app.cursor = c + *p * r;
@@ -3653,6 +3938,9 @@ const DEFAULT_BUDGET: usize = 64_000_000;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a|a=="--version"||a=="-V") {
+        println!("Klay {}",branding::VERSION);return;
+    }
     let flag = |name: &str| -> Option<&String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
     };
@@ -3716,6 +4004,15 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-mask") {
         app.selftest_mask = Some(MaskTest::default());
     }
+    if args.iter().any(|a| a == "--selftest-paint") {
+        app.selftest_paint = Some(PaintTest::default());
+    }
+    if args.iter().any(|a| a == "--selftest-brushes") {
+        app.selftest_brushes = Some(BrushTest::default());
+    }
+    if args.iter().any(|a| a == "--selftest-surface") {
+        app.selftest_surface = Some(native_tests::SurfaceTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-transpose") {
         app.selftest_transpose = Some(TransposeTest::default());
     }
@@ -3737,6 +4034,45 @@ fn main() {
 #[cfg(test)]
 mod nav_tests {
     use super::*;
+
+    #[test]
+    fn about_modal_blocks_editing_and_canvas_shortcuts() {
+        let mut app = App::new(4, false, 1000);
+        app.workspace.about_open = true;
+        let radius = app.brush.radius;
+        let brush = app.brush.kind;
+        let perspective = app.workspace.perspective;
+        let symmetry = app.workspace.symmetry;
+        app.modifiers = ModifiersState::CONTROL;
+        app.on_key(KeyCode::KeyD);
+        app.on_key(KeyCode::KeyZ);
+        assert!(!app.pending_divide);
+        assert!(!app.pending_undo);
+        app.modifiers = ModifiersState::empty();
+        for key in [
+            KeyCode::Digit3,
+            KeyCode::BracketRight,
+            KeyCode::KeyP,
+            KeyCode::KeyX,
+        ] {
+            app.on_key(key);
+        }
+        app.left_press(false, false);
+        assert!(app.stroke.is_none());
+        assert!(app.nav.is_none());
+        assert_eq!(app.brush.radius, radius);
+        assert_eq!(app.brush.kind, brush);
+        assert_eq!(app.workspace.perspective, perspective);
+        assert_eq!(app.workspace.symmetry, symmetry);
+        let (yaw, pitch) = (app.camera.yaw, app.camera.pitch);
+        app.nav = Some(NavDrag {
+            button: MouseButton::Right,
+            alt_used: false,
+            shift_at_press: false,
+        });
+        app.cursor_moved(app.cursor + Vec2::new(40.0, 20.0), false);
+        assert_eq!((app.camera.yaw, app.camera.pitch), (yaw, pitch));
+    }
 
     #[test]
     fn alt_click_release_alt_zooms() {
@@ -4021,7 +4357,7 @@ mod subtool_tests {
 
         // A brush stroke over the border only moves vertices that touch a visible triangle.
         let before = app.doc.mesh().positions.clone();
-        app.brush = Brush { kind: BrushKind::Draw, radius: 0.8, strength: 1.0 };
+        app.brush = Brush { kind: BrushKind::Draw, radius: 0.8, strength: 1.0, ..Brush::default() };
         drag(&mut app, ModifiersState::empty(), centre, centre + Vec2::new(30.0, 0.0));
         let mesh = app.doc.mesh();
         let moved: Vec<usize> = (0..before.len()).filter(|&v| mesh.positions[v] != before[v]).collect();
@@ -4368,6 +4704,7 @@ mod mask_tests {
 
     fn app() -> App {
         let mut app = App::new(30, false, usize::MAX);
+        app.workspace.assets = sculpt::StampSettings::default();
         app.camera.aspect = 1.6;
         app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
         app
@@ -4557,5 +4894,62 @@ mod mask_tests {
         assert!(other.status.starts_with("Opened"), "{}", other.status);
         assert_eq!(other.doc.mesh().mask, mask);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod surface_input_tests {
+    use super::*;
+    fn app()->App {
+        let mut app=App::new(30,false,usize::MAX);app.camera.aspect=1.6;
+        app.canvas_rect=egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1600.0,1000.0));
+        app.workspace.assets=sculpt::StampSettings::default();app.brush.strength=1.0;app
+    }
+    fn drag(app:&mut App,kind:BrushKind,alt:bool) {
+        let c=app.project(Vec3::ZERO);app.workspace.select_brush(&mut app.brush,kind);
+        app.modifiers=if alt {ModifiersState::ALT}else{ModifiersState::empty()};
+        let a=c+Vec2::new(-80.0,-60.0);let b=c+Vec2::new(80.0,60.0);
+        app.cursor_moved(a,false);app.left_press(false,false);
+        if kind==BrushKind::MaskLasso {
+            for p in [Vec2::new(b.x,a.y),b,Vec2::new(a.x,b.y),a] {app.cursor_moved(p,false);}
+        } else {app.cursor_moved(b,false);}
+        app.left_release();app.modifiers=ModifiersState::empty();
+    }
+    #[test]
+    fn direct_mask_shapes_commit_and_undo_without_sculpting() {
+        for kind in [BrushKind::MaskRect,BrushKind::MaskLasso,BrushKind::MaskCircle,BrushKind::MaskLine] {
+            let mut a=app();let before=a.mesh().positions.clone();drag(&mut a,kind,false);
+            let after=a.mesh().mask.clone();assert!(after.iter().any(|&v|v>0),"{kind:?}");
+            assert_eq!(a.mesh().positions,before);assert!(!a.busy());
+            a.history.undo(&mut a.doc);assert!(a.mesh().mask.iter().all(|&v|v==0));
+            a.history.redo(&mut a.doc);assert_eq!(a.mesh().mask,after);
+            drag(&mut a,kind,true);assert!(a.mesh().mask.iter().all(|&v|v==0),"{kind:?} erase");
+        }
+    }
+    #[test]
+    fn direct_mask_click_and_remembered_ctrl_brush_work() {
+        let mut a=app();let c=a.project(Vec3::ZERO);let original=a.mesh().positions.clone();
+        a.workspace.select_brush(&mut a.brush,BrushKind::MaskPen);
+        a.cursor_moved(c,false);a.left_press(false,false);a.left_release();
+        assert!(a.mesh().mask.iter().any(|&v|v>0));assert_eq!(a.mesh().positions,original);
+        a.mask_op(MaskOp::Clear);
+        a.workspace.select_brush(&mut a.brush,BrushKind::MaskCircle);
+        a.workspace.select_brush(&mut a.brush,BrushKind::Draw);a.modifiers=ModifiersState::CONTROL;
+        a.cursor_moved(c-Vec2::splat(70.0),false);a.left_press(false,false);a.cursor_moved(c+Vec2::splat(70.0),false);a.left_release();
+        assert_eq!(a.brush.kind,BrushKind::Draw);assert!(a.mesh().mask.iter().any(|&v|v>0));
+        assert_eq!(a.mesh().positions,original);
+        a.mask_op(MaskOp::Clear);a.cursor_moved(Vec2::splat(90.0),false);a.left_press(false,false);a.left_release();
+        assert!(a.mesh().mask.iter().all(|&v|v==255),"Ctrl background click still inverts with a shape brush");
+    }
+    #[test]
+    fn clip_can_start_off_mesh_cancel_and_undo() {
+        let mut a=app();let c=a.project(Vec3::ZERO);let original=a.mesh().positions.clone();
+        a.workspace.select_brush(&mut a.brush,BrushKind::ClipLine);
+        let start=c+Vec2::new(80.0,-400.0);let end=c+Vec2::new(80.0,400.0);
+        a.cursor_moved(start,false);a.left_press(false,false);a.cursor_moved(end,false);
+        assert!(a.gesture.is_some()&&a.nav.is_none());assert!(a.workspace.gesture_preview.is_some());
+        a.on_key(KeyCode::Escape);a.left_release();assert_eq!(a.mesh().positions,original);assert!(!a.history.can_undo());
+        a.cursor_moved(start,false);a.left_press(false,false);a.cursor_moved(end,false);a.left_release();
+        assert_ne!(a.mesh().positions,original);a.history.undo(&mut a.doc);assert_eq!(a.mesh().positions,original);
     }
 }

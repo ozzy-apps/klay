@@ -1,4 +1,4 @@
-# Klay
+# Klay 0.4.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -25,6 +25,10 @@ cargo run --release -- --segments 400 --divide 2 --novsync --selftest-transpose 
 cargo run --release -- --segments 400 --divide 2 --novsync --selftest-mask          # Ctrl masking, a masked move and undo through the input path, log, exit
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
+cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
+cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
+cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
+cargo run --release -- --version                                     # application version
 cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
 ```
 
@@ -35,7 +39,7 @@ windowed runs below were taken with `--segments 400`.
 
 `--budget N` caps the vertex count a Divide may reach (default 64 000 000, three divides of the
 960k sphere); the Geometry section of the Mesh palette has the same slider. Each level costs
-about 140 bytes per vertex of RAM and 52 bytes per vertex of GPU memory while it is shown.
+about 140 bytes per vertex of RAM before optional paint and 57 bytes per vertex of GPU memory while it is shown. Paint adds four bytes per vertex in RAM for each painted level; historical benchmark numbers below predate this buffer.
 
 ### Primitives
 
@@ -69,6 +73,14 @@ there as a dropdown; any palette can also be docked into the left, right, top or
 Fixed shelves hold the live sculpt controls. The look is dark and flat with one clay accent;
 `ui-mockup.html` is the interactive HTML reference it was ported from.
 
+The native UI has a restrained readability pass: brighter labels, 13 px body text,
+12 px numeric fields, slightly taller rows and a neutral value area in the existing
+bar sliders. Long label/value rows wrap inside narrow trays.
+`ui-readability.png` shows the updated native interface.
+
+- **Klay logo and name**: one button opens About Klay, showing the Coral Fold logo, package
+  version, build language and GitHub repository link. Close it with **Close**, **Escape** or a
+  click outside the dialog; canvas input and sculpting shortcuts are suspended while it is open.
 - **Menu bar**: click a palette name to drop it down. A dot marks palettes that are also docked.
 - **Dock button** (the ◉ at the left of every palette header): click for a menu (left, right, top
   or bottom tray, or menu only), or drag it onto a highlighted canvas edge or between palettes in
@@ -76,7 +88,7 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
 - **Trays**: the thin dividers beside the canvas toggle the left and right trays. Top and bottom
   trays appear when something is docked there. Drag empty tray space with a pen or mouse to
   scroll.
-- **Top shelf**: Sculpt mode, Zadd/Zsub, Z Intensity (strength), Draw Size (radius), Undo/Redo.
+- **Top shelf**: Sculpt mode, Z+RGB / RGB / Z, RGB Intensity, Zadd/Zsub, Z Intensity (strength), Focal Shift, Draw Size (radius), Undo/Redo.
 - **Left shelf**: the current brush and material as rendered sphere thumbnails (click for a
   picker), stroke/alpha/texture slots, and an HSV colour picker with swap.
 - **Right shelf**: Frame, Floor grid, Symmetry, PolyF (polygroup colours), Solo, Detail
@@ -86,19 +98,92 @@ Fixed shelves hold the live sculpt controls. The look is dark and flat with one 
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The five brushes, radius/strength, Add/Subtract, materials, floor grid, detail shading, view
-presets, primitives (Mesh → Initialize), Wedge remeshing and Del Higher / Del Lower (Mesh →
-Wedge, Geometry), polygroups and visibility (Mesh → Visibility and Polygroups, Ctrl + Shift
-gestures, Ctrl + W, PolyF), masking (Ctrl, Masking palette), subdivision levels (Mesh →
-Geometry: Divide, SDiv slider, vertex counts, vertex budget), undo/redo, OBJ export, the Move /
-Scale / Rotate modes (Transpose action line) and live statistics are connected to the engine.
-Paint modes, Zcut, Focal Shift, stroke options, alpha, texture, mask types (rect / lasso), the
-Transform palette, symmetry and
-the Persp/Local/Transp/Ghost/Solo toggles are drawn dimmed and marked **Not connected**.
+The 33 brushes and tools, alphas and textures, RGB painting, focal shift, radius/strength,
+Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
+Wedge remeshing, polygroups, visibility, masking, subdivision, undo/redo, OBJ export,
+Transpose and live statistics are connected to the engine. Zcut, advanced stroke options,
+parts of the Transform palette and reserved Local/Transp/Ghost toggles
+remain marked **Not connected**.
 
-Brush thumbnails are rendered on the CPU at startup: a sphere in the current material with the
-stroke each brush produces (Draw and Inflate flip in Zsub). They re-render when the material
-changes.
+### Brushes, alphas and textures
+
+Press **B**, click the current brush thumbnail or choose **All Brushes** for the catalog:
+Quick Pick, search, All/Sculpt/Mask/Detail/Clip filters, alphabet filter, brush grid and a
+large hover preview. The docked Brush palette
+uses a compact working set: one larger current-brush preview, two recent picks and twelve
+small paired brush cells. **Sculpt / Mask** tabs switch the working set and restore the last
+brush from that set. Layer, FormSoft, Zipper and Clip Line are directly available in Sculpt.
+**All Brushes (33)** opens the full library; selecting any brush
+puts it in the active preview and recent picks. This keeps the panel compact as the library
+grows. Previews are original 160 px sculpted clay studies in Klay's
+material colors, including the brush's subtract variant where applicable.
+
+- Draw, Smooth, Grab, Flatten and Inflate retain shortcuts **1–5**.
+- **6–9** select Dam Standard, Pinch, Clay and Clay Buildup. The catalog also provides
+  Crease, Trim Dynamic, Polish and Paint. The library also includes:
+- New standard tools: **Blob** builds soft domes; **Layer** caps thickness within each stroke
+  (release to build another layer); **Fill** raises low areas to a plane; **Scrape** shaves peaks.
+- New advanced tools: **Nudge** pushes in the stroke direction; **Sharpen** enhances local
+  detail; **Elastic** pulls a broad area with directional deformation; **Snake Hook** pulls a
+  tapered tip. Snake Hook uses GPU deformation; Elastic runs on the CPU. These tools move
+  existing vertices—Divide before long pulls for finer topology.
+- Dam Standard cuts a narrow groove; Pinch contracts the surface; Crease combines both.
+  Clay and Clay Buildup deposit clay, Trim Dynamic planes raised areas and Polish smooths
+  the local plane. **Alt** reverses direction where applicable. **Shift** temporarily smooths.
+- **FormSoft / FormHard** build gentle rounded forms or firm planar forms. **Zipper** draws
+  two staggered tooth rows and a recessed seam; **Stitch** draws thread-like marks; **Rake**
+  draws parallel grooves. These are relief on the existing mesh, with stroke-distance spacing.
+  **Divide** for finer detail; they do not insert a separate zipper or thread mesh.
+- **Layer** builds a capped thickness per stroke. It is now in the compact Sculpt working
+  set; release and start another stroke to add another layer.
+- **Clip Line**: choose it, drag a guide across the model and release to push one side onto
+  the line. It can start outside the model. **Alt** flips the clipped side, **Shift** snaps
+  the angle and **Escape** cancels. The arrow shows the side that will move. It preserves
+  topology, vertex paint, masks and hidden regions. This is straight-line clipping; it does
+  not cut polygons or add curve control points. Ctrl+Shift also draws the line when this
+  tool is selected; other tools retain Ctrl+Shift visibility selection.
+- Click the left **Alpha** or **Texture** thumbnail, or open its menu-bar palette, to select
+  a built-in pattern or **Import Alpha… / Import Texture…**. PNG, JPEG and BMP are supported.
+  Alpha luminance and transparency shape the stamp. Texture **Relief** modulates sculpting;
+  **Tiling** controls repetition within the brush footprint.
+- **Z** sculpts, **RGB** paints color only and **Z+RGB** does both. Selecting Paint activates
+  RGB mode. Choose color with the left HSV picker; RGB Intensity controls paint opacity.
+  Textures supply their sampled color when painting, tinted by the chosen color. Masks,
+  hidden vertices and X symmetry are respected by both paint and sculpting.
+- **Focal Shift** changes the falloff from a soft center to a broad plateau. Its neutral
+  value retains the original falloff. The Space palette places **Draw Size → Z Intensity →
+  Focal Shift → RGB Intensity → brushes**, with a color picker on the left.
+
+### Masking brushes
+
+Select **Mask** in the side Brush panel, open the catalog's Mask category, or use
+**Masking → Mask type**. The six tools are **Mask Pen, Mask Soft, Mask Rect, Mask Lasso,
+Mask Circle and Mask Line**. Mask Soft uses a gentler, broader profile. The pen tools
+sample the chosen alpha and focal shift.
+
+A selected mask works with **left drag**; **Alt** erases. When a sculpt brush is active,
+**Ctrl** temporarily uses the last chosen mask brush. Z Intensity controls mask strength.
+Rectangle, ellipse and lasso masks select through the view depth; Mask Line masks one side
+of the guide (reverse the drag to change sides). Live outlines show the region before release.
+Masks preserve geometry, paint, hidden regions, X symmetry and the existing multires undo path.
+
+**Ctrl click** still blurs/sharpens on the model or inverts on the background. With Mask Pen
+or Mask Soft selected for Ctrl, dragging the background clears the mask; shape brushes draw
+their region there instead. **Ctrl+Shift+A** and **Masking → Clear** always clear it.
+**Escape** cancels a mask-shape guide. The compact Mask tab and catalog filter make these
+brushes visible without expanding the side panel.
+
+Imported image paths and selections save to `$XDG_CONFIG_HOME/klay/brush-assets.v1`
+(`~/.config/klay/brush-assets.v1` by default). Keep imported files at those paths to reuse
+them. Import uses a native Zenity picker when available and a path-entry fallback otherwise.
+Large images are reduced to a maximum 1024 px side for sampling; inputs over 8192 px per
+side or 64 MB are refused.
+
+Color is vertex paint: use **Divide** for finer texture detail. Paint follows subdivision,
+parked subtools, Wedge remeshing, undo/redo and `.klay` saves. This release does not create UV
+maps or texture-image exports; **OBJ export contains geometry, normals and groups**. The baked
+sculpt and paint remain in the project even when the source stamp image is unavailable.
+`ui-brush-panel.png`, `ui-brush-catalog.png` and `ui-quick-menu.png` show the native 0.4.0 controls.
 
 The default start is light (4k vertices); `cargo run --release -- --segments 400` gives the
 960k-vertex sphere.
@@ -114,6 +199,29 @@ collapsing, scrolling and persistence. The workspace reads `Model` and returns `
 follow the available canvas rectangle.
 
 Run the layout and pointer-interaction checks with `cargo test --release --offline`.
+
+`src/branding.rs` embeds the approved `assets/icon/klay-512.png` for the native window icon,
+menu-bar control and About dialog. Version and repository metadata come from `Cargo.toml`.
+`ui-about.png` shows the native About dialog.
+
+## Versioning and Linux packaging
+
+Application versions follow semantic versioning from **0.2.0**: minor releases add features,
+patch releases fix/polish and major releases introduce incompatible application changes.
+`Cargo.toml` and `Cargo.lock` define the version shown by About and `--version`; releases are
+recorded in `CHANGELOG.md` and `handoff.md`. Project format **4** is versioned independently.
+
+```bash
+cargo build --release --offline --locked
+python3 scripts/install-desktop.py  # install the current build's launcher and Coral Fold icon
+bash scripts/package-linux.sh      # create dist/Klay-0.4.0-<architecture>.AppDir
+```
+
+The executable embeds the window icon. The installer adds an application-menu launcher,
+hicolor icons and GIO custom-icon metadata on desktops that support it, so the local Linux
+executable also displays Klay's icon in the file manager. Rerun the installer after replacing
+the binary. The versioned AppDir bundles the executable, launcher, icon and docs; run its
+`AppRun`. It requires compatible Linux graphics/system libraries and is not an AppImage.
 
 ## Controls
 
@@ -143,10 +251,13 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
 | Alt + right / middle drag | Move |
 | Ctrl + right / middle drag | Zoom |
 | Scroll | Zoom towards the cursor (Ctrl + scroll: brush radius) |
-| Space (hold) or right-click tap | Quick menu at the cursor: brushes, Zadd/Zsub, Z Intensity, Draw Size, modes |
-| `S` / `U` | Draw-size / Z-intensity slider popup at the cursor (`I`, `O` are stubs) |
+| Space (hold) or right-click tap | Quick menu: left color picker; Draw Size, Z Intensity, Focal Shift, RGB Intensity, brushes, then mode buttons |
+| `S` / `U` / `I` / `O` | Draw Size / Z Intensity / RGB Intensity / Focal Shift popup at the cursor |
 | `[` `]` | Brush radius |
-| `1`–`5` | Draw, Smooth, Grab, Flatten, Inflate |
+| `1`–`9` | Draw, Smooth, Grab, Flatten, Inflate, Dam Standard, Pinch, Clay, Clay Buildup |
+| `B` | Searchable brush catalog; Mask, Detail and Clip categories |
+| Selected Mask brush, left drag / Alt + left drag | Apply / erase the mask; Ctrl temporarily restores the last mask brush while sculpting |
+| Selected Clip Line, left drag | Push one side onto the guide on release; Alt flips, Shift snaps, Escape cancels |
 | `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode |
 | `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press (Shift snaps it to 45°) |
 | `W`, drag the line's middle circle | Move the active subtool in the view plane |
@@ -179,6 +290,15 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   chunk the first time a stroke touches it. Grab runs on the GPU (`grab.wgsl`): the
   selection, original positions and weights go up once, each frame sends one delta, and
   the CPU applies the final result when the stroke ends.
+- `brush_asset.rs`, `asset_library.rs`, `brush_preview.rs`, `brush_ui.rs`: bounded image decoding,
+  shared alpha/texture sampling, local library persistence, original clay previews, catalog and
+  Space controls. `brush_ui` is a child module of `workspace.rs`.
+- `surface_tools.rs`: screen-space masks and homogeneous screen-line clipping, retaining
+  vertex identity, paint, visibility and masks. `detail_brush.rs` provides continuous repeating
+  relief; `native_tests.rs` verifies masks/clipping through actual input and GPU readback.
+- `paint.rs`: premultiplied sRGB vertex paint, chunk snapshots and blending. Multires edits
+  carry down to lower levels and apply color deltas upward while retaining existing fine detail;
+  all affected chunks are captured for exact undo. Wedge interpolates paint from the old surface.
 - `primitive.rs`: the starting meshes (Sphere3D, Cube3D, Cylinder3D, Ring3D, Plane3D). Sphere,
   Cube and Cylinder are the surface of a lattice box mapped onto the shape, so `--segments`
   still gives the old cube sphere bit for bit. The box is built face by face, so the Cube's
@@ -283,15 +403,15 @@ Run the layout and pointer-interaction checks with `cargo test --release --offli
   subtools use (base mesh in chunk order, replay labels, sculpted offsets), written as a few
   large binary blocks behind a magic number and version, through a temporary file that is
   moved into place. Version 2 added the shown level's mask, version 3 the polygroups and
-  hidden triangles of every level (ZBrush keeps both in its tools); version 1 and 2 files
-  still open. Reading checks every length against the bytes left before allocating;
+  hidden triangles of every level, and version 4 adds per-level vertex paint; versions 1–3
+  still open as unpainted clay. Reading checks every length against the bytes left before allocating;
   rebuilding checks index bounds, the chunk table, manifold edges and every level's labels
   and offsets, and turns anything else that fails into an error. Open rebuilds each
   subtool once to bake its stand-in and swaps the model only when all of them succeeded.
   Undo history is not saved. Export OBJ writes every visible subtool at its shown level as
   its own object, rebuilding parked ones one at a time.
 - `render.rs`: positions, packed normals, indices and fixed-point normal accumulators live
-  on the GPU (52 bytes per vertex), one set per subdivision level that has been shown, so
+  on the GPU, with a separate four-byte vertex-paint buffer (about 57 bytes per vertex total), one set per subdivision level that has been shown, so
   stepping between levels is a pointer swap. Levels that are not shown keep their copies up
   to 1 GB in total; beyond that the largest are dropped and re-uploaded on the next visit,
   and a level that still does not fit is refused with a notice while the previous level

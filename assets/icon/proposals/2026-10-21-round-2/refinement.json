@@ -1,0 +1,7 @@
+{
+  "proposal": 5,
+  "method": "Built-in image_gen edit",
+  "input": "05-loop.png",
+  "output": "05-loop-v2.png",
+  "prompt": "Refine this existing Klay sculpting application icon proposal. Preserve the terracotta clay, the broad carved scoop and thick clay shaving, the muted sage background, and the soft material lighting. Change only composition and tool proportions: use a much shorter, compact sculpting-tool handle and pull the entire tool inward so the whole wooden handle, ferrule, oval steel loop, shaving, and clay mass are comfortably visible inside the square. Leave approximately 12 percent clean background all around the combined silhouette; absolutely no part of the handle may touch or leave the frame. Keep the icon recognizable and uncluttered at 48 px. The handle should be one small purposeful accent, not the subject. Maintain the same 3D material quality. No text, borders or added objects."
+}

@@ -8,7 +8,8 @@
 //! shown level changes.
 
 use crate::mesh::SculptMesh;
-use crate::sculpt::{Brush, falloff};
+use crate::sculpt::{Brush, BrushKind, StampSettings, focal_falloff};
+use crate::brush_asset::{Pattern, tangent};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -157,6 +158,8 @@ pub struct MaskStroke {
     snapshotted: HashSet<u32>,
     last_dab: Option<Vec3>,
     pub dabs: u32,
+    kind: BrushKind,
+    assets: StampSettings,
 }
 
 impl MaskStroke {
@@ -168,12 +171,23 @@ impl MaskStroke {
             snapshotted: HashSet::new(),
             last_dab: None,
             dabs: 0,
+            kind: BrushKind::MaskPen,
+            assets: StampSettings::default(),
         }
     }
 
     /// One dab at a surface hit, with the brush's radius and strength (ZBrush: MaskPen with
     /// Draw Size and Z Intensity).
+    #[cfg(test)]
     pub fn dab(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3) {
+        self.dab_normal(mesh,brush,hit,Vec3::Z);
+    }
+
+    pub fn with_brush(mut self,kind:BrushKind,assets:StampSettings)->Self {
+        self.kind=kind;self.assets=assets;self
+    }
+
+    pub fn dab_normal(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, normal: Vec3) {
         if let Some(last) = self.last_dab {
             if (hit - last).length() < brush.radius * 0.15 {
                 return;
@@ -198,10 +212,18 @@ impl MaskStroke {
             }
             mesh.mask = vec![0; mesh.vertex_count()];
         }
-        let step = brush.strength * 255.0 * if self.erase { -1.0 } else { 1.0 };
+        let step = brush.strength * 255.0 * if self.erase { -1.0 } else { 1.0 }
+            * if self.kind==BrushKind::MaskSoft {0.4}else{1.0};
         let r = brush.radius;
+        let (u,tangent_v)=tangent(normal);
         let values = sel.par_map(|i, v| {
-            let m = mesh.mask[v as usize] as f32 + step * falloff(sel.dist[i], r);
+            let p=mesh.positions[v as usize];let p=if sel.side(i)<0.0 {Vec3::new(-p.x,p.y,p.z)}else{p};
+            let delta=p-hit;
+            let uv=glam::Vec2::new(delta.dot(u),-delta.dot(tangent_v))/(2.0*r)+glam::Vec2::splat(0.5);
+            let alpha=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
+            let f=focal_falloff(sel.dist[i],r,brush.focal_shift);
+            let f=if self.kind==BrushKind::MaskSoft {f.sqrt()}else{f};
+            let m = mesh.mask[v as usize] as f32 + step * f * alpha;
             m.round().clamp(0.0, 255.0) as u8
         });
         for (&v, m) in sel.verts.iter().zip(values) {
@@ -238,7 +260,7 @@ mod tests {
     #[test]
     fn paint_erase_and_undo_a_mask_stroke() {
         let mut mesh = sphere();
-        let brush = Brush { kind: BrushKind::Draw, radius: 0.3, strength: 1.0 };
+        let brush = Brush { kind: BrushKind::Draw, radius: 0.3, strength: 1.0, ..Brush::default() };
         let hit = Vec3::Z;
         let mut s = MaskStroke::begin(false, false);
         s.dab(&mut mesh, &brush, hit);
@@ -264,7 +286,7 @@ mod tests {
     #[test]
     fn symmetry_masks_the_mirror_image() {
         let mut mesh = sphere();
-        let brush = Brush { kind: BrushKind::Draw, radius: 0.3, strength: 1.0 };
+        let brush = Brush { kind: BrushKind::Draw, radius: 0.3, strength: 1.0, ..Brush::default() };
         let hit = Vec3::new(0.6, 0.2, 0.77).normalize();
         let mut s = MaskStroke::begin(false, true);
         s.dab(&mut mesh, &brush, hit);
@@ -292,5 +314,27 @@ mod tests {
         let spread = |m: &[u8]| m.iter().filter(|&&x| x > 20 && x < 235).count();
         assert!(spread(&hard) < spread(&soft), "sharpen narrows the soft band");
         assert_eq!(inverted(&mesh).iter().zip(&soft).filter(|(a, b)| **a as u32 + **b as u32 != 255).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod brush_tool_tests {
+    use super::*;
+    #[test]
+    fn soft_mask_has_gentler_strength_and_alpha_can_block_masking() {
+        let make=||{let (p,i)=crate::mesh::cube_sphere(28,1.0);SculptMesh::from_raw(p,i)};
+        let brush=Brush{radius:0.4,strength:1.0,..Brush::default()};
+        let mut pen=make();let positions=pen.positions.clone();let mut soft=make();
+        for (mesh,kind) in [(&mut pen,BrushKind::MaskPen),(&mut soft,BrushKind::MaskSoft)] {
+            let mut stroke=MaskStroke::begin(false,false).with_brush(kind,StampSettings::default());
+            stroke.dab_normal(mesh,&brush,Vec3::Z,Vec3::Z);
+        }
+        assert!(pen.mask.iter().max()>soft.mask.iter().max());
+        assert!(soft.mask.iter().any(|&m|m>0));assert_eq!(soft.positions,positions);
+        let image=crate::brush_asset::BrushImage{id:1234,name:"black".into(),source:"black.png".into(),width:2,height:2,rgba:vec![[0,0,0,255];4]};
+        let mut blocked=make();let mut stroke=MaskStroke::begin(false,false).with_brush(BrushKind::MaskPen,
+            StampSettings{alpha:Pattern::Image(std::sync::Arc::new(image)),..StampSettings::default()});
+        stroke.dab_normal(&mut blocked,&brush,Vec3::Z,Vec3::Z);
+        assert!(blocked.mask.iter().all(|&m|m==0));assert_eq!(blocked.positions,positions);
     }
 }

@@ -79,7 +79,7 @@ impl Level {
             + (m.adj_verts.len() + m.vt_tris.len() + m.adj_offsets.len() + m.vt_offsets.len()) * 4;
         let link = self.link.as_ref().map_or(0, |l| l.stencil.len() * 17);
         let offsets: usize = self.offsets.iter().map(|o| o.len() * 12).sum();
-        mesh + link + offsets
+        mesh + link + offsets + m.colors.len() * 4
     }
 }
 
@@ -157,6 +157,49 @@ fn carry_down<T: Copy + Send + Sync>(link: &Link, child: &[T], parent_count: usi
 
 fn mid_u8(a: u8, b: u8) -> u8 {
     ((a as u16 + b as u16 + 1) / 2) as u8
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+    use crate::sculpt::{Brush,BrushKind,Stroke,History,UndoStep};
+    #[test]
+    fn paint_survives_levels_parking_files_and_exact_undo() {
+        let (p,i)=crate::mesh::cube_sphere(8,1.0);let mut doc=Multires::new(SculptMesh::from_raw(p,i),100_000);
+        doc.divide();doc.divide();let level=doc.active();let positions=doc.mesh().positions.clone();
+        let before:Vec<_>=doc.levels.iter().map(|l|l.mesh.colors.clone()).collect();
+        let brush=Brush{kind:BrushKind::Paint,paint:true,sculpt:false,radius:0.6,color:[255,50,20],..Brush::default()};
+        let mut stroke=Stroke::begin(false,false,false);
+        stroke.dab(doc.mesh_mut(),&brush,Vec3::Z,Vec3::Z,-Vec3::Z,(Vec3::Z*5.0,-Vec3::Z));
+        let paint=stroke.take_paint();assert!(stroke.end(doc.mesh_mut()).is_none());
+        let undo=doc.finish_paint(level,paint);assert_eq!(doc.mesh().positions,positions);
+        assert!(doc.levels.iter().all(|l|l.mesh.colors.iter().any(|c|c[3]>0)));
+        let after:Vec<_>=doc.levels.iter().map(|l|l.mesh.colors.clone()).collect();
+        let mut history=History::new(10);history.push(UndoStep::Paint(undo));history.undo(&mut doc);
+        for (l,before) in doc.levels.iter().zip(&before) {assert!(l.mesh.colors.iter().all(|c|*c==[0;4]));assert!(before.is_empty());}
+        history.redo(&mut doc);assert_eq!(doc.levels.iter().map(|l|l.mesh.colors.clone()).collect::<Vec<_>>(),after);
+        doc.set_active(0);doc.set_active(level);assert_eq!(doc.mesh().colors,after[level]);
+        let packed=doc.pack_copy();let back=packed.clone().unpack();assert_eq!(back.mesh().colors,after[level]);
+        let bytes=crate::project::write_to(Vec::new(),&[("Paint",true,&packed)],0).unwrap();
+        let project=crate::project::read_from(&bytes[..],bytes.len() as u64).unwrap();let back=project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.levels.iter().map(|l|l.mesh.colors.clone()).collect::<Vec<_>>(),after);
+        for version in 1..=3 {
+            let bytes=crate::project::write_version(Vec::new(),&[("Legacy",true,&packed)],0,version).unwrap();
+            let old=crate::project::read_from(&bytes[..],bytes.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+            assert!(old.levels.iter().all(|l|l.mesh.colors.is_empty()));
+        }
+    }
+    #[test]
+    fn editing_lower_paint_keeps_upper_detail_and_undo_restores_every_level() {
+        let (p,i)=crate::mesh::cube_sphere(6,1.0);let mut doc=Multires::new(SculptMesh::from_raw(p,i),100_000);doc.divide();doc.divide();
+        let top=doc.top();crate::paint::ensure(doc.mesh_mut());
+        for (i,c) in doc.mesh_mut().colors.iter_mut().enumerate(){*c=[(i%80) as u8,0,0,200];}
+        let before=doc.mesh().colors.clone();doc.set_active(0);
+        let ids=vec![0];let old=crate::paint::snapshot(doc.mesh(),&ids);crate::paint::ensure(doc.mesh_mut());
+        let (a,b)=doc.mesh().chunks[0].range();for c in &mut doc.mesh_mut().colors[a..b]{*c=[0,80,0,100];}
+        let undo=doc.finish_paint(0,old);assert_ne!(doc.levels[top].mesh.colors,before);
+        let _=doc.restore_paint(undo);assert_eq!(doc.levels[top].mesh.colors,before);
+    }
 }
 
 /// Parent chunks a child vertex's stencil reads.
@@ -722,6 +765,8 @@ pub struct Packed {
     counts: Vec<usize>,
     /// Mask of the shown level (empty when nothing is masked).
     mask: Vec<u8>,
+    /// Polypaint of every level. Empty entries mean unpainted clay.
+    colors: Vec<Vec<[u8;4]>>,
     /// Polygroups and hidden triangles of every level, base first, run-length coded.
     marks: Vec<Marks>,
 }
@@ -766,6 +811,24 @@ struct PackedLevel {
 }
 
 impl Packed {
+    pub fn write_colors<W:std::io::Write>(&self,out:&mut crate::project::Out<W>)->std::io::Result<()> {
+        out.u32(self.counts.len() as u32)?;
+        for l in 0..self.counts.len() {out.slice(self.colors.get(l).map_or(&[][..],|c|c.as_slice()))?;}
+        Ok(())
+    }
+
+    pub fn read_colors<R:std::io::Read>(&mut self,input:&mut crate::project::In<R>)->Result<(),String> {
+        let n=input.u32()? as usize;
+        if n!=self.counts.len(){return Err("paint has a different number of levels".into());}
+        let mut colors=Vec::with_capacity(n);
+        for l in 0..n {
+            let c:Vec<[u8;4]>=input.vec()?;
+            if !c.is_empty() && c.len()!=self.counts[l] {return Err("paint does not match the level's vertices".into());}
+            if c.par_iter().any(|c|c[..3].iter().any(|&v|v>c[3])) {return Err("invalid premultiplied paint color".into());}
+            colors.push(c);
+        }
+        self.colors=colors;Ok(())
+    }
     /// Memory held, in bytes.
     pub fn bytes(&self) -> usize {
         let levels: usize = self
@@ -782,6 +845,7 @@ impl Packed {
             + self.ranges.len() * 20
             + levels
             + self.mask.len()
+            + self.colors.iter().map(|c|c.len()*4).sum::<usize>()
             + self.marks.iter().map(Marks::bytes).sum::<usize>()
     }
 
@@ -927,6 +991,7 @@ impl Packed {
             counts,
             marks,
             mask,
+            colors: Vec::new(),
         })
     }
 
@@ -960,6 +1025,7 @@ impl Packed {
             budget,
             marks,
             mask,
+            colors,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
@@ -1011,6 +1077,11 @@ impl Packed {
             return Err("the stored mask does not match the shown level".into());
         }
         crate::mask::replace(&mut levels[active].mesh, mask);
+        for (level,colors) in levels.iter_mut().zip(colors) {
+            if !colors.is_empty() && colors.len()!=level.mesh.vertex_count(){return Err("paint count does not match the rebuilt level".into());}
+            level.mesh.colors=colors;
+            for c in &mut level.mesh.chunks {c.dirty_color=true;}
+        }
         Ok(Multires {
             levels,
             active,
@@ -1099,6 +1170,7 @@ fn check_labels(parent: &SculptMesh, labels: &[u8]) -> Result<(), String> {
 pub struct StandIn {
     pub positions: Vec<Vec3>,
     pub normals: Vec<PackedNormal>,
+    pub colors: Vec<[u8;4]>,
     pub indices: Vec<u32>,
     /// The level whose topology it uses.
     pub level: usize,
@@ -1209,7 +1281,11 @@ impl Multires {
         }
         let top = self.top();
         self.sync_to(top);
-        let (mesh, link) = subdivide(&self.levels[top].mesh);
+        let (mut mesh, link) = subdivide(&self.levels[top].mesh);
+        if !self.levels[top].mesh.colors.is_empty() {
+            mesh.colors=carry_up(&link,&self.levels[top].mesh.colors,|a,b|std::array::from_fn(|i|mid_u8(a[i],b[i])));
+            for c in &mut mesh.chunks {c.dirty_color=true;}
+        }
         let n = mesh.chunks.len();
         self.levels.push(Level {
             mesh,
@@ -1257,6 +1333,60 @@ impl Multires {
         }
         crate::mask::replace(&mut self.levels[to].mesh, mask);
         log::debug!("mask carried from level {from} to {to} in {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// Carry a paint stroke through the stack while retaining detail on upper levels.
+    /// Every changed level is snapshotted so undo is exact even when colors clamp.
+    pub fn finish_paint(&mut self,level:usize,before:crate::paint::Chunks)->crate::paint::Snapshot {
+        let mut delta=vec![[0i16;4];self.levels[level].mesh.vertex_count()];
+        let mesh=&self.levels[level].mesh;
+        for (c,old) in &before {
+            let (a,_)=mesh.chunks[*c as usize].range();
+            for (i,old) in old.iter().enumerate() {
+                let now=crate::paint::at(mesh,a+i);
+                delta[a+i]=std::array::from_fn(|k|now[k] as i16-old[k] as i16);
+            }
+        }
+        let mut snapshot=crate::paint::Snapshot {active:level,levels:vec![(level,before)]};
+        for l in (0..level).rev() {
+            let n=self.levels[l].mesh.vertex_count();
+            let colors=carry_down(self.levels[l+1].link.as_ref().unwrap(),&self.levels[l+1].mesh.colors,n);
+            let mesh=&mut self.levels[l].mesh;
+            let ids:Vec<_>=mesh.chunks.iter().enumerate().filter_map(|(i,c)| {
+                let (a,b)=c.range();
+                (a..b).any(|v|crate::paint::at(mesh,v)!=colors[v]).then_some(i as u32)
+            }).collect();
+            if !ids.is_empty() {
+                let old=crate::paint::snapshot(mesh,&ids);
+                mesh.colors=colors;
+                for c in ids {mesh.chunks[c as usize].dirty_color=true;}
+                snapshot.levels.push((l,old));
+            }
+        }
+        for l in level+1..self.levels.len() {
+            delta=carry_up(self.levels[l].link.as_ref().unwrap(),&delta,|a,b|std::array::from_fn(|k|((a[k] as f32+b[k] as f32)*0.5).round() as i16));
+            let mesh=&mut self.levels[l].mesh;
+            let ids:Vec<_>=mesh.chunks.iter().enumerate().filter_map(|(i,c)| {
+                let (a,b)=c.range();delta[a..b].iter().any(|d|*d!=[0;4]).then_some(i as u32)
+            }).collect();
+            if !ids.is_empty() {
+                let old=crate::paint::snapshot(mesh,&ids);crate::paint::ensure(mesh);
+                mesh.colors.par_iter_mut().zip(delta.par_iter()).for_each(|(c,d)| {
+                    let a=(c[3] as i16+d[3]).clamp(0,255) as u8;
+                    for k in 0..3 {c[k]=(c[k] as i16+d[k]).clamp(0,a as i16) as u8;}
+                    c[3]=a;
+                });
+                for c in ids {mesh.chunks[c as usize].dirty_color=true;}
+                snapshot.levels.push((l,old));
+            }
+        }
+        snapshot
+    }
+
+    pub fn restore_paint(&mut self,data:crate::paint::Snapshot)->crate::paint::Snapshot {
+        self.set_active(data.active);
+        let levels=data.levels.into_iter().map(|(l,c)|(l,crate::paint::restore(&mut self.levels[l].mesh,c))).collect();
+        crate::paint::Snapshot {active:data.active,levels}
     }
 
     /// Put back mask data saved for `level` and return what undoes it. The shown level
@@ -1459,6 +1589,7 @@ impl Multires {
     pub fn pack(mut self) -> Packed {
         let counts = self.vertex_counts();
         let marks = self.marks();
+        let colors=self.levels.iter_mut().map(|l|std::mem::take(&mut l.mesh.colors)).collect();
         let mask = std::mem::take(&mut self.levels[self.active].mesh.mask);
         let Multires {
             levels,
@@ -1488,6 +1619,7 @@ impl Multires {
             counts,
             marks,
             mask,
+            colors,
         }
     }
 
@@ -1510,6 +1642,7 @@ impl Multires {
             counts: self.vertex_counts(),
             marks: self.marks(),
             mask: self.mesh().mask.clone(),
+            colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
         }
     }
 
@@ -1692,6 +1825,8 @@ impl Multires {
         }
         let top_positions = &self.levels[top].mesh.positions;
         let positions: Vec<Vec3> = ids.par_iter().map(|&v| top_positions[v as usize]).collect();
+        let top_colors=&self.levels[top].mesh.colors;
+        let colors=if top_colors.is_empty(){Vec::new()}else{ids.par_iter().map(|&v|top_colors[v as usize]).collect()};
         drop(ids);
         let m = &self.levels[level].mesh;
         let normals = (0..n as u32)
@@ -1712,6 +1847,7 @@ impl Multires {
         StandIn {
             positions,
             normals,
+            colors,
             // Hidden parts stay hidden while the subtool is parked.
             indices: m.visible_indices().unwrap_or_else(|| m.indices.clone()),
             level,

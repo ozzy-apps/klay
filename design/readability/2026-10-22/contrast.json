@@ -1,0 +1,26 @@
+[
+  {
+    "concept": "Graphite",
+    "body_px": 13,
+    "primary": 13.37,
+    "secondary": 8.25,
+    "secondary_on_control": 6.31,
+    "selected": 6.96
+  },
+  {
+    "concept": "Slate",
+    "body_px": 14,
+    "primary": 12.67,
+    "secondary": 8.59,
+    "secondary_on_control": 6.23,
+    "selected": 6.7
+  },
+  {
+    "concept": "Light Studio",
+    "body_px": 14,
+    "primary": 13.74,
+    "secondary": 7.06,
+    "secondary_on_control": 7.81,
+    "selected": 10.22
+  }
+]

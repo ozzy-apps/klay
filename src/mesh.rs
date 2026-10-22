@@ -70,6 +70,7 @@ pub struct Chunk {
     pub dirty_nrm: bool,
     /// Mask values of the owned range changed: re-upload them.
     pub dirty_mask: bool,
+    pub dirty_color: bool,
     /// Chunks that share at least one edge with this one.
     pub neighbors: Vec<u32>,
     /// Vertices referenced by `tris` but owned by another chunk.
@@ -89,6 +90,7 @@ impl Chunk {
             dirty_pos: true,
             dirty_nrm: true,
             dirty_mask: false,
+            dirty_color: false,
             neighbors: Vec::new(),
             external: Vec::new(),
             stamp: 0,
@@ -189,6 +191,8 @@ pub struct SculptMesh {
     /// nothing is masked. Only the shown level of a stack carries it (see
     /// [`crate::multires::Multires::set_active`]).
     pub mask: Vec<u8>,
+    /// Premultiplied sRGB polypaint; empty while no vertex has been painted.
+    pub colors: Vec<[u8; 4]>,
     /// Polygroup per triangle (ZBrush: PolyGroups). Empty while the whole mesh is group 0.
     pub groups: Vec<u16>,
     /// 1 per hidden triangle (ZBrush: visibility). Empty while nothing is hidden.
@@ -259,8 +263,14 @@ impl SculptMesh {
 
     /// [`from_raw`](Self::from_raw) with a polygroup per triangle (or none), kept with its
     /// triangle when they are regrouped by chunk.
-    pub fn from_raw_with_groups(positions: Vec<Vec3>, indices: Vec<u32>, mut tri_groups: Vec<u16>) -> Self {
+    pub fn from_raw_with_groups(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>) -> Self {
+        Self::from_raw_painted(positions, indices, tri_groups, Vec::new())
+    }
+
+    /// Repartition geometry and vertex paint together, preserving their correspondence.
+    pub fn from_raw_painted(positions: Vec<Vec3>, indices: Vec<u32>, mut tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> Self {
         let n = positions.len();
+        assert!(colors.is_empty() || colors.len() == n);
 
         // 1. Partition vertices into spatial chunks by recursive median split.
         let groups = partition_vertices(&positions);
@@ -268,6 +278,7 @@ impl SculptMesh {
         // 2. Reorder vertices so each chunk is contiguous.
         let mut remap = vec![0u32; n];
         let mut new_positions = Vec::with_capacity(n);
+        let mut new_colors = Vec::with_capacity(colors.len());
         let mut vert_chunk = Vec::with_capacity(n);
         let mut chunks = Vec::with_capacity(groups.len());
         for (ci, g) in groups.iter().enumerate() {
@@ -275,6 +286,7 @@ impl SculptMesh {
             for &old in g {
                 remap[old as usize] = new_positions.len() as u32;
                 new_positions.push(positions[old as usize]);
+                if !colors.is_empty() { new_colors.push(colors[old as usize]); }
                 vert_chunk.push(ci as u32);
             }
             chunks.push(Chunk::new(start, new_positions.len() as u32, 0, 0, 0));
@@ -287,6 +299,7 @@ impl SculptMesh {
 
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
         let mut mesh = Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris);
+        mesh.colors = new_colors;
         if !tri_groups.is_empty() {
             mesh.set_groups(tri_groups);
         }
@@ -429,6 +442,7 @@ impl SculptMesh {
             vt_offsets,
             vt_tris,
             mask: Vec::new(),
+            colors: Vec::new(),
             groups: Vec::new(),
             hidden: Vec::new(),
             shown: Vec::new(),

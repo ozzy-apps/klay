@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+      <title id="title">Klay — Sweep</title>
+      <desc id="desc">Flat two-dimensional K logo. Solid colors and transparent negative space.</desc>
+      <rect x="32" y="32" width="448" height="448" rx="104" fill="#FFEBDF"/><path d="M157 128C138 128 126 143 126 163V352C126 378 145 396 171 396 197 396 216 377 216 351V308Q216 285 234 303L295 370C317 394 345 403 375 393Q386 389 380 377L287 265Q280 256 289 247L369 167Q380 156 369 145L343 119Q332 108 320 120L235 205Q216 224 216 198V163C216 143 200 128 179 128Z" fill="#DB5B49"/>
+    </svg>

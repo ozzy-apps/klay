@@ -69,12 +69,14 @@ struct VsOut {
     // 1 for a parked subtool (drawn as instance 1), 0 for the active one.
     @location(2) @interpolate(flat) parked: u32,
     @location(3) mask: f32,
+    @location(4) color: vec4<f32>,
 };
 
 @vertex
 fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) nrm: vec4<f32>,
+    @location(2) color: vec4<f32>,
     @builtin(instance_index) instance: u32,
     @builtin(vertex_index) vertex: u32,
 ) -> VsOut {
@@ -102,6 +104,7 @@ fn vs_main(
     out.world_pos = p;
     out.normal = n;
     out.parked = instance;
+    out.color = color;
     return out;
 }
 
@@ -130,6 +133,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (u.params.w > 0.5 && u.params.w < 1.5) { base = vec3<f32>(0.52, 0.58, 0.66); }
     if (u.params.w > 1.5 && u.params.w < 2.5) { base = vec3<f32>(0.62, 0.29, 0.20); }
     if (u.params.w > 2.5) { base = vec3<f32>(0.55, 0.43, 0.25); }
+    if (in.color.a > 0.0001) {
+        let rgb=clamp(in.color.rgb/in.color.a,vec3<f32>(0.0),vec3<f32>(1.0));
+        base=mix(base,pow(rgb,vec3<f32>(2.2)),in.color.a);
+    }
     return shade(in, base);
 }
 

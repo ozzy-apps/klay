@@ -82,6 +82,7 @@ const MAX_POINTS: u64 = 1 << 20;
 
 pub struct Output {
     pub positions: Vec<Vec3>,
+    pub colors: Vec<[u8; 4]>,
     pub indices: Vec<u32>,
     /// Per triangle; empty when the input had no polygroups.
     pub groups: Vec<u16>,
@@ -844,8 +845,10 @@ pub fn remesh(mesh: &SculptMesh, s: &Settings) -> Result<Output, String> {
             groups.extend_from_slice(&[*g, *g]);
         }
     }
+    let colors = transfer_paint(mesh, &positions, &origin_tri);
     Ok(Output {
         positions,
+        colors,
         indices,
         groups,
         stats,
@@ -930,6 +933,34 @@ fn project(mesh: &SculptMesh, positions: &mut [Vec3], origin_tri: &[u32]) {
         try_tris(v);
         *p = best.1;
     });
+}
+
+/// Interpolate premultiplied paint from the closest old surface, including with Project off.
+fn transfer_paint(mesh: &SculptMesh, positions: &[Vec3], origin_tri: &[u32]) -> Vec<[u8; 4]> {
+    if mesh.colors.is_empty() { return Vec::new(); }
+    positions.par_iter().zip(origin_tri).map(|(&p, &t0)| {
+        if t0 == u32::MAX { return [0; 4]; }
+        let v = nearest_vertex(mesh, p, t0);
+        let mut best = (f32::INFINITY, [0; 4]);
+        for &t in mesh.incident(v) {
+            let ids = &mesh.indices[3*t as usize..3*t as usize+3];
+            let [a,b,c] = [mesh.positions[ids[0] as usize], mesh.positions[ids[1] as usize], mesh.positions[ids[2] as usize]];
+            let q = closest_on_triangle(p,a,b,c);
+            let distance = (q-p).length_squared();
+            if distance >= best.0 { continue; }
+            let ab=b-a; let ac=c-a; let aq=q-a;
+            let d=ab.dot(ab)*ac.dot(ac)-ab.dot(ac).powi(2);
+            let weights = if d > 1e-20 {
+                let y=((ac.dot(ac)*aq.dot(ab)-ab.dot(ac)*aq.dot(ac))/d).clamp(0.0,1.0);
+                let z=((ab.dot(ab)*aq.dot(ac)-ab.dot(ac)*aq.dot(ab))/d).clamp(0.0,1.0-y);
+                [1.0-y-z,y,z]
+            } else { [1.0,0.0,0.0] };
+            best = (distance, std::array::from_fn(|channel| {
+                (0..3).map(|j|mesh.colors[ids[j] as usize][channel] as f32*weights[j]).sum::<f32>().round() as u8
+            }));
+        }
+        best.1
+    }).collect()
 }
 
 /// The vertex of `mesh` nearest `p`, walking from a corner of triangle `t0` to whichever
@@ -1070,6 +1101,22 @@ mod tests {
     fn mesh_of(p: Primitive, segments: u32) -> SculptMesh {
         let (pos, idx) = p.build(segments, 1.0);
         SculptMesh::from_raw(pos, idx)
+    }
+
+    #[test]
+    fn remesh_preserves_surface_paint_and_vertex_correspondence() {
+        let mut mesh=mesh_of(Primitive::Sphere,20);
+        mesh.colors=mesh.positions.iter().map(|p|[((p.x+1.0)*90.0) as u8,30,0,200]).collect();
+        for project in [false,true] {
+            let out=remesh(&mesh,&Settings{resolution:32,blur:1,project}).unwrap();
+            assert_eq!(out.colors.len(),out.positions.len());
+            let rebuilt=SculptMesh::from_raw_painted(out.positions,out.indices,out.groups,out.colors);
+            for (p,c) in rebuilt.positions.iter().zip(&rebuilt.colors) {
+                assert_eq!(c[3],200);
+                assert_eq!(c[1],30);
+                assert!((c[0] as f32-((p.normalize().x+1.0)*90.0)).abs()<10.0,"paint moved at {p:?}: {c:?}");
+            }
+        }
     }
 
     /// Closed (every edge on two triangles, used once each way), no degenerate triangle,

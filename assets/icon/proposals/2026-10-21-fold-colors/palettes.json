@@ -1,0 +1,100 @@
+{
+  "source": "../2026-10-21/03-fold.svg",
+  "source_sha256": "c9f5eab0287271e00444e46426be0611a3ae450dfd411f4db72a80b2a5b9c9f2",
+  "color_roles": [
+    "body_top",
+    "body_middle",
+    "body_base",
+    "fold_base",
+    "fold_middle",
+    "fold_top",
+    "rim",
+    "edge_highlight"
+  ],
+  "palettes": [
+    {
+      "slug": "01-mint",
+      "name": "Mint",
+      "colors": [
+        "#d3f4d7",
+        "#93d9bd",
+        "#3d9f90",
+        "#328e7d",
+        "#7bc9ac",
+        "#c5edcf",
+        "#efffe6",
+        "#d8f7db"
+      ]
+    },
+    {
+      "slug": "02-blue",
+      "name": "Blue",
+      "colors": [
+        "#d6eaff",
+        "#91c4ed",
+        "#4585bf",
+        "#2c6d9d",
+        "#73b0d8",
+        "#c3e2f8",
+        "#eff7ff",
+        "#d8ebfa"
+      ]
+    },
+    {
+      "slug": "03-violet",
+      "name": "Violet",
+      "colors": [
+        "#eadbff",
+        "#c1a2e8",
+        "#8c61c4",
+        "#7250aa",
+        "#ad89d5",
+        "#e0cdf8",
+        "#f9f0ff",
+        "#eadcfc"
+      ]
+    },
+    {
+      "slug": "04-coral",
+      "name": "Coral",
+      "colors": [
+        "#ffdbc9",
+        "#f2a58c",
+        "#cf6b5a",
+        "#b85648",
+        "#df9077",
+        "#fbd2bb",
+        "#fff4e9",
+        "#ffe0cc"
+      ]
+    },
+    {
+      "slug": "05-amber",
+      "name": "Amber",
+      "colors": [
+        "#ffe9ae",
+        "#f0c469",
+        "#c29034",
+        "#a77a28",
+        "#dbac4f",
+        "#fbe3a0",
+        "#fff9de",
+        "#fff1be"
+      ]
+    },
+    {
+      "slug": "06-rose",
+      "name": "Rose",
+      "colors": [
+        "#ffdceb",
+        "#eb9dbd",
+        "#bf5c8e",
+        "#a84678",
+        "#d484aa",
+        "#f6c9de",
+        "#fff0f7",
+        "#fcdce9"
+      ]
+    }
+  ]
+}

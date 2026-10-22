@@ -7,13 +7,15 @@
 //! magic "KLAYPRJ\0" · version u32 · subtool count u32 · active subtool u32
 //! per subtool: name (u32 length + UTF-8) · visible u8 · packed stack
 //!              · (version 2 on) the shown level's mask, inside the packed stack
-//!              · (version 3) polygroups and hidden triangles of every level
+//!              · (version 3 on) polygroups and hidden triangles of every level
+//!              · (version 4 on) premultiplied vertex paint of every level
 //! end marker "KLAYEND\0"
 //! ```
 //!
 //! Version 1 files (no mask) and version 2 files (no polygroups, nothing hidden) still open.
 //! Version 3 adds the polygroups and hidden triangles of every level as run-length blocks
 //! (ZBrush keeps both in its tools).
+//! Version 4 retains RGB paint; versions 1–3 still open as unpainted clay.
 //!
 //! Every length is checked against the bytes left in the file before anything is
 //! allocated, so a truncated or foreign file is refused with a message, never a crash. The
@@ -26,9 +28,8 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 3: polygroups and hidden triangles of every level; 2: a mask per subtool. Versions 1 and
-/// 2 still open (without what they did not store).
-pub const VERSION: u32 = 3;
+/// 4: vertex paint; 3: polygroups and hidden triangles; 2: mask. Versions 1–3 still open.
+pub const VERSION: u32 = 4;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -177,6 +178,7 @@ pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: us
         if version >= 3 {
             packed.write_marks(&mut out)?;
         }
+        if version >= 4 {packed.write_colors(&mut out)?;}
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -218,6 +220,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         if version >= 3 {
             packed.read_marks(&mut input)?;
         }
+        if version >= 4 {packed.read_colors(&mut input)?;}
         tools.push(SavedTool {
             name,
             visible,
