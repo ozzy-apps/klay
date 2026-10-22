@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 — 2026-10-22
+
+- Curve strokes (ZBrush Stroke › Curve): the stroke is drawn as a path and, on release, smoothed, laid onto the surface and applied along it. Zipper, Stitch and Rake start in Curve mode and are laid out in the curve's own frame, so a shaky hand gives even, square teeth; other dab brushes step evenly along it. The curve stays as a dashed line and can be dragged to bend it, re-applying the brush along the new shape; Esc lets it go. Freehand / Curve per brush on the left shelf stroke thumbnail and in Stroke › Curve, with Curve smooth and Curve step.
+- Pen pressure on X11 (XInput2, any pen with an "Abs Pressure" axis, e.g. XP-Pen, Wacom, Huion): Draw Size and Z / RGB Intensity follow the pen, linear like ZBrush's default curves, with Size and Z Intensity toggles and a live readout in Brush › Tablet pressure. Drag brushes and the detail reliefs keep their size; a mouse strokes at full strength.
+- Merged with the polygroup, primitive, Wedge and PolyF work from main (0.4.0 was built on it).
+- Verification: 148 release tests; --selftest-curve (a shaky stroke's curve lies within 0.24 % of Draw Size of a steady stroke's in the middle; its Zipper strays 6–8 % from the steady line's, against 46 % freehand; bend, GPU readback, undo/redo exact) and --selftest-pressure, plus every earlier native self-test, on Xvfb/llvmpipe.
+
 ## 0.4.0 — 2026-10-22
 
 - Expanded the library to 33 tools with Mask Pen, Mask Soft, Mask Rect, Mask Lasso, Mask Circle, Mask Line, Clip Line, FormSoft, FormHard, Zipper, Stitch and Rake.

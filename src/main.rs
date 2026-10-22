@@ -7,6 +7,7 @@ mod camera;
 mod mask;
 mod surface_tools;
 mod detail_brush;
+mod curve;
 mod native_tests;
 mod mesh;
 mod multires;
@@ -92,6 +93,72 @@ impl NavDrag {
             }
         }
     }
+}
+
+/// How close (physical pixels at scale 1) a press must be to an applied curve to bend it.
+const CURVE_GRAB_PX: f32 = 10.0;
+
+/// The brush along `curve`: detail reliefs as one pattern in the curve's frame, other
+/// brushes as dabs every `step` of arc length.
+fn apply_curve(stroke: &mut Stroke, mesh: &mut SculptMesh, brush: &Brush, curve: &curve::Curve, view_dir: Vec3, step: f32) {
+    if brush.kind.is_detail() {
+        stroke.detail_curve(mesh, brush, curve);
+    } else {
+        stroke.dabs_along(mesh, brush, curve, view_dir, step);
+    }
+}
+
+/// State of `--selftest-curve` between its phases.
+#[derive(Default)]
+struct CurveTest {
+    ok: bool,
+    original: Vec<Vec3>,
+    applied: Vec<Vec3>,
+    bent: Vec<Vec3>,
+}
+
+/// A curve stroke being drawn (ZBrush: Stroke › Curve): the cursor path in canvas pixels
+/// and the brush as it was at the press. It is applied on release.
+struct CurveDraw {
+    path: Vec<Vec2>,
+    brush: Brush,
+    invert: bool,
+}
+
+/// An applied curve that can still be bent (see `curve.rs`), with what it was applied
+/// with and where.
+struct CurveTool {
+    curve: curve::Curve,
+    brush: Brush,
+    invert: bool,
+    symmetry: bool,
+    assets: sculpt::StampSettings,
+    level: usize,
+    tool: usize,
+    vertices: usize,
+    /// `History::edits` right after it was applied: any other edit lets it go.
+    edits: u64,
+    /// Positions and colours of every chunk it has touched, from before it was first
+    /// applied: a bent curve is re-applied from these.
+    base: std::collections::HashMap<u32, Vec<Vec3>>,
+    base_paint: std::collections::HashMap<u32, Vec<paint::Color>>,
+    bend: Option<CurveBend>,
+}
+
+/// A drag on an applied curve: its points on the canvas when the drag began (`None`
+/// behind the camera), their arc length along the whole curve, the grabbed arc length and
+/// how far along the curve the pull reaches. `stroke` records the bend for undo.
+struct CurveBend {
+    stroke: Stroke,
+    /// The curve's pieces when the drag began (`screen` and `along` follow them).
+    pieces: Vec<std::ops::Range<usize>>,
+    screen: Vec<Option<Vec2>>,
+    along: Vec<f32>,
+    grab: f32,
+    reach: f32,
+    press: Vec2,
+    /// Moved since the last frame's re-application.
+    pending: bool,
 }
 
 /// A Ctrl + Shift press in progress (ZBrush: SelectRect). A click acts on the polygroup
@@ -292,6 +359,12 @@ struct App {
     tablet_error: Option<String>,
     /// `--selftest-pressure`: frames left before the scripted pressure strokes.
     selftest_pressure: Option<u32>,
+    /// Curve mode: the curve being drawn, and the applied one that can be bent.
+    curve_draw: Option<CurveDraw>,
+    curve: Option<CurveTool>,
+    /// `--selftest-curve`: phase and frames left before it.
+    selftest_curve: Option<(u8, u32)>,
+    selftest_curve_state: CurveTest,
 
     cursor: Vec2,
     last_cursor: Vec2,
@@ -416,6 +489,10 @@ impl App {
             pressure: None,
             tablet_error: None,
             selftest_pressure: None,
+            curve_draw: None,
+            curve: None,
+            selftest_curve: None,
+            selftest_curve_state: CurveTest::default(),
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             scale: 1.0,
@@ -479,6 +556,8 @@ impl App {
             || self.mask_stroke.is_some()
             || self.gesture.is_some()
             || self.select.is_some()
+            || self.curve_draw.is_some()
+            || self.curve.as_ref().is_some_and(|c| c.bend.is_some())
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -2095,6 +2174,178 @@ impl App {
         false
     }
 
+    /// `--selftest-curve`, one phase per call a few frames apart. Phase 0 draws the same
+    /// Zipper line four ways through the window's input handlers (a shaky and a steady hand,
+    /// each in Curve and Freehand mode) and measures how far the shaky result strays from
+    /// the steady one, then applies a curve and bends it. Phase 1 checks the GPU copy of the
+    /// bent result, undo and redo of the bend and the curve, and Esc. Logs and exits.
+    fn selftest_curve_phase(&mut self, phase: u8) -> Option<u8> {
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_curve_state.ok &= pass;
+            log::info!("selftest-curve: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let max_diff = |a: &[Vec3], b: &[Vec3]| a.par_iter().zip(b).map(|(x, y)| x.distance(*y)).reduce(|| 0.0, f32::max);
+        match phase {
+            0 => {
+                self.selftest_curve_state = CurveTest { ok: true, ..CurveTest::default() };
+                self.workspace.select_brush(&mut self.brush, BrushKind::Zipper);
+                self.workspace.assets = sculpt::StampSettings::default();
+                self.brush.radius = 0.15;
+                self.brush.strength = 1.0;
+                self.pressure = None;
+                let original = self.mesh().positions.clone();
+                let vp = self.viewport();
+                let c = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+                let len = vp.y * 0.5;
+                // A gentle arc, drawn every 2 px, with or without a few pixels of hand shake.
+                let path = |shake: f32| -> Vec<Vec2> {
+                    (0..=(len / 2.0) as usize)
+                        .map(|k| {
+                            let x = k as f32 * 2.0;
+                            let arc = (std::f32::consts::PI * x / len).sin() * len * 0.12;
+                            let jitter = ((x * 0.9).sin() + 0.6 * (x * 0.47 + 1.0).sin()) * shake;
+                            c + Vec2::new(x - len * 0.5, -arc + jitter)
+                        })
+                        .collect()
+                };
+                let draw = |app: &mut Self, path: &[Vec2], curve: bool| -> (Vec<Vec3>, bool, f32) {
+                    app.workspace.set_curve_mode(BrushKind::Zipper, curve);
+                    app.cursor_moved(path[0], false);
+                    app.left_press(false, false);
+                    for &p in &path[1..] {
+                        app.cursor_moved(p, false);
+                    }
+                    let untouched = app.mesh().positions == original;
+                    let t = Instant::now();
+                    app.left_release();
+                    let ms = t.elapsed().as_secs_f32() * 1000.0;
+                    (app.mesh().positions.clone(), untouched, ms)
+                };
+                let undo = |app: &mut Self| {
+                    app.history.undo(&mut app.doc);
+                    app.show_active_level();
+                };
+                let (shaky, steady) = (path(3.0), path(0.0));
+                let (a, waited, apply_ms) = draw(self, &shaky, true);
+                let shaky_curve = self.curve.as_ref().map(|c| c.curve.clone()).unwrap_or_default();
+                undo(self);
+                let back = max_diff(&self.mesh().positions, &original) < 1e-5;
+                let (b, _, _) = draw(self, &steady, true);
+                let steady_curve = self.curve.as_ref().map(|c| c.curve.clone()).unwrap_or_default();
+                undo(self);
+                // How far the curve laid from the shaky stroke strays from the steady one's,
+                // in Draw Size: in the middle, and at the ends.
+                let gap = |p: Vec3| {
+                    steady_curve
+                        .points
+                        .windows(2)
+                        .map(|w| {
+                            let ab = w[1] - w[0];
+                            let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-12)).clamp(0.0, 1.0);
+                            (w[0] + ab * t).distance(p)
+                        })
+                        .fold(f32::INFINITY, f32::min)
+                };
+                let n = shaky_curve.points.len();
+                let (mut middle, mut ends) = (0.0f32, 0.0f32);
+                for (i, &p) in shaky_curve.points.iter().enumerate() {
+                    let d = gap(p) / self.brush.radius;
+                    if i * 10 < n || i * 10 > n * 9 { ends = ends.max(d) } else { middle = middle.max(d) }
+                }
+                let lengths = (shaky_curve.along.last().copied().unwrap_or(0.0), steady_curve.along.last().copied().unwrap_or(0.0));
+                let curve_ok = middle < 0.01 && ends < 0.03 && (lengths.0 - lengths.1).abs() < 0.01 * lengths.1;
+                let (fc, _, _) = draw(self, &shaky, false);
+                undo(self);
+                let (fd, _, _) = draw(self, &steady, false);
+                undo(self);
+                // Stray of a result from the steady line's: RMS vertex difference over the
+                // relief's height.
+                let stray = |x: &[Vec3], y: &[Vec3]| {
+                    let height = y.par_iter().zip(&original).map(|(p, q)| p.distance(*q)).reduce(|| 0.0, f32::max).max(1e-9);
+                    let sum: f64 = x.par_iter().zip(y).map(|(p, q)| p.distance_squared(*q) as f64).sum();
+                    let moved = y.par_iter().zip(&original).filter(|(p, q)| p.distance(**q) > 1e-7).count().max(1);
+                    ((sum / moved as f64).sqrt() as f32) / height
+                };
+                let moved = a.par_iter().zip(&original).filter(|(p, q)| p.distance(**q) > 1e-7).count();
+                let (curve_stray, free_stray) = (stray(&a, &b), stray(&fc, &fd));
+                check(self, &format!("Curve mode changes nothing until release, then applies along the curve in {apply_ms:.0} ms ({} vertices)", fmt_count(moved)), waited && moved > 0);
+                check(self, "undo restores the curve stroke", back);
+                check(
+                    self,
+                    &format!(
+                        "a shaky stroke lays the steady stroke's curve: {:.2} % of Draw Size apart in the middle, {:.2} % at the ends, lengths {:.4} / {:.4}",
+                        middle * 100.0, ends * 100.0, lengths.0, lengths.1
+                    ),
+                    curve_ok,
+                );
+                // Vertex by vertex the relief's sharp tooth edges magnify even sub-percent
+                // differences, so this compares the two modes rather than expecting zero.
+                check(
+                    self,
+                    &format!("its Zipper strays {:.1} % from the steady line's (RMS over tooth height); freehand strays {:.1} %", curve_stray * 100.0, free_stray * 100.0),
+                    curve_stray * 3.0 < free_stray,
+                );
+                // Apply once more and bend it: grab the middle and pull it up.
+                let (applied, _, _) = draw(self, &shaky, true);
+                let live = self.curve.is_some();
+                let mid = self.curve.as_ref().map(|c| c.curve.points[c.curve.points.len() / 2]).unwrap_or(Vec3::ZERO);
+                let grab = self.project(mid);
+                self.cursor_moved(grab, false);
+                self.left_press(false, false);
+                let bending = self.curve.as_ref().is_some_and(|c| c.bend.is_some());
+                let t = Instant::now();
+                for k in 1..=10 {
+                    self.cursor_moved(grab + Vec2::new(0.0, -vp.y * 0.008 * k as f32), false);
+                    self.bend_curve();
+                }
+                let bend_ms = t.elapsed().as_secs_f32() * 1000.0 / 10.0;
+                self.left_release();
+                let bent = self.mesh().positions.clone();
+                let still = self.live_curve().is_some();
+                check(self, &format!("the applied curve stays and a press on it bends it ({bend_ms:.0} ms per re-application)"), live && bending);
+                check(self, "the bend re-applies along the new shape and the curve can be bent again", max_diff(&bent, &applied) > 1e-4 && still);
+                self.selftest_curve_state.original = original;
+                self.selftest_curve_state.applied = applied;
+                self.selftest_curve_state.bent = bent;
+                Some(1)
+            }
+            _ => {
+                let t = std::mem::take(&mut self.selftest_curve_state);
+                self.selftest_curve_state.ok = t.ok;
+                if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                    let d = max_diff(&gpu[..t.bent.len()], &t.bent);
+                    check(self, &format!("GPU copy of the bent result matches the CPU ({d:.1e})"), d < 1e-5);
+                }
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                let d1 = max_diff(&self.mesh().positions, &t.applied);
+                let gone = self.live_curve().is_none();
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                let d0 = max_diff(&self.mesh().positions, &t.original);
+                check(self, &format!("undo takes back the bend ({d1:.1e}), then the curve ({d0:.1e}); the curve is let go"), d1 < 1e-5 && d0 < 1e-5 && gone);
+                self.history.redo(&mut self.doc);
+                self.history.redo(&mut self.doc);
+                self.show_active_level();
+                let d2 = max_diff(&self.mesh().positions, &t.bent);
+                check(self, &format!("redo brings both back ({d2:.1e})"), d2 < 1e-5);
+                // Esc lets an applied curve go and keeps its result.
+                let c = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+                self.cursor_moved(c, false);
+                self.left_press(false, false);
+                self.cursor_moved(c + Vec2::new(60.0, 0.0), false);
+                self.left_release();
+                let before = self.mesh().positions.clone();
+                let had = self.curve.is_some();
+                self.on_key(KeyCode::Escape);
+                check(self, "Esc lets the curve go and keeps its result", had && self.curve.is_none() && self.mesh().positions == before);
+                let ok = self.selftest_curve_state.ok;
+                log::info!("selftest-curve: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -2583,23 +2834,303 @@ impl App {
             self.stroke_pending = false;
             self.apply_stroke();
         }
-        if let Some(mut stroke) = self.stroke.take() {
+        if let Some(stroke) = self.stroke.take() {
             let level = self.doc.active();
-            let paint=stroke.take_paint();
-            let mut steps=Vec::new();
-            if let Some(snapshot) = stroke.end(self.doc.mesh_mut()) {
-                let chunks = self.doc.finish_stroke(level, snapshot);
-                steps.push(UndoStep::Stroke { level, chunks });
-            }
-            if !paint.is_empty() {steps.push(UndoStep::Paint(self.doc.finish_paint(level,paint)));}
-            match steps.len() {
-                0=>{},1=>self.history.push(steps.pop().unwrap()),
-                _=>self.history.push(UndoStep::Steps(steps.into_iter().rev().collect())),
-            }
+            self.commit_stroke(stroke, level);
         }
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.end_gpu_grab();
         }
+    }
+
+    /// One undo step for a finished stroke at `level`: its positions and its paint.
+    fn commit_stroke(&mut self, mut stroke: Stroke, level: usize) {
+        let paint=stroke.take_paint();
+        let mut steps=Vec::new();
+        if let Some(snapshot) = stroke.end(self.doc.mesh_mut()) {
+            let chunks = self.doc.finish_stroke(level, snapshot);
+            steps.push(UndoStep::Stroke { level, chunks });
+        }
+        if !paint.is_empty() {steps.push(UndoStep::Paint(self.doc.finish_paint(level,paint)));}
+        match steps.len() {
+            0=>{},1=>self.history.push(steps.pop().unwrap()),
+            _=>self.history.push(UndoStep::Steps(steps.into_iter().rev().collect())),
+        }
+    }
+
+    /// Whether `kind` strokes along a curve (Stroke › Curve).
+    fn curve_mode(&self, kind: BrushKind) -> bool {
+        curve::capable(kind) && self.workspace.curve_kinds.contains(&kind)
+    }
+
+    /// The applied curve, if it can still be bent: nothing edited since, and the same level
+    /// of the same subtool shown. Otherwise it is let go.
+    fn live_curve(&mut self) -> Option<&mut CurveTool> {
+        let edits = self.history.edits();
+        let (level, tool, vertices) = (self.doc.active(), self.active_tool, self.doc.mesh().vertex_count());
+        let live = self
+            .curve
+            .as_ref()
+            .is_some_and(|c| c.edits == edits && c.level == level && c.tool == tool && c.vertices == vertices);
+        if !live {
+            self.curve = None;
+        }
+        self.curve.as_mut()
+    }
+
+    /// Window pixels of a world point in front of the camera.
+    fn project_front(&self, p: Vec3) -> Option<Vec2> {
+        let clip = self.camera.view_proj() * p.extend(1.0);
+        (clip.w > 1e-6).then(|| self.project(p))
+    }
+
+    /// Pixels on screen of `r` world units at `at`.
+    fn screen_radius(&self, at: Vec3, r: f32) -> f32 {
+        let right = self.camera.forward().cross(Vec3::Y).normalize_or(Vec3::X);
+        (self.project(at + right * r) - self.project(at)).length()
+    }
+
+    /// Lay a screen path (canvas pixels) onto the surface: smoothed by Curve smooth times
+    /// the brush's screen radius (when `smooth`), raycast every tenth of that radius, then
+    /// resampled every 4 % of `radius` in the world.
+    fn lay_curve(&self, path: &[Vec2], radius: f32, smooth: bool) -> curve::Curve {
+        let vp = self.viewport();
+        let (cam, mesh) = (&self.camera, self.doc.mesh());
+        let hit = |p: &Vec2| {
+            let (o, d) = cam.ray(p.x, p.y, vp.x, vp.y);
+            mesh.raycast(o, d).map(|h| (h.point, h.normal))
+        };
+        let Some((at, _)) = path.iter().find_map(hit) else {
+            return curve::Curve::default();
+        };
+        let screen_r = self.screen_radius(at, radius).max(1.0);
+        let step = (screen_r * 0.1).clamp(1.0, 6.0);
+        let pts = if smooth {
+            curve::smooth_path(path, (self.workspace.curve_smooth * screen_r).clamp(0.0, 150.0), step)
+        } else {
+            curve::resample(path, step)
+        };
+        let hits: Vec<_> = pts.par_iter().map(hit).collect();
+        curve::Curve::from_hits(&hits, radius * 0.04)
+    }
+
+    /// Press on the model with a brush in Curve mode: start drawing a new curve (the
+    /// previous one keeps its result and can no longer be bent).
+    fn begin_curve(&mut self) {
+        let brush = self.effective_brush();
+        self.curve = None;
+        self.curve_draw = Some(CurveDraw {
+            path: vec![self.cursor - self.canvas_origin()],
+            brush,
+            invert: self.modifiers.alt_key() ^ self.workspace.subtract,
+        });
+        self.hover = None;
+    }
+
+    /// Release after drawing: lay the path onto the surface as a smooth curve and apply the
+    /// brush along it, as one undo step. The curve stays so it can be bent.
+    fn end_curve_draw(&mut self) {
+        let Some(d) = self.curve_draw.take() else {
+            return;
+        };
+        let t = Instant::now();
+        let curve = self.lay_curve(&d.path, d.brush.radius, true);
+        self.workspace.curve_preview = None;
+        if curve.is_empty() {
+            return;
+        }
+        let (symmetry, assets) = (self.workspace.symmetry, self.workspace.assets.clone());
+        let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone());
+        let (fwd, step) = (self.camera.forward(), d.brush.radius * self.workspace.curve_step);
+        apply_curve(&mut stroke, self.doc.mesh_mut(), &d.brush, &curve, fwd, step);
+        let base = stroke.position_snapshots().iter().cloned().collect();
+        let base_paint = stroke.paint_snapshots().iter().cloned().collect();
+        self.last_dab_count = stroke.last_count;
+        let level = self.doc.active();
+        self.commit_stroke(stroke, level);
+        self.curve = Some(CurveTool {
+            curve,
+            brush: d.brush,
+            invert: d.invert,
+            symmetry,
+            assets,
+            level,
+            tool: self.active_tool,
+            vertices: self.doc.mesh().vertex_count(),
+            edits: self.history.edits(),
+            base,
+            base_paint,
+            bend: None,
+        });
+        self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.update_hover();
+    }
+
+    /// Press within reach of the applied curve: start bending it (ZBrush: drag a curve to
+    /// reshape it; the brush is re-applied along the new shape).
+    fn begin_curve_bend(&mut self) -> bool {
+        if self.live_curve().is_none() {
+            return false;
+        }
+        let c = self.curve.as_ref().unwrap();
+        let origin = self.canvas_origin();
+        let screen: Vec<Option<Vec2>> = c.curve.points.iter().map(|&p| self.project_front(p).map(|q| q - origin)).collect();
+        let mut along = vec![0.0; screen.len()];
+        let mut total = 0.0;
+        for piece in &c.curve.pieces {
+            for i in piece.clone() {
+                along[i] = total + c.curve.along[i];
+            }
+            total += c.curve.along[piece.end - 1];
+        }
+        let cursor = self.cursor - origin;
+        let nearest = screen
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|s| (s.distance(cursor), i)))
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((d, i)) = nearest else {
+            return false;
+        };
+        if d > CURVE_GRAB_PX / self.scale {
+            return false;
+        }
+        let reach = (total * 0.35).max(c.brush.radius * 2.0);
+        let stroke = Stroke::begin(c.invert, false, c.symmetry).with_assets(c.assets.clone());
+        let grab = along[i];
+        let press = self.cursor;
+        let pieces = c.curve.pieces.clone();
+        self.curve.as_mut().unwrap().bend = Some(CurveBend { stroke, pieces, screen, along, grab, reach, press, pending: false });
+        self.hover = None;
+        true
+    }
+
+    /// Re-apply a bent curve: put back the surface it was first applied to, move its points
+    /// on the screen with a smooth falloff from the grabbed point, lay them onto the surface
+    /// again and apply the brush along the new shape.
+    fn bend_curve(&mut self) {
+        let vp = self.viewport();
+        let (fwd, cursor) = (self.camera.forward(), self.cursor);
+        let step_share = self.workspace.curve_step;
+        let Some(c) = self.curve.as_mut() else {
+            return;
+        };
+        let Some(b) = c.bend.as_mut() else {
+            return;
+        };
+        b.pending = false;
+        let delta = cursor - b.press;
+        let pull = |i: usize| {
+            let x = ((b.along[i] - b.grab) / b.reach).abs();
+            if x >= 1.0 { 0.0 } else { (1.0 - x * x).powi(2) }
+        };
+        // At most ~200 raycasts: the curve is resampled finely again in the world.
+        let stride = (b.screen.len() / 200).max(1);
+        let mut pts: Vec<Option<Vec2>> = Vec::new();
+        for piece in &b.pieces {
+            for i in piece.clone() {
+                if (i - piece.start) % stride == 0 || i + 1 == piece.end {
+                    pts.push(b.screen[i].map(|s| s + delta * pull(i)));
+                }
+            }
+            pts.push(None);
+        }
+        let mesh = self.doc.mesh_mut();
+        // Record for undo what the curve covers now, then restore its base.
+        let chunks: Vec<u32> = c.base.keys().copied().collect();
+        b.stroke.snapshot_now(mesh, &chunks);
+        for (&k, values) in &c.base {
+            let (a, e) = mesh.chunks[k as usize].range();
+            mesh.positions[a..e].copy_from_slice(values);
+        }
+        if !c.base_paint.is_empty() && !mesh.colors.is_empty() {
+            for (&k, values) in &c.base_paint {
+                let (a, e) = mesh.chunks[k as usize].range();
+                mesh.colors[a..e].copy_from_slice(values);
+                mesh.chunks[k as usize].dirty_color = true;
+            }
+        }
+        mesh.finish_edit(&chunks);
+        let cam = &self.camera;
+        let mesh_ref: &SculptMesh = mesh;
+        let hits: Vec<_> = pts
+            .par_iter()
+            .map(|p| {
+                p.and_then(|p| {
+                    let (o, d) = cam.ray(p.x, p.y, vp.x, vp.y);
+                    mesh_ref.raycast(o, d).map(|h| (h.point, h.normal))
+                })
+            })
+            .collect();
+        let curve = curve::Curve::from_hits(&hits, c.brush.radius * 0.04);
+        apply_curve(&mut b.stroke, mesh, &c.brush, &curve, fwd, c.brush.radius * step_share);
+        for (k, v) in b.stroke.position_snapshots() {
+            c.base.entry(*k).or_insert_with(|| v.clone());
+        }
+        for (k, v) in b.stroke.paint_snapshots() {
+            c.base_paint.entry(*k).or_insert_with(|| v.clone());
+        }
+        if !curve.is_empty() {
+            c.curve = curve;
+        }
+    }
+
+    /// Release after bending: one undo step for the bend; the curve stays bendable.
+    fn end_curve_bend(&mut self) {
+        if self.curve.as_ref().is_some_and(|c| c.bend.as_ref().is_some_and(|b| b.pending)) {
+            self.bend_curve();
+        }
+        let Some(c) = self.curve.as_mut() else {
+            return;
+        };
+        let Some(b) = c.bend.take() else {
+            return;
+        };
+        let level = c.level;
+        self.commit_stroke(b.stroke, level);
+        let edits = self.history.edits();
+        if let Some(c) = self.curve.as_mut() {
+            c.edits = edits;
+        }
+        self.update_hover();
+    }
+
+    /// The curve on the canvas for the overlay: the path being drawn, or the applied curve
+    /// (highlighted when the cursor is on it or it is being bent).
+    fn curve_preview(&mut self) -> Option<workspace::CurvePreview> {
+        let origin = self.canvas_origin();
+        let scale = self.scale;
+        let logical = |q: Vec2| egui::pos2(q.x / scale, q.y / scale);
+        if let Some(d) = &self.curve_draw {
+            let pieces = vec![d.path.iter().map(|&p| logical(p + origin)).collect()];
+            return Some(workspace::CurvePreview { pieces, drawing: true, hot: false });
+        }
+        self.live_curve()?;
+        let c = self.curve.as_ref()?;
+        let mut pieces = Vec::new();
+        let mut nearest = f32::INFINITY;
+        for piece in &c.curve.pieces {
+            let mut run = Vec::new();
+            for i in piece.clone() {
+                match self.project_front(c.curve.points[i]) {
+                    Some(q) => {
+                        nearest = nearest.min(q.distance(self.cursor));
+                        run.push(logical(q));
+                    }
+                    None => {
+                        if run.len() > 1 {
+                            pieces.push(std::mem::take(&mut run));
+                        }
+                        run.clear();
+                    }
+                }
+            }
+            if run.len() > 1 {
+                pieces.push(run);
+            }
+        }
+        let hot = c.bend.is_some() || nearest <= CURVE_GRAB_PX / scale;
+        Some(workspace::CurvePreview { pieces, drawing: false, hot })
     }
 
     fn update_hover(&mut self) {
@@ -2878,6 +3409,15 @@ impl App {
             self.transpose_move();
         } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
             self.mask_move();
+        } else if self.curve_draw.is_some() {
+            let p = self.cursor - self.canvas_origin();
+            let d = self.curve_draw.as_mut().unwrap();
+            if d.path.last().is_none_or(|q| q.distance(p) >= 1.0) {
+                d.path.push(p);
+            }
+        } else if let Some(b) = self.curve.as_mut().and_then(|c| c.bend.as_mut()) {
+            // Re-applied once per frame.
+            b.pending = true;
         } else if self.stroke.is_some() {
             if self.stroke_brush.kind.is_drag() {
                 self.stroke_pending = true;
@@ -2951,11 +3491,17 @@ impl App {
             if self.workspace.mode != Mode::Draw && self.begin_transpose() {
                 return;
             }
+            // ZBrush Curve mode: a press on the applied curve bends it.
+            if self.workspace.mode == Mode::Draw && self.begin_curve_bend() {
+                return;
+            }
             let (o, d) = self.cursor_ray();
             let hit = self.mesh().raycast(o, d);
             log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
             if hit.is_none() {
                 self.begin_nav(MouseButton::Left);
+            } else if self.curve_mode(self.effective_brush().kind) {
+                self.begin_curve();
             } else {
                 self.begin_stroke();
             }
@@ -2980,6 +3526,8 @@ impl App {
             return;
         }
         self.end_mask();
+        self.end_curve_draw();
+        self.end_curve_bend();
         self.end_stroke();
         self.end_transpose();
         self.end_nav(MouseButton::Left);
@@ -3035,6 +3583,13 @@ impl App {
         match key {
             KeyCode::Escape if self.workspace.popup.is_some() => self.workspace.popup = None,
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
+            // Esc drops the curve being drawn, or lets go of the applied one (its result
+            // stays), unless it is being bent.
+            KeyCode::Escape if self.curve_draw.is_some() || self.curve.as_ref().is_some_and(|c| c.bend.is_none()) => {
+                self.curve_draw = None;
+                self.curve = None;
+                self.workspace.curve_preview = None;
+            }
             KeyCode::KeyS if ctrl => self.pending_doc = Some(DocOp::Save),
             KeyCode::KeyO if ctrl => self.pending_doc = Some(DocOp::Open),
             // ZBrush masking: Ctrl + I invert, Ctrl + A mask all, Ctrl + Shift + A clear,
@@ -3131,6 +3686,7 @@ impl App {
             (None, Some(e)) => e.clone(),
             (None, None) => String::new(),
         };
+        self.workspace.curve_preview = self.curve_preview();
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -3382,6 +3938,21 @@ impl App {
         if self.stroke_pending {
             self.stroke_pending = false;
             self.apply_stroke();
+        }
+        if self.curve.as_ref().is_some_and(|c| c.bend.as_ref().is_some_and(|b| b.pending)) {
+            let t = Instant::now();
+            self.bend_curve();
+            self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+        }
+        if let Some((phase, left)) = self.selftest_curve {
+            if left == 0 {
+                self.selftest_curve = self.selftest_curve_phase(phase).map(|next| (next, 10));
+                if self.selftest_curve.is_none() {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_curve = Some((phase, left - 1));
+            }
         }
         if let Some((phase, left)) = self.selftest_wedge {
             if left == 0 {
@@ -4175,6 +4746,9 @@ fn main() {
     }
     if args.iter().any(|a| a == "--selftest-pressure") {
         app.selftest_pressure = Some(20);
+    }
+    if args.iter().any(|a| a == "--selftest-curve") {
+        app.selftest_curve = Some((0, 20));
     }
     app.open_on_start = flag("--open").cloned();
     if stress {
@@ -5189,5 +5763,107 @@ mod surface_input_tests {
         a.on_key(KeyCode::Escape);a.left_release();assert_eq!(a.mesh().positions,original);assert!(!a.history.can_undo());
         a.cursor_moved(start,false);a.left_press(false,false);a.cursor_moved(end,false);a.left_release();
         assert_ne!(a.mesh().positions,original);a.history.undo(&mut a.doc);assert_eq!(a.mesh().positions,original);
+    }
+}
+
+#[cfg(test)]
+mod curve_input_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new(40, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app.workspace.assets = sculpt::StampSettings::default();
+        app
+    }
+
+    /// Press, a shaky drag along +X, and optionally the release.
+    fn drag(app: &mut App, from: Vec2, len: f32, release: bool) {
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for k in 1..=40 {
+            let x = len * k as f32 / 40.0;
+            app.cursor_moved(from + Vec2::new(x, (x * 0.9).sin() * 3.0), false);
+        }
+        if release {
+            app.left_release();
+        }
+    }
+
+    #[test]
+    fn zipper_strokes_along_a_curve_by_default_and_bends() {
+        let mut a = app();
+        a.workspace.select_brush(&mut a.brush, BrushKind::Zipper);
+        a.brush.radius = 0.2;
+        assert!(a.curve_mode(BrushKind::Zipper) && !a.curve_mode(BrushKind::Draw));
+        let original = a.mesh().positions.clone();
+        let c = a.project(Vec3::ZERO) - Vec2::new(150.0, 0.0);
+        drag(&mut a, c, 300.0, false);
+        assert_eq!(a.mesh().positions, original, "nothing until release");
+        assert!(a.curve_preview().is_some_and(|p| p.drawing));
+        a.left_release();
+        let applied = a.mesh().positions.clone();
+        assert_ne!(applied, original);
+        assert!(a.history.can_undo() && a.live_curve().is_some());
+        assert!(a.curve_preview().is_some_and(|p| !p.drawing && !p.pieces.is_empty()));
+        // Grab the middle of the curve and pull it.
+        let mid = { let c = &a.curve.as_ref().unwrap().curve; c.points[c.points.len() / 2] };
+        let at = a.project(mid);
+        a.cursor_moved(at, false);
+        a.left_press(false, false);
+        assert!(a.curve.as_ref().unwrap().bend.is_some());
+        a.cursor_moved(at + Vec2::new(0.0, -60.0), false);
+        a.left_release();
+        let bent = a.mesh().positions.clone();
+        assert_ne!(bent, applied);
+        assert!(a.live_curve().is_some(), "still bendable");
+        // Undo the bend, then the curve.
+        a.history.undo(&mut a.doc);
+        let d = a.mesh().positions.iter().zip(&applied).map(|(p, q)| p.distance(*q)).fold(0.0f32, f32::max);
+        assert!(d < 1e-6, "{d}");
+        assert!(a.live_curve().is_none(), "an undo lets the curve go");
+        a.history.undo(&mut a.doc);
+        assert_eq!(a.mesh().positions, original);
+    }
+
+    #[test]
+    fn another_edit_or_esc_lets_the_curve_go_and_freehand_stays_the_default() {
+        let mut a = app();
+        a.workspace.select_brush(&mut a.brush, BrushKind::Zipper);
+        let c = a.project(Vec3::ZERO) - Vec2::new(100.0, 0.0);
+        drag(&mut a, c, 200.0, true);
+        assert!(a.live_curve().is_some());
+        // A freehand Draw stroke elsewhere: the curve can no longer be bent.
+        a.workspace.select_brush(&mut a.brush, BrushKind::Draw);
+        drag(&mut a, c + Vec2::new(0.0, 120.0), 100.0, true);
+        assert!(a.live_curve().is_none());
+        // Esc lets a curve go and keeps its result.
+        a.workspace.select_brush(&mut a.brush, BrushKind::Zipper);
+        drag(&mut a, c - Vec2::new(0.0, 120.0), 200.0, true);
+        let result = a.mesh().positions.clone();
+        assert!(a.curve.is_some());
+        a.on_key(KeyCode::Escape);
+        assert!(a.curve.is_none() && a.mesh().positions == result);
+        // Esc while drawing drops the stroke.
+        drag(&mut a, c, 200.0, false);
+        a.on_key(KeyCode::Escape);
+        a.left_release();
+        assert_eq!(a.mesh().positions, result);
+        // Any dab brush can stroke along a curve; Freehand turns it off again.
+        let undo_steps = |a: &App| a.history.edits();
+        a.workspace.set_curve_mode(BrushKind::DamStandard, true);
+        a.workspace.select_brush(&mut a.brush, BrushKind::DamStandard);
+        let before = (a.mesh().positions.clone(), undo_steps(&a));
+        drag(&mut a, c + Vec2::new(0.0, 60.0), 200.0, false);
+        assert_eq!(a.mesh().positions, before.0);
+        a.left_release();
+        assert_ne!(a.mesh().positions, before.0);
+        assert_eq!(undo_steps(&a), before.1 + 1, "one undo step");
+        a.workspace.set_curve_mode(BrushKind::DamStandard, false);
+        assert!(!a.curve_mode(BrushKind::DamStandard));
+        // Drag brushes never stroke along a curve.
+        a.workspace.set_curve_mode(BrushKind::Grab, true);
+        assert!(!a.curve_mode(BrushKind::Grab));
     }
 }

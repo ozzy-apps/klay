@@ -26,6 +26,7 @@ cargo run --release -- --segments 400 --divide 2 --novsync --selftest-mask      
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
 cargo run --release -- --divide 2 --selftest-pressure                # tablet connection (moves the pointer once via XTest), strokes at set pen pressures, log, exit
+cargo run --release -- --divide 2 --selftest-curve                   # Zipper along a curve vs freehand with a shaky hand, bend, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
@@ -74,14 +75,39 @@ Pressure" axis, as the libinput and wacom drivers do), pen pressure scales each 
 ZBrush's Brush › Tablet Pressure with its default linear curves: **Draw Size** and **Z
 Intensity** both follow the pen, and either can be turned off in Brush › Tablet pressure.
 The lightest touch still leaves a dab 5 % of Draw Size wide, with no strength. Sculpting
-brushes, Shift smoothing and Ctrl mask painting follow the pen; Grab (Move) keeps the size it
-picked up with. A mouse, or any device without pressure, sculpts at full Draw Size and Z
-Intensity, so switching between pen and mouse needs no setting.
+brushes, Shift smoothing and Ctrl mask painting follow the pen, and RGB Intensity follows
+Z Intensity's toggle. Drag brushes (Grab, Elastic, Snake Hook) keep what they picked up
+with, and Zipper, Stitch and Rake keep their size so the teeth stay even. Curve strokes are
+applied at full Draw Size and Z Intensity. A mouse, or any device without pressure, sculpts
+at full Draw Size and Z Intensity, so switching between pen and mouse needs no setting.
 
 Brush › Tablet pressure shows the live pressure and the pen found. The libinput driver adds
 the pen's device the first time the pen comes near the screen, so it shows "none yet" until
 then. Pressure is not read on Wayland yet (winit, the window library, does not report it):
 run an X11 session.
+
+### Curve strokes
+
+ZBrush's Stroke › Curve: instead of following every wobble of the hand, the stroke is drawn
+as a path, and on release it becomes a smooth curve on the surface and the brush is applied
+along it. **Zipper, Stitch and Rake start in Curve mode**, as ZBrush's zipper and stitch
+brushes do; any dab brush (Draw, Dam Standard, Clay Buildup, Paint…) can use it too. Switch
+a brush between Freehand and Curve with the stroke thumbnail on the left shelf or in
+**Stroke › Curve**.
+
+- Draw the stroke: a dashed line follows the cursor and nothing changes until release.
+- On release the path is smoothed (**Curve smooth**, times the brush's size on screen),
+  laid onto the surface and the brush is applied along it as one undo step. Zipper, Stitch
+  and Rake are laid out in the curve's own frame: every vertex near it is set once from its
+  nearest point on the curve, so the teeth stay square to the line and evenly spaced by its
+  length. Other brushes dab every **Curve step** (times Draw Size) along it.
+- The curve stays on the model as a dashed line. It lights up under the cursor: **drag it
+  to bend it**, and the brush is re-applied along the new shape from the surface the curve
+  was first applied to (one undo step per bend). A new stroke starts a new curve.
+- **Esc** lets the curve go (the result stays); Esc while drawing drops the stroke. Any
+  other edit (another stroke, undo, a level change) lets it go as well.
+- Drag brushes, masks and shape tools stroke freehand only. Curve strokes respect masks,
+  hidden polygons and X symmetry, like freehand ones.
 
 ## Workspace
 
@@ -118,8 +144,8 @@ bar sliders. Long label/value rows wrap inside narrow trays.
 The 33 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Wedge remeshing, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X
-symmetry, Transpose and live statistics are connected to the engine. Zcut, advanced stroke
-options, Y / Z / radial symmetry, parts of the Transform palette and reserved
+symmetry, Transpose, Curve strokes and live statistics are connected to the engine. Zcut, stroke
+spacing and stabilizer, Y / Z / radial symmetry, parts of the Transform palette and reserved
 Local/Transp/Ghost toggles remain marked **Not connected**.
 
 ### Brushes, alphas and textures
@@ -294,6 +320,21 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 
 ## How it works
 
+- `curve.rs`: curve strokes. The screen path is resampled every pixel or finer and
+  smoothed in two passes: a light one takes out fast jitter so the path's length is honest
+  (a shaky path is much longer than the line it follows, and a window measured along it
+  would smooth a shaky stroke less than a steady one), then a Gaussian of Curve smooth
+  times the brush's screen radius. Each end keeps its place along the stroke but takes the
+  averaged line's place across it, and the path is mirrored through it so a straight run
+  stays straight. The result is raycast every tenth of the brush's screen radius and
+  resampled every 4 % of Draw Size in the world, with averaged normals and tangents kept
+  in the surface. `band` finds each vertex's nearest point on the curve (chunks culled by
+  their bounds, segments by chunk) and its arc length and signed distance across, so
+  Zipper/Stitch/Rake are evaluated once per vertex in the curve's frame. With X symmetry
+  the mirrored curve is searched too and the nearer one wins. A bend moves the curve's
+  projected points with a smooth falloff from the grabbed point, restores the chunks the
+  curve has touched to their first-application state, lays the points onto that surface
+  again and re-applies; the bend's own stroke keeps the pre-bend state for undo.
 - `tablet.rs`: pen pressure on X11. winit does not report it on Linux, so Klay opens a
   second connection to the X server that only listens: XInput2 raw events (motion and
   buttons, from every device) and device changes, selected on the root window. Devices with

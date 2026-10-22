@@ -251,6 +251,9 @@ pub struct History {
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
     pub limit: usize,
+    /// Counts every push, undo, redo and clear: a curve stays bendable only while no other
+    /// edit has happened since it was applied.
+    edits: u64,
 }
 
 impl History {
@@ -259,7 +262,13 @@ impl History {
             undo: Vec::new(),
             redo: Vec::new(),
             limit,
+            edits: 0,
         }
+    }
+
+    /// See [`History::edits`](Self).
+    pub fn edits(&self) -> u64 {
+        self.edits
     }
 
     pub fn can_undo(&self) -> bool {
@@ -287,6 +296,7 @@ impl History {
     }
 
     pub fn push(&mut self, step: UndoStep) {
+        self.edits += 1;
         self.redo.clear();
         self.undo.push(step);
         if self.undo.len() > self.limit {
@@ -295,6 +305,7 @@ impl History {
     }
 
     pub fn undo(&mut self, doc: &mut Multires) {
+        self.edits += 1;
         if let Some(step) = self.undo.pop() {
             let inverse = apply_step(doc, step);
             self.redo.push(inverse);
@@ -302,6 +313,7 @@ impl History {
     }
 
     pub fn redo(&mut self, doc: &mut Multires) {
+        self.edits += 1;
         if let Some(step) = self.redo.pop() {
             let inverse = apply_step(doc, step);
             self.undo.push(inverse);
@@ -309,6 +321,7 @@ impl History {
     }
 
     pub fn clear(&mut self) {
+        self.edits += 1;
         self.undo.clear();
         self.redo.clear();
     }
@@ -789,6 +802,98 @@ impl Stroke {
         self.last_count=sel.len();self.dabs+=1;
     }
 
+    /// Position of vertex `v` when this stroke first touched its chunk.
+    fn stroke_start_position(&self, mesh: &SculptMesh, v: u32) -> Vec3 {
+        let chunk = mesh.vert_chunk[v as usize];
+        match self.snapshot_index.get(&chunk) {
+            Some(&k) => self.snapshots[k].1[(v - mesh.chunks[chunk as usize].vert_start) as usize],
+            None => mesh.positions[v as usize],
+        }
+    }
+
+    /// A detail relief (Zipper, Stitch, Rake) along a whole curve at once: every vertex near
+    /// it is set from its nearest point on the curve, so the pattern follows the curve's
+    /// smooth direction and is spaced by its arc length (see `crate::curve`). Heights are set
+    /// relative to the stroke's start, as in the freehand relief.
+    pub fn detail_curve(&mut self, mesh: &mut SculptMesh, brush: &Brush, curve: &crate::curve::Curve) {
+        if curve.is_empty() {
+            return;
+        }
+        let r = brush.radius;
+        let (sel, feet) = crate::curve::band(mesh, curve, r, self.symmetry);
+        if sel.is_empty() {
+            return;
+        }
+        let chunks = sel.chunks();
+        if brush.sculpt {
+            self.snapshot(mesh, &chunks);
+        }
+        let mid = curve.points.len() / 2;
+        self.paint_selected(mesh, &sel, brush, curve.points[mid], curve.normals[mid]);
+        self.last_count = sel.len();
+        self.dabs += 1;
+        if !brush.sculpt || !brush.kind.is_detail() {
+            return;
+        }
+        let sign = if self.invert { -1.0 } else { 1.0 };
+        let next = sel.par_map(|i, v| {
+            let f = feet[i];
+            let actual = mesh.positions[v as usize];
+            // The foot is on the vertex's own side, so the stamp needs no mirroring.
+            let weight = focal_falloff(f.across.abs(), r, brush.focal_shift)
+                * self.stamp_weight(actual, f.point, f.normal, r, 1.0)
+                * crate::mask::freedom(&mesh.mask, v);
+            if weight <= 0.0 {
+                return actual;
+            }
+            let height = crate::detail_brush::profile(brush.kind, f.across / r, f.along / r) * r * 0.12 * brush.strength * sign * weight;
+            let old = self.stroke_start_position(mesh, v);
+            actual + f.normal * (height - (actual - old).dot(f.normal))
+        });
+        mesh.scatter_positions(&sel, &next);
+        mesh.finish_edit(&chunks);
+    }
+
+    /// Dab brushes along a curve: a dab every `step` of arc length (at least the freehand
+    /// dab spacing), at the curve's surface points and normals. Each piece starts afresh.
+    pub fn dabs_along(&mut self, mesh: &mut SculptMesh, brush: &Brush, curve: &crate::curve::Curve, view_dir: Vec3, step: f32) {
+        let step = step.max(brush.radius * 0.16);
+        for piece in &curve.pieces {
+            self.last_dab = None;
+            let mut next = curve.along[piece.start];
+            for i in piece.clone() {
+                if curve.along[i] + 1e-6 < next {
+                    continue;
+                }
+                let (p, n) = (curve.points[i], curve.normals[i]);
+                self.dab(mesh, brush, p, n, view_dir, (p + n * brush.radius * 4.0, -n));
+                next = curve.along[i] + step;
+            }
+        }
+        self.last_dab = None;
+    }
+
+    /// Record the positions and colours of `chunks` for undo now, before the caller changes
+    /// them outside the brush (a bent curve restores its base first).
+    pub fn snapshot_now(&mut self, mesh: &SculptMesh, chunks: &[u32]) {
+        self.snapshot(mesh, chunks);
+        // Colours only once the model has paint: an unpainted level has none to keep.
+        if !mesh.colors.is_empty() {
+            let fresh: Vec<_> = chunks.iter().copied().filter(|c| self.paint_snapshotted.insert(*c)).collect();
+            self.paint_snapshots.extend(crate::paint::snapshot(mesh, &fresh));
+        }
+    }
+
+    /// Positions of every chunk the stroke touched, from before it touched them.
+    pub fn position_snapshots(&self) -> &[(u32, Vec<Vec3>)] {
+        &self.snapshots
+    }
+
+    /// Colours of every chunk the stroke painted, from before it painted them.
+    pub fn paint_snapshots(&self) -> &crate::paint::Chunks {
+        &self.paint_snapshots
+    }
+
     fn grab_dab(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, view_dir: Vec3, ray: (Vec3, Vec3)) {
         if self.grab.is_none() {
             let sel = self.select(mesh, hit, brush.radius);
@@ -1124,5 +1229,92 @@ mod pressure_tests {
         let z = Brush { kind: BrushKind::Zipper, ..b }.at_pressure(Some(0.5), true, true);
         assert_eq!(z.radius, 0.4);
         assert!((z.strength - 0.4).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+    use crate::curve::Curve;
+    use crate::primitive::Primitive;
+
+    fn plane() -> SculptMesh {
+        let (p, i) = Primitive::Plane.build(160, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    /// A curve along +X at height `y` on the plane z = 0, from `x0` to `x1`.
+    fn line(x0: f32, x1: f32, y: f32) -> Curve {
+        let hits: Vec<_> = (0..=40).map(|i| Some((Vec3::new(x0 + (x1 - x0) * i as f32 / 40.0, y, 0.0), Vec3::Z))).collect();
+        Curve::from_hits(&hits, 0.01)
+    }
+
+    fn zipper() -> Brush {
+        Brush { kind: BrushKind::Zipper, radius: 0.25, strength: 1.0, ..Brush::default() }
+    }
+
+    #[test]
+    fn zipper_along_a_curve_is_the_profile_in_the_curves_own_frame() {
+        let mut m = plane();
+        let before = m.positions.clone();
+        let b = zipper();
+        let mut s = Stroke::begin(false, false, false);
+        s.detail_curve(&mut m, &b, &line(-0.6, 0.6, 0.0));
+        assert!(s.end(&mut m).is_some());
+        // Every vertex is set once from its own place: teeth square to the line, spaced by
+        // arc length from its start, nothing past the ends.
+        let r = b.radius;
+        let mut checked = 0;
+        for (p, q) in m.positions.iter().zip(&before) {
+            if q.x < -0.6 - 0.02 * r || q.x > 0.6 + 0.02 * r || q.y.abs() > r {
+                assert_eq!(p, q, "outside the band");
+                continue;
+            }
+            let expect = crate::detail_brush::profile(BrushKind::Zipper, q.y / r, (q.x + 0.6) / r) * r * 0.12 * focal_falloff(q.y.abs(), r, 0.0);
+            assert!((p.z - expect).abs() < 1e-4, "{q:?}: {} vs {expect}", p.z);
+            assert!((p.truncate() - q.truncate()).length() < 1e-6, "moves along the normal only");
+            checked += 1;
+        }
+        assert!(checked > 1000);
+    }
+
+    #[test]
+    fn curve_reliefs_respect_masks_and_mirror_with_symmetry() {
+        let b = zipper();
+        // Fully masked: nothing moves.
+        let mut m = plane();
+        m.mask = vec![255; m.vertex_count()];
+        let before = m.positions.clone();
+        let mut s = Stroke::begin(false, false, false);
+        s.detail_curve(&mut m, &b, &line(-0.6, 0.6, 0.0));
+        assert_eq!(m.positions, before);
+        // With symmetry, a curve on +X leaves its mirror image on -X.
+        let mut m = plane();
+        let mut s = Stroke::begin(false, false, true);
+        s.detail_curve(&mut m, &b, &line(0.15, 0.65, 0.1));
+        let height = |m: &SculptMesh, x: f32, y: f32| {
+            m.positions.iter().min_by(|a, b| (a.truncate() - glam::Vec2::new(x, y)).length().total_cmp(&(b.truncate() - glam::Vec2::new(x, y)).length())).unwrap().z
+        };
+        let mut moved = 0;
+        for k in 0..60 {
+            let (x, y) = (0.2 + 0.4 * k as f32 / 60.0, 0.1 + 0.2 * ((k * 7 % 11) as f32 / 11.0 - 0.5));
+            let (a, b) = (height(&m, x, y), height(&m, -x, y));
+            assert!((a - b).abs() < 1e-5, "({x}, {y}): {a} vs mirrored {b}");
+            moved += (a.abs() > 1e-4) as usize;
+        }
+        assert!(moved > 10);
+    }
+
+    #[test]
+    fn dab_brushes_step_evenly_along_a_curve() {
+        let mut m = plane();
+        let before = m.positions.clone();
+        let b = Brush { kind: BrushKind::Draw, radius: 0.1, strength: 0.5, ..Brush::default() };
+        let mut s = Stroke::begin(false, false, false);
+        s.dabs_along(&mut m, &b, &line(-0.5, 0.5, 0.0), -Vec3::Z, 0.05);
+        // A dab every 0.05 over a 1.0 line: 21 dabs, and the ridge runs end to end.
+        assert_eq!(s.dabs, 21);
+        let raised = |x: f32| m.positions.iter().zip(&before).filter(|(_, q)| (q.x - x).abs() < 0.01 && q.y.abs() < 0.02).all(|(p, q)| p.z > q.z);
+        assert!(raised(-0.45) && raised(0.0) && raised(0.45));
     }
 }

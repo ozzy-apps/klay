@@ -499,6 +499,15 @@ impl QuickPopup {
     }
 }
 
+/// A curve stroke on the canvas (see `crate::curve`): its pieces in logical pixels,
+/// whether it is still being drawn, and whether the cursor is on it (it can be bent).
+#[derive(Clone, Debug, Default)]
+pub struct CurvePreview {
+    pub pieces: Vec<Vec<Pos2>>,
+    pub drawing: bool,
+    pub hot: bool,
+}
+
 pub struct Workspace {
     pub layout: DockLayout,
     pub canvas: Rect,
@@ -515,6 +524,13 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Brushes in Curve mode (ZBrush: Stroke › Curve), how much a curve is smoothed
+    /// (times the brush's screen radius) and the dab step along it (times Draw Size).
+    pub curve_kinds: Vec<BrushKind>,
+    pub curve_smooth: f32,
+    pub curve_step: f32,
+    /// The curve being drawn or the one that can be bent, in logical pixels, per piece.
+    pub curve_preview: Option<CurvePreview>,
     /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
     pub pressure_size: bool,
     pub pressure_intensity: bool,
@@ -581,6 +597,10 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            curve_kinds: crate::curve::CURVE_BY_DEFAULT.to_vec(),
+            curve_smooth: 0.5,
+            curve_step: 0.16,
+            curve_preview: None,
             pressure_size: true,
             pressure_intensity: true,
             show_mask: true,
@@ -1133,8 +1153,16 @@ impl Workspace {
                         let tex = self.texture(ui.ctx(), Some(m.brush.kind), self.subtract);
                         let resp = thumb(ui, Thumb::Texture(tex), m.brush.kind.name(), true, false);
                         if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
-                        thumb(ui, Thumb::Glyph("stroke"), "Freehand", false, false)
-                            .on_hover_text("Stroke types are not connected yet");
+                        let kind = m.brush.kind;
+                        let curve = self.curve_kinds.contains(&kind) && crate::curve::capable(kind);
+                        let resp = thumb(ui, Thumb::Glyph("stroke"), if curve { "Curve" } else { "Freehand" }, false, false);
+                        if crate::curve::capable(kind) {
+                            if resp.on_hover_text("Click: Freehand / Curve for this brush").clicked() {
+                                self.set_curve_mode(kind, !curve);
+                            }
+                        } else {
+                            resp.on_hover_text(format!("{} strokes freehand only", kind.name()));
+                        }
                         self.asset_shelf(ui,false);
                         self.asset_shelf(ui,true);
                         // material
@@ -2517,13 +2545,24 @@ impl Workspace {
                     ui,
                     h,
                     id,
-                    "type",
-                    "Stroke type",
-                    Some(NC),
+                    "curve",
+                    "Curve",
+                    None,
                     true,
-                    false,
-                    &mut |_, ui| {
-                        seg(ui, &["Freehand", "Dots", "Drag rect"], 0, false);
+                    true,
+                    &mut |ws, ui| {
+                        let kind = m.brush.kind;
+                        if crate::curve::capable(kind) {
+                            let on = ws.curve_kinds.contains(&kind);
+                            if let Some(i) = seg(ui, &["Freehand", "Curve"], on as usize, false) {
+                                ws.set_curve_mode(kind, i == 1);
+                            }
+                        } else {
+                            note(ui, &format!("{} strokes freehand only", kind.name()));
+                        }
+                        zslider(ui, "Curve smooth", &mut ws.curve_smooth, 0.0..=2.0, false, false, 2);
+                        zslider(ui, "Curve step", &mut ws.curve_step, 0.16..=1.0, false, false, 2);
+                        note(ui, "Release applies along the curve · drag the curve to bend it · Esc lets it go");
                     },
                 );
                 self.sec(
@@ -2808,8 +2847,33 @@ impl Workspace {
         });
     }
 
+    /// Turn Curve mode on or off for one brush (Stroke › Curve).
+    pub fn set_curve_mode(&mut self, kind: BrushKind, on: bool) {
+        self.curve_kinds.retain(|&k| k != kind);
+        if on {
+            self.curve_kinds.push(kind);
+        }
+    }
+
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if let Some(c) = &self.curve_preview {
+            // ZBrush draws a curve as a dotted line on the surface; it lights up under the
+            // cursor, where a drag bends it.
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("curve"))).with_clip_rect(self.canvas);
+            let (color, width) = if c.hot || c.drawing { (ACC, 2.0) } else { (Color32::from_rgb(236, 226, 205), 1.5) };
+            for piece in &c.pieces {
+                if piece.len() < 2 {
+                    continue;
+                }
+                p.extend(egui::Shape::dashed_line(piece, Stroke::new(width, color), 6.0, 4.0));
+                if !c.drawing {
+                    for end in [piece[0], *piece.last().unwrap()] {
+                        p.circle_filled(end, 3.0, color);
+                    }
+                }
+            }
+        }
         if let Some(g)=&self.gesture_preview {
             let p=ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground,Id::unique("brush-gesture"))).with_clip_rect(self.canvas);
             let start=pos2(g.start.x,g.start.y);let end=pos2(g.end.x,g.end.y);
@@ -4195,6 +4259,28 @@ mod tests {
             matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://github.com/ozzy-apps/klay")
         }));
         assert!(workspace.about_open);
+    }
+
+    #[test]
+    fn shelf_and_stroke_palette_switch_a_brush_between_freehand_and_curve() {
+        let (mut workspace, ctx) = test_workspace("curve-mode");
+        let size = vec2(1600.0, 1000.0);
+        // Zipper, Stitch and Rake start in Curve mode; the test model's brush is Draw.
+        assert!(workspace.curve_kinds.contains(&BrushKind::Zipper));
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        // The left shelf names the current brush's stroke; a click switches it.
+        let shelf = text_position(&output, "Freehand");
+        click(&mut workspace, &ctx, size, shelf + vec2(6.0, 4.0));
+        assert!(workspace.curve_kinds.contains(&BrushKind::Draw));
+        // Stroke › Curve switches it back.
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        click(&mut workspace, &ctx, size, text_position(&output, "Stroke") + vec2(6.0, 4.0));
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        assert!(text_count(&output, "Curve smooth") == 1, "the Curve section is open");
+        click(&mut workspace, &ctx, size, text_position(&output, "Freehand") + vec2(6.0, 4.0));
+        assert!(!workspace.curve_kinds.contains(&BrushKind::Draw));
+        assert!(workspace.curve_kinds.contains(&BrushKind::Zipper));
     }
 
     #[test]
