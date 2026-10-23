@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 — 2026-10-23
+
+- Fixed Clip Line pushing earlier cuts back out when cuts cross (with or without symmetry): a cut moved every vertex on its side straight onto its plane, and where the cut crossed an earlier cut face at a wide angle (a pie slice), vertices of that face and around its edge landed outside the model, past the earlier cut, visible once the model is turned. On a solid, a clipped vertex now lands inside the model's cross-section on the cut plane, or on the nearest point of its outline (outline segments in a grid; each edge's crossing computed in one order so the outline has no rounding gaps).
+- New --selftest-clip (three crossing cuts through the real handlers, every vertex checked against every cut, view turned; --hold to look at it). A cut on a 960k-vertex sphere takes 13–35 ms.
+- Verification: 162 release tests (crossing cuts in orthographic and perspective views, canvas sizes, turned views, 4k to 960k vertices); --selftest-clip at 4k and 960k vertices and --selftest-surface on the GPU.
+
 ## 0.6.2 — 2026-10-23
 
 - Fixed Clip Line squashing the model with X symmetry: the mirrored plane was applied to the whole model, so in any view turned or panned off the symmetry plane it cut deeper than the guide (a cut drawn at 77 % of the height took it to 59 %), more with every clip. Now the half under the line is clipped by the guide's plane and the other half by its mirror image; vertices on the symmetry plane stay on it.

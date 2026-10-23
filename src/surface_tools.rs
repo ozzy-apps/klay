@@ -172,6 +172,147 @@ pub fn mask_shape(
         .then_some(mask)
 }
 
+/// Where a solid mesh crosses a plane: the outline segments in the plane's own 2D frame,
+/// binned in a square grid so a point is tested inside or outside, and its nearest outline
+/// point found, by looking at a few cells.
+struct Section {
+    origin: Vec3,
+    u: Vec3,
+    v: Vec3,
+    segments: Vec<(Vec2, Vec2)>,
+    /// Grid corner, cell size, cells per side, and the segments touching each cell.
+    lo: Vec2,
+    cell: f32,
+    side: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl Section {
+    fn new(mesh: &SculptMesh, plane: Vec4) -> Option<Self> {
+        let n = plane.truncate();
+        let origin = -n * plane.w;
+        let u = n.any_orthonormal_vector();
+        let v = n.cross(u);
+        let at = |p: Vec3| Vec2::new((p - origin).dot(u), (p - origin).dot(v));
+        let segments: Vec<(Vec2, Vec2)> = mesh
+            .indices
+            .par_chunks_exact(3)
+            .filter_map(|t| {
+                let d = [0, 1, 2].map(|k| n.dot(mesh.positions[t[k] as usize]) + plane.w);
+                let mut ends = [Vec2::ZERO; 2];
+                let mut found = 0;
+                for k in 0..3 {
+                    let (a, b) = (k, (k + 1) % 3);
+                    if (d[a] > 0.0) != (d[b] > 0.0) && found < 2 {
+                        // From the lower vertex id, so the two triangles of an edge get the
+                        // very same point: a gap of rounding between their copies lets a ray
+                        // slip through the outline and turns inside and outside around.
+                        let (a, b) = if t[a] < t[b] { (a, b) } else { (b, a) };
+                        let f = d[a] / (d[a] - d[b]);
+                        ends[found] = at(mesh.positions[t[a] as usize].lerp(mesh.positions[t[b] as usize], f));
+                        found += 1;
+                    }
+                }
+                (found == 2).then_some((ends[0], ends[1]))
+            })
+            .collect();
+        if segments.is_empty() {
+            return None;
+        }
+        let (lo, hi) = segments.iter().fold((Vec2::MAX, Vec2::MIN), |(lo, hi), (a, b)| (lo.min(*a).min(*b), hi.max(*a).max(*b)));
+        let side = ((segments.len() as f32).sqrt().ceil() as usize).clamp(1, 1024);
+        let cell = ((hi - lo).max_element() / side as f32).max(1e-9);
+        let mut cells = vec![Vec::new(); side * side];
+        let index = |p: Vec2| (((p - lo) / cell).floor().as_ivec2()).clamp(glam::IVec2::ZERO, glam::IVec2::splat(side as i32 - 1));
+        for (k, (a, b)) in segments.iter().enumerate() {
+            let (c0, c1) = (index(a.min(*b)), index(a.max(*b)));
+            for y in c0.y..=c1.y {
+                for x in c0.x..=c1.x {
+                    cells[y as usize * side + x as usize].push(k as u32);
+                }
+            }
+        }
+        Some(Self { origin, u, v, segments, lo, cell, side, cells })
+    }
+
+    fn cell_of(&self, p: Vec2) -> (i64, i64) {
+        let c = ((p - self.lo) / self.cell).floor();
+        (c.x as i64, c.y as i64)
+    }
+
+    /// Whether `q` lies inside the outline: crossings of a ray toward +u (even-odd), each
+    /// counted in the cell where it happens so a segment in several cells counts once.
+    fn inside(&self, q: Vec2) -> bool {
+        let (cx, cy) = self.cell_of(q);
+        let side = self.side as i64;
+        if cy < 0 || cy >= side || cx >= side {
+            return false;
+        }
+        let mut inside = false;
+        for x in cx.max(0)..side {
+            for &k in &self.cells[(cy * side + x) as usize] {
+                let (a, b) = self.segments[k as usize];
+                if (a.y > q.y) != (b.y > q.y) {
+                    let at = a.x + (b.x - a.x) * (q.y - a.y) / (b.y - a.y);
+                    // The segment's own cells: rounding can put `at` just past them, and
+                    // then the crossing would be counted nowhere.
+                    let column = |x: f32| (((x - self.lo.x) / self.cell).floor() as i64).clamp(0, side - 1);
+                    let home = column(at).clamp(column(a.x.min(b.x)), column(a.x.max(b.x)));
+                    if at > q.x && home == x {
+                        inside = !inside;
+                    }
+                }
+            }
+        }
+        inside
+    }
+
+    /// `q` (a point on the plane) itself when it is inside the cross-section, otherwise the
+    /// nearest point of its outline.
+    fn keep_inside(&self, q: Vec3) -> Vec3 {
+        let flat = Vec2::new((q - self.origin).dot(self.u), (q - self.origin).dot(self.v));
+        if self.inside(flat) {
+            return q;
+        }
+        // Rings of cells outward from the point's own (clamped onto the grid), until a ring
+        // is farther away than the best point found.
+        let side = self.side as i64;
+        let (cx, cy) = self.cell_of(flat);
+        let (cx, cy) = (cx.clamp(0, side - 1), cy.clamp(0, side - 1));
+        let gap = |x: i64, y: i64| {
+            let a = self.lo + Vec2::new(x as f32, y as f32) * self.cell;
+            let d = (a - flat).max(flat - (a + Vec2::splat(self.cell))).max(Vec2::ZERO);
+            d.length_squared()
+        };
+        let mut best = (f32::MAX, flat);
+        for ring in 0..side {
+            let mut any = false;
+            for y in (cy - ring).max(0)..=(cy + ring).min(side - 1) {
+                for x in (cx - ring).max(0)..=(cx + ring).min(side - 1) {
+                    if (x - cx).abs().max((y - cy).abs()) != ring || gap(x, y) > best.0 {
+                        continue;
+                    }
+                    any = true;
+                    for &k in &self.cells[(y * side + x) as usize] {
+                        let (a, b) = self.segments[k as usize];
+                        let ab = b - a;
+                        let t = ((flat - a).dot(ab) / ab.length_squared().max(1e-20)).clamp(0.0, 1.0);
+                        let c = a + ab * t;
+                        let d = c.distance_squared(flat);
+                        if d < best.0 {
+                            best = (d, c);
+                        }
+                    }
+                }
+            }
+            if !any && best.0 < f32::MAX {
+                break;
+            }
+        }
+        self.origin + self.u * best.1.x + self.v * best.1.y
+    }
+}
+
 /// Collapse the chosen half-space onto the guide plane, preserving topology and paint.
 ///
 /// With X symmetry, `symmetry` is the side (+1 or -1 along X) of the half the line was
@@ -190,12 +331,25 @@ pub fn clip_line(
         plane = -plane;
     }
     let mirrored = Vec4::new(-plane.x, plane.y, plane.z, plane.w);
-    let project = |mut p: Vec3, plane: Vec4, freedom: f32| {
-        let distance = plane.truncate().dot(p) + plane.w;
-        if distance > 0.0 {
-            p -= plane.truncate() * distance * freedom;
+    // A vertex on the removed side moves straight onto the plane. On a solid it must land
+    // inside the model's cross-section there: where the cut crosses an earlier cut face (or
+    // takes more than half of a round part), moving straight would put it outside, sticking
+    // out past the earlier cut once the model is turned. Such a vertex goes to the nearest
+    // point of the cross-section's outline instead.
+    let solid = crate::wedge::closed(mesh);
+    let section = |plane: Vec4| solid.then(|| Section::new(mesh, plane)).flatten();
+    let own = section(plane);
+    let other = symmetry.filter(|_| plane.x.abs() > 1e-6).and_then(|_| section(mirrored));
+    let project = |v: usize, plane: Vec4, section: Option<&Section>, freedom: f32| {
+        let p = mesh.positions[v];
+        let n = plane.truncate();
+        let distance = n.dot(p) + plane.w;
+        if distance <= 0.0 {
+            return p;
         }
-        p
+        let q = p - n * distance;
+        let q = section.map_or(q, |s| s.keep_inside(q));
+        p + (q - p) * freedom
     };
     let changed: Vec<_> = mesh
         .chunks
@@ -213,17 +367,18 @@ pub fn clip_line(
                     let freedom = crate::mask::freedom(&mesh.mask, v as u32);
                     match symmetry {
                         Some(side) if plane.x.abs() > 1e-6 => {
+                            let (a, b) = (own.as_ref(), other.as_ref());
                             if p.x.abs() <= 1e-6 {
                                 // On the symmetry plane both halves meet: the mean of the two
                                 // keeps the vertex on it.
-                                (project(p, plane, freedom) + project(p, mirrored, freedom)) * 0.5
+                                (project(v, plane, a, freedom) + project(v, mirrored, b, freedom)) * 0.5
                             } else if p.x * side > 0.0 {
-                                project(p, plane, freedom)
+                                project(v, plane, a, freedom)
                             } else {
-                                project(p, mirrored, freedom)
+                                project(v, mirrored, b, freedom)
                             }
                         }
-                        _ => project(p, plane, freedom),
+                        _ => project(v, plane, own.as_ref(), freedom),
                     }
                 })
                 .collect();
@@ -374,6 +529,46 @@ mod tests {
             }
         }
         assert!(pairs > before.len() / 2);
+    }
+
+    #[test]
+    #[ignore]
+    fn time_crossing_clips_on_a_million_vertices() {
+        let (p, i) = crate::mesh::cube_sphere(400, 1.0);
+        let mut m = SculptMesh::from_raw(p, i);
+        let s = screen();
+        for (a, b) in [(Vec2::new(260.0, 0.0), Vec2::new(260.0, 400.0)), (Vec2::new(60.0, 400.0), Vec2::new(300.0, 0.0)), (Vec2::new(400.0, 300.0), Vec2::new(0.0, 280.0))] {
+            let mut g = Gesture::new(BrushKind::ClipLine, a, false);
+            g.end = b;
+            let t = std::time::Instant::now();
+            clip_line(&mut m, s, &g, None).unwrap();
+            eprintln!("TIME {} vertices: {:.0} ms", m.vertex_count(), t.elapsed().as_secs_f32() * 1000.0);
+        }
+    }
+
+    #[test]
+    fn crossing_clips_never_push_an_earlier_cut_back_out() {
+        // A wedge from three cuts whose removed sides face away from each other, like
+        // slicing a pie piece out of a sphere: right, upper left, then bottom.
+        let s = screen();
+        let cuts = [
+            (Vec2::new(260.0, 0.0), Vec2::new(260.0, 400.0)),
+            (Vec2::new(60.0, 400.0), Vec2::new(300.0, 0.0)),
+            (Vec2::new(400.0, 300.0), Vec2::new(0.0, 280.0)),
+        ];
+        let mut m = mesh();
+        let mut planes = Vec::new();
+        for (a, b) in cuts {
+            let mut g = Gesture::new(BrushKind::ClipLine, a, false);
+            g.end = b;
+            planes.push(s.plane(a, b).unwrap());
+            clip_line(&mut m, s, &g, None).unwrap();
+            // Every vertex stays on the kept side of every cut so far.
+            for (k, plane) in planes.iter().enumerate() {
+                let worst = m.positions.iter().map(|p| plane.truncate().dot(*p) + plane.w).fold(f32::MIN, f32::max);
+                assert!(worst < 1e-4, "after {} cuts, cut {k} was pushed back out by {worst}", planes.len());
+            }
+        }
     }
 
     #[test]

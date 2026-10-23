@@ -429,3 +429,9 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Verification: 160 tests; --selftest-surface/brushes/mask pass on the GPU. Not visually checked with a real held key (XTest avoided while the user is active); the UI test renders the real `App::ui` with the modifiers set.
 - Not done: the clip guide does not draw the mirrored line under symmetry.
 
+## Step 47: 0.6.3 — crossing Clip Line cuts stick out (2026-10-23, Claude Code)
+- User report (symmetry off, screenshots): after cutting a pie slice out of a sphere with 2–3 crossing clips, turning the model shows the cut faces squashed outward. Cause: `clip_line` moved each cut-side vertex straight along the plane normal; where the new cut meets an earlier cut face at a wide angle that move leaves the model (test: 0.126 past the first cut on a unit sphere). Local fixes (slide along the vertex normal or incident faces) were not enough: plain sphere vertices near the earlier cut also land outside.
+- Fix (`surface_tools.rs`): on a closed mesh (`wedge::closed`) a `Section` of the mesh by the cut plane is built (outline segments in the plane's 2D frame, binned in a square grid); a projected vertex outside it goes to the nearest outline point. Edge crossings are computed from the lower vertex id so both triangles of an edge give the identical point (rounding gaps let parity rays slip through: found at 960k vertices). Open meshes keep the straight move.
+- `--selftest-clip` (+ `--hold`), tests `crossing_clips_never_push_an_earlier_cut_back_out`, `a_pie_slice_cut_from_crossing_clips_stays_inside_every_cut` (canvas sizes, views, 4k–960k), and the repeated-clips test now checks every earlier plane. Ignored timing test: 13/26/35 ms per cut at 960k.
+- Screenshot `ui-clip-crossing.png` (4k and 960k pie slice, turned). On low-poly models the new edges look lumpy because vertices pile up along them; Divide first for clean edges.
+

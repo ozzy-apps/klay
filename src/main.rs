@@ -383,6 +383,8 @@ struct App {
     selftest_tube: Option<(u8, u32)>,
     /// `--hold`: a self-test leaves the window open when it is done.
     selftest_hold: bool,
+    /// `--selftest-clip`: frames left before the crossing Clip Line cuts.
+    selftest_clip: Option<u32>,
 
     cursor: Vec2,
     last_cursor: Vec2,
@@ -513,6 +515,7 @@ impl App {
             selftest_curve_state: CurveTest::default(),
             selftest_tube: None,
             selftest_hold: false,
+            selftest_clip: None,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             scale: 1.0,
@@ -2401,6 +2404,47 @@ impl App {
                 None
             }
         }
+    }
+
+    /// `--selftest-clip`: a pie slice cut out of the model with three crossing Clip Line
+    /// strokes through the real handlers (the cuts meet at wide angles), then the view is
+    /// turned. No cut may push an earlier one back out, and the GPU copy must match.
+    fn selftest_clip_cuts(&mut self) -> bool {
+        self.workspace.select_brush(&mut self.brush, BrushKind::ClipLine);
+        let b = self.doc.bounds();
+        let c = self.project((b.min + b.max) * 0.5);
+        let r = (self.project((b.min + b.max) * 0.5 + Vec3::X * (b.max - b.min).max_element() * 0.5) - c).length();
+        // Two cuts meeting at a point near the top, each taking the outside of the slice,
+        // then one across the bottom (a cut removes the side to the left of its drag).
+        let cuts = [
+            (Vec2::new(-1.2, 1.2), Vec2::new(0.05, -0.85)),
+            (Vec2::new(0.05, -0.85), Vec2::new(1.2, 1.2)),
+            (Vec2::new(1.5, 0.6), Vec2::new(-1.5, 0.6)),
+        ];
+        let mut planes = Vec::new();
+        let mut ok = true;
+        for (k, (a, e)) in cuts.into_iter().enumerate() {
+            let (a, e) = (c + a * r, c + e * r);
+            planes.push(self.surface_screen().plane(a - self.canvas_origin(), e - self.canvas_origin()).unwrap());
+            let t = Instant::now();
+            self.cursor_moved(a, false);
+            self.left_press(false, false);
+            self.cursor_moved(e, false);
+            self.left_release();
+            let ms = t.elapsed().as_secs_f32() * 1000.0;
+            let out = planes
+                .iter()
+                .map(|q| self.mesh().positions.iter().map(|p| q.truncate().dot(*p) + q.w).fold(f32::MIN, f32::max))
+                .fold(f32::MIN, f32::max);
+            let pass = out < 1e-4;
+            ok &= pass;
+            log::info!("selftest-clip: cut {} in {ms:.0} ms, worst vertex past any cut so far {out:.1e} ({})", k + 1, if pass { "ok" } else { "FAIL" });
+        }
+        self.camera.yaw += 0.9;
+        self.camera.pitch -= 0.35;
+        self.wedge_info = None;
+        log::info!("selftest-clip: {}", if ok { "all passed" } else { "FAILED" });
+        ok
     }
 
     /// `--selftest-tube`: CurveTube through the real input handlers on the GPU. Phase 0
@@ -4392,6 +4436,17 @@ impl App {
             self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
         self.follow_tube_settings();
+        if let Some(left) = self.selftest_clip {
+            if left == 0 {
+                self.selftest_clip = None;
+                self.selftest_clip_cuts();
+                if !self.selftest_hold {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_clip = Some(left - 1);
+            }
+        }
         if let Some((phase, left)) = self.selftest_tube {
             if left == 0 {
                 self.selftest_tube = self.selftest_tube_phase(phase).map(|next| (next, 10));
@@ -5212,6 +5267,9 @@ fn main() {
         app.selftest_tube = Some((0, 20));
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
+    if args.iter().any(|a| a == "--selftest-clip") {
+        app.selftest_clip = Some(20);
+    }
     app.open_on_start = flag("--open").cloned();
     if stress {
         app.stress = Some((240, 0.0, 0.0));
@@ -6237,16 +6295,39 @@ mod surface_input_tests {
         assert!(top(after,side)>0.7,"cut deeper than the guide: {}",top(after,side));
     }
     #[test]
+    fn a_pie_slice_cut_from_crossing_clips_stays_inside_every_cut() {
+        let mut a=app();
+        assert!(a.selftest_clip_cuts());
+        // Finer meshes have far more outline segments and coincident points.
+        for segments in [100, 400] {
+            for (origin,size) in [(egui::Pos2::ZERO,egui::vec2(1600.0,1000.0)),(egui::pos2(369.0,90.0),egui::vec2(908.0,864.0))] {
+                let mut a=App::new(segments,false,usize::MAX);a.camera.aspect=size.x/size.y;
+                a.canvas_rect=egui::Rect::from_min_size(origin,size);
+                assert!(a.selftest_clip_cuts(),"{segments} segments, canvas {size:?}");
+            }
+        }
+        // Turned and tilted views.
+        for (yaw,pitch) in [(0.4,0.0),(-0.7,0.3),(1.2,-0.4),(2.5,0.6)] {
+            let mut a=App::new(150,false,usize::MAX);a.camera.aspect=1.6;
+            a.canvas_rect=egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1600.0,1000.0));
+            a.camera.yaw+=yaw;a.camera.pitch+=pitch;
+            assert!(a.selftest_clip_cuts(),"view {yaw} {pitch}");
+        }
+    }
+    #[test]
     fn repeated_clips_leave_the_kept_side_alone() {
         for levels in 0..=2 {
             let mut a=app();
             for _ in 0..levels {a.divide();}
             a.workspace.select_brush(&mut a.brush,BrushKind::ClipLine);
             let c=a.project(Vec3::ZERO);
-            let cuts=[(Vec2::new(150.0,-400.0),Vec2::new(150.0,400.0)),(Vec2::new(-400.0,-120.0),Vec2::new(400.0,-140.0)),(Vec2::new(-300.0,300.0),Vec2::new(200.0,-300.0))];
+            // The last two cross the earlier cuts at wide angles, the way a pie slice is cut.
+            let cuts=[(Vec2::new(150.0,-400.0),Vec2::new(150.0,400.0)),(Vec2::new(-400.0,-120.0),Vec2::new(400.0,-140.0)),(Vec2::new(-300.0,300.0),Vec2::new(200.0,-300.0)),(Vec2::new(-120.0,400.0),Vec2::new(300.0,-400.0))];
+            let mut planes=Vec::new();
             for (k,(s,e)) in cuts.into_iter().enumerate() {
                 let before=a.mesh().positions.clone();
                 let plane=a.surface_screen().plane(c+s,c+e).unwrap();
+                planes.push(plane);
                 a.cursor_moved(c+s,false);a.left_press(false,false);a.cursor_moved(c+e,false);a.left_release();
                 let after=&a.mesh().positions;
                 let mut worst_kept=0.0f32;let mut worst_cut=0.0f32;let mut moved=0;
@@ -6255,6 +6336,11 @@ mod surface_input_tests {
                     if d<=0.0 {worst_kept=worst_kept.max(p.distance(*q));} else {moved+=1;worst_cut=worst_cut.max((plane.truncate().dot(*q)+plane.w).abs());}
                 }
                 assert!(moved>0 && worst_kept==0.0 && worst_cut<1e-5,"levels {levels} clip {k}: kept side moved {worst_kept}, cut side off the plane by {worst_cut}");
+                // No cut pushes an earlier one back out (the model turned shows it).
+                for (j,q) in planes.iter().enumerate() {
+                    let out=after.iter().map(|p|q.truncate().dot(*p)+q.w).fold(f32::MIN,f32::max);
+                    assert!(out<1e-4,"levels {levels}: clip {k} pushed clip {j} back out by {out}");
+                }
                 // Step down and up again: the levels must not drift.
                 if levels>0 {
                     let top=a.doc.active();let at_top=a.mesh().positions.clone();

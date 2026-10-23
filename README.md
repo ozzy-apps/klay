@@ -1,4 +1,4 @@
-# Klay 0.6.2
+# Klay 0.6.3
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -27,6 +27,7 @@ cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Sh
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
 cargo run --release -- --divide 2 --selftest-pressure                # tablet connection (moves the pointer once via XTest), strokes at set pen pressures, log, exit
 cargo run --release -- --divide 2 --selftest-curve                   # Zipper along a curve vs freehand with a shaky hand, bend, GPU readback, undo/redo, log, exit
+cargo run --release -- --segments 400 --selftest-clip                # three crossing Clip Line cuts (a pie slice), checks no cut pushes an earlier one out, log, exit (--hold keeps it open, turned)
 cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
@@ -210,7 +211,9 @@ material colors, including the brush's subtract variant where applicable.
   not cut polygons or add curve control points. Ctrl+Shift also draws the line when this
   tool is selected; other tools retain Ctrl+Shift visibility selection. With **X symmetry**
   the half under the line is clipped to the guide and the other half gets its mirror image,
-  so the result is symmetric from any view.
+  so the result is symmetric from any view. Cuts can cross earlier cuts at any angle: a
+  vertex moved onto the new cut stays inside the model's cross-section there, so an earlier
+  cut face is never pushed back out.
 - Click the left **Alpha** or **Texture** thumbnail, or open its menu-bar palette, to select
   a built-in pattern or **Import Alpha… / Import Texture…**. PNG, JPEG and BMP are supported.
   Alpha luminance and transparency shape the stamp. Texture **Relief** modulates sculpting;
