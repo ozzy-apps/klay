@@ -2075,6 +2075,9 @@ impl App {
             BrushKind::Stitch,
             BrushKind::Rake,
         ];
+        if t.index >= kinds.len() {
+            return self.selftest_tiny_drag_frame(t, t.index - kinds.len());
+        }
         let kind = kinds[t.index];
         let frame = t.frame;
         t.frame += 1;
@@ -2140,10 +2143,44 @@ impl App {
                     kind.name()
                 );
                 t.index += 1;
-                if t.index == kinds.len() {
-                    log::info!("selftest-brushes: all passed");
-                    return true;
-                }
+                t.frame = 18;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// End of `--selftest-brushes`: Grab and Snake Hook (`which` 0, 1) with a brush smaller
+    /// than the polygons under it, so the press selects no vertex. The stroke must do
+    /// nothing, add no undo step and keep the GPU copy in step, not crash.
+    fn selftest_tiny_drag_frame(&mut self, t: &mut BrushTest, which: usize) -> bool {
+        let kinds = [BrushKind::Grab, BrushKind::SnakeHook];
+        let Some(&kind) = kinds.get(which) else {
+            log::info!("selftest-brushes: all passed");
+            return true;
+        };
+        let frame = t.frame;
+        t.frame += 1;
+        let centre = self.project((self.doc.bounds().min + self.doc.bounds().max) * 0.5);
+        match frame {
+            20 => {
+                t.original = self.mesh().positions.clone();
+                t.edited = vec![Vec3::splat(self.history.edits() as f32)];
+                self.workspace.select_brush(&mut self.brush, kind);
+                self.brush.radius = 1e-5;
+                self.brush.strength = 1.0;
+                self.on_key(KeyCode::KeyQ);
+                self.cursor_moved(centre, false);
+                self.left_press(false, false);
+            }
+            21..=27 => self.cursor_moved(centre + Vec2::new((frame - 20) as f32 * 12.0, 0.0), false),
+            28 => self.left_release(),
+            34 => {
+                assert!(self.mesh().positions == t.original, "{kind:?} smaller than a polygon moved the mesh");
+                let gpu = self.gfx.as_ref().and_then(Gfx::read_positions).unwrap_or_default();
+                assert!(gpu.len() == t.original.len() && gpu.iter().zip(&t.original).all(|(a, b)| a.distance(*b) < 1e-6), "{kind:?} GPU copy");
+                log::info!("selftest-brushes: {} smaller than a polygon does nothing, no crash (ok)", kind.name());
+                t.index += 1;
                 t.frame = 18;
             }
             _ => {}

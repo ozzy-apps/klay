@@ -418,3 +418,8 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Version **0.6.0** (Cargo.toml / Cargo.lock), CHANGELOG, README updated. Project, workspace and asset formats unchanged.
 - Not done: other ZBrush curve insert brushes (CurveStrapSnap, IMM curve with a custom mesh), click-on-curve re-apply, Split by polygroup into its own subtool, keeping a live curve across save/subtool switch, pressure along the curve (ZBrush's curve size profile), routing tube undo through the in-place GPU path.
 
+## Step 45: 0.6.1 — tiny drag brush crash (2026-10-23, Claude Code)
+- User report: Snake Hook crashes on a low-poly model when the brush is smaller than a polygon. Cause: the press selects no vertex and `Gfx::begin_gpu_grab` bound zero-size buffers (wgpu validation panic, "binding size is zero"); Grab had the same bug.
+- Fix: `Stroke::grab_dab` only makes a GPU grab when the selection is not empty; `begin_gpu_grab` also returns early on an empty selection. The stroke does nothing and adds no undo step.
+- Verification: new `drag_brushes_smaller_than_a_polygon_do_nothing` test, 156 tests pass; `--selftest-brushes` reproduced the panic before the fix and now ends with tiny Grab / Snake Hook strokes (mesh and GPU copy unchanged).
+

@@ -930,13 +930,16 @@ impl Stroke {
                 .collect();
             let orig = sel.par_map(|_, v| mesh.positions[v as usize]);
             self.last_count = sel.len();
+            // A brush smaller than the polygons under it picks up no vertex: nothing to
+            // hand to the GPU (it would bind empty buffers), the stroke just does nothing.
+            let gpu = self.gpu_grab && brush.kind.gpu_drag() && !sel.is_empty();
             self.grab = Some(GrabState {
                 sel,
                 chunks,
                 weights,
                 orig,
                 anchor: hit,
-                gpu: self.gpu_grab && brush.kind.gpu_drag(),
+                gpu,
                 delta: Vec3::ZERO,
                 kind: brush.kind,
                 radius: r,
@@ -1055,6 +1058,27 @@ mod brush_tests {
             s.dab(m,&b,hit,Vec3::Z,-Vec3::Z,(hit+Vec3::Z*4.0,-Vec3::Z));
         }
         s
+    }
+
+    #[test]
+    fn drag_brushes_smaller_than_a_polygon_do_nothing() {
+        // A coarse cube sphere: faces far wider than the brush, pressed mid-face.
+        let (p,i)=crate::mesh::cube_sphere(2,1.0);
+        for kind in [BrushKind::Grab,BrushKind::SnakeHook,BrushKind::Elastic] {
+            for gpu in [false,true] {
+                let mut m=SculptMesh::from_raw(p.clone(),i.clone());
+                let before=m.positions.clone();
+                let b=Brush{kind,radius:1e-4,strength:1.0,..Brush::default()};
+                let mut s=Stroke::begin(false,gpu,false);
+                let hit=Vec3::new(0.1,0.13,1.0);
+                for k in 0..4 {
+                    s.dab(&mut m,&b,hit,Vec3::Z,-Vec3::Z,(hit+Vec3::new(k as f32*0.1,0.0,4.0),-Vec3::Z));
+                }
+                assert!(s.gpu_grab_setup().is_none(),"{kind:?}: nothing to hand to the GPU");
+                assert!(s.end(&mut m).is_none(),"{kind:?}: no undo step");
+                assert_eq!(m.positions,before,"{kind:?} gpu={gpu}");
+            }
+        }
     }
 
     #[test]

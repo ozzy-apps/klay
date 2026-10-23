@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 — 2026-10-23
+
+- Fixed a crash with Grab or Snake Hook when the brush is smaller than the polygons under it: the press picked up no vertex and the GPU grab bound empty buffers, which wgpu rejects. Such a stroke now does nothing (no undo step).
+- Verification: 156 release tests (new: drag brushes smaller than a polygon, CPU and GPU paths); --selftest-brushes now ends with tiny Grab and Snake Hook strokes on the GPU.
+
 ## 0.6.0 — 2026-10-23
 
 - CurveTube brush (ZBrush: Brush › CurveTube): draw a curve on the model and, on release, a closed round tube is built along it and added to the active subtool as a new polygroup (dreadlocks, cables, straps). Its centre runs on the surface, so the root sits half inside the model; where the stroke runs off the model it carries on at the depth where it left, so a tube can hang free. Rings are as far apart as a side is wide, carried along the curve without twisting, with round caps at both ends. X symmetry adds the mirror tube in the same polygroup.

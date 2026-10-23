@@ -1,4 +1,4 @@
-# Klay 0.6.0
+# Klay 0.6.1
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.

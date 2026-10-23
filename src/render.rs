@@ -1439,6 +1439,10 @@ impl Gfx {
         let Some(m) = self.active_buffers() else {
             return;
         };
+        // wgpu refuses to bind empty buffers.
+        if setup.verts.is_empty() {
+            return;
+        }
         use wgpu::BufferUsages as U;
         let init = |label: &str, data: &[u8]| {
             self.device
