@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2 — 2026-10-23
+
+- Fixed Clip Line squashing the model with X symmetry: the mirrored plane was applied to the whole model, so in any view turned or panned off the symmetry plane it cut deeper than the guide (a cut drawn at 77 % of the height took it to 59 %), more with every clip. Now the half under the line is clipped by the guide's plane and the other half by its mirror image; vertices on the symmetry plane stay on it.
+- Holding Ctrl shows the Ctrl mask brush in the brush panels, and Shift shows Smooth, as in ZBrush; a mask brush picked while Ctrl is held becomes the Ctrl mask brush.
+- Verification: 160 release tests (new: symmetric clip in a turned view against the guide and mirror-symmetric, three clips at levels 0–2 leave the kept side and the levels exact, held Ctrl/Shift brush display through the real UI); --selftest-surface, --selftest-brushes, --selftest-mask pass on the GPU.
+
 ## 0.6.1 — 2026-10-23
 
 - Fixed a crash with Grab or Snake Hook when the brush is smaller than the polygons under it: the press picked up no vertex and the GPU grab bound empty buffers, which wgpu rejects. Such a stroke now does nothing (no undo step).

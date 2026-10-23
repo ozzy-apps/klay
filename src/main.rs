@@ -3645,6 +3645,47 @@ impl App {
         true
     }
 
+    /// The brush a held modifier strokes with, when it is not the brush itself (ZBrush
+    /// shows it in the brush panels while the key is down): Ctrl the remembered mask brush,
+    /// Shift Smooth for sculpt and paint brushes (masks and shape tools keep their own:
+    /// Shift snaps or smooths with them). Ctrl + Shift (selection) and Alt (the alternate
+    /// side of the same brush) show the brush itself.
+    fn held_brush(&self) -> Option<BrushKind> {
+        if self.egui_ctx.egui_wants_keyboard_input() {
+            return None;
+        }
+        let (ctrl, shift) = (self.modifiers.control_key(), self.modifiers.shift_key());
+        let kind = self.brush.kind;
+        let shown = match (ctrl, shift) {
+            (true, false) => self.workspace.mask_brush,
+            (false, true) if !kind.is_mask() && !kind.is_shape() => BrushKind::Smooth,
+            _ => return None,
+        };
+        (shown != kind).then_some(shown)
+    }
+
+    /// The half (+1 or -1 along X) a Clip Line was drawn on, for X symmetry: the side of
+    /// most of the surface under the guide line, or, with no surface under it or as much on
+    /// each side, the side the camera is on.
+    fn clip_side(&self, g: &surface_tools::Gesture) -> f32 {
+        let (vp, cam, mesh) = (self.viewport(), &self.camera, self.mesh());
+        let sum: f32 = (0..=64)
+            .into_par_iter()
+            .filter_map(|k| {
+                let p = g.start.lerp(g.end, k as f32 / 64.0);
+                let (o, d) = cam.ray(p.x, p.y, vp.x, vp.y);
+                mesh.raycast(o, d).map(|h| h.point.x.signum())
+            })
+            .sum();
+        if sum != 0.0 {
+            sum.signum()
+        } else if self.camera.eye().x < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
     fn surface_screen(&self) -> surface_tools::Screen {
         surface_tools::Screen {matrix:self.camera.view_proj(),size:self.viewport()}
     }
@@ -3677,7 +3718,8 @@ impl App {
         }
         let screen=self.surface_screen();let level=self.doc.active();
         if g.kind==BrushKind::ClipLine {
-            if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,self.workspace.symmetry) {
+            let symmetry=self.workspace.symmetry.then(||self.clip_side(&g));
+            if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,symmetry) {
                 let chunks=self.doc.finish_stroke(level,before);
                 self.history.push(UndoStep::Stroke {level,chunks});
                 self.subtools[self.active_tool].bounds=self.doc.bounds();
@@ -4091,6 +4133,7 @@ impl App {
             (None, None) => String::new(),
         };
         self.workspace.curve_preview = self.curve_preview();
+        self.workspace.held_brush = self.held_brush();
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -6171,6 +6214,56 @@ mod surface_input_tests {
         assert_eq!(a.mesh().positions,original);
         a.mask_op(MaskOp::Clear);a.cursor_moved(Vec2::splat(90.0),false);a.left_press(false,false);a.left_release();
         assert!(a.mesh().mask.iter().all(|&v|v==255),"Ctrl background click still inverts with a shape brush");
+    }
+    #[test]
+    fn a_symmetric_clip_in_a_turned_view_cuts_no_deeper_than_the_guide() {
+        let mut a=app();a.workspace.symmetry=true;a.camera.yaw+=0.6;a.camera.pitch+=0.25;
+        a.workspace.select_brush(&mut a.brush,BrushKind::ClipLine);
+        let c=a.project(Vec3::ZERO);
+        let before=a.mesh().positions.clone();
+        let (s,e)=(c+Vec2::new(-400.0,-150.0),c+Vec2::new(400.0,-150.0));
+        let plane=a.surface_screen().plane(s,e).unwrap();
+        let side=a.clip_side(&surface_tools::Gesture{end:e,..surface_tools::Gesture::new(BrushKind::ClipLine,s,false)});
+        a.cursor_moved(s,false);a.left_press(false,false);a.cursor_moved(e,false);a.left_release();
+        // On the half under the line nothing below the guide moves (before the fix the
+        // mirrored plane cut this half too, 0.56 deep).
+        for (p,q) in before.iter().zip(&a.mesh().positions) {
+            if p.x*side>0.0 && plane.truncate().dot(*p)+plane.w<=0.0 {assert_eq!(p,q);}
+        }
+        // And the top comes down to the guide on both halves alike.
+        let top=|v:&[Vec3],s:f32|v.iter().filter(|p|p.x*s>0.0).map(|p|p.y).fold(f32::MIN,f32::max);
+        let after=&a.mesh().positions;
+        assert!((top(after,1.0)-top(after,-1.0)).abs()<0.02,"{} {}",top(after,1.0),top(after,-1.0));
+        assert!(top(after,side)>0.7,"cut deeper than the guide: {}",top(after,side));
+    }
+    #[test]
+    fn repeated_clips_leave_the_kept_side_alone() {
+        for levels in 0..=2 {
+            let mut a=app();
+            for _ in 0..levels {a.divide();}
+            a.workspace.select_brush(&mut a.brush,BrushKind::ClipLine);
+            let c=a.project(Vec3::ZERO);
+            let cuts=[(Vec2::new(150.0,-400.0),Vec2::new(150.0,400.0)),(Vec2::new(-400.0,-120.0),Vec2::new(400.0,-140.0)),(Vec2::new(-300.0,300.0),Vec2::new(200.0,-300.0))];
+            for (k,(s,e)) in cuts.into_iter().enumerate() {
+                let before=a.mesh().positions.clone();
+                let plane=a.surface_screen().plane(c+s,c+e).unwrap();
+                a.cursor_moved(c+s,false);a.left_press(false,false);a.cursor_moved(c+e,false);a.left_release();
+                let after=&a.mesh().positions;
+                let mut worst_kept=0.0f32;let mut worst_cut=0.0f32;let mut moved=0;
+                for (p,q) in before.iter().zip(after) {
+                    let d=plane.truncate().dot(*p)+plane.w;
+                    if d<=0.0 {worst_kept=worst_kept.max(p.distance(*q));} else {moved+=1;worst_cut=worst_cut.max((plane.truncate().dot(*q)+plane.w).abs());}
+                }
+                assert!(moved>0 && worst_kept==0.0 && worst_cut<1e-5,"levels {levels} clip {k}: kept side moved {worst_kept}, cut side off the plane by {worst_cut}");
+                // Step down and up again: the levels must not drift.
+                if levels>0 {
+                    let top=a.doc.active();let at_top=a.mesh().positions.clone();
+                    a.set_level(0);a.set_level(top);
+                    let drift=a.mesh().positions.iter().zip(&at_top).map(|(p,q)|p.distance(*q)).fold(0.0f32,f32::max);
+                    assert_eq!(drift,0.0,"levels {levels} clip {k}: level round trip drift");
+                }
+            }
+        }
     }
     #[test]
     fn clip_can_start_off_mesh_cancel_and_undo() {

@@ -80,7 +80,45 @@ impl BrushUi {
     }
 }
 
+/// What the brush panels showed before a held modifier swapped in the brush it strokes
+/// with (see [`Workspace::held_brush`]).
+pub(super) struct HeldBrush {
+    kind: BrushKind,
+    shown: BrushKind,
+    sculpt: bool,
+    paint: bool,
+    masks: bool,
+}
+
 impl Workspace {
+    /// ZBrush shows the brush a held modifier strokes with: the panels show `held_brush`
+    /// (the Ctrl mask brush, Smooth for Shift) for this frame instead of the brush.
+    pub(super) fn begin_held_brush(&mut self, brush: &mut Brush) -> Option<HeldBrush> {
+        let shown = self.held_brush.filter(|&k| k != brush.kind)?;
+        let held = HeldBrush { kind: brush.kind, shown, sculpt: brush.sculpt, paint: brush.paint, masks: self.brush_ui.palette_masks };
+        brush.kind = shown;
+        brush.sculpt = !shown.is_mask();
+        brush.paint = false;
+        self.brush_ui.palette_masks = shown.is_mask();
+        Some(held)
+    }
+
+    /// Put the brush back after the frame. A brush picked meanwhile stays the brush,
+    /// except a mask brush: it becomes the Ctrl mask brush (as in ZBrush) and the brush
+    /// stays what it was.
+    pub(super) fn end_held_brush(&mut self, brush: &mut Brush, held: Option<HeldBrush>) {
+        let Some(h) = held else {
+            return;
+        };
+        if brush.kind != h.shown && !brush.kind.is_mask() {
+            return;
+        }
+        brush.kind = h.kind;
+        brush.sculpt = h.sculpt;
+        brush.paint = h.paint;
+        self.brush_ui.palette_masks = h.masks;
+    }
+
     pub fn brush_catalog_open(&self) -> bool {
         self.brush_ui.catalog.is_some()
             || self.brush_ui.path_dialog.is_some()
@@ -976,6 +1014,50 @@ fn compact_brush_tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_ctrl_and_shift_show_the_brush_they_stroke_with() {
+        use winit::keyboard::ModifiersState;
+        let mut app = app("held");
+        app.workspace.select_brush(&mut app.brush, BrushKind::Clay);
+        app.workspace.mask_brush = BrushKind::MaskLasso;
+        let count = |app: &mut crate::App, m: ModifiersState, text: &str| {
+            app.modifiers = m;
+            let output = frame(app, Vec::new());
+            output.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == text)).count()
+        };
+        let plain = count(&mut app, ModifiersState::empty(), "Mask Lasso");
+        let ctrl = count(&mut app, ModifiersState::CONTROL, "Mask Lasso");
+        assert!(ctrl > plain, "Ctrl shows the mask brush: {ctrl} vs {plain}");
+        assert_eq!(app.brush.kind, BrushKind::Clay, "only shown, the brush stays");
+        assert!(app.brush.sculpt && !app.workspace.brush_ui.palette_masks);
+        // Shift shows Smooth; Ctrl + Shift (selection) and Alt show the brush itself.
+        let plain = count(&mut app, ModifiersState::empty(), "Smooth");
+        assert!(count(&mut app, ModifiersState::SHIFT, "Smooth") > plain);
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(app.held_brush(), None);
+        app.modifiers = ModifiersState::ALT;
+        assert_eq!(app.held_brush(), None);
+        // A mask brush picked while Ctrl is held becomes the Ctrl mask brush.
+        app.modifiers = ModifiersState::CONTROL;
+        app.workspace.held_brush = app.held_brush();
+        let held = app.workspace.begin_held_brush(&mut app.brush);
+        assert_eq!(app.brush.kind, BrushKind::MaskLasso);
+        app.workspace.select_brush(&mut app.brush, BrushKind::MaskCircle);
+        app.workspace.end_held_brush(&mut app.brush, held);
+        assert_eq!((app.brush.kind, app.workspace.mask_brush), (BrushKind::Clay, BrushKind::MaskCircle));
+        // Any other brush picked meanwhile becomes the brush.
+        let held = app.workspace.begin_held_brush(&mut app.brush);
+        app.workspace.select_brush(&mut app.brush, BrushKind::Pinch);
+        app.workspace.end_held_brush(&mut app.brush, held);
+        assert_eq!(app.brush.kind, BrushKind::Pinch);
+        // A shape tool or mask keeps its own brush under Shift (Shift snaps or smooths the mask).
+        app.workspace.select_brush(&mut app.brush, BrushKind::ClipLine);
+        app.modifiers = ModifiersState::SHIFT;
+        assert_eq!(app.held_brush(), None);
+        app.modifiers = ModifiersState::CONTROL;
+        assert_eq!(app.held_brush(), Some(BrushKind::MaskCircle));
+    }
     fn app(name: &str) -> crate::App {
         let mut app = crate::App::new(8, false, 200_000);
         let root = std::env::temp_dir().join(format!("klay-020-ui-{}-{name}", std::process::id()));

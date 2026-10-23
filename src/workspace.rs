@@ -549,6 +549,9 @@ pub struct Workspace {
     pub select_rect: Option<(Rect, bool)>,
     pub gesture_preview: Option<crate::surface_tools::Gesture>,
     pub mask_brush: BrushKind,
+    /// The brush a held modifier strokes with, shown in the panels this frame instead of
+    /// the brush (ZBrush: holding Ctrl shows the mask brush, Shift shows Smooth).
+    pub held_brush: Option<BrushKind>,
     /// Deformation slider being dragged, and its value.
     deform_drag: Option<(Deform, f32)>,
     pub mode: Mode,
@@ -615,6 +618,7 @@ impl Workspace {
             select_rect: None,
             gesture_preview: None,
             mask_brush: BrushKind::MaskPen,
+            held_brush: None,
             deform_drag: None,
             mode: Mode::Draw,
             popup: None,
@@ -639,6 +643,13 @@ impl Workspace {
     }
 
     pub fn show(&mut self, ui: &mut Ui, m: &mut Model<'_>) -> Actions {
+        let held = self.begin_held_brush(m.brush);
+        let a = self.show_panels(ui, m);
+        self.end_held_brush(m.brush, held);
+        a
+    }
+
+    fn show_panels(&mut self, ui: &mut Ui, m: &mut Model<'_>) -> Actions {
         let mut a = Actions::default();
         self.brush_assets_frame(ui.ctx());
         if let Some(text) = self.pending_notice.take() {

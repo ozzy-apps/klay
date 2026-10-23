@@ -173,11 +173,17 @@ pub fn mask_shape(
 }
 
 /// Collapse the chosen half-space onto the guide plane, preserving topology and paint.
+///
+/// With X symmetry, `symmetry` is the side (+1 or -1 along X) of the half the line was
+/// drawn on: that half is clipped by the line's plane and the other half by its mirror
+/// image, so the result is symmetric. Each half gets one plane: the line's plane only
+/// matches the guide on its own half, and applying its mirror there too would cut deeper
+/// than the guide wherever the view is turned or panned off the symmetry plane.
 pub fn clip_line(
     mesh: &mut SculptMesh,
     screen: Screen,
     gesture: &Gesture,
-    symmetry: bool,
+    symmetry: Option<f32>,
 ) -> Option<ChunkData> {
     let mut plane = screen.plane(gesture.start, gesture.end)?;
     if gesture.alternate {
@@ -205,11 +211,19 @@ pub fn clip_line(
                         return p;
                     }
                     let freedom = crate::mask::freedom(&mesh.mask, v as u32);
-                    let q = project(p, plane, freedom);
-                    if symmetry && plane.x.abs() > 1e-6 {
-                        project(q, mirrored, freedom)
-                    } else {
-                        q
+                    match symmetry {
+                        Some(side) if plane.x.abs() > 1e-6 => {
+                            if p.x.abs() <= 1e-6 {
+                                // On the symmetry plane both halves meet: the mean of the two
+                                // keeps the vertex on it.
+                                (project(p, plane, freedom) + project(p, mirrored, freedom)) * 0.5
+                            } else if p.x * side > 0.0 {
+                                project(p, plane, freedom)
+                            } else {
+                                project(p, mirrored, freedom)
+                            }
+                        }
+                        _ => project(p, plane, freedom),
                     }
                 })
                 .collect();
@@ -258,7 +272,7 @@ mod tests {
             let colors = m.colors.clone();
             let mut g = Gesture::new(BrushKind::ClipLine, Vec2::new(200.0, 0.0), alternate);
             g.end = Vec2::new(200.0, 400.0);
-            let saved = clip_line(&mut m, screen(), &g, false).unwrap();
+            let saved = clip_line(&mut m, screen(), &g, None).unwrap();
             for (p, old) in m.positions.iter().zip(&before) {
                 let selected = if alternate { old.x < 0.0 } else { old.x > 0.0 };
                 if selected {
@@ -286,7 +300,7 @@ mod tests {
         let before = m.positions.clone();
         let mut g = Gesture::new(BrushKind::ClipLine, Vec2::new(220.0, 0.0), false);
         g.end = Vec2::new(220.0, 400.0);
-        clip_line(&mut m, s, &g, false).unwrap();
+        clip_line(&mut m, s, &g, None).unwrap();
         let mut changed = 0;
         for (&p, &old) in m.positions.iter().zip(&before) {
             if p.distance_squared(old) > 1e-12 {
@@ -304,9 +318,9 @@ mod tests {
         m.mask = vec![255; m.vertex_count()];
         let mut g = Gesture::new(BrushKind::ClipLine, Vec2::new(0.0, 200.0), false);
         g.end = Vec2::new(400.0, 200.0);
-        assert!(clip_line(&mut m, screen(), &g, true).is_none());
+        assert!(clip_line(&mut m, screen(), &g, Some(1.0)).is_none());
         m.mask.fill(128);
-        clip_line(&mut m, screen(), &g, true).unwrap();
+        clip_line(&mut m, screen(), &g, Some(1.0)).unwrap();
         for (p, old) in m.positions.iter().zip(&before) {
             if old.y > 0.0 {
                 assert!((p.y - old.y * (128.0 / 255.0)).abs() < 1e-6);
@@ -314,7 +328,52 @@ mod tests {
         }
         let mut hidden = mesh();
         hidden.set_hidden(vec![1; hidden.triangle_count()]);
-        assert!(clip_line(&mut hidden, screen(), &g, false).is_none());
+        assert!(clip_line(&mut hidden, screen(), &g, None).is_none());
+    }
+
+    #[test]
+    fn a_symmetric_clip_cuts_each_half_once_and_stays_symmetric() {
+        // A view turned and raised off the symmetry plane: the line's plane leans in X.
+        let mut camera = crate::camera::Camera::new();
+        camera.aspect = 1.0;
+        camera.yaw += 0.6;
+        camera.pitch += 0.25;
+        let s = Screen { matrix: camera.view_proj(), size: Vec2::splat(400.0) };
+        let mut g = Gesture::new(BrushKind::ClipLine, Vec2::new(0.0, 120.0), false);
+        g.end = Vec2::new(400.0, 120.0);
+        let plane = s.plane(g.start, g.end).unwrap();
+        assert!(plane.x.abs() > 0.1);
+        let mirrored = Vec4::new(-plane.x, plane.y, plane.z, plane.w);
+        let side = -plane.x.signum();
+        let mut m = mesh();
+        let before = m.positions.clone();
+        clip_line(&mut m, s, &g, Some(side)).unwrap();
+        let at = |q: Vec4, p: Vec3| q.truncate().dot(p) + q.w;
+        for (p, old) in m.positions.iter().zip(&before) {
+            if old.x.abs() <= 1e-6 {
+                // On the symmetry plane: the mean of both cuts keeps it there.
+                assert!(p.x.abs() <= 1e-6);
+                continue;
+            }
+            let own = if old.x * side > 0.0 { plane } else { mirrored };
+            if at(own, *old) <= 0.0 {
+                assert_eq!(p, old, "kept side of its own plane moved");
+            } else {
+                assert!(at(own, *p).abs() < 1e-5, "cut onto its own plane");
+            }
+        }
+        // Mirror images of each other stay mirror images.
+        let key = |p: Vec3| ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64, (p.z * 1e4).round() as i64);
+        let index: std::collections::HashMap<_, _> = before.iter().enumerate().map(|(i, p)| (key(*p), i)).collect();
+        let mut pairs = 0;
+        for (i, p) in before.iter().enumerate() {
+            if let Some(&j) = index.get(&key(Vec3::new(-p.x, p.y, p.z))) {
+                let (a, b) = (m.positions[i], m.positions[j]);
+                assert!(a.distance(Vec3::new(-b.x, b.y, b.z)) < 1e-5, "{a} vs {b}");
+                pairs += 1;
+            }
+        }
+        assert!(pairs > before.len() / 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Klay 0.6.1
+# Klay 0.6.2
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -208,7 +208,9 @@ material colors, including the brush's subtract variant where applicable.
   the angle and **Escape** cancels. The arrow shows the side that will move. It preserves
   topology, vertex paint, masks and hidden regions. This is straight-line clipping; it does
   not cut polygons or add curve control points. Ctrl+Shift also draws the line when this
-  tool is selected; other tools retain Ctrl+Shift visibility selection.
+  tool is selected; other tools retain Ctrl+Shift visibility selection. With **X symmetry**
+  the half under the line is clipped to the guide and the other half gets its mirror image,
+  so the result is symmetric from any view.
 - Click the left **Alpha** or **Texture** thumbnail, or open its menu-bar palette, to select
   a built-in pattern or **Import Alpha… / Import Texture…**. PNG, JPEG and BMP are supported.
   Alpha luminance and transparency shape the stamp. Texture **Relief** modulates sculpting;
@@ -230,6 +232,9 @@ sample the chosen alpha and focal shift.
 
 A selected mask works with **left drag**; **Alt** erases. When a sculpt brush is active,
 **Ctrl** temporarily uses the last chosen mask brush. Z Intensity controls mask strength.
+As in ZBrush, the brush panels show the brush a held key strokes with: **Ctrl** shows the
+mask brush (picking a mask brush while holding Ctrl makes it the Ctrl mask brush) and
+**Shift** shows Smooth; releasing the key shows your brush again.
 Rectangle, ellipse and lasso masks select through the view depth; Mask Line masks one side
 of the guide (reverse the drag to change sides). Live outlines show the region before release.
 Masks preserve geometry, paint, hidden regions, X symmetry and the existing multires undo path.
