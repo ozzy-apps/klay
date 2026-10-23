@@ -11,14 +11,16 @@ enum BrushGroup {
     Mask,
     Detail,
     Clip,
+    Curve,
 }
 impl BrushGroup {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::All,
         Self::Sculpt,
         Self::Mask,
         Self::Detail,
         Self::Clip,
+        Self::Curve,
     ];
     fn accepts(self, k: BrushKind) -> bool {
         match self {
@@ -26,7 +28,8 @@ impl BrushGroup {
             Self::Mask => k.is_mask(),
             Self::Detail => k.is_detail(),
             Self::Clip => k == BrushKind::ClipLine,
-            Self::Sculpt => !k.is_mask() && !k.is_detail() && k != BrushKind::ClipLine,
+            Self::Curve => k.is_insert(),
+            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && k != BrushKind::ClipLine,
         }
     }
 }
@@ -559,7 +562,7 @@ impl Workspace {
                         }
                         if let Some(i) = seg(
                             ui,
-                            &["All", "Sculpt", "Mask", "Detail", "Clip"],
+                            &["All", "Sculpt", "Mask", "Detail", "Clip", "Curve"],
                             BrushGroup::ALL
                                 .iter()
                                 .position(|g| *g == self.brush_ui.group)

@@ -173,6 +173,14 @@ impl Selection {
             .collect_into_vec(out);
     }
 }
+/// A leading part of a mesh (see [`SculptMesh::extent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub verts: usize,
+    pub tris: usize,
+    pub chunks: usize,
+}
+
 
 pub struct SculptMesh {
     pub positions: Vec<Vec3>,
@@ -346,6 +354,149 @@ impl SculptMesh {
             .collect();
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
         Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris)
+    }
+
+    /// How much of the mesh comes first: its first `verts` vertices, `tris` triangles and
+    /// `chunks` chunks. Parts added with [`appended`](Self::appended) go after it.
+    pub fn extent(&self) -> Extent {
+        Extent { verts: self.vertex_count(), tris: self.triangle_count(), chunks: self.chunks.len() }
+    }
+
+    /// The first `keep` of this mesh followed by `part` (a separate piece of geometry, such
+    /// as a CurveTube, with its own polygroups) as chunks of its own; with no part, just the
+    /// first `keep`. What is kept is unchanged: same vertex order, chunks, mask, paint,
+    /// groups and hidden faces, so the part can later be swapped by cutting back to `keep`.
+    #[cfg(test)]
+    pub fn appended(&self, keep: Extent, part: Option<&SculptMesh>) -> SculptMesh {
+        let ranges = self.chunk_ranges();
+        assert!(keep.chunks <= ranges.len());
+        let (kv, kt) = (keep.verts as u32, keep.tris as u32);
+        assert_eq!(ranges[..keep.chunks].last().map_or(0, |r| r[1]), kv, "keep ends at a chunk");
+        assert_eq!(ranges[..keep.chunks].last().map_or(0, |r| r[4]), kt, "keep ends at a chunk");
+        let (pv, pt) = part.map_or((0, 0), |p| (p.vertex_count(), p.triangle_count()));
+        let mut positions = Vec::with_capacity(keep.verts + pv);
+        positions.extend_from_slice(&self.positions[..keep.verts]);
+        let mut indices = Vec::with_capacity(3 * (keep.tris + pt));
+        indices.extend_from_slice(&self.indices[..3 * keep.tris]);
+        let mut all = ranges[..keep.chunks].to_vec();
+        if let Some(part) = part {
+            positions.extend_from_slice(&part.positions);
+            indices.extend(part.indices.iter().map(|&i| i + kv));
+            all.extend(part.chunk_ranges().iter().map(|r| [r[0] + kv, r[1] + kv, r[2] + kt, r[3] + kt, r[4] + kt]));
+        }
+        let mut mesh = Self::from_chunked(positions, indices, &all);
+        // Per-vertex and per-triangle data of both, an empty array standing for defaults.
+        fn join<T: Copy>(a: &[T], keep: usize, b: Option<&[T]>, len: usize, none: T) -> Vec<T> {
+            let b = b.unwrap_or(&[]);
+            if a.is_empty() && b.is_empty() {
+                return Vec::new();
+            }
+            let mut out = Vec::with_capacity(keep + len);
+            if a.is_empty() { out.resize(keep, none) } else { out.extend_from_slice(&a[..keep]) }
+            if b.is_empty() { out.resize(keep + len, none) } else { out.extend_from_slice(b) }
+            out
+        }
+        mesh.mask = join(&self.mask, keep.verts, part.map(|p| &p.mask[..]), pv, 0);
+        mesh.colors = join(&self.colors, keep.verts, part.map(|p| &p.colors[..]), pv, [0; 4]);
+        mesh.set_groups(join(&self.groups, keep.tris, part.map(|p| &p.groups[..]), pt, 0));
+        mesh.set_hidden(join(&self.hidden, keep.tris, part.map(|p| &p.hidden[..]), pt, 0));
+        mesh
+    }
+
+    /// Everything after `keep` as a mesh of its own (what [`appended`](Self::appended)
+    /// added), or `None` when nothing follows it.
+    pub fn tail(&self, keep: Extent) -> Option<SculptMesh> {
+        if keep.chunks >= self.chunks.len() {
+            return None;
+        }
+        let (kv, kt) = (keep.verts as u32, keep.tris as u32);
+        let ranges: Vec<[u32; 5]> = self.chunk_ranges()[keep.chunks..]
+            .iter()
+            .map(|r| [r[0] - kv, r[1] - kv, r[2] - kt, r[3] - kt, r[4] - kt])
+            .collect();
+        let positions = self.positions[keep.verts..].to_vec();
+        let indices = self.indices[3 * keep.tris..].iter().map(|&i| i - kv).collect();
+        let mut mesh = Self::from_chunked(positions, indices, &ranges);
+        let tail = |v: &[u8], from: usize| if v.is_empty() { Vec::new() } else { v[from..].to_vec() };
+        mesh.mask = tail(&self.mask, keep.verts);
+        mesh.colors = if self.colors.is_empty() { Vec::new() } else { self.colors[keep.verts..].to_vec() };
+        mesh.set_groups(if self.groups.is_empty() { Vec::new() } else { self.groups[keep.tris..].to_vec() });
+        mesh.set_hidden(tail(&self.hidden, keep.tris));
+        Some(mesh)
+    }
+
+    /// [`appended`](Self::appended) in place: everything after `keep` is replaced by `part`
+    /// (or removed), and what was there is returned. The kept part's arrays and tables are
+    /// only cut and extended, never rebuilt, so this costs about the size of the parts, not
+    /// of the model (a CurveTube is bent this way every frame).
+    pub fn swap_tail(&mut self, keep: Extent, part: Option<&SculptMesh>) -> Option<SculptMesh> {
+        assert!(keep.chunks <= self.chunks.len());
+        let (kv, kt, kc) = (keep.verts, keep.tris, keep.chunks);
+        assert_eq!(self.chunks[..kc].last().map_or(0, |c| c.vert_end as usize), kv, "keep ends at a chunk");
+        assert_eq!(self.chunks[..kc].last().map_or(0, |c| c.tri_end as usize), kt, "keep ends at a chunk");
+        let old = self.tail(keep);
+        self.positions.truncate(kv);
+        self.indices.truncate(3 * kt);
+        self.chunks.truncate(kc);
+        self.vert_chunk.truncate(kv);
+        self.adj_offsets.truncate(kv + 1);
+        self.adj_verts.truncate(self.adj_offsets[kv] as usize);
+        self.vt_offsets.truncate(kv + 1);
+        self.vt_tris.truncate(self.vt_offsets[kv] as usize);
+        self.mask.truncate(kv);
+        self.colors.truncate(kv);
+        self.shown.truncate(kv);
+        let mut groups = std::mem::take(&mut self.groups);
+        groups.truncate(kt);
+        let mut hidden = std::mem::take(&mut self.hidden);
+        hidden.truncate(kt);
+        if let Some(p) = part {
+            let (v, t, c) = (kv as u32, kt as u32, kc as u32);
+            let (pv, pt) = (p.vertex_count(), p.triangle_count());
+            self.positions.extend_from_slice(&p.positions);
+            self.indices.extend(p.indices.iter().map(|&i| i + v));
+            self.chunks.extend(p.chunks.iter().map(|ch| Chunk {
+                vert_start: ch.vert_start + v,
+                vert_end: ch.vert_end + v,
+                tri_start: ch.tri_start + t,
+                tri_border: ch.tri_border + t,
+                tri_end: ch.tri_end + t,
+                aabb: ch.aabb,
+                dirty_pos: true,
+                dirty_nrm: true,
+                dirty_mask: true,
+                dirty_color: true,
+                neighbors: ch.neighbors.iter().map(|&n| n + c).collect(),
+                external: ch.external.iter().map(|&e| e + v).collect(),
+                stamp: 0,
+            }));
+            self.vert_chunk.extend(p.vert_chunk.iter().map(|&ch| ch + c));
+            let (adj_end, vt_end) = (self.adj_offsets[kv], self.vt_offsets[kv]);
+            self.adj_offsets.extend(p.adj_offsets[1..].iter().map(|&o| o + adj_end));
+            self.adj_verts.extend(p.adj_verts.iter().map(|&w| w + v));
+            self.vt_offsets.extend(p.vt_offsets[1..].iter().map(|&o| o + vt_end));
+            self.vt_tris.extend(p.vt_tris.iter().map(|&x| x + t));
+            // Per-vertex and per-triangle data, an empty array standing for defaults.
+            fn extend<T: Copy>(a: &mut Vec<T>, keep: usize, b: &[T], len: usize, none: T) {
+                if a.is_empty() && b.is_empty() {
+                    return;
+                }
+                a.resize(keep, none);
+                if b.is_empty() { a.resize(keep + len, none) } else { a.extend_from_slice(b) }
+            }
+            extend(&mut self.mask, kv, &p.mask, pv, 0);
+            extend(&mut self.colors, kv, &p.colors, pv, [0; 4]);
+            extend(&mut groups, kt, &p.groups, pt, 0);
+            extend(&mut hidden, kt, &p.hidden, pt, 0);
+        }
+        self.set_groups(groups);
+        self.set_hidden(hidden);
+        old
+    }
+
+    /// The highest polygroup in use, 0 for none.
+    pub fn max_group(&self) -> u16 {
+        self.groups.par_iter().copied().max().unwrap_or(0)
     }
 }
 
@@ -719,9 +870,14 @@ impl SculptMesh {
 
     /// Nearest ray hit against the mesh, using chunk bounds for culling.
     pub fn raycast(&self, o: Vec3, d: Vec3) -> Option<RayHit> {
+        self.raycast_in(o, d, self.chunks.len())
+    }
+
+    /// [`raycast`](Self::raycast) against the first `chunks` chunks only (a part added
+    /// after them, such as the CurveTube being bent, is left out).
+    pub fn raycast_in(&self, o: Vec3, d: Vec3, chunks: usize) -> Option<RayHit> {
         let inv_d = Vec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
-        let mut candidates: Vec<(f32, usize)> = self
-            .chunks
+        let mut candidates: Vec<(f32, usize)> = self.chunks[..chunks.min(self.chunks.len())]
             .iter()
             .enumerate()
             .filter_map(|(i, ch)| ch.aabb.ray_hit(o, inv_d).map(|t| (t, i)))

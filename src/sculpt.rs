@@ -45,10 +45,11 @@ pub enum BrushKind {
     Zipper,
     Stitch,
     Rake,
+    CurveTube,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 33] = [
+    pub const ALL: [BrushKind; 34] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -72,7 +73,7 @@ impl BrushKind {
         BrushKind::SnakeHook,
         Self::MaskPen, Self::MaskSoft, Self::MaskRect, Self::MaskLasso, Self::MaskCircle,
         Self::MaskLine, Self::ClipLine, Self::FormSoft, Self::FormHard, Self::Zipper,
-        Self::Stitch, Self::Rake,
+        Self::Stitch, Self::Rake, Self::CurveTube,
     ];
 
     pub fn name(self) -> &'static str {
@@ -103,6 +104,7 @@ impl BrushKind {
             Self::MaskCircle => "Mask Circle", Self::MaskLine => "Mask Line",
             Self::ClipLine => "Clip Line", Self::FormSoft => "FormSoft", Self::FormHard => "FormHard",
             Self::Zipper => "Zipper", Self::Stitch => "Stitch", Self::Rake => "Rake",
+            Self::CurveTube => "CurveTube",
         }
     }
 
@@ -115,6 +117,7 @@ impl BrushKind {
             Self::MaskPen|Self::MaskSoft|Self::MaskRect|Self::MaskLasso|Self::MaskCircle|Self::MaskLine=>"Mask",
             Self::ClipLine=>"Clip",Self::FormSoft|Self::FormHard=>"Clay",
             Self::Zipper|Self::Stitch|Self::Rake=>"Detail",
+            Self::CurveTube=>"Curve",
         }
     }
 
@@ -123,6 +126,8 @@ impl BrushKind {
     pub fn is_mask(self) -> bool { self.base_type()=="Mask" }
     pub fn is_shape(self) -> bool { matches!(self,Self::MaskRect|Self::MaskLasso|Self::MaskCircle|Self::MaskLine|Self::ClipLine) }
     pub fn is_detail(self) -> bool { matches!(self,Self::Zipper|Self::Stitch|Self::Rake) }
+    /// Adds geometry along a curve instead of moving the surface (ZBrush: curve insert brushes).
+    pub fn is_insert(self) -> bool { matches!(self,Self::CurveTube) }
 
     pub fn description(self) -> &'static str {
         match self {
@@ -152,6 +157,7 @@ impl BrushKind {
             Self::Zipper=>"Draw paired zipper teeth and a center seam as relief. Divide for fine detail.",
             Self::Stitch=>"Draw spaced stitches along a seam. Divide for fine detail.",
             Self::Rake=>"Draw parallel grooves in the stroke direction. Alt raises ridges.",
+            Self::CurveTube=>"Draw a curve to add a tube along it as a new polygroup. Drag the curve to bend the tube; Draw Size sets its radius. Needs a subtool without subdivision levels.",
         }
     }
 }
@@ -239,6 +245,9 @@ pub enum UndoStep {
     Groups(Vec<crate::polygroup::GroupRuns>),
     /// The whole stack before it was replaced (Wedge), packed.
     Replace(Box<crate::multires::Packed>),
+    /// What followed `keep` in the base mesh before a part was added or changed there
+    /// (CurveTube): `None` for nothing. Only the part is kept, not the whole model.
+    Part { keep: crate::mesh::Extent, part: Option<Box<SculptMesh>> },
     /// The mask of `level` changed (Ctrl).
     Mask { level: usize, data: MaskData },
     Paint(crate::paint::Snapshot),
@@ -350,6 +359,7 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
         UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
         UndoStep::Replace(packed) => packed.bytes(),
+        UndoStep::Part { part, .. } => part.as_ref().map_or(0, |m| m.vertex_count() * 40 + m.triangle_count() * 14),
         UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
     }
 }
@@ -391,6 +401,10 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             doc.budget = budget;
             UndoStep::Replace(Box::new(now.pack()))
         }
+        UndoStep::Part { keep, part } => UndoStep::Part {
+            keep,
+            part: doc.swap_part(keep, part.as_deref()).map(Box::new),
+        },
         UndoStep::Steps(steps) => {
             // Applied in order; their inverses run the other way.
             let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, s)).collect();

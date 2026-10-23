@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 — 2026-10-23
+
+- CurveTube brush (ZBrush: Brush › CurveTube): draw a curve on the model and, on release, a closed round tube is built along it and added to the active subtool as a new polygroup (dreadlocks, cables, straps). Its centre runs on the surface, so the root sits half inside the model; where the stroke runs off the model it carries on at the depth where it left, so a tube can hang free. Rings are as far apart as a side is wide, carried along the curve without twisting, with round caps at both ends. X symmetry adds the mirror tube in the same polygroup.
+- The curve stays live: drag it to bend the tube (pulled points snap to the model under them, or stay in the air off it); changing Draw Size, Tube taper or Tube sides (Stroke › Curve) rebuilds it. Esc or any other edit lets it go. One undo step per tube and per bend; undo keeps only the tube, not a copy of the model.
+- Like ZBrush's insert brushes it needs a subtool without subdivision levels, and says so otherwise. The tube is part of the mesh: it saves, exports, divides and can be Wedged with the rest.
+- Catalog: 34 tools, new Curve filter. The tube is swapped in place, on the CPU (cut and extend the model's arrays and tables, never rebuild them) and on the GPU (buffers get room once, then only the tube's slice is written): a bend re-builds in 5–6 ms on a 966k-vertex model, against 78 ms rebuilding the model.
+- Verification: 155 release tests (tube shape, closed and outward winding, no twist, append/cut/swap identical to a full rebuild, input path with bend/resize/undo/redo/project round trip/refusal); new --selftest-tube (nine tubes, a bend, GPU readback exact, undo/redo of all of them) at 4k and 966k vertices, plus every earlier native self-test.
+
 ## 0.5.0 — 2026-10-22
 
 - Curve strokes (ZBrush Stroke › Curve): the stroke is drawn as a path and, on release, smoothed, laid onto the surface and applied along it. Zipper, Stitch and Rake start in Curve mode and are laid out in the curve's own frame, so a shaky hand gives even, square teeth; other dab brushes step evenly along it. The curve stays as a dashed line and can be dragged to bend it, re-applying the brush along the new shape; Esc lets it go. Freehand / Curve per brush on the left shelf stroke thumbnail and in Stroke › Curve, with Curve smooth and Curve step.

@@ -15,8 +15,14 @@ use rayon::prelude::*;
 
 /// Whether `kind` can stroke along a curve: every brush that works in dabs or reliefs, not
 /// the drag brushes (they pull what they picked up) nor shape tools and masks.
+/// Insert brushes (CurveTube) are left out: they always draw a curve (see [`always`]).
 pub fn capable(kind: crate::sculpt::BrushKind) -> bool {
-    !kind.is_drag() && !kind.is_shape() && !kind.is_mask()
+    !kind.is_drag() && !kind.is_shape() && !kind.is_mask() && !kind.is_insert()
+}
+
+/// Brushes that only work along a curve (ZBrush's curve insert brushes, such as CurveTube).
+pub fn always(kind: crate::sculpt::BrushKind) -> bool {
+    kind.is_insert()
 }
 
 /// Brushes that start in Curve mode, as ZBrush's zipper and stitch brushes do.

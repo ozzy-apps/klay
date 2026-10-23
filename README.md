@@ -1,4 +1,4 @@
-# Klay 0.4.0
+# Klay 0.6.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -27,6 +27,7 @@ cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Sh
 cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
 cargo run --release -- --divide 2 --selftest-pressure                # tablet connection (moves the pointer once via XTest), strokes at set pen pressures, log, exit
 cargo run --release -- --divide 2 --selftest-curve                   # Zipper along a curve vs freehand with a shaky hand, bend, GPU readback, undo/redo, log, exit
+cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
@@ -108,6 +109,29 @@ a brush between Freehand and Curve with the stroke thumbnail on the left shelf o
   other edit (another stroke, undo, a level change) lets it go as well.
 - Drag brushes, masks and shape tools stroke freehand only. Curve strokes respect masks,
   hidden polygons and X symmetry, like freehand ones.
+
+### CurveTube
+
+ZBrush's CurveTube: a curve brush that adds geometry instead of moving the surface, for
+dreadlocks, cables, straps or piping. Pick **CurveTube** (B catalog, Curve filter) and draw
+a curve on the model; on release a closed round tube is built along it and added to the
+active subtool as a **new polygroup**.
+
+- The tube's centre runs on the surface, so its root sits half inside the model. Where the
+  stroke runs off the model, the curve carries on at the depth where it left it, so a tube
+  can hang in the air (a lock falling past the shoulder).
+- **Draw Size** is the radius. **Stroke › Curve** has **Tube taper** (0 keeps the radius,
+  1 narrows it to a point at the end) and **Tube sides** (3–32 around). Curve smooth
+  applies as for any curve.
+- The curve stays live: **drag it to bend the tube**. Pulled points snap to the model where
+  it is under them and stay at their depth where it is not, so a tube can be pulled off the
+  surface. Changing Draw Size, taper or sides rebuilds the live tube. Esc or any other edit
+  lets the curve go; the tube stays.
+- One undo step per tube and per bend. X symmetry adds the mirrored tube in the same
+  polygroup.
+- Like ZBrush's insert brushes it needs a subtool **without subdivision levels** (Del Lower,
+  or Append a subtool for the tubes). The tube is ordinary mesh: it saves, exports, divides
+  and can be Wedged with the rest.
 
 ## Workspace
 
@@ -335,6 +359,16 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   projected points with a smooth falloff from the grabbed point, restores the chunks the
   curve has touched to their first-application state, lays the points onto that surface
   again and re-applies; the bend's own stroke keeps the pre-bend state for undo.
+- `curve_tube.rs`: CurveTube geometry. The curve's points are resampled into rings one
+  side's width apart; each ring's frame starts along the surface normal and is carried to
+  the next by the rotation between their tangents (no twist), and quarter-circle rings and
+  a pole close each end. The tube is added after the model's last chunk
+  (`SculptMesh::swap_tail`): the model's arrays, adjacency tables and chunks are only cut
+  back and extended by the tube's own, so adding, bending or undoing a tube costs about the
+  tube, not the model. The renderer gives the level's buffers room the first time and then
+  writes only the tube's slice (`Gfx::swap_tail`). Undo keeps only the tube
+  (`UndoStep::Part`). A bend re-raycasts pulled points against the model without the tube
+  (`raycast_in`).
 - `tablet.rs`: pen pressure on X11. winit does not report it on Linux, so Klay opens a
   second connection to the X server that only listens: XInput2 raw events (motion and
   buttons, from every device) and device changes, selected on the root window. Devices with

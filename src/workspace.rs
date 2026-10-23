@@ -13,6 +13,7 @@
 
 use crate::sculpt::{Brush, BrushKind};
 use crate::subtool::Deform;
+use crate::curve_tube::Tube;
 use egui::ecolor::Hsva;
 use egui::{
     Align, Align2, Color32, ColorImage, Context, CornerRadius, FontId, Frame, Id, Layout, Margin,
@@ -529,6 +530,9 @@ pub struct Workspace {
     pub curve_kinds: Vec<BrushKind>,
     pub curve_smooth: f32,
     pub curve_step: f32,
+    /// CurveTube shape (Stroke › Curve): taper toward the end, vertices around each ring.
+    pub tube_taper: f32,
+    pub tube_sides: u32,
     /// The curve being drawn or the one that can be bent, in logical pixels, per piece.
     pub curve_preview: Option<CurvePreview>,
     /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
@@ -600,6 +604,8 @@ impl Workspace {
             curve_kinds: crate::curve::CURVE_BY_DEFAULT.to_vec(),
             curve_smooth: 0.5,
             curve_step: 0.16,
+            tube_taper: 0.0,
+            tube_sides: 12,
             curve_preview: None,
             pressure_size: true,
             pressure_intensity: true,
@@ -1154,9 +1160,11 @@ impl Workspace {
                         let resp = thumb(ui, Thumb::Texture(tex), m.brush.kind.name(), true, false);
                         if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
                         let kind = m.brush.kind;
-                        let curve = self.curve_kinds.contains(&kind) && crate::curve::capable(kind);
+                        let curve = (self.curve_kinds.contains(&kind) && crate::curve::capable(kind)) || crate::curve::always(kind);
                         let resp = thumb(ui, Thumb::Glyph("stroke"), if curve { "Curve" } else { "Freehand" }, false, false);
-                        if crate::curve::capable(kind) {
+                        if crate::curve::always(kind) {
+                            resp.on_hover_text(format!("{} always strokes along a curve", kind.name()));
+                        } else if crate::curve::capable(kind) {
                             if resp.on_hover_text("Click: Freehand / Curve for this brush").clicked() {
                                 self.set_curve_mode(kind, !curve);
                             }
@@ -2552,7 +2560,9 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         let kind = m.brush.kind;
-                        if crate::curve::capable(kind) {
+                        if crate::curve::always(kind) {
+                            note(ui, &format!("{} always strokes along a curve", kind.name()));
+                        } else if crate::curve::capable(kind) {
                             let on = ws.curve_kinds.contains(&kind);
                             if let Some(i) = seg(ui, &["Freehand", "Curve"], on as usize, false) {
                                 ws.set_curve_mode(kind, i == 1);
@@ -2562,7 +2572,15 @@ impl Workspace {
                         }
                         zslider(ui, "Curve smooth", &mut ws.curve_smooth, 0.0..=2.0, false, false, 2);
                         zslider(ui, "Curve step", &mut ws.curve_step, 0.16..=1.0, false, false, 2);
-                        note(ui, "Release applies along the curve · drag the curve to bend it · Esc lets it go");
+                        if kind.is_insert() {
+                            zslider(ui, "Tube taper", &mut ws.tube_taper, 0.0..=1.0, false, false, 2);
+                            let mut sides = ws.tube_sides as f32;
+                            zslider(ui, "Tube sides", &mut sides, Tube::MIN_SIDES as f32..=Tube::MAX_SIDES as f32, false, false, 0);
+                            ws.tube_sides = sides.round() as u32;
+                            note(ui, "Release adds the tube · drag the curve to bend it · Draw Size, taper and sides update it · Esc lets it go");
+                        } else {
+                            note(ui, "Release applies along the curve · drag the curve to bend it · Esc lets it go");
+                        }
                     },
                 );
                 self.sec(

@@ -1203,6 +1203,30 @@ impl Multires {
         }
     }
 
+    /// Put `part` (or nothing) in place of everything after `keep` in the base mesh and
+    /// return what was there (CurveTube adds its tube this way; its undo steps too). Only
+    /// for a stack without upper levels; it counts as a new stack for the renderer.
+    pub fn swap_part(&mut self, keep: crate::mesh::Extent, part: Option<&SculptMesh>) -> Option<SculptMesh> {
+        let old = self.swap_part_in_place(keep, part);
+        self.generation = next_generation();
+        old
+    }
+
+    /// [`swap_part`](Self::swap_part) for a caller that updates the renderer's copy itself
+    /// (`Gfx::swap_tail`): the stack keeps its generation.
+    pub fn swap_part_in_place(&mut self, keep: crate::mesh::Extent, part: Option<&SculptMesh>) -> Option<SculptMesh> {
+        assert_eq!(self.levels.len(), 1, "parts are added to a stack without levels");
+        let level = &mut self.levels[0];
+        let old = level.mesh.swap_tail(keep, part);
+        let n = level.mesh.chunks.len();
+        level.offsets.truncate(keep.chunks);
+        level.offsets.resize(n, Vec::new());
+        level.stale.truncate(keep.chunks);
+        level.stale.resize(n, false);
+        self.active = 0;
+        old
+    }
+
     /// Delete the levels above the shown one (ZBrush: Del Higher). Returns how many went.
     pub fn delete_higher(&mut self) -> usize {
         let n = self.levels.len() - 1 - self.active;

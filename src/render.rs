@@ -107,8 +107,18 @@ struct MeshBuffers {
     vis_version: Option<u32>,
     /// Polygroup per drawn triangle for the PolyF pass (2 bytes per triangle), while shown.
     groups: Option<GroupBuffers>,
+    /// What the buffers have room for (see [`Gfx::swap_tail`]).
+    room: Room,
     // Kept alive for the bind group.
     _tables: [wgpu::Buffer; 4],
+}
+
+/// Vertices, triangles and chunks a level's buffers have room for.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Room {
+    pub verts: usize,
+    pub tris: usize,
+    pub chunks: usize,
 }
 
 struct GroupBuffers {
@@ -1053,9 +1063,14 @@ impl Gfx {
     /// Create a buffer and fill it in pieces, flushing between them so the staging memory
     /// in flight stays bounded.
     fn upload(&self, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        self.upload_in(label, data, data.len(), usage)
+    }
+
+    /// [`upload`](Self::upload) into a buffer of at least `size` bytes.
+    fn upload_in(&self, label: &str, data: &[u8], size: usize, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: data.len().max(4) as u64,
+            size: data.len().max(size).max(4).next_multiple_of(4) as u64,
             usage: usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1074,6 +1089,12 @@ impl Gfx {
     /// frame. When the level does not fit, every cached level is dropped and the upload is
     /// tried once more; if it still fails the level is not shown and false is returned.
     pub fn upload_level(&mut self, mesh: &mut SculptMesh, level: usize) -> bool {
+        self.upload_level_with_room(mesh, level, Room::default())
+    }
+
+    /// [`upload_level`](Self::upload_level) with buffers big enough for `room` (vertices,
+    /// triangles, chunks), so a part can later be added in place (see [`swap_tail`](Self::swap_tail)).
+    pub fn upload_level_with_room(&mut self, mesh: &mut SculptMesh, level: usize, room: Room) -> bool {
         let previous = self.active;
         if self.levels.len() <= level {
             self.levels.resize_with(level + 1, || None);
@@ -1085,7 +1106,7 @@ impl Gfx {
         self.active = level;
         self.trim_cache();
         for attempt in 0..2 {
-            match self.create_level(mesh) {
+            match self.create_level(mesh, room) {
                 Some(buffers) => {
                     log::info!(
                         "gpu: level {level} uploaded, {} MB ({} bytes per vertex)",
@@ -1110,18 +1131,25 @@ impl Gfx {
     }
 
     /// Buffers for a level, or `None` when the GPU is out of memory.
-    fn create_level(&self, mesh: &SculptMesh) -> Option<MeshBuffers> {
+    fn create_level(&self, mesh: &SculptMesh, room: Room) -> Option<MeshBuffers> {
         use wgpu::BufferUsages as U;
+        let room = Room {
+            verts: room.verts.max(mesh.vertex_count()),
+            tris: room.tris.max(mesh.triangle_count()),
+            chunks: room.chunks.max(mesh.chunks.len()),
+        };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let positions = self.upload(
+        let positions = self.upload_in(
             "positions",
             bytemuck::cast_slice(&mesh.positions),
+            room.verts * 12,
             // COPY_SRC: read back by `--selftest-transpose`.
             U::VERTEX | U::STORAGE | U::COPY_SRC,
         );
-        let indices = self.upload(
+        let indices = self.upload_in(
             "indices",
             bytemuck::cast_slice(&mesh.indices),
+            room.tris * 12,
             U::INDEX | U::STORAGE,
         );
         let chunk_count = mesh.chunks.len();
@@ -1135,9 +1163,10 @@ impl Gfx {
         }
         chunk_verts.push(mesh.vertex_count() as u32);
         chunk_tris.push(mesh.triangle_count() as u32);
-        let chunk_verts = self.upload("chunk_verts", bytemuck::cast_slice(&chunk_verts), U::STORAGE);
-        let chunk_tris = self.upload("chunk_tris", bytemuck::cast_slice(&chunk_tris), U::STORAGE);
-        let chunk_border = self.upload("chunk_border", bytemuck::cast_slice(&chunk_border), U::STORAGE);
+        let tables = (room.chunks + 1) * 4;
+        let chunk_verts = self.upload_in("chunk_verts", bytemuck::cast_slice(&chunk_verts), tables, U::STORAGE);
+        let chunk_tris = self.upload_in("chunk_tris", bytemuck::cast_slice(&chunk_tris), tables, U::STORAGE);
+        let chunk_border = self.upload_in("chunk_border", bytemuck::cast_slice(&chunk_border), tables, U::STORAGE);
         let plain = |label: &str, size: usize, usage: U| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1146,13 +1175,13 @@ impl Gfx {
                 mapped_at_creation: false,
             })
         };
-        let normals = plain("normals", mesh.vertex_count() * 4, U::VERTEX | U::STORAGE);
+        let normals = plain("normals", room.verts * 4, U::VERTEX | U::STORAGE);
         let colors=if mesh.colors.is_empty() {
-            plain("paint",mesh.vertex_count()*4,U::VERTEX|U::COPY_DST|U::COPY_SRC)
-        } else {self.upload("paint",bytemuck::cast_slice(&mesh.colors),U::VERTEX|U::COPY_SRC)};
-        let acc = plain("normal accumulators", mesh.vertex_count() * 12, U::STORAGE);
-        let chunk_flag = plain("chunk_flag", chunk_count * 4, U::STORAGE | U::COPY_DST);
-        let work = plain("normal work list", chunk_count * 4, U::STORAGE | U::COPY_DST);
+            plain("paint",room.verts*4,U::VERTEX|U::COPY_DST|U::COPY_SRC)
+        } else {self.upload_in("paint",bytemuck::cast_slice(&mesh.colors),room.verts*4,U::VERTEX|U::COPY_SRC)};
+        let acc = plain("normal accumulators", room.verts * 12, U::STORAGE);
+        let chunk_flag = plain("chunk_flag", room.chunks * 4, U::STORAGE | U::COPY_DST);
+        let work = plain("normal work list", room.chunks * 4, U::STORAGE | U::COPY_DST);
         let normal_params = plain(
             "normal params",
             std::mem::size_of::<NormalParams>(),
@@ -1160,10 +1189,10 @@ impl Gfx {
         );
         // Padded to whole words; zero (nothing masked) unless the mesh has a mask.
         let mask = if mesh.mask.is_empty() {
-            plain("mask", mesh.vertex_count().div_ceil(4) * 4, U::STORAGE | U::COPY_DST | U::COPY_SRC)
+            plain("mask", room.verts.div_ceil(4) * 4, U::STORAGE | U::COPY_DST | U::COPY_SRC)
         } else {
             let mut padded = mesh.mask.clone();
-            padded.resize(mesh.vertex_count().div_ceil(4) * 4, 0);
+            padded.resize(room.verts.div_ceil(4) * 4, 0);
             // COPY_SRC: read back by `--selftest-mask`.
             self.upload("mask", &padded, U::STORAGE | U::COPY_SRC)
         };
@@ -1276,8 +1305,66 @@ impl Gfx {
             draw: None,
             vis_version: None,
             groups: None,
+            room,
             _tables: [chunk_verts, chunk_tris, chunk_border, acc],
         })
+    }
+
+    /// Show the active level again after everything after `keep` in it changed (a
+    /// CurveTube added, bent or removed), writing only that part when its buffers have room
+    /// (see [`upload_level_with_room`](Self::upload_level_with_room)). False when they do
+    /// not: the caller uploads the level afresh.
+    pub fn swap_tail(&mut self, mesh: &mut SculptMesh, keep: crate::mesh::Extent) -> bool {
+        let Some(b) = self.levels.get_mut(self.active).and_then(Option::as_mut) else {
+            return false;
+        };
+        let (n, t, c) = (mesh.vertex_count(), mesh.triangle_count(), mesh.chunks.len());
+        if n > b.room.verts || t > b.room.tris || c > b.room.chunks || keep.chunks > c {
+            return false;
+        }
+        let (kv, kt) = (keep.verts, keep.tris);
+        let q = &self.queue;
+        if n > kv {
+            q.write_buffer(&b.positions, (kv * 12) as u64, bytemuck::cast_slice(&mesh.positions[kv..]));
+            if mesh.colors.is_empty() {
+                q.write_buffer(&b.colors, (kv * 4) as u64, &vec![0u8; (n - kv) * 4]);
+            } else {
+                q.write_buffer(&b.colors, (kv * 4) as u64, bytemuck::cast_slice(&mesh.colors[kv..]));
+            }
+            // One byte per vertex in whole words: from the word holding the first new one.
+            let (from, to) = (kv / 4 * 4, n.div_ceil(4) * 4);
+            let mut words = if mesh.mask.is_empty() { Vec::new() } else { mesh.mask[from..].to_vec() };
+            words.resize(to - from, 0);
+            q.write_buffer(&b.mask, from as u64, &words);
+        }
+        if t > kt {
+            q.write_buffer(&b.indices, (kt * 12) as u64, bytemuck::cast_slice(&mesh.indices[3 * kt..]));
+        }
+        let mut verts: Vec<u32> = mesh.chunks.iter().map(|ch| ch.vert_start).collect();
+        let mut tris: Vec<u32> = mesh.chunks.iter().map(|ch| ch.tri_start).collect();
+        let border: Vec<u32> = mesh.chunks.iter().map(|ch| ch.tri_border).collect();
+        verts.push(n as u32);
+        tris.push(t as u32);
+        let [chunk_verts, chunk_tris, chunk_border, _] = &b._tables;
+        q.write_buffer(chunk_verts, 0, bytemuck::cast_slice(&verts));
+        q.write_buffer(chunk_tris, 0, bytemuck::cast_slice(&tris));
+        if !border.is_empty() {
+            q.write_buffer(chunk_border, 0, bytemuck::cast_slice(&border));
+        }
+        b.index_count = (3 * t) as u32;
+        b.dirty_flags.resize(c, 0);
+        // Rebuilt from the mesh when next needed.
+        b.bytes -= b.draw.as_ref().map_or(0, |(d, _)| d.size()) + b.groups.as_ref().map_or(0, |g| g.bytes);
+        b.draw = None;
+        b.vis_version = None;
+        b.groups = None;
+        for ch in &mut mesh.chunks[keep.chunks..] {
+            ch.dirty_pos = false;
+            ch.dirty_mask = false;
+            ch.dirty_color = false;
+            ch.dirty_nrm = true;
+        }
+        true
     }
 
     /// Bring the active level's visible-triangle index buffer and, while `want_groups`, its

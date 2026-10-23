@@ -8,6 +8,7 @@ mod mask;
 mod surface_tools;
 mod detail_brush;
 mod curve;
+mod curve_tube;
 mod native_tests;
 mod mesh;
 mod multires;
@@ -143,6 +144,17 @@ struct CurveTool {
     base: std::collections::HashMap<u32, Vec<Vec3>>,
     base_paint: std::collections::HashMap<u32, Vec<paint::Color>>,
     bend: Option<CurveBend>,
+    /// CurveTube: the tube it added instead of a brush result.
+    tube: Option<TubePart>,
+}
+
+/// The tube a CurveTube curve added to the active subtool: everything after `keep` in its
+/// base mesh, in polygroup `group`, built with `shape`. Bending or resizing swaps it.
+#[derive(Clone, Copy, Debug)]
+struct TubePart {
+    keep: mesh::Extent,
+    group: u16,
+    shape: curve_tube::Tube,
 }
 
 /// A drag on an applied curve: its points on the canvas when the drag began (`None`
@@ -159,6 +171,8 @@ struct CurveBend {
     press: Vec2,
     /// Moved since the last frame's re-application.
     pending: bool,
+    /// CurveTube: the curve and the tube when the drag began (the undo step of the bend).
+    tube_from: Option<(curve::Curve, Option<Box<SculptMesh>>)>,
 }
 
 /// A Ctrl + Shift press in progress (ZBrush: SelectRect). A click acts on the polygroup
@@ -365,6 +379,10 @@ struct App {
     /// `--selftest-curve`: phase and frames left before it.
     selftest_curve: Option<(u8, u32)>,
     selftest_curve_state: CurveTest,
+    /// `--selftest-tube`: phase and frames left before it (shares `selftest_curve_state`).
+    selftest_tube: Option<(u8, u32)>,
+    /// `--hold`: a self-test leaves the window open when it is done.
+    selftest_hold: bool,
 
     cursor: Vec2,
     last_cursor: Vec2,
@@ -493,6 +511,8 @@ impl App {
             curve: None,
             selftest_curve: None,
             selftest_curve_state: CurveTest::default(),
+            selftest_tube: None,
+            selftest_hold: false,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             scale: 1.0,
@@ -2346,6 +2366,121 @@ impl App {
         }
     }
 
+    /// `--selftest-tube`: CurveTube through the real input handlers on the GPU. Phase 0
+    /// draws a fringe of tubes over the model (each one let go with Esc), the last one off
+    /// the side of the model, and bends it; phase 1 checks the GPU copy, undo and redo.
+    fn selftest_tube_phase(&mut self, phase: u8) -> Option<u8> {
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_curve_state.ok &= pass;
+            log::info!("selftest-tube: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let max_diff = |a: &[Vec3], b: &[Vec3]| a.par_iter().zip(b).map(|(x, y)| x.distance(*y)).reduce(|| 0.0, f32::max);
+        let draw = |app: &mut Self, path: &[Vec2]| -> f32 {
+            app.cursor_moved(path[0], false);
+            app.left_press(false, false);
+            for &p in &path[1..] {
+                app.cursor_moved(p, false);
+            }
+            let t = Instant::now();
+            app.left_release();
+            t.elapsed().as_secs_f32() * 1000.0
+        };
+        match phase {
+            0 => {
+                self.selftest_curve_state = CurveTest { ok: true, ..CurveTest::default() };
+                self.workspace.select_brush(&mut self.brush, BrushKind::CurveTube);
+                let b = self.doc.bounds();
+                let (centre, size) = ((b.min + b.max) * 0.5, (b.max - b.min).max_element());
+                self.brush.radius = size * 0.022;
+                self.workspace.tube_taper = 0.35;
+                self.pressure = None;
+                let original = self.mesh().positions.clone();
+                let groups = self.mesh().group_count();
+                let c = self.project(centre);
+                let r = (self.project(centre + Vec3::X * size * 0.5) - c).length();
+                // Locks from the crown falling down over the front and sides, with a
+                // little wave, the last one running off the side.
+                let mut times = Vec::new();
+                for k in 0..9 {
+                    let a = (k as f32 / 8.0 - 0.5) * 2.4;
+                    let start = c + Vec2::new(a.sin() * r * 0.25, -r * 0.8);
+                    let end = c + Vec2::new(a.sin() * r * (if k == 8 { 1.5 } else { 0.95 }), r * (0.1 + 0.25 * a.cos()));
+                    let path: Vec<Vec2> = (0..=120)
+                        .map(|i| {
+                            let f = i as f32 / 120.0;
+                            let p = start.lerp(end, f);
+                            let n = (end - start).perp().normalize_or_zero();
+                            p + n * (f * 18.0).sin() * r * 0.03
+                        })
+                        .collect();
+                    times.push(draw(self, &path));
+                    if k < 8 {
+                        self.on_key(KeyCode::Escape);
+                    }
+                }
+                let n = original.len();
+                let added = self.mesh().vertex_count() - n;
+                let kept = max_diff(&self.mesh().positions[..n], &original) == 0.0;
+                let avg = times.iter().sum::<f32>() / times.len() as f32;
+                check(self, &format!("nine tubes added {} vertices in {avg:.0} ms each, the model untouched", fmt_count(added)), added > 0 && kept);
+                check(self, &format!("each tube is a polygroup of its own ({} → {})", groups, self.mesh().group_count()), self.mesh().group_count() == groups + 9);
+                let applied = self.mesh().positions.clone();
+                // Bend the last one: grab its middle and pull it up.
+                let mid = self.curve.as_ref().map(|c| c.curve.points[c.curve.points.len() / 2]).unwrap_or(centre);
+                let grab = self.project(mid);
+                self.cursor_moved(grab, false);
+                self.left_press(false, false);
+                let bending = self.curve.as_ref().is_some_and(|c| c.bend.is_some());
+                let t = Instant::now();
+                for k in 1..=10 {
+                    self.cursor_moved(grab + Vec2::new(r * 0.02 * k as f32, -r * 0.03 * k as f32), false);
+                    self.bend_curve();
+                }
+                let bend_ms = t.elapsed().as_secs_f32() * 1000.0 / 10.0;
+                self.left_release();
+                let bent = self.mesh().positions.clone();
+                let n_last = self.curve.as_ref().and_then(|c| c.tube).map_or(0, |t| t.keep.verts);
+                check(
+                    self,
+                    &format!("a press on the last curve bends its tube ({bend_ms:.0} ms per rebuild at {} vertices)", fmt_count(bent.len())),
+                    bending && max_diff(&bent[..n_last], &applied[..n_last]) == 0.0 && bent[n_last..] != applied[n_last..],
+                );
+                self.selftest_curve_state.original = original;
+                self.selftest_curve_state.applied = applied;
+                self.selftest_curve_state.bent = bent;
+                Some(1)
+            }
+            _ => {
+                let t = std::mem::take(&mut self.selftest_curve_state);
+                self.selftest_curve_state.ok = t.ok;
+                if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                    let d = if gpu.len() >= t.bent.len() { max_diff(&gpu[..t.bent.len()], &t.bent) } else { f32::INFINITY };
+                    check(self, &format!("GPU copy of the model with its tubes matches the CPU ({d:.1e})"), d < 1e-6);
+                }
+                let undo = |app: &mut Self| {
+                    app.history.undo(&mut app.doc);
+                    app.show_active_level();
+                };
+                undo(self);
+                let d1 = max_diff(&self.mesh().positions, &t.applied);
+                let same = self.mesh().vertex_count() == t.applied.len();
+                for _ in 0..9 {
+                    undo(self);
+                }
+                let back = self.mesh().positions == t.original;
+                check(self, &format!("undo takes back the bend ({d1:.1e}), then every tube"), same && d1 == 0.0 && back);
+                for _ in 0..10 {
+                    self.history.redo(&mut self.doc);
+                }
+                self.show_active_level();
+                check(self, "redo brings them all back", self.mesh().positions == t.bent);
+                let ok = self.selftest_curve_state.ok;
+                log::info!("selftest-tube: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -2860,7 +2995,27 @@ impl App {
 
     /// Whether `kind` strokes along a curve (Stroke › Curve).
     fn curve_mode(&self, kind: BrushKind) -> bool {
-        curve::capable(kind) && self.workspace.curve_kinds.contains(&kind)
+        curve::always(kind) || (curve::capable(kind) && self.workspace.curve_kinds.contains(&kind))
+    }
+
+    /// CurveTube's shape at brush radius `radius` (Stroke › Curve: Tube taper, Tube sides).
+    fn tube_shape(&self, radius: f32) -> curve_tube::Tube {
+        curve_tube::Tube { radius, taper: self.workspace.tube_taper, sides: self.workspace.tube_sides }
+    }
+
+    /// Why CurveTube cannot add geometry to the active subtool now, if it cannot.
+    fn tube_refusal(&self) -> Option<&'static str> {
+        (self.doc.count() > 1).then_some(
+            "CurveTube adds geometry, which needs a subtool without subdivision levels · Del Lower first, or Append a subtool for it",
+        )
+    }
+
+    /// The point under canvas pixel `p` at the depth of `at` (on the plane through `at`
+    /// facing the camera): where a curve continues off the surface.
+    fn at_depth(cam: &Camera, vp: Vec2, p: Vec2, at: Vec3) -> Vec3 {
+        let (o, d) = cam.ray(p.x, p.y, vp.x, vp.y);
+        let f = cam.forward();
+        o + d * ((at - o).dot(f) / d.dot(f).max(1e-6))
     }
 
     /// The applied curve, if it can still be bent: nothing edited since, and the same level
@@ -2893,7 +3048,10 @@ impl App {
     /// Lay a screen path (canvas pixels) onto the surface: smoothed by Curve smooth times
     /// the brush's screen radius (when `smooth`), raycast every tenth of that radius, then
     /// resampled every 4 % of `radius` in the world.
-    fn lay_curve(&self, path: &[Vec2], radius: f32, smooth: bool) -> curve::Curve {
+    ///
+    /// With `free` (CurveTube) the curve does not stop where the path leaves the surface: it
+    /// goes on at the depth of the nearest point on it, so a tube can hang off the model.
+    fn lay_curve(&self, path: &[Vec2], radius: f32, smooth: bool, free: bool) -> curve::Curve {
         let vp = self.viewport();
         let (cam, mesh) = (&self.camera, self.doc.mesh());
         let hit = |p: &Vec2| {
@@ -2910,7 +3068,22 @@ impl App {
         } else {
             curve::resample(path, step)
         };
-        let hits: Vec<_> = pts.par_iter().map(hit).collect();
+        let mut hits: Vec<_> = pts.par_iter().map(hit).collect();
+        if free {
+            // Before the first hit at its depth, after it at the last one's.
+            let mut last = None;
+            for k in 0..hits.len() {
+                match hits[k] {
+                    Some(h) => last = Some(h),
+                    None => {
+                        if let Some((p, n)) = last.or_else(|| hits[k..].iter().flatten().next().copied()) {
+                            hits[k] = Some((Self::at_depth(cam, vp, pts[k], p), n));
+                            last = hits[k];
+                        }
+                    }
+                }
+            }
+        }
         curve::Curve::from_hits(&hits, radius * 0.04)
     }
 
@@ -2918,6 +3091,13 @@ impl App {
     /// previous one keeps its result and can no longer be bent).
     fn begin_curve(&mut self) {
         let brush = self.effective_brush();
+        if brush.kind.is_insert() {
+            if let Some(why) = self.tube_refusal() {
+                self.workspace.notify(why);
+                self.status = why.to_string();
+                return;
+            }
+        }
         self.curve = None;
         self.curve_draw = Some(CurveDraw {
             path: vec![self.cursor - self.canvas_origin()],
@@ -2934,9 +3114,13 @@ impl App {
             return;
         };
         let t = Instant::now();
-        let curve = self.lay_curve(&d.path, d.brush.radius, true);
+        let curve = self.lay_curve(&d.path, d.brush.radius, true, d.brush.kind.is_insert());
         self.workspace.curve_preview = None;
         if curve.is_empty() {
+            return;
+        }
+        if d.brush.kind.is_insert() {
+            self.add_tube(curve, d, t);
             return;
         }
         let (symmetry, assets) = (self.workspace.symmetry, self.workspace.assets.clone());
@@ -2961,9 +3145,184 @@ impl App {
             base,
             base_paint,
             bend: None,
+            tube: None,
         });
         self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.update_hover();
+    }
+
+    /// CurveTube release: a tube along `curve` (and its mirror image with symmetry) added
+    /// to the active subtool as a new polygroup, as one undo step. The curve stays so the
+    /// tube can be bent and resized.
+    fn add_tube(&mut self, curve: curve::Curve, d: CurveDraw, t: Instant) {
+        if let Some(why) = self.tube_refusal() {
+            self.workspace.notify(why);
+            return;
+        }
+        let (symmetry, shape) = (self.workspace.symmetry, self.tube_shape(d.brush.radius));
+        let keep = self.mesh().extent();
+        let group = self.mesh().max_group().saturating_add(1);
+        let Some(part) = curve_tube::tubes(&curve, shape, symmetry, group) else {
+            return;
+        };
+        let added = part.vertex_count();
+        self.doc.swap_part_in_place(keep, Some(&part));
+        self.history.push(UndoStep::Part { keep, part: None });
+        self.show_swapped_part(keep);
+        self.curve = Some(CurveTool {
+            curve,
+            brush: d.brush,
+            invert: d.invert,
+            symmetry,
+            assets: self.workspace.assets.clone(),
+            level: 0,
+            tool: self.active_tool,
+            vertices: self.mesh().vertex_count(),
+            edits: self.history.edits(),
+            base: Default::default(),
+            base_paint: Default::default(),
+            bend: None,
+            tube: Some(TubePart { keep, group, shape }),
+        });
+        self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.status = format!("CurveTube: added {} vertices as polygroup {group} in {:.0} ms", fmt_count(added), self.stroke_ms);
+        log::info!("{}", self.status);
+    }
+
+    /// Put a new tube along the live CurveTube curve `curve` with `shape`, in place of the
+    /// one it made before (a bend, or a new Draw Size, taper or sides).
+    fn rebuild_tube(&mut self, curve: Option<curve::Curve>, shape: curve_tube::Tube) {
+        let Some(c) = self.curve.as_mut() else {
+            return;
+        };
+        let Some(tube) = c.tube.as_mut() else {
+            return;
+        };
+        if let Some(curve) = curve {
+            c.curve = curve;
+        }
+        tube.shape = shape;
+        let part = curve_tube::tubes(&c.curve, shape, c.symmetry, tube.group);
+        let keep = tube.keep;
+        self.doc.swap_part_in_place(keep, part.as_ref());
+        let vertices = self.doc.mesh().vertex_count();
+        self.curve.as_mut().unwrap().vertices = vertices;
+        self.show_swapped_part(keep);
+    }
+
+    /// Show the active subtool after everything after `keep` changed in place: only that
+    /// part is written to the GPU while its buffers have room; otherwise the level is
+    /// uploaded afresh with room for more (so the next tubes and bends go in place).
+    fn show_swapped_part(&mut self, keep: mesh::Extent) {
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        let Some(gfx) = self.gfx.as_mut() else {
+            return self.update_hover();
+        };
+        let generation = self.doc.generation;
+        let mesh = self.doc.mesh_mut();
+        if gfx.generation == generation && gfx.swap_tail(mesh, keep) {
+            return self.update_hover();
+        }
+        let (n, t, c) = (mesh.vertex_count(), mesh.triangle_count(), mesh.chunks.len());
+        let (pn, pt, pc) = (n - keep.verts, t - keep.tris, c - keep.chunks);
+        let room = render::Room {
+            verts: n + (n / 16).max(4 * pn).max(1 << 16),
+            tris: t + (t / 16).max(4 * pt).max(1 << 17),
+            chunks: c + (c / 16).max(4 * pc).max(64),
+        };
+        gfx.clear_levels();
+        gfx.generation = generation;
+        if !gfx.upload_level_with_room(mesh, 0, room) {
+            self.show_active_level();
+            return;
+        }
+        self.update_hover();
+    }
+
+    /// A live CurveTube follows Draw Size, Tube taper and Tube sides while CurveTube is the
+    /// brush (ZBrush: change the size to update the curve's mesh).
+    fn follow_tube_settings(&mut self) {
+        if self.busy() || !self.brush.kind.is_insert() {
+            return;
+        }
+        let Some(tube) = self.live_curve().and_then(|c| c.tube) else {
+            return;
+        };
+        let shape = self.tube_shape(self.brush.radius);
+        if shape != tube.shape {
+            self.rebuild_tube(None, shape);
+        }
+    }
+
+    /// Bend a CurveTube curve: points pulled with the falloff snap to the model where it is
+    /// under them (the tube itself left out) and stay at their own depth where it is not, so
+    /// a tube can be pulled off the surface; points the pull does not reach stay put.
+    fn bend_tube(&mut self) {
+        let (vp, cursor) = (self.viewport(), self.cursor);
+        let Some(c) = self.curve.as_mut() else {
+            return;
+        };
+        let (Some(b), Some(tube)) = (c.bend.as_mut(), c.tube) else {
+            return;
+        };
+        b.pending = false;
+        let Some((from, _)) = b.tube_from.as_ref() else {
+            return;
+        };
+        let delta = cursor - b.press;
+        let (grab, reach) = (b.grab, b.reach);
+        let along = &b.along;
+        let pull = |i: usize| {
+            let x = ((along[i] - grab) / reach).abs();
+            if x >= 1.0 { 0.0 } else { (1.0 - x * x).powi(2) }
+        };
+        let (cam, mesh) = (&self.camera, self.doc.mesh());
+        let mut slots: Vec<Option<usize>> = Vec::new();
+        for piece in &b.pieces {
+            slots.extend(piece.clone().map(Some));
+            slots.push(None);
+        }
+        // Ok: kept or snapped to the model; Err: pulled off it, placed below.
+        let found: Vec<Option<Result<(Vec3, Vec3), (Vec2, Vec3)>>> = slots
+            .par_iter()
+            .map(|slot| {
+                let i = (*slot)?;
+                let (p, n) = (from.points[i], from.normals[i]);
+                let w = pull(i);
+                let Some(s) = b.screen[i].filter(|_| w > 1e-4) else {
+                    return Some(Ok((p, n)));
+                };
+                let q = s + delta * w;
+                let (o, d) = cam.ray(q.x, q.y, vp.x, vp.y);
+                Some(mesh.raycast_in(o, d, tube.keep.chunks).map(|h| (h.point, h.normal)).ok_or((q, n)))
+            })
+            .collect();
+        // Off the model a point goes on at the depth of the point before it on the curve
+        // (the one after it at the start of a piece), as when the curve was drawn, so the
+        // tube does not jump in depth where it leaves the surface.
+        let mut hits: Vec<Option<(Vec3, Vec3)>> = vec![None; found.len()];
+        let mut k = 0;
+        while k < found.len() {
+            let end = (k..found.len()).find(|&j| found[j].is_none()).unwrap_or(found.len());
+            let mut last: Option<Vec3> = None;
+            for j in k..end {
+                hits[j] = match found[j] {
+                    Some(Ok(h)) => Some(h),
+                    Some(Err((q, n))) => {
+                        let near = last.or_else(|| found[j..end].iter().find_map(|f| f.and_then(Result::ok)).map(|h| h.0));
+                        let at = near.unwrap_or(from.points[slots[j].unwrap()]);
+                        Some((Self::at_depth(cam, vp, q, at), n))
+                    }
+                    None => None,
+                };
+                last = hits[j].map(|h| h.0);
+            }
+            k = end + 1;
+        }
+        let curve = curve::Curve::from_hits(&hits, c.brush.radius * 0.04);
+        if !curve.is_empty() {
+            self.rebuild_tube(Some(curve), tube.shape);
+        }
     }
 
     /// Press within reach of the applied curve: start bending it (ZBrush: drag a curve to
@@ -3000,7 +3359,8 @@ impl App {
         let grab = along[i];
         let press = self.cursor;
         let pieces = c.curve.pieces.clone();
-        self.curve.as_mut().unwrap().bend = Some(CurveBend { stroke, pieces, screen, along, grab, reach, press, pending: false });
+        let tube_from = c.tube.map(|t| (c.curve.clone(), self.doc.mesh().tail(t.keep).map(Box::new)));
+        self.curve.as_mut().unwrap().bend = Some(CurveBend { stroke, pieces, screen, along, grab, reach, press, pending: false, tube_from });
         self.hover = None;
         true
     }
@@ -3009,6 +3369,10 @@ impl App {
     /// on the screen with a smooth falloff from the grabbed point, lay them onto the surface
     /// again and apply the brush along the new shape.
     fn bend_curve(&mut self) {
+        if self.curve.as_ref().is_some_and(|c| c.tube.is_some()) {
+            self.bend_tube();
+            return;
+        }
         let vp = self.viewport();
         let (fwd, cursor) = (self.camera.forward(), self.cursor);
         let step_share = self.workspace.curve_step;
@@ -3087,7 +3451,10 @@ impl App {
             return;
         };
         let level = c.level;
-        self.commit_stroke(b.stroke, level);
+        match (c.tube, b.tube_from) {
+            (Some(tube), Some((_, before))) => self.history.push(UndoStep::Part { keep: tube.keep, part: before }),
+            _ => self.commit_stroke(b.stroke, level),
+        }
         let edits = self.history.edits();
         if let Some(c) = self.curve.as_mut() {
             c.edits = edits;
@@ -3944,6 +4311,17 @@ impl App {
             self.bend_curve();
             self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
+        self.follow_tube_settings();
+        if let Some((phase, left)) = self.selftest_tube {
+            if left == 0 {
+                self.selftest_tube = self.selftest_tube_phase(phase).map(|next| (next, 10));
+                if self.selftest_tube.is_none() && !self.selftest_hold {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_tube = Some((phase, left - 1));
+            }
+        }
         if let Some((phase, left)) = self.selftest_curve {
             if left == 0 {
                 self.selftest_curve = self.selftest_curve_phase(phase).map(|next| (next, 10));
@@ -4750,6 +5128,10 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-curve") {
         app.selftest_curve = Some((0, 20));
     }
+    if args.iter().any(|a| a == "--selftest-tube") {
+        app.selftest_tube = Some((0, 20));
+    }
+    app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.open_on_start = flag("--open").cloned();
     if stress {
         app.stress = Some((240, 0.0, 0.0));
@@ -5865,5 +6247,111 @@ mod curve_input_tests {
         // Drag brushes never stroke along a curve.
         a.workspace.set_curve_mode(BrushKind::Grab, true);
         assert!(!a.curve_mode(BrushKind::Grab));
+    }
+
+    fn tube_app() -> App {
+        let mut a = app();
+        a.workspace.select_brush(&mut a.brush, BrushKind::CurveTube);
+        a.brush.radius = 0.05;
+        a
+    }
+
+    #[test]
+    fn curve_tube_adds_a_polygroup_that_bends_and_undoes() {
+        let mut a = tube_app();
+        a.workspace.set_curve_mode(BrushKind::CurveTube, false);
+        assert!(a.curve_mode(BrushKind::CurveTube), "CurveTube always draws a curve");
+        let (positions, groups, verts) = (a.mesh().positions.clone(), a.mesh().group_count(), a.mesh().vertex_count());
+        let c = a.project(Vec3::ZERO) - Vec2::new(150.0, 0.0);
+        drag(&mut a, c, 300.0, false);
+        assert_eq!(a.mesh().vertex_count(), verts, "nothing until release");
+        a.left_release();
+        let added = a.mesh().vertex_count();
+        assert!(added > verts + 100, "{added}");
+        assert_eq!(a.mesh().positions[..verts], positions[..], "the model itself is untouched");
+        assert_eq!(a.mesh().group_count(), groups + 1);
+        // The tube runs along the front of the unit sphere, its centre on the surface.
+        let tube = a.mesh().positions[verts..].to_vec();
+        assert!(tube.iter().all(|p| (p.length() - 1.0).abs() < 0.06 && p.z > 0.0), "off the surface");
+        assert!(a.live_curve().is_some());
+        // Bend it: the model stays, the tube moves.
+        let mid = { let c = &a.curve.as_ref().unwrap().curve; c.points[c.points.len() / 2] };
+        let at = a.project(mid);
+        a.cursor_moved(at, false);
+        a.left_press(false, false);
+        assert!(a.curve.as_ref().unwrap().bend.is_some());
+        a.cursor_moved(at + Vec2::new(0.0, -80.0), false);
+        a.left_release();
+        assert!(a.live_curve().is_some(), "still bendable");
+        let bent = a.mesh().positions.clone();
+        assert_eq!(bent[..verts], positions[..]);
+        assert_ne!(bent[verts..], tube[..]);
+        let lift = |p: &[Vec3]| p.iter().map(|q| q.y).fold(f32::MIN, f32::max);
+        assert!(lift(&bent[verts..]) > lift(&tube) + 0.05, "pulled up the screen");
+        // Undo the bend, then the tube; redo both.
+        a.history.undo(&mut a.doc);
+        assert_eq!(a.mesh().positions[verts..], tube[..]);
+        a.history.undo(&mut a.doc);
+        assert_eq!(a.mesh().positions, positions);
+        assert_eq!(a.mesh().group_count(), groups);
+        a.history.redo(&mut a.doc);
+        a.history.redo(&mut a.doc);
+        assert_eq!(a.mesh().positions, bent);
+        assert_eq!(a.mesh().group_count(), groups + 1);
+        // Saved in a project and opened again, the model and its tube come back exactly.
+        let back = a.doc.pack_copy().try_unpack().unwrap();
+        assert_eq!((&back.mesh().positions, &back.mesh().indices, &back.mesh().groups), (&a.mesh().positions, &a.mesh().indices, &a.mesh().groups));
+        // A tube can be divided like the rest of the model (closed, two triangles per edge).
+        assert!(!a.mesh().edges_over_two_triangles());
+        a.divide();
+        assert_eq!(a.doc.count(), 2);
+    }
+
+    #[test]
+    fn curve_tube_follows_draw_size_hangs_off_the_model_and_mirrors() {
+        let mut a = tube_app();
+        let verts = a.mesh().vertex_count();
+        let centre = a.project(Vec3::ZERO);
+        drag(&mut a, centre - Vec2::new(100.0, 0.0), 200.0, true);
+        let width = |a: &App| {
+            let t = &a.mesh().positions[verts..];
+            t.iter().map(|p| p.y).fold(f32::MIN, f32::max) - t.iter().map(|p| p.y).fold(f32::MAX, f32::min)
+        };
+        let (thin, edits) = (width(&a), a.history.edits());
+        a.brush.radius = 0.1;
+        a.follow_tube_settings();
+        assert!(width(&a) > thin * 1.6, "{} vs {thin}", width(&a));
+        assert_eq!(a.history.edits(), edits, "resizing is part of the same tube");
+        assert!(a.live_curve().is_some());
+        a.workspace.tube_sides = 5;
+        a.follow_tube_settings();
+        assert!(a.mesh().vertex_count() < verts + 400);
+        a.on_key(KeyCode::Escape);
+        // A stroke that runs off the side of the model goes on at the depth it left.
+        let start = a.mesh().vertex_count();
+        a.brush.radius = 0.05;
+        drag(&mut a, centre + Vec2::new(0.0, 150.0), 700.0, true);
+        let far = a.mesh().positions[start..].iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        assert!(far > 1.3, "the tube stops at the silhouette: {far}");
+        // With symmetry a second tube on the other side, in the same polygroup.
+        a.on_key(KeyCode::Escape);
+        a.workspace.symmetry = true;
+        let (start, groups) = (a.mesh().vertex_count(), a.mesh().group_count());
+        drag(&mut a, centre + Vec2::new(60.0, -150.0), 120.0, true);
+        let part = &a.mesh().positions[start..];
+        assert!(part.iter().any(|p| p.x > 0.1) && part.iter().any(|p| p.x < -0.1));
+        assert_eq!(a.mesh().group_count(), groups + 1);
+    }
+
+    #[test]
+    fn curve_tube_needs_a_subtool_without_levels() {
+        let mut a = tube_app();
+        a.divide();
+        let (verts, edits) = (a.mesh().vertex_count(), a.history.edits());
+        let c = a.project(Vec3::ZERO) - Vec2::new(100.0, 0.0);
+        drag(&mut a, c, 200.0, true);
+        assert_eq!((a.mesh().vertex_count(), a.history.edits()), (verts, edits));
+        assert!(a.curve.is_none() && a.curve_draw.is_none());
+        assert!(a.status.contains("subdivision levels"));
     }
 }

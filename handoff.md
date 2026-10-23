@@ -3,7 +3,7 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Current implementation — 0.4.0
+## Current implementation — 0.6.0 (see Step 44; the summary below describes 0.4.0)
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
 - Space palette: left HSV picker; Draw Size → Z Intensity → Focal Shift → RGB Intensity → brushes. All values affect the real stroke.
 - Application version: `Cargo.toml` / `Cargo.lock` **0.4.0**. Project format **4**, backward readers for 1–3. Brush library format **v1**; workspace layout remains **v2**.
@@ -406,4 +406,15 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Version **0.5.0** (Cargo.toml / Cargo.lock), CHANGELOG and README updated. Project, workspace and asset formats unchanged; curve settings are per session.
 - Verification: `cargo test --release` 148 passed; `--selftest-curve`, `--selftest-pressure` and every earlier self-test pass on Xvfb/llvmpipe. Visual check: the same shaky stroke drawn freehand reproduces the torn zipper, in Curve mode gives even teeth along the arc.
 - Not done: ZBrush's click-on-curve re-apply, curve snapping to polygroup borders, Lazy Mouse for freehand strokes, pressure along curves. Pen pressure was verified with real XInput2 events from XTest only; the user's XP-Pen has not been tested yet.
+
+
+## Step 44: 0.6.0 — CurveTube (2026-10-23, Claude Code)
+- User request: the 0.5.0 curve only drives the detail brushes; they want ZBrush's curve brushes that add geometry along a line drawn on the model (dreadlocks).
+- Added `BrushKind::CurveTube` (`is_insert`, catalog **34** tools, new Curve filter, preview), `src/curve_tube.rs` (tube along a curve: rings one side's width apart, rotation-minimizing frames from the surface normal, round caps, taper, X-mirror), Stroke › Curve **Tube taper** / **Tube sides** (per session, `Workspace::tube_taper` / `tube_sides`).
+- Input (`main.rs`): CurveTube always draws a curve (`curve::always`); `lay_curve(.., free)` carries off-surface samples at the depth of the last hit; `add_tube` on release (refused with a notice when the subtool has levels); the curve stays live (`CurveTool::tube: Option<TubePart>`): `bend_tube` (pulled points snap to the model without the tube, `raycast_in`, or go on at the depth of their neighbour along the curve), `follow_tube_settings` (Draw Size / taper / sides rebuild without an undo step).
+- Mesh/stack: `mesh::Extent`, `SculptMesh::swap_tail` (in place, O(tube)), `tail`, test-only `appended` (the reference), `max_group`; `Multires::swap_part` (bumps generation, used by undo) / `swap_part_in_place`; `UndoStep::Part { keep, part }` stores only the tube. Renderer: `render::Room`, `upload_level_with_room`, `Gfx::swap_tail` writes only the tail slice; `App::show_swapped_part` falls back to a full upload with room.
+- Numbers (RTX 5060, `--segments 400`, 966k vertices): a bend rebuild went 78 ms (full rebuild + upload) → 23 ms (in-place CPU) → 5–6 ms (in-place GPU). Undo of a tube still re-uploads the level (one-off).
+- Verification: `cargo test --release` 155 passed; `--selftest-tube` all passed at 4k and 966k vertices (GPU readback exact, undo/redo exact); every earlier self-test re-run. Visual check: wavy tapered locks on the sphere, one hanging off the side and bent, no fold where it leaves the surface.
+- Version **0.6.0** (Cargo.toml / Cargo.lock), CHANGELOG, README updated. Project, workspace and asset formats unchanged.
+- Not done: other ZBrush curve insert brushes (CurveStrapSnap, IMM curve with a custom mesh), click-on-curve re-apply, Split by polygroup into its own subtool, keeping a live curve across save/subtool switch, pressure along the curve (ZBrush's curve size profile), routing tube undo through the in-place GPU path.
 

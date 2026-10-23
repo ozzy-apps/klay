@@ -128,6 +128,11 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                     * sign
                     * ((0.57 - p.y.abs()) * 25.0).clamp(0.0, 1.0)
             }
+            // A raised round tube along the stroke.
+            Some(BrushKind::CurveTube) => {
+                let d = distance(p, &curve);
+                (0.085f32 * 0.085 - d * d).max(0.0).sqrt() * 1.1
+            }
             Some(
                 BrushKind::ClipLine
                 | BrushKind::MaskPen
