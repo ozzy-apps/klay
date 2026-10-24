@@ -890,15 +890,7 @@ impl Workspace {
                         ui.separator();
                         ui.vertical(|ui| {
                             ui.set_width(320.0);
-                            zslider(
-                                ui,
-                                "Draw Size",
-                                &mut m.brush.radius,
-                                0.01..=2.0,
-                                true,
-                                true,
-                                2,
-                            );
+                            draw_size_slider(ui, "Draw Size", &mut m.brush.radius, true);
                             zslider(
                                 ui,
                                 "Z Intensity",

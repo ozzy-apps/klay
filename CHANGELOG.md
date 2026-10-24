@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0 — 2026-10-24
+
+- Wedge is now called **Remesh** everywhere you see it: the Mesh › Remesh section, its Remesh (on/off) and Update buttons, notices and status lines. `--selftest-remesh` and `--remesh-resolution` are the new flags (the old ones still work); project and layout files are unchanged.
+- SubTool › Save / Load / Export OBJ: a path field under the SubTool list. Save writes the active subtool alone with all its levels (a one-subtool `.klay` that Document › Open also reads); Load adds every subtool of a `.klay` to the end of the list, parked, without changing the active one (a bad file adds nothing); Export OBJ writes the active subtool at its shown level next to the path.
+- PolyF on dense meshes: lines are lighter, stay drawn down to polygons about 3 px across, and below that blend into an even tint at the frame's average darkness (at most 42 %), so the frame stays visible from a distance instead of fading out; it no longer shimmers in between.
+- Draw Size sliders use a gentle curve (0.01 + 1.99 · position²) instead of a logarithmic one: same 0.01–2.0 range, half the slider is about 0.5 and the last tenth covers under a fifth of the range (it was 40 %).
+- Ctrl + drag on the background with nothing to clear and Remesh off now says that it remeshes while Remesh is on (it already did, as ZBrush's re-DynaMesh).
+- New `--polyf` flag starts with PolyF on.
+- Verification: 183 release tests (new: subtool save, load into another model with levels and sculpting exact, bad file, OBJ of the active subtool; Draw Size curve; the remesh hint); every native self-test passes on the GPU.
+
 ## 0.8.0 — 2026-10-24
 
 - Z Intensity, Focal Shift, RGB Intensity and Zadd/Zsub are now per brush, as in ZBrush (Maxon: every Draw palette setting except Draw Size is stored per tool). Switching brushes restores that brush's values; Draw Size stays shared. Smooth (and SmoothValleys/SmoothPeaks) and the mask brushes start at full intensity, other brushes at 0.5. Values last for the session.

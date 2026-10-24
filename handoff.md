@@ -450,3 +450,14 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Not done: ZBrush's "Remember Draw Size per brush" option, per-brush Z / RGB / Z+RGB mode (Maxon lists it per tool too; Klay keeps the Paint-brush logic), and saving the values across sessions (ZBrush only keeps them when a brush is saved).
 - Verification: 181 tests (3 new); all 14 native self-tests pass.
 
+## Step 50: 0.9.0 — Remesh name, subtool files, dense PolyF, Draw Size curve (2026-10-24, Claude Code)
+- User requests: rename Wedge to something neutral (Remesh), save subtools separately, keep the PolyF frame visible on dense meshes from a distance but discreet, make the Draw Size slider ramp up less suddenly, and Ctrl + drag outside the model to remesh like ZBrush.
+- Remesh: only user-visible text changed (`workspace.rs` section title "Remesh" with layout key still `wedge`, buttons Remesh / Update, notices and status in `main.rs`); code keeps `wedge.rs`, `GeoOp::Wedge`, `SubTool::wedge`. `--selftest-remesh` / `--remesh-resolution` with the old flags as aliases. The second button became "Update": "Remesh now" widened a 200 px tray (caught by `subtool_section_never_widens_a_narrow_tray`).
+- Ctrl + drag on the background already remeshed while Remesh is on (ZBrush needs DynaMesh on too; the user's model had 3 subdivision levels, which Remesh refuses with a notice). With Remesh off and no mask to clear, `mask_release` now notifies how to turn it on.
+- Subtool files (`main.rs`): `App::subtool_path`, `DocOp::{SaveSubtool, LoadSubtools, ExportSubtool}`, `save_subtool` (one-subtool `.klay`), `load_subtools` (unpack and check every stack, then append parked via the new `parked_subtool`, also used by `load_project`), `export_subtool_obj`. UI row under the SubTool list (`Model::subtool_path`, `Actions::{save_subtool, load_subtools, export_subtool}`). Not undoable, like Append / Delete.
+- PolyF (`groups.wgsl`): crisp lines at 0.55 darkness (was 0.85); `average = min(1.1 / px, 0.42)` blended in with `smoothstep(3, 7, px)` instead of fading to nothing below 3–8 px. Checked on spheres of 40 / 120 / 400 / 1000 segments (`ui-polyf-density.png`, last panel PolyF off for reference). Sub-pixel polygons can only show as a tint.
+- Draw Size: `SliderScale` (Linear, Logarithmic, Power) with `zslider_scaled`; `draw_size_slider` (`DRAW_SIZE`, `DRAW_SIZE_SCALE = Power(2)`) for all four Draw Size sliders. Other log sliders unchanged.
+- New `--polyf` flag. Screenshot `ui-subtool-remesh.png` (SubTool Save / Load / Export OBJ row, Remesh section).
+- Verification: 183 tests (2 new + the hint assertion); all 14 native self-tests pass.
+- Not done: showing a coarser level's frame when the shown level is too dense (ZBrush does not), Load as undoable, native file dialogs.
+

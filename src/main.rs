@@ -194,6 +194,11 @@ enum DocOp {
     New,
     Open,
     Save,
+    /// SubTool: save the active subtool on its own, add the subtools of a file, export the
+    /// active subtool as OBJ (all at `App::subtool_path`).
+    SaveSubtool,
+    LoadSubtools,
+    ExportSubtool,
 }
 
 /// Polygroup and visibility operations queued by the interface or a shortcut.
@@ -363,6 +368,8 @@ struct App {
     selftest_materials: Option<native_tests::MaterialTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
+    /// SubTool › Save / Load / Export OBJ: a file holding single subtools.
+    subtool_path: String,
     /// `--open PATH`: project to open once the window exists.
     open_on_start: Option<String>,
     pending_doc: Option<DocOp>,
@@ -506,6 +513,7 @@ impl App {
             selftest_surface: None,
             selftest_materials: None,
             project_path: "untitled.klay".to_string(),
+            subtool_path: "subtool.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
             doc: Multires::new(mesh, budget),
@@ -1132,6 +1140,116 @@ impl App {
         self.workspace.notify(self.status.clone());
     }
 
+    /// Write the active subtool on its own, with all its levels, as a one-subtool project
+    /// (SubTool › Save). It opens with Open, or joins another model with Load.
+    fn save_subtool(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let path = self.subtool_path.clone();
+        let name = self.subtools[self.active_tool].name.clone();
+        let packed = self.doc.pack_copy();
+        self.status = match project::save(Path::new(&path), &[(name.as_str(), true, &packed)], 0) {
+            Ok(bytes) => format!(
+                "Saved subtool {name} to {path}: {} levels, {:.1} MB in {:.2} s",
+                self.doc.count(),
+                bytes as f64 / 1e6,
+                t.elapsed().as_secs_f32()
+            ),
+            Err(e) => format!("Save failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Add every subtool of the project at `subtool_path` to the end of the list, parked,
+    /// with its levels (SubTool › Load; ZBrush: Append a saved tool). The active subtool
+    /// stays active. Every stack is rebuilt and checked first; a file that fails adds
+    /// nothing.
+    fn load_subtools(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let path = self.subtool_path.clone();
+        let result = (|| -> Result<Vec<(String, bool, Multires)>, String> {
+            let project = project::open(Path::new(&path))?;
+            project
+                .tools
+                .into_iter()
+                .map(|saved| {
+                    let doc = saved.packed.try_unpack().map_err(|e| format!("subtool {:?}: {e}", saved.name))?;
+                    Ok((saved.name, saved.visible, doc))
+                })
+                .collect()
+        })();
+        self.status = match result {
+            Ok(docs) => {
+                let count = docs.len();
+                for (name, visible, doc) in docs {
+                    let tool = self.parked_subtool(name, visible, doc);
+                    self.subtools.push(tool);
+                }
+                format!("Loaded {count} subtool{} from {path} in {:.2} s", if count == 1 { "" } else { "s" }, t.elapsed().as_secs_f32())
+            }
+            Err(e) => format!("Could not load {path}: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// A parked subtool holding `doc`, its stand-in uploaded.
+    fn parked_subtool(&mut self, name: String, visible: bool, mut doc: Multires) -> SubTool {
+        let id = self.new_tool_id();
+        let stand_in = doc.stand_in(STAND_IN_VERTICES);
+        let mut stand_in_vertices = stand_in.positions.len();
+        if let Some(gfx) = self.gfx.as_mut() {
+            if !gfx.upload_stand_in(id, &stand_in) {
+                stand_in_vertices = 0;
+            }
+        }
+        SubTool {
+            id,
+            name,
+            visible,
+            bounds: stand_in.bounds,
+            wedge: false,
+            parked: Some(Box::new(Parked {
+                packed: doc.pack(),
+                history: History::new(32),
+                stand_in_vertices,
+            })),
+        }
+    }
+
+    /// The active subtool at its shown level as an OBJ, next to `subtool_path` with an
+    /// `.obj` extension (SubTool › Export OBJ).
+    fn export_subtool_obj(&mut self) {
+        let t = Instant::now();
+        let path = Path::new(&self.subtool_path).with_extension("obj");
+        let name = self.subtools[self.active_tool].name.clone();
+        let result = (|| -> std::io::Result<()> {
+            let file = std::fs::File::create(&path)?;
+            let mut w = std::io::BufWriter::with_capacity(8 << 20, file);
+            use std::io::Write;
+            writeln!(w, "# Klay export: subtool {name}")?;
+            self.doc.mesh().write_obj(&mut w, &name, 0)?;
+            w.flush()
+        })();
+        self.status = match result {
+            Ok(()) => format!(
+                "Exported {name} ({} vertices) to {} in {:.1} s",
+                fmt_count(self.mesh().vertex_count()),
+                path.display(),
+                t.elapsed().as_secs_f32()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
     /// Replace the model with the project at `path` (ZBrush: Open; Ctrl + O). Every stack is
     /// rebuilt and checked, one at a time, before the current model is let go; a file that
     /// fails leaves the current model as it was.
@@ -1162,15 +1280,15 @@ impl App {
         let mut active_doc = None;
         let mut failure = None;
         for (i, saved) in project.tools.into_iter().enumerate() {
-            let mut doc = match saved.packed.try_unpack() {
+            let doc = match saved.packed.try_unpack() {
                 Ok(doc) => doc,
                 Err(e) => {
                     failure = Some(format!("subtool {:?}: {e}", saved.name));
                     break;
                 }
             };
-            let id = self.new_tool_id();
             if i == active {
+                let id = self.new_tool_id();
                 staged.push(SubTool {
                     id,
                     name: saved.name,
@@ -1181,25 +1299,8 @@ impl App {
                 });
                 active_doc = Some(doc);
             } else {
-                let stand_in = doc.stand_in(STAND_IN_VERTICES);
-                let mut stand_in_vertices = stand_in.positions.len();
-                if let Some(gfx) = self.gfx.as_mut() {
-                    if !gfx.upload_stand_in(id, &stand_in) {
-                        stand_in_vertices = 0;
-                    }
-                }
-                staged.push(SubTool {
-                    id,
-                    name: saved.name,
-                    visible: saved.visible,
-                    bounds: stand_in.bounds,
-                    wedge: false,
-                    parked: Some(Box::new(Parked {
-                        packed: doc.pack(),
-                        history: History::new(32),
-                        stand_in_vertices,
-                    })),
-                });
+                let tool = self.parked_subtool(saved.name, saved.visible, doc);
+                staged.push(tool);
             }
         }
         let (Some(doc), None) = (active_doc, &failure) else {
@@ -1497,7 +1598,7 @@ impl App {
                 let tool = &mut self.subtools[self.active_tool];
                 if tool.wedge {
                     tool.wedge = false;
-                    self.workspace.notify("Wedge off");
+                    self.workspace.notify("Remesh off");
                 } else if self.wedge_now() {
                     self.subtools[self.active_tool].wedge = true;
                 }
@@ -1527,10 +1628,10 @@ impl App {
     /// Why Wedge cannot run on the active subtool now, if it cannot.
     fn wedge_refusal(&mut self) -> Option<String> {
         if self.doc.count() > 1 {
-            return Some("Wedge needs a subtool without subdivision levels · Geometry: Del Higher / Del Lower".into());
+            return Some("Remesh needs a subtool without subdivision levels · Geometry: Del Higher / Del Lower".into());
         }
         if !self.wedge_info().0 {
-            return Some("Wedge needs a closed surface (this one has a border)".into());
+            return Some("Remesh needs a closed surface (this one has a border)".into());
         }
         None
     }
@@ -1549,7 +1650,7 @@ impl App {
         let out = match result {
             Ok(out) => out,
             Err(e) => {
-                self.status = format!("Wedge: {e}");
+                self.status = format!("Remesh: {e}");
                 self.workspace.notify(self.status.clone());
                 return false;
             }
@@ -1566,7 +1667,7 @@ impl App {
         self.show_active_level();
         let st = &out.stats;
         self.status = format!(
-            "Wedge at {}: {} → {} vertices in {:.0} ms (remesh {remesh_ms:.0}, chunks {build_ms:.0}; grid {}×{}×{}, {} corners turned)",
+            "Remeshed at {}: {} → {} vertices in {:.0} ms (remesh {remesh_ms:.0}, chunks {build_ms:.0}; grid {}×{}×{}, {} corners turned)",
             self.wedge.resolution,
             fmt_count(before),
             fmt_count(self.mesh().vertex_count()),
@@ -1638,7 +1739,7 @@ impl App {
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
                 let on = self.subtools[self.active_tool].wedge;
                 let after = self.mesh().vertex_count();
-                check(self, &format!("Wedge on at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), on && after > 0);
+                check(self, &format!("Remesh on at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), on && after > 0);
                 let ok = solid(self);
                 check(self, "the result is closed and manifold", ok);
                 Some(1)
@@ -1653,14 +1754,14 @@ impl App {
                 self.gesture(ModifiersState::CONTROL, corner, corner + Vec2::new(60.0, 40.0));
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
                 let after = self.mesh().vertex_count();
-                check(self, &format!("Ctrl + drag on the background re-wedged at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), after > before);
+                check(self, &format!("Ctrl + drag on the background remeshed again at {}: {} -> {} vertices in {ms:.0} ms", self.wedge.resolution, fmt_count(before), fmt_count(after)), after > before);
                 let ok = solid(self);
                 check(self, "still closed and manifold", ok);
                 Some(2)
             }
             2 => {
                 let (d, t) = (drawn(self), self.mesh().triangle_count());
-                check(self, &format!("GPU draws the {} re-wedged triangles", fmt_count(d)), d == t);
+                check(self, &format!("GPU draws the {} remeshed triangles", fmt_count(d)), d == t);
                 let t = Instant::now();
                 self.history.undo(&mut self.doc);
                 self.history.undo(&mut self.doc);
@@ -3943,7 +4044,11 @@ impl App {
             (true, true, _) => None,
         };
         if let Some(op) = op {
-            self.mask_op(op);
+            let changed = self.mask_op(op);
+            if op == MaskOp::Clear && !changed {
+                // Nothing to clear: say how this gesture remeshes (ZBrush: re-DynaMesh).
+                self.workspace.notify("Ctrl + drag on the background remeshes while Remesh is on · Mesh › Remesh");
+            }
         }
     }
 
@@ -4282,6 +4387,7 @@ impl App {
                 parked_bytes,
                 stand_in_bytes,
                 project_path: &mut self.project_path,
+                subtool_path: &mut self.subtool_path,
                 groups,
                 hidden,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
@@ -4302,6 +4408,15 @@ impl App {
         }
         if actions.save {
             self.pending_doc = Some(DocOp::Save);
+        }
+        if actions.save_subtool {
+            self.pending_doc = Some(DocOp::SaveSubtool);
+        }
+        if actions.load_subtools {
+            self.pending_doc = Some(DocOp::LoadSubtools);
+        }
+        if actions.export_subtool {
+            self.pending_doc = Some(DocOp::ExportSubtool);
         }
         if let Some(i) = actions.select_subtool {
             self.pending_subtool = Some(SubToolOp::Select(i));
@@ -4444,6 +4559,9 @@ impl App {
                 self.open_project(&path);
             }
             Some(DocOp::Save) => self.save_project(),
+            Some(DocOp::SaveSubtool) => self.save_subtool(),
+            Some(DocOp::LoadSubtools) => self.load_subtools(),
+            Some(DocOp::ExportSubtool) => self.export_subtool_obj(),
             None => {}
         }
         match self.pending_subtool.take() {
@@ -5186,7 +5304,7 @@ fn bench_wedge(mesh: &SculptMesh, what: &str) {
         let out = match wedge::remesh(mesh, &s) {
             Ok(out) => out,
             Err(e) => {
-                println!("wedge: {e}");
+                println!("remesh: {e}");
                 return;
             }
         };
@@ -5308,10 +5426,10 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-subtools") {
         app.selftest = Some(20);
     }
-    if args.iter().any(|a| a == "--selftest-wedge") {
+    if args.iter().any(|a| a == "--selftest-remesh" || a == "--selftest-wedge") {
         app.selftest_wedge = Some((0, 20));
     }
-    if let Some(r) = flag("--wedge-resolution").and_then(|s| s.parse().ok()) {
+    if let Some(r) = flag("--remesh-resolution").or_else(|| flag("--wedge-resolution")).and_then(|s| s.parse().ok()) {
         app.wedge.resolution = r;
     }
     if args.iter().any(|a| a == "--selftest-groups") {
@@ -5349,6 +5467,8 @@ fn main() {
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
+    // `--polyf`: start with polygroup colours and the polygon frame shown (Shift + F).
+    app.workspace.polyframe = args.iter().any(|a| a == "--polyf");
     // `--material <name or number>`: start in that material (e.g. "MatCap Red Wax").
     if let Some(m) = flag("--material") {
         let names = workspace::MATERIALS.iter().map(|(_, n)| n.to_lowercase()).collect::<Vec<_>>();
@@ -5485,6 +5605,53 @@ mod subtool_tests {
     fn worst(a: &[Vec3], b: &[Vec3]) -> f32 {
         assert_eq!(a.len(), b.len());
         a.iter().zip(b).map(|(p, q)| (*p - *q).length()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_subtool_saves_alone_and_loads_into_another_model() {
+        let dir = std::env::temp_dir().join(format!("klay-subtool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("part.klay");
+        // Two subtools; the active one divided once and sculpted at the top level.
+        let mut app = App::new(12, false, usize::MAX);
+        app.append_primitive();
+        assert!(app.doc.divide());
+        let hit = app.doc.mesh().positions[0];
+        let mut stroke = Stroke::begin(false, false, false);
+        stroke.dab(app.doc.mesh_mut(), &Brush { radius: 0.3, strength: 1.0, ..Brush::default() }, hit, hit.normalize(), -Vec3::Z, (hit * 3.0, -hit));
+        let snapshot = stroke.end(app.doc.mesh_mut()).unwrap();
+        app.doc.finish_stroke(1, snapshot);
+        let name = app.subtools[app.active_tool].name.clone();
+        let sculpted = app.doc.pack_copy().unpack().mesh().positions.clone();
+        app.subtool_path = path.to_string_lossy().into_owned();
+        app.save_subtool();
+        // The file holds that subtool alone, with both levels; Open reads it.
+        let saved = project::open(&path).unwrap();
+        assert_eq!(saved.tools.len(), 1);
+        assert_eq!(saved.tools[0].name, name);
+        assert_eq!(saved.tools[0].packed.clone().unpack().count(), 2);
+        // Load adds it to another model, parked at the end; the active subtool stays.
+        let mut other = App::new(10, false, usize::MAX);
+        other.subtool_path = app.subtool_path.clone();
+        let before = other.doc.mesh().positions.clone();
+        other.load_subtools();
+        assert_eq!(other.subtools.len(), 2);
+        assert_eq!((other.active_tool, other.subtools[1].name.as_str()), (0, name.as_str()));
+        assert_eq!(other.doc.mesh().positions, before);
+        other.activate(1);
+        assert_eq!(other.doc.count(), 2);
+        assert_eq!(worst(&other.doc.mesh().positions, &sculpted), 0.0, "levels and sculpting came back exactly");
+        // A file that is not a project adds nothing.
+        std::fs::write(&path, b"not a project").unwrap();
+        other.load_subtools();
+        assert_eq!(other.subtools.len(), 2);
+        // Export OBJ writes the active subtool alone, next to the path.
+        app.subtool_path = path.to_string_lossy().into_owned();
+        app.export_subtool_obj();
+        let obj = std::fs::read_to_string(path.with_extension("obj")).unwrap();
+        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), app.doc.mesh().vertex_count());
+        assert_eq!(obj.lines().filter(|l| l.starts_with("o ")).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5767,6 +5934,8 @@ mod subtool_tests {
         drag(&mut app, ModifiersState::CONTROL, corner, corner + Vec2::splat(60.0));
         assert_eq!(app.doc.mesh().positions, original);
         assert_eq!(app.camera.yaw, yaw);
+        // With no mask to clear, it says how to remesh with it.
+        assert!(app.workspace.pending_notice.take().is_some_and(|n| n.contains("Remesh is on")));
 
         // Polygroups made before Wedge ride along.
         let centre = app.viewport() * 0.5;

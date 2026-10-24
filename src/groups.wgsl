@@ -92,11 +92,15 @@ fn fs_groups(in: VsOut, @builtin(primitive_index) prim: u32) -> @location(0) vec
         if (!(diagonal && lab == longest)) { d = min(d, segment_distance(p, a.xy, b.xy)); }
         if (!(diagonal && lbc == longest)) { d = min(d, segment_distance(p, b.xy, c.xy)); }
         if (!(diagonal && lca == longest)) { d = min(d, segment_distance(p, c.xy, a.xy)); }
-        // Dense meshes would turn black: fade the frame where polygons are a few pixels.
+        // Lines are discreet: they darken the surface by about half.
         let px = min(length(b.xy - a.xy), min(length(c.xy - b.xy), length(a.xy - c.xy)));
-        let fade = smoothstep(3.0, 8.0, px);
-        let line = (1.0 - smoothstep(0.4, 1.4, d)) * fade;
-        color = vec4<f32>(mix(color.rgb, color.rgb * 0.3, line * 0.85), 1.0);
+        let crisp = (1.0 - smoothstep(0.4, 1.4, d)) * 0.55;
+        // Where polygons are only a few pixels across, single lines would shimmer or vanish:
+        // draw the frame's average darkness instead (about two one-pixel lines per polygon),
+        // capped so a dense mesh far away keeps a light, even frame rather than turning black.
+        let average = min(0.55 * 2.0 / max(px, 0.5), 0.42);
+        let line = mix(average, crisp, smoothstep(3.0, 7.0, px));
+        color = vec4<f32>(mix(color.rgb, color.rgb * 0.3, line), 1.0);
     }
     return color;
 }

@@ -1,4 +1,4 @@
-# Klay 0.8.0
+# Klay 0.9.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -24,7 +24,7 @@ cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-project
 cargo run --release -- --segments 400 --divide 2 --novsync --selftest-transpose     # Transpose move / scale / rotate + undo through the input path, log, exit
 cargo run --release -- --segments 400 --divide 2 --novsync --selftest-mask          # Ctrl masking, a masked move and undo through the input path, log, exit
 cargo run --release -- --segments 200 --divide 1 --selftest-groups   # Ctrl + Shift rectangle, Ctrl + W, GPU draw and pick checks, undo, log, exit
-cargo run --release -- --primitive cube --selftest-wedge             # Wedge on, Ctrl + drag re-wedge, GPU checks, undo, log, exit
+cargo run --release -- --primitive cube --selftest-remesh            # Remesh on, Ctrl + drag remeshes again, GPU checks, undo, log, exit (--selftest-wedge still works)
 cargo run --release -- --divide 2 --selftest-pressure                # tablet connection (moves the pointer once via XTest), strokes at set pen pressures, log, exit
 cargo run --release -- --divide 2 --selftest-curve                   # Zipper along a curve vs freehand with a shaky hand, bend, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 400 --selftest-clip                # three crossing Clip Line cuts (a pie slice), checks no cut pushes an earlier one out, log, exit (--hold keeps it open, turned)
@@ -35,7 +35,8 @@ cargo run --release -- --selftest-materials                            # every m
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
 cargo run --release -- --version                                     # application version
-cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
+cargo run --release -- --remesh-resolution 256                       # start with this Remesh resolution (--wedge-resolution still works)
+cargo run --release -- --segments 200 --polyf                        # start with PolyF (polygroup colours and frame) on
 ```
 
 `--segments N` sets the resolution of the starting primitive (`--primitive NAME`, Sphere by
@@ -70,7 +71,7 @@ stays flat. It is drawn from the front only, like any open surface (back faces a
 
 Cube3D starts with a polygroup per face and Cylinder3D with one for the wall and one per cap,
 so Ctrl + Shift + click isolates a face or cap straight away; the others start as one
-polygroup. The groups are carried through Divide and Wedge like any others.
+polygroup. The groups are carried through Divide and Remesh like any others.
 
 ### Pen pressure
 
@@ -134,7 +135,7 @@ active subtool as a **new polygroup**.
   polygroup.
 - Like ZBrush's insert brushes it needs a subtool **without subdivision levels** (Del Lower,
   or Append a subtool for the tubes). The tube is ordinary mesh: it saves, exports, divides
-  and can be Wedged with the rest.
+  and can be remeshed with the rest.
 
 ## Workspace
 
@@ -170,7 +171,7 @@ bar sliders. Long label/value rows wrap inside narrow trays.
 
 The 46 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
-Wedge remeshing, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X
+Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X
 symmetry, Transpose, Curve strokes and live statistics are connected to the engine. Zcut, stroke
 spacing and stabilizer, Y / Z / radial symmetry, parts of the Transform palette and reserved
 Local/Transp/Ghost toggles remain marked **Not connected**.
@@ -236,7 +237,9 @@ current material, including the brush's subtract variant where applicable.
   hidden vertices and X symmetry are respected by both paint and sculpting.
 - Like ZBrush, every brush keeps its own **Z Intensity, Focal Shift, RGB Intensity and
   Zadd / Zsub**; switching brushes brings back the values you last used with that brush.
-  **Draw Size** is shared by all brushes. Smooth and the mask brushes start at full Z
+  **Draw Size** is shared by all brushes. Its sliders run from 0.01 to 2.0 on a gentle
+  curve (size = 0.01 + 1.99 · position²): fine steps for small brushes, half the slider is
+  about 0.5, and the top no longer jumps the way a logarithmic slider did. Smooth and the mask brushes start at full Z
   Intensity, the other brushes at 0.5. Holding **Shift** shows Smooth's own values in the
   panels, and changing Z Intensity while Shift is held sets Smooth's; Shift strokes and Ctrl
   masking use the Smooth and mask brush's own intensity. The values last for the session.
@@ -286,7 +289,7 @@ Large images are reduced to a maximum 1024 px side for sampling; inputs over 819
 side or 64 MB are refused.
 
 Color is vertex paint: use **Divide** for finer texture detail. Paint follows subdivision,
-parked subtools, Wedge remeshing, undo/redo and `.klay` saves. This release does not create UV
+parked subtools, Remesh, undo/redo and `.klay` saves. This release does not create UV
 maps or texture-image exports; **OBJ export contains geometry, normals and groups**. The baked
 sculpt and paint remain in the project even when the source stamp image is unavailable.
 `ui-brush-panel.png`, `ui-brush-catalog.png` and `ui-quick-menu.png` show the native 0.4.0 controls.
@@ -339,7 +342,7 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | Ctrl + left drag on the model | Paint a mask (Draw Size, Z Intensity, X symmetry); masked clay goes dark and stays still |
 | Ctrl + Alt + left drag on the model | Erase the mask |
 | Ctrl + click on the model / Ctrl + Alt + click | Blur / sharpen the mask |
-| Ctrl + click on the background / Ctrl + drag on the background | Invert / clear the mask (the canvas border counts as background); with Wedge on, the drag also Wedges again on release (ZBrush: re-DynaMesh) |
+| Ctrl + click on the background / Ctrl + drag on the background | Invert / clear the mask (the canvas border counts as background); with Remesh on, the drag also remeshes again on release (ZBrush: re-DynaMesh); with nothing to clear and Remesh off it says so |
 | Ctrl + `I` / Ctrl + `A` / Ctrl + Shift + `A` | Invert / mask all / clear the mask (invert and mask all leave hidden polygons alone) |
 | Ctrl + `H` | Show or hide the mask |
 | Ctrl + Shift + drag | Keep what the rectangle covers visible, hide the rest (ZBrush SelectRect); hold Alt during the drag to hide what it covers instead (the rectangle turns red) |
@@ -438,7 +441,7 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   relief; `native_tests.rs` verifies masks/clipping through actual input and GPU readback.
 - `paint.rs`: premultiplied sRGB vertex paint, chunk snapshots and blending. Multires edits
   carry down to lower levels and apply color deltas upward while retaining existing fine detail;
-  all affected chunks are captured for exact undo. Wedge interpolates paint from the old surface.
+  all affected chunks are captured for exact undo. Remesh interpolates paint from the old surface.
 - `primitive.rs`: the starting meshes (Sphere3D, Cube3D, Cylinder3D, Ring3D, Plane3D). Sphere,
   Cube and Cylinder are the surface of a lattice box mapped onto the shape, so `--segments`
   still gives the old cube sphere bit for bit. The box is built face by face, so the Cube's
@@ -465,7 +468,11 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   subdivisions from those labels, so vertex order and chunks come back identical and its
   undo list stays valid. Alt + click picks a subtool with a one-pixel GPU id pass. The
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
-  Delete and reordering; Deformation moves and sizes the active subtool exactly at every
+  Delete and reordering. Under the list, a path field with **Save** (the active subtool
+  alone, with all its levels, as a one-subtool `.klay` that Document › Open also reads),
+  **Load** (adds every subtool of a `.klay` file to the end of the list, parked, without
+  changing the active one; a bad file adds nothing) and **Export OBJ** (the active subtool
+  at its shown level, written next to the path as `.obj`); Deformation moves and sizes the active subtool exactly at every
   level, undoably.
 - `transform.rs`: moving, scaling and rotating a whole subtool, ZBrush Transpose style.
   The map is `p -> c + s R (p - c) + t` (rotation, uniform scale, translation). Loop weights
@@ -513,13 +520,15 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   index (only while PolyF is on). The same shader draws the polyframe: it fetches the
   triangle's three corners from the index and position buffers it already has, measures the
   pixel distance to each edge, leaves out a quad's diagonal (the longest edge in the world
-  when it is over 1.1 times the next) and fades the lines where polygons are under a few
-  pixels, so a dense level does not turn black. No extra memory is used. With nothing hidden and PolyF off, the buffers and the
+  when it is over 1.1 times the next) and darkens the surface by about half on a line. Where
+  polygons get under 3–7 pixels the lines blend into the frame's average darkness (about two
+  one-pixel lines per polygon, at most 42 %), so a dense level far away keeps an even, light
+  tint that shows how dense it is instead of shimmering, vanishing or turning black. No extra memory is used. With nothing hidden and PolyF off, the buffers and the
   pipeline are exactly the ones used before. Undo stores the previous groups or visibility
   of every level run-length coded; parked subtools and project files keep them the same way,
   and stand-ins of parked subtools leave hidden triangles out. OBJ export writes polygroups
   as OBJ groups.
-- `wedge.rs`: Wedge, a DynaMesh-style remesher. Every triangle is rasterised onto the lines of
+- `wedge.rs`: Remesh (Mesh › Remesh; called Wedge before 0.9), a DynaMesh-style remesher. Every triangle is rasterised onto the lines of
   a regular grid along x, y and z with exact, watertight edge tests (a shared edge is
   evaluated the same way from both sides, ties broken by one fixed rule), giving where each
   line crosses the surface; summing the crossing signs along a line is the winding number,
@@ -535,7 +544,7 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   of the old triangle their edge crossed, and vertices on a group border move onto the old
   border, so groups keep clean borders. Project (with Blur passes first) moves every vertex
   to the closest point of the old surface by walking the old mesh. The result replaces the
-  subtool's stack as a new base level; the old stack is kept packed for undo. Wedge refuses
+  subtool's stack as a new base level; the old stack is kept packed for undo. Remesh refuses
   subtools with subdivision levels (as ZBrush does for DynaMesh; Geometry has Del Higher and
   Del Lower now) and open surfaces (Plane3D). Hidden triangles are remeshed too and the result
   is all visible.
@@ -649,24 +658,24 @@ the A/B run on software rendering (llvmpipe, 960k vertices, `--novsync --frames`
 the noise of `main`. In-window checks at 15.4M vertices were not possible on that VM, whose
 software GPU caps a buffer binding at 128 MB.
 
-### Wedge (same 4-core VM, `--bench 400 --divide 2`)
+### Remesh (same 4-core VM, `--bench 400 --divide 2`)
 
 Resolution chosen for about a million output vertices (460 voxels across two units);
 "chunk" is building the chunked mesh (`SculptMesh::from_raw`) from the result.
 
-| Input | Wedge | + Project (Blur 2) | Chunk |
+| Input | Remesh | + Project (Blur 2) | Chunk |
 | --- | --- | --- | --- |
 | 960k-vertex sphere (sculpted) → 997k vertices | 0.31 s (scan 0.13, cells 0.03, surface 0.15) | 0.44 s | 0.16–0.21 s |
 | 15.4M-vertex level → 1.0M vertices | 0.67 s (scan 0.4, surface 0.2) | 1.1 s | 0.19–0.24 s |
 
-In the window (`--selftest-wedge`, software GPU): a 4k-vertex primitive wedges at the default
-resolution 128 to 77k (sphere) or 98k (cube) vertices in 45–50 ms, re-wedging at 192 takes
+In the window (`--selftest-remesh`, software GPU): a 4k-vertex primitive remeshes at the default
+resolution 128 to 77k (sphere) or 98k (cube) vertices in 45–50 ms, remeshing again at 192 takes
 90–120 ms, and undoing both takes about 10 ms. Twice the resolution gives about four times
 the vertices; the output is closed and manifold (tested on primitives, overlapping shells and
 a sphere folded through itself), keeps the volume to within a voxel, and divides like any
 mesh.
 
-ZBrush's DynaMesh decisions and what Wedge does:
+ZBrush's DynaMesh decisions and what Remesh does:
 
 - **Resolution** (default 128) is relative to two world units, the size of a new primitive,
   so like ZBrush a bigger model gets more polygons at the same value. The section shows an
@@ -674,13 +683,14 @@ ZBrush's DynaMesh decisions and what Wedge does:
 - **Blur** (default 2) and **Project** (off): as in ZBrush, Blur only acts with Project.
 - **Groups**: polygroups are always carried over with clean borders. ZBrush's Groups button,
   which splits the result into separate pieces at group borders, is not implemented.
-- **Re-wedge gesture**: in ZBrush, Ctrl + drag on the background clears the mask, and while
-  DynaMesh is on it remeshes. Klay does both: with Wedge off it clears the mask, with Wedge
-  on it re-wedges, and the new surface starts without a mask (undo brings back the old
+- **Remesh again gesture**: in ZBrush, Ctrl + drag on the background clears the mask, and
+  while DynaMesh is on it remeshes. Klay does both: with Remesh off it clears the mask (and,
+  with no mask to clear, says how to turn Remesh on), with Remesh on it remeshes again, and the new surface starts without a mask (undo brings back the old
   surface with its mask). A Ctrl click on the background still inverts the mask.
 - **Merge of overlapping subtools and Alt carving** (subtractive inserts) are not done: they
   need a SubTool Merge first. Within one subtool, overlapping parts already merge.
-- The Wedge on/off state is per subtool and not saved in project files.
+- The Remesh on/off state is per subtool and not saved in project files. **Update** remeshes
+  again at the current settings, like the gesture.
 
 The remaining limit for CPU brushes is host-to-GPU upload bandwidth: about 5 GB/s on
 this machine, so moving a third of a 13.5M-vertex mesh on the CPU would cost 12 ms of

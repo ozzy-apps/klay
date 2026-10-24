@@ -376,6 +376,8 @@ pub struct Model<'a> {
     pub stand_in_bytes: u64,
     /// Project file used by Save and Open.
     pub project_path: &'a mut String,
+    /// File for SubTool › Save / Load (and Export OBJ, as `.obj`).
+    pub subtool_path: &'a mut String,
     /// Polygroups and hidden triangles at the shown level of the active subtool.
     pub groups: usize,
     pub hidden: usize,
@@ -439,6 +441,11 @@ pub struct Actions {
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
+    /// SubTool: save the active subtool alone, add the subtools of a file, export the
+    /// active subtool as OBJ.
+    pub save_subtool: bool,
+    pub load_subtools: bool,
+    pub export_subtool: bool,
     /// Polygroups: one new group of the visible polygons (Ctrl + W).
     pub group_visible: bool,
     /// Visibility: show everything / swap hidden and visible.
@@ -586,7 +593,7 @@ pub struct Workspace {
     textures: HashMap<(usize, usize, bool), TextureHandle>,
     message: Option<(String, f64)>,
     /// Text queued by the app for the status bar; shown on the next frame.
-    pending_notice: Option<String>,
+    pub(crate) pending_notice: Option<String>,
     saved: String,
     persistence_path: PathBuf,
     pub persistence_error: Option<String>,
@@ -779,7 +786,7 @@ impl Workspace {
                     ui.set_width(width);
                     match kind {
                         QuickPopup::Size => {
-                            zslider(ui, kind.label(), &mut m.brush.radius, 0.01..=2.0, true, true, 2);
+                            draw_size_slider(ui, kind.label(), &mut m.brush.radius, true);
                         }
                         QuickPopup::Intensity => {
                             zslider(ui, kind.label(), &mut m.brush.strength, 0.0..=1.0, false, true, 2);
@@ -1130,15 +1137,7 @@ impl Workspace {
                             let w = ui.available_width() - 40.0;
                             ui.scope(|ui| {
                                 ui.set_width(w);
-                                zslider(
-                                    ui,
-                                    "Draw Size",
-                                    &mut m.brush.radius,
-                                    0.01..=2.0,
-                                    true,
-                                    true,
-                                    2,
-                                );
+                                draw_size_slider(ui, "Draw Size", &mut m.brush.radius, true);
                             });
                             if small_toggle(ui, "Dyn", self.dynamic, vec2(36.0, 22.0))
                                 .on_hover_text("Radius follows zoom")
@@ -1769,15 +1768,7 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
-                        zslider(
-                            ui,
-                            "Radius",
-                            &mut m.brush.radius,
-                            0.01..=2.0,
-                            true,
-                            false,
-                            2,
-                        );
+                        draw_size_slider(ui, "Radius", &mut m.brush.radius, false);
                         zslider(
                             ui,
                             "Strength",
@@ -2125,6 +2116,38 @@ impl Workspace {
                         if clicked[5] {
                             ws.solo = !ws.solo;
                         }
+                        // Single subtools to and from files (ZBrush: Tool › Export, Append).
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::TextEdit::singleline(m.subtool_path)
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::monospace(12.0)),
+                        );
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                        let w = (r.width() - 6.0) / 3.0;
+                        for (col, (label, hint)) in [
+                            ("Save", "Save the active subtool alone, with its levels, to this path"),
+                            ("Load", "Add the subtools saved at this path to the list"),
+                            ("Export OBJ", "The active subtool at its shown level, as an OBJ next to this path"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                            child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                            if child
+                                .put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate())
+                                .on_hover_text(hint)
+                                .clicked()
+                            {
+                                match col {
+                                    0 => a.save_subtool = true,
+                                    1 => a.load_subtools = true,
+                                    _ => a.export_subtool = true,
+                                }
+                            }
+                        }
                         kv(
                             ui,
                             "Active in RAM",
@@ -2244,7 +2267,7 @@ impl Workspace {
                     h,
                     id,
                     "wedge",
-                    "Wedge",
+                    "Remesh",
                     None,
                     true,
                     true,
@@ -2254,8 +2277,8 @@ impl Workspace {
                             let can = m.wedge_refusal.is_none() || m.wedge_on;
                             ui.add_enabled_ui(can, |ui| {
                                 let r = ui
-                                    .add(egui::Button::new("Wedge").selected(m.wedge_on).min_size(vec2(w, 20.0)))
-                                    .on_hover_text("Remesh into an even, closed surface and keep Wedge on (ZBrush: DynaMesh)");
+                                    .add(egui::Button::new("Remesh").selected(m.wedge_on).min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Remesh into an even, closed surface and keep Remesh on, so Ctrl + drag on the background remeshes again (ZBrush: DynaMesh)");
                                 let r = match m.wedge_refusal {
                                     Some(why) => r.on_disabled_hover_text(why),
                                     None => r,
@@ -2266,8 +2289,8 @@ impl Workspace {
                             });
                             ui.add_enabled_ui(m.wedge_on && m.wedge_refusal.is_none(), |ui| {
                                 if ui
-                                    .add(egui::Button::new("Remesh").min_size(vec2(w, 20.0)))
-                                    .on_hover_text("Wedge again now · Ctrl + drag on the background")
+                                    .add(egui::Button::new("Update").truncate().min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Remesh again now · Ctrl + drag on the background")
                                     .clicked()
                                 {
                                     a.wedge_now = true;
@@ -2290,7 +2313,7 @@ impl Workspace {
                         if let Some(why) = m.wedge_refusal {
                             note(ui, why);
                         } else {
-                            note(ui, "Overlapping parts merge. Ctrl + drag on the background re-wedges while on.");
+                            note(ui, "Overlapping parts merge. While Remesh is on, Ctrl + drag on the background remeshes again.");
                         }
                     },
                 );
@@ -2551,7 +2574,7 @@ impl Workspace {
                             ("Ctrl + Shift + drag bg", "invert visibility (a rectangle around nothing)"),
                             ("Ctrl + W", "group masked, else visible: a new polygroup"),
                             ("Shift + F", "polygroup colours (PolyF)"),
-                            ("Ctrl + drag bg, Wedge on", "re-wedge"),
+                            ("Ctrl + drag bg, Remesh on", "remesh again"),
                             ("Ctrl + S / Ctrl + O", "save / open project"),
                             ("S / U", "draw size / Z intensity popup"),
                             ("I / O", "RGB intensity / focal shift"),
@@ -3166,12 +3189,65 @@ pub fn sphere_image(kind: Option<BrushKind>, material: usize, sub: bool) -> Colo
 // ---------------------------------------------------------------- widgets
 /// ZBrush-style slider: label inside the bar, value on a neutral field at the
 /// right. `line` draws the shelf variant with a thin value line underneath.
+/// How a slider's position maps to its value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SliderScale {
+    Linear,
+    Logarithmic,
+    /// value = min + (max - min) · position^k: fine steps at the low end, rising steadily
+    /// instead of shooting up at the top like a logarithmic scale.
+    Power(f32),
+}
+
+impl SliderScale {
+    /// The value at slider position `f` (0..=1).
+    pub fn value(self, f: f32, min: f32, max: f32) -> f32 {
+        match self {
+            Self::Linear => min + f * (max - min),
+            Self::Logarithmic => min * (max / min).powf(f),
+            Self::Power(k) => min + f.powf(k) * (max - min),
+        }
+    }
+
+    /// The slider position (0..=1) of `v`.
+    pub fn position(self, v: f32, min: f32, max: f32) -> f32 {
+        let f = match self {
+            Self::Linear => (v - min) / (max - min),
+            Self::Logarithmic => (v / min).ln() / (max / min).ln(),
+            Self::Power(k) => ((v - min) / (max - min)).max(0.0).powf(1.0 / k),
+        };
+        f.clamp(0.0, 1.0)
+    }
+}
+
+/// Draw Size: the range of every Draw Size slider, and its scale.
+pub const DRAW_SIZE: std::ops::RangeInclusive<f32> = 0.01..=2.0;
+pub const DRAW_SIZE_SCALE: SliderScale = SliderScale::Power(2.0);
+
+/// A Draw Size slider (top shelf, Brush palette, quick menu).
+pub fn draw_size_slider(ui: &mut Ui, label: &str, value: &mut f32, line: bool) -> bool {
+    zslider_scaled(ui, label, value, DRAW_SIZE, DRAW_SIZE_SCALE, line, 2)
+}
+
 pub fn zslider(
     ui: &mut Ui,
     label: &str,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     logarithmic: bool,
+    line: bool,
+    decimals: usize,
+) -> bool {
+    let scale = if logarithmic { SliderScale::Logarithmic } else { SliderScale::Linear };
+    zslider_scaled(ui, label, value, range, scale, line, decimals)
+}
+
+pub fn zslider_scaled(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    scale: SliderScale,
     line: bool,
     decimals: usize,
 ) -> bool {
@@ -3182,22 +3258,14 @@ pub fn zslider(
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             let f = ((p.x - r.left()) / r.width()).clamp(0.0, 1.0);
-            let v = if logarithmic {
-                min * (max / min).powf(f)
-            } else {
-                min + f * (max - min)
-            };
+            let v = scale.value(f, min, max);
             if v != *value {
                 *value = v;
                 changed = true;
             }
         }
     }
-    let frac = if logarithmic {
-        ((*value / min).ln() / (max / min).ln()).clamp(0.0, 1.0)
-    } else {
-        ((*value - min) / (max - min)).clamp(0.0, 1.0)
-    };
+    let frac = scale.position(*value, min, max);
     let p = ui.painter();
     // Disabled UIs already apply the theme opacity to their painter.
     p.rect_filled(r, 2, if line { BG2 } else { BG3 });
@@ -4181,6 +4249,7 @@ mod tests {
                         parked_bytes: 0,
                         stand_in_bytes: 0,
                         project_path: &mut String::from("untitled.klay"),
+                        subtool_path: &mut String::from("subtool.klay"),
                         groups: 1,
                         hidden: 0,
                         polyframe_supported: true,
@@ -4622,20 +4691,38 @@ mod tests {
     }
 
     #[test]
-    fn wedge_section_turns_wedge_on_and_shows_the_estimate() {
+    fn draw_size_rises_steadily_across_its_slider() {
+        let (min, max) = (*DRAW_SIZE.start(), *DRAW_SIZE.end());
+        let size = |f: f32| DRAW_SIZE_SCALE.value(f, min, max);
+        for f in [0.0, 0.1, 0.37, 0.5, 0.9, 1.0] {
+            assert!((DRAW_SIZE_SCALE.position(size(f), min, max) - f).abs() < 1e-5);
+        }
+        assert_eq!((size(0.0), size(1.0)), (min, max), "the full range is kept");
+        // The last tenth of the slider used to cover 40 % of the range (logarithmic); now
+        // under a fifth, and the middle of the slider is a mid-sized brush.
+        let log = |f: f32| SliderScale::Logarithmic.value(f, min, max);
+        assert!((log(1.0) - log(0.9)) / (max - min) > 0.4);
+        assert!((size(1.0) - size(0.9)) / (max - min) < 0.2);
+        assert!(size(0.5) > 0.4 && size(0.5) < 0.6);
+        // Small brushes keep fine steps at the low end.
+        assert!(size(0.1) < 0.04);
+    }
+
+    #[test]
+    fn remesh_section_turns_remesh_on_and_shows_the_estimate() {
         let (mut workspace, ctx) = test_workspace("wedge");
         let size = vec2(1600.0, 3000.0);
         let rows = [row("Sphere 1", true)];
         let mut settings = crate::primitive::Settings::default();
         let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
         assert_eq!(text_count(&out, "75 000 vertices"), 1, "the estimate is shown");
-        // The section title reads "Wedge" too; the button is the one just above the slider.
+        // The section title reads "Remesh" too; the button is the one just above the slider.
         let slider = text_position(&out, "Resolution").y;
         let at = out
             .shapes
             .iter()
             .filter_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.job.text == "Wedge" => Some(t.pos),
+                egui::Shape::Text(t) if t.galley.job.text == "Remesh" => Some(t.pos),
                 _ => None,
             })
             .min_by(|a, b| (a.y - slider).abs().total_cmp(&(b.y - slider).abs()))
