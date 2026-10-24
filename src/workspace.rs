@@ -561,6 +561,10 @@ pub struct Workspace {
     /// The brush a held modifier strokes with, shown in the panels this frame instead of
     /// the brush (ZBrush: holding Ctrl shows the mask brush, Shift shows Smooth).
     pub held_brush: Option<BrushKind>,
+    /// Each brush's own Draw settings (ZBrush: everything in the Draw palette but Draw
+    /// Size follows the brush), for every brush but the one in use, whose values are live
+    /// in `Brush` and `subtract`. See `select_brush`.
+    pub(super) draw_settings: HashMap<BrushKind, brush_ui::DrawSettings>,
     /// Deformation slider being dragged, and its value.
     deform_drag: Option<(Deform, f32)>,
     pub mode: Mode,
@@ -628,6 +632,7 @@ impl Workspace {
             gesture_preview: None,
             mask_brush: BrushKind::MaskPen,
             held_brush: None,
+            draw_settings: HashMap::new(),
             deform_drag: None,
             mode: Mode::Draw,
             popup: None,

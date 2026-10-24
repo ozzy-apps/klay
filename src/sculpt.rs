@@ -10,7 +10,7 @@ use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BrushKind {
     Draw,
     Smooth,

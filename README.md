@@ -1,4 +1,4 @@
-# Klay 0.7.0
+# Klay 0.8.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -234,6 +234,12 @@ current material, including the brush's subtract variant where applicable.
   RGB mode. Choose color with the left HSV picker; RGB Intensity controls paint opacity.
   Textures supply their sampled color when painting, tinted by the chosen color. Masks,
   hidden vertices and X symmetry are respected by both paint and sculpting.
+- Like ZBrush, every brush keeps its own **Z Intensity, Focal Shift, RGB Intensity and
+  Zadd / Zsub**; switching brushes brings back the values you last used with that brush.
+  **Draw Size** is shared by all brushes. Smooth and the mask brushes start at full Z
+  Intensity, the other brushes at 0.5. Holding **Shift** shows Smooth's own values in the
+  panels, and changing Z Intensity while Shift is held sets Smooth's; Shift strokes and Ctrl
+  masking use the Smooth and mask brush's own intensity. The values last for the session.
 - **Focal Shift** changes the falloff from a soft center to a broad plateau. Its neutral
   value retains the original falloff. The Space palette places **Draw Size → Z Intensity →
   Focal Shift → RGB Intensity → brushes**, with a color picker on the left.

@@ -80,6 +80,33 @@ impl BrushUi {
     }
 }
 
+/// The Draw settings each brush keeps for itself (ZBrush: every Draw palette setting but
+/// Draw Size is stored per brush; Draw Size is shared).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DrawSettings {
+    /// Z Intensity.
+    pub strength: f32,
+    pub focal_shift: f32,
+    pub rgb_intensity: f32,
+    /// Zsub.
+    pub subtract: bool,
+}
+
+impl DrawSettings {
+    /// A brush's settings before it is first changed: ZBrush starts Smooth and the mask
+    /// brushes at full intensity; Klay's other brushes start at half.
+    pub fn default_for(kind: BrushKind) -> Self {
+        let full = kind.is_mask() || matches!(kind, BrushKind::Smooth | BrushKind::SmoothValleys | BrushKind::SmoothPeaks);
+        let b = Brush::default();
+        Self {
+            strength: if full { 1.0 } else { b.strength },
+            focal_shift: b.focal_shift,
+            rgb_intensity: b.rgb_intensity,
+            subtract: false,
+        }
+    }
+}
+
 /// What the brush panels showed before a held modifier swapped in the brush it strokes
 /// with (see [`Workspace::held_brush`]).
 pub(super) struct HeldBrush {
@@ -96,6 +123,9 @@ impl Workspace {
     pub(super) fn begin_held_brush(&mut self, brush: &mut Brush) -> Option<HeldBrush> {
         let shown = self.held_brush.filter(|&k| k != brush.kind)?;
         let held = HeldBrush { kind: brush.kind, shown, sculpt: brush.sculpt, paint: brush.paint, masks: self.brush_ui.palette_masks };
+        // The sliders show and change the held brush's own settings.
+        self.store_settings(brush);
+        self.load_settings(brush, shown);
         brush.kind = shown;
         brush.sculpt = !shown.is_mask();
         brush.paint = false;
@@ -111,8 +141,12 @@ impl Workspace {
             return;
         };
         if brush.kind != h.shown && !brush.kind.is_mask() {
+            // Picked meanwhile: `select_brush` kept the held brush's settings and loaded
+            // the new brush's; the brush's own were kept when it was swapped out.
             return;
         }
+        self.store_settings(brush);
+        self.load_settings(brush, h.kind);
         brush.kind = h.kind;
         brush.sculpt = h.sculpt;
         brush.paint = h.paint;
@@ -150,7 +184,43 @@ impl Workspace {
         self.select_brush(m.brush, kind);
     }
 
+    /// The settings `kind` strokes with: the live ones when it is the brush in use.
+    pub fn settings_of(&self, brush: &Brush, kind: BrushKind) -> DrawSettings {
+        if kind == brush.kind {
+            DrawSettings { strength: brush.strength, focal_shift: brush.focal_shift, rgb_intensity: brush.rgb_intensity, subtract: self.subtract }
+        } else {
+            self.draw_settings.get(&kind).copied().unwrap_or_else(|| DrawSettings::default_for(kind))
+        }
+    }
+
+    /// `brush` as `kind` with that brush's own settings, sharing Draw Size, colour and
+    /// stroke modes (Shift's Smooth, the Ctrl mask brush).
+    pub fn brush_for(&self, brush: &Brush, kind: BrushKind) -> Brush {
+        let s = self.settings_of(brush, kind);
+        Brush { kind, strength: s.strength, focal_shift: s.focal_shift, rgb_intensity: s.rgb_intensity, ..*brush }
+    }
+
+    /// Keep the live settings as the brush's own.
+    fn store_settings(&mut self, brush: &Brush) {
+        let s = self.settings_of(brush, brush.kind);
+        self.draw_settings.insert(brush.kind, s);
+    }
+
+    /// Make `kind`'s own settings the live ones.
+    fn load_settings(&mut self, brush: &mut Brush, kind: BrushKind) {
+        let s = self.draw_settings.get(&kind).copied().unwrap_or_else(|| DrawSettings::default_for(kind));
+        brush.strength = s.strength;
+        brush.focal_shift = s.focal_shift;
+        brush.rgb_intensity = s.rgb_intensity;
+        self.subtract = s.subtract;
+    }
+
     pub fn select_brush(&mut self, brush: &mut Brush, kind: BrushKind) {
+        // Z Intensity, Focal Shift, RGB Intensity and Zadd / Zsub follow the brush.
+        if kind != brush.kind {
+            self.store_settings(brush);
+            self.load_settings(brush, kind);
+        }
         let was_special = brush.kind == BrushKind::Paint
             || brush.kind.is_mask()
             || brush.kind == BrushKind::ClipLine;
@@ -1058,6 +1128,52 @@ mod tests {
         app.modifiers = ModifiersState::CONTROL;
         assert_eq!(app.held_brush(), Some(BrushKind::MaskCircle));
     }
+    #[test]
+    fn draw_settings_follow_the_brush_and_draw_size_is_shared() {
+        let mut app = app("per-brush");
+        let ws = &mut app.workspace;
+        ws.select_brush(&mut app.brush, BrushKind::Draw);
+        (app.brush.strength, app.brush.focal_shift, app.brush.rgb_intensity, ws.subtract) = (0.3, 40.0, 0.6, true);
+        app.brush.radius = 0.7;
+        ws.select_brush(&mut app.brush, BrushKind::ClayBuildup);
+        let fresh = DrawSettings::default_for(BrushKind::ClayBuildup);
+        assert_eq!(ws.settings_of(&app.brush, BrushKind::ClayBuildup), fresh);
+        assert_eq!(app.brush.radius, 0.7, "Draw Size is shared");
+        app.brush.strength = 0.2;
+        ws.select_brush(&mut app.brush, BrushKind::Draw);
+        assert_eq!((app.brush.strength, app.brush.focal_shift, app.brush.rgb_intensity, ws.subtract), (0.3, 40.0, 0.6, true));
+        assert_eq!(ws.settings_of(&app.brush, BrushKind::ClayBuildup).strength, 0.2);
+        // ZBrush starts Smooth and the mask brushes at full intensity.
+        ws.select_brush(&mut app.brush, BrushKind::Smooth);
+        assert_eq!((app.brush.strength, ws.subtract), (1.0, false));
+        ws.select_brush(&mut app.brush, BrushKind::MaskLasso);
+        assert_eq!(app.brush.strength, 1.0);
+        assert_eq!(fresh.strength, Brush::default().strength);
+    }
+
+    #[test]
+    fn holding_shift_shows_and_sets_smooths_own_z_intensity() {
+        use winit::keyboard::ModifiersState;
+        let mut app = app("held-intensity");
+        app.workspace.select_brush(&mut app.brush, BrushKind::Clay);
+        app.brush.strength = 0.25;
+        app.modifiers = ModifiersState::SHIFT;
+        app.workspace.held_brush = app.held_brush();
+        // While Shift is held the panels edit Smooth (the slider writes the live value).
+        let held = app.workspace.begin_held_brush(&mut app.brush);
+        assert_eq!((app.brush.kind, app.brush.strength), (BrushKind::Smooth, 1.0));
+        app.brush.strength = 0.4;
+        app.workspace.end_held_brush(&mut app.brush, held);
+        assert_eq!((app.brush.kind, app.brush.strength), (BrushKind::Clay, 0.25));
+        assert_eq!(app.effective_brush().strength, 0.4, "Shift strokes with Smooth's own");
+        // A whole UI frame with Shift held leaves the brush as it was.
+        frame(&mut app, Vec::new());
+        app.modifiers = ModifiersState::empty();
+        assert_eq!((app.brush.kind, app.brush.strength), (BrushKind::Clay, 0.25));
+        app.workspace.select_brush(&mut app.brush, BrushKind::Smooth);
+        assert_eq!(app.brush.strength, 0.4);
+    }
+
     fn app(name: &str) -> crate::App {
         let mut app = crate::App::new(8, false, 200_000);
         let root = std::env::temp_dir().join(format!("klay-020-ui-{}-{name}", std::process::id()));

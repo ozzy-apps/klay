@@ -3025,7 +3025,8 @@ impl App {
             b.kind=BrushKind::Paint;b.sculpt=false;
         }
         if self.modifiers.shift_key() {
-            b.kind = BrushKind::Smooth;
+            // Smooth with its own Z Intensity (ZBrush: Shift + Z Intensity sets it).
+            b = self.workspace.brush_for(&b, BrushKind::Smooth);
             b.sculpt=true;b.paint=false;
         }
         b
@@ -3834,7 +3835,7 @@ impl App {
                 self.history.push(UndoStep::Stroke {level,chunks});
                 self.subtools[self.active_tool].bounds=self.doc.bounds();
             }
-        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.brush.strength,self.workspace.symmetry) {
+        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.symmetry) {
             let old=mask::replace(self.doc.mesh_mut(),new);
             self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
         }
@@ -3868,7 +3869,7 @@ impl App {
         let Some(hit) = self.mesh().raycast(o, d) else {
             return;
         };
-        let brush = self.at_pressure(self.brush);
+        let brush = self.at_pressure(self.workspace.brush_for(&self.brush, self.workspace.mask_brush));
         if let Some(stroke) = self.mask_stroke.as_mut() {
             stroke.dab_normal(self.doc.mesh_mut(), &brush, hit.point, hit.normal);
         }
@@ -3900,7 +3901,7 @@ impl App {
         self.mask_press = None;
         let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry)
             .with_brush(press.kind,self.workspace.assets.clone());
-        let brush = self.at_pressure(self.brush);
+        let brush = self.at_pressure(self.workspace.brush_for(&self.brush, press.kind));
         stroke.dab_normal(self.doc.mesh_mut(), &brush, hit, press.normal);
         self.mask_stroke = Some(stroke);
         self.mask_dab();
@@ -6103,6 +6104,35 @@ mod mask_tests {
         assert_eq!(masked(&app), app.doc.mesh().vertex_count());
         assert!(app.mask_op(MaskOp::Clear));
         assert!(!app.mask_op(MaskOp::Clear), "clearing nothing is not an undo step");
+    }
+
+    #[test]
+    fn ctrl_masks_and_shift_smooths_with_their_own_z_intensity() {
+        // ZBrush: the Ctrl mask brush and Shift's Smooth keep their own Z Intensity; the
+        // sculpt brush's does not leak into them.
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let peak = |app: &App| app.doc.mesh().mask.iter().copied().max().unwrap_or(0);
+        app.workspace.select_brush(&mut app.brush, BrushKind::ClayBuildup);
+        app.brush.strength = 0.05;
+        drag(&mut app, c, c + Vec2::new(30.0, 0.0), ModifiersState::CONTROL);
+        assert_eq!(peak(&app), 255, "Mask Pen starts at full intensity");
+        assert_eq!(app.brush.strength, 0.05, "the sculpt brush keeps its own");
+        // Turn the mask brush down: Ctrl masks lightly, whatever the sculpt brush has.
+        app.mask_op(MaskOp::Clear);
+        app.workspace.select_brush(&mut app.brush, BrushKind::MaskPen);
+        app.brush.strength = 0.1;
+        app.workspace.select_brush(&mut app.brush, BrushKind::ClayBuildup);
+        app.brush.strength = 1.0;
+        drag(&mut app, c, c + Vec2::new(30.0, 0.0), ModifiersState::CONTROL);
+        let light = peak(&app);
+        assert!(light > 0 && light < 128, "{light}");
+        // Shift smooths with Smooth's intensity, at the shared Draw Size.
+        app.brush.radius = 0.31;
+        app.modifiers = ModifiersState::SHIFT;
+        let smooth = app.effective_brush();
+        app.modifiers = ModifiersState::empty();
+        assert_eq!((smooth.kind, smooth.strength, smooth.radius), (BrushKind::Smooth, 1.0, 0.31));
     }
 
     #[test]

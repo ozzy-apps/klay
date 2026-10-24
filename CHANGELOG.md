@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 — 2026-10-24
+
+- Z Intensity, Focal Shift, RGB Intensity and Zadd/Zsub are now per brush, as in ZBrush (Maxon: every Draw palette setting except Draw Size is stored per tool). Switching brushes restores that brush's values; Draw Size stays shared. Smooth (and SmoothValleys/SmoothPeaks) and the mask brushes start at full intensity, other brushes at 0.5. Values last for the session.
+- Shift smoothing uses Smooth's own Z Intensity (before, it used the sculpt brush's), and holding Shift shows and edits Smooth's values in the panels. Ctrl masking and mask shapes use the mask brush's own intensity instead of the sculpt brush's.
+- Verification: 181 release tests (new: settings follow the brush with Draw Size shared; Shift shows and sets Smooth's intensity through the held-brush path and a UI frame; Ctrl masking at the mask brush's intensity, not the sculpt brush's); every native self-test passes on the GPU.
+
 ## 0.7.0 — 2026-10-23
 
 - Twelve of ZBrush's advanced brushes (catalog: 46 tools): ClayTubes (square, flat-topped clay strips that turn with the stroke), hPolish (flatten with a hard square edge), TrimAdaptive (trim to the plane under the brush centre), Planar (flatten onto the plane where the stroke started), TrimSmoothBorder (trim and soften the cut's edge), MalletFast (square, flat-bottomed dents; Alt raises a plateau), Move Topological (pull only the surface connected to the click point; GPU like Grab), Inflate Balloon (round swell), Magnify (spread and swell; Alt contracts), Orb Cracks (sharp crack of varying depth; Alt raises a ridge), SmoothValleys and SmoothPeaks (smooth only recessed or only raised areas). Each works through canvas input, undo/redo, X symmetry, masks, hidden faces, pen pressure, Curve strokes and subdivision levels, with a catalog preview and description.
