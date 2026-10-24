@@ -455,6 +455,11 @@ pub struct Model<'a> {
     pub import_path: &'a mut String,
     /// Mesh › Morph Target: the level (0-based) of the active subtool's stored target.
     pub morph_level: Option<usize>,
+    /// Mesh › Layers of the active subtool: name, visible, recording, intensity.
+    pub layers: Vec<(String, bool, bool, f32)>,
+    /// Edit › History: steps that can be undone (oldest first) and redone (next first).
+    pub undo_names: &'a [String],
+    pub redo_names: Vec<String>,
     /// Polygroups and hidden triangles at the shown level of the active subtool.
     pub groups: usize,
     pub hidden: usize,
@@ -536,6 +541,12 @@ pub struct Actions {
     pub import_obj: bool,
     /// Mesh › Morph Target: StoreMT, DelMT, Switch.
     pub morph: Option<crate::MorphOp>,
+    /// Edit › History: undo (negative) or redo (positive) this many steps.
+    pub history_jump: Option<i64>,
+    /// Preferences › QuickSave › QuickSave now.
+    pub quicksave: bool,
+    /// Mesh › Layers.
+    pub layer: Option<crate::LayerOp>,
     /// Polygroups: one new group of the visible polygons (Ctrl + W).
     pub group_visible: bool,
     /// Visibility: show everything / swap hidden and visible.
@@ -661,6 +672,15 @@ pub struct Workspace {
     pub import_fit: bool,
     /// SubTool › Extract thickness, % of the subtool's size.
     pub extract_thick: f32,
+    /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
+    pub gizmo: bool,
+    /// Mesh › Layers: the selected layer, and the Intensity slider's value while dragged
+    /// with the value it started from.
+    pub layer_selected: usize,
+    layer_drag: Option<(f32, f32)>,
+    /// Preferences › QuickSave: on, and every how many minutes.
+    pub quicksave: bool,
+    pub quicksave_minutes: f32,
     /// Masking › Mask By Cavity sensitivity (1..=100) and Mask By Polygroups border width
     /// (rings).
     pub cavity_sensitivity: f32,
@@ -679,6 +699,11 @@ pub struct Workspace {
     /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
     pub pressure_size: bool,
     pub pressure_intensity: bool,
+    /// Brush › Tablet Pressure curves for Draw Size and for Z / RGB Intensity.
+    pub size_curve: crate::pressure::PressureCurve,
+    pub intensity_curve: crate::pressure::PressureCurve,
+    /// The curve point being dragged: (which curve, point index).
+    curve_drag: Option<(bool, usize)>,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -763,6 +788,11 @@ impl Workspace {
             fov: 45.0,
             import_fit: true,
             extract_thick: 2.0,
+            quicksave: true,
+            quicksave_minutes: 10.0,
+            gizmo: false,
+            layer_selected: 0,
+            layer_drag: None,
             cavity_sensitivity: 50.0,
             normals_angle: 20.0,
             group_border_width: 2.0,
@@ -774,6 +804,9 @@ impl Workspace {
             curve_preview: None,
             pressure_size: true,
             pressure_intensity: true,
+            size_curve: crate::pressure::PressureCurve::linear(),
+            intensity_curve: crate::pressure::PressureCurve::linear(),
+            curve_drag: None,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -2014,7 +2047,30 @@ impl Workspace {
                         if !m.tablet.is_empty() {
                             note(ui, &format!("Pen: {}", m.tablet));
                         }
-                        note(ui, "Linear, like ZBrush's default curves · Grab keeps its size");
+                        let live = m.pressure.filter(|_| m.tablet_on);
+                        for size in [true, false] {
+                            ui.label(RichText::new(if size { "Size curve" } else { "Intensity curve" }).size(12.0).color(FG2));
+                            let mut drag = ws.curve_drag.filter(|d| d.0 == size).map(|d| d.1);
+                            let curve = if size { &mut ws.size_curve } else { &mut ws.intensity_curve };
+                            pressure_curve_editor(ui, curve, &mut drag, live);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                let w = (ui.available_width() - 9.0) / 4.0;
+                                for name in crate::pressure::PressureCurve::PRESETS {
+                                    let preset = crate::pressure::PressureCurve::preset(name);
+                                    let on = *curve == preset;
+                                    if ui.add(egui::Button::new(RichText::new(name).size(11.5)).selected(on).min_size(vec2(w, 18.0))).clicked() {
+                                        *curve = preset;
+                                    }
+                                }
+                            });
+                            if drag.is_some() {
+                                ws.curve_drag = drag.map(|i| (size, i));
+                            } else if ws.curve_drag.is_some_and(|d| d.0 == size) {
+                                ws.curve_drag = None;
+                            }
+                        }
+                        note(ui, "Drag a point · click to add one · double-click to remove it · Grab keeps its size");
                     },
                 );
                 self.sec(
@@ -2232,12 +2288,34 @@ impl Workspace {
                     true,
                     true,
                     &mut |_, ui| {
-                        if m.can_undo || m.can_redo {
-                            kv(ui, "Undo available", if m.can_undo { "yes" } else { "no" });
-                            kv(ui, "Redo available", if m.can_redo { "yes" } else { "no" });
-                        } else {
-                            note(ui, "No strokes yet.");
+                        // ZBrush: Edit › Undo History. Click a step to go back (or forward)
+                        // to just after it; the first row is the subtool before any step.
+                        let done = m.undo_names.len();
+                        if done == 0 && m.redo_names.is_empty() {
+                            note(ui, "No steps yet.");
+                            return;
                         }
+                        egui::ScrollArea::vertical().max_height(240.0).stick_to_bottom(true).show(ui, |ui| {
+                            let rows = std::iter::once("Start".to_string())
+                                .chain(m.undo_names.iter().cloned())
+                                .chain(m.redo_names.iter().cloned());
+                            for (k, name) in rows.enumerate() {
+                                let here = k == done;
+                                let future = k > done;
+                                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
+                                let p = ui.painter();
+                                if here {
+                                    p.rect_filled(r, 2, ACC_DIM);
+                                } else if resp.hovered() {
+                                    p.rect_filled(r, 2, BG4);
+                                }
+                                let label = if k == 0 { name } else { format!("{k}. {name}") };
+                                p.text(r.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(12.5), if future { FG3 } else { FG });
+                                if resp.on_hover_text(if future { "Redo to here" } else { "Undo to here" }).clicked() && !here {
+                                    a.history_jump = Some(k as i64 - done as i64);
+                                }
+                            }
+                        });
                     },
                 );
             }
@@ -2535,6 +2613,76 @@ impl Workspace {
                             Some(l) => kv(ui, "Stored at level", &(l + 1).to_string()),
                             None => note(ui, "Store a target, sculpt, then brush back to it with the Morph brush or Switch."),
                         }
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "layers",
+                    "Layers",
+                    None,
+                    false,
+                    true,
+                    &mut |ws, ui| {
+                        use crate::LayerOp;
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            if ui.add(egui::Button::new("New").min_size(vec2(w, 20.0))).on_hover_text("A new layer, recording").clicked() {
+                                a.layer = Some(LayerOp::New);
+                            }
+                            if ui
+                                .add_enabled(!m.layers.is_empty(), egui::Button::new("Bake All").min_size(vec2(w, 20.0)))
+                                .on_hover_text("Keep every layer's effect in the sculpt and remove the layers")
+                                .clicked()
+                            {
+                                a.layer = Some(LayerOp::BakeAll);
+                            }
+                        });
+                        // Newest on top, as in ZBrush.
+                        for (i, (name, visible, rec, _)) in m.layers.iter().enumerate().rev() {
+                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+                            let p = ui.painter();
+                            p.rect_filled(r, 2, if ws.layer_selected == i { ACC_DIM } else if resp.hovered() { BG4 } else { BG2 });
+                            let eye = Rect::from_min_size(r.min + vec2(4.0, 3.0), vec2(16.0, 16.0));
+                            let recr = Rect::from_min_size(r.min + vec2(24.0, 3.0), vec2(30.0, 16.0));
+                            p.circle(eye.center(), 4.5, if *visible { FG } else { Color32::TRANSPARENT }, Stroke::new(1.2, FG2));
+                            p.rect_filled(recr, 2, if *rec { Color32::from_rgb(200, 50, 45) } else { BG3 });
+                            p.text(recr.center(), Align2::CENTER_CENTER, "REC", FontId::proportional(10.5), if *rec { Color32::WHITE } else { FG3 });
+                            p.text(r.left_center() + vec2(60.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
+                            if resp.clicked() {
+                                let at = resp.interact_pointer_pos().unwrap_or(r.center());
+                                if eye.expand(2.0).contains(at) {
+                                    a.layer = Some(LayerOp::Eye(i));
+                                } else if recr.expand(2.0).contains(at) {
+                                    a.layer = Some(LayerOp::Rec(i));
+                                } else {
+                                    ws.layer_selected = i;
+                                }
+                            }
+                        }
+                        if let Some(&(_, _, _, intensity)) = m.layers.get(ws.layer_selected) {
+                            let i = ws.layer_selected;
+                            let mut value = ws.layer_drag.map_or(intensity, |d| d.0);
+                            if zslider(ui, "Intensity", &mut value, -1.0..=2.0, false, false, 2) {
+                                let start = ws.layer_drag.map_or(intensity, |d| d.1);
+                                ws.layer_drag = Some((value, start));
+                                a.layer = Some(LayerOp::Intensity(i, value));
+                            } else if let Some((_, start)) = ws.layer_drag.filter(|_| !ui.input(|inp| inp.pointer.any_down())) {
+                                ws.layer_drag = None;
+                                a.layer = Some(LayerOp::IntensityDone(i, start));
+                            }
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 4.0) * 0.5;
+                                if ui.add(egui::Button::new("Delete").min_size(vec2(w, 20.0))).on_hover_text("Remove the layer and its effect").clicked() {
+                                    a.layer = Some(LayerOp::Delete(i));
+                                }
+                                if ui.add(egui::Button::new("Bake").min_size(vec2(w, 20.0))).on_hover_text("Keep its effect in the sculpt and remove the layer").clicked() {
+                                    a.layer = Some(LayerOp::Bake(i));
+                                }
+                            });
+                        }
+                        note(ui, "Layers live on the highest subdivision level · REC sculpts into a layer · the eye shows or hides it · Divide waits until they are baked · not saved in projects yet");
                     },
                 );
                 self.sec(ui, h, id, "info", "Mesh", None, true, true, &mut |_, ui| {
@@ -2938,6 +3086,27 @@ impl Workspace {
                     ui,
                     h,
                     id,
+                    "quicksave",
+                    "QuickSave",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        ui.checkbox(&mut ws.quicksave, "QuickSave")
+                            .on_hover_text("Save every subtool now and then to a rotating set of five files");
+                        ui.add_enabled_ui(ws.quicksave, |ui| {
+                            zslider(ui, "Every (min)", &mut ws.quicksave_minutes, 1.0..=60.0, false, false, 0);
+                        });
+                        if ui.add_sized([ui.available_width(), 20.0], egui::Button::new("QuickSave now")).clicked() {
+                            a.quicksave = true;
+                        }
+                        note(ui, "When something changed and you pause for a few seconds · ~/.local/share/klay/quicksave, QuickSave_1–5.klay · open one with Document › Open");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
                     "keys",
                     "Shortcuts",
                     None,
@@ -2972,6 +3141,7 @@ impl Workspace {
                             ("[ ]", "brush radius"),
                             ("1 – 5", "brushes"),
                             ("Q W E R", "draw / move / scale / rotate"),
+                            ("Y", "Gizmo 3D / action line"),
                             ("W E R + drag model", "action line · Shift: 45°"),
                             ("Drag circle", "middle: move · end: scale / rotate"),
                             ("Drag ring / line", "move the action line"),
@@ -3091,12 +3261,22 @@ impl Workspace {
                     id,
                     "xf",
                     "Transform",
-                    Some(NC),
+                    None,
                     true,
-                    false,
-                    &mut |_, ui| {
-                        seg(ui, &["Move", "Rotate", "Scale"], 0, false);
-                        full_button(ui, "Reset transform");
+                    true,
+                    &mut |ws, ui| {
+                        let modes = [Mode::Draw, Mode::Move, Mode::Scale, Mode::Rotate];
+                        let at = modes.iter().position(|m| *m == ws.mode).unwrap_or(0);
+                        if let Some(i) = seg(ui, &["Draw", "Move", "Scale", "Rotate"], at, false) {
+                            ws.mode = modes[i];
+                        }
+                        ui.checkbox(&mut ws.gizmo, "Gizmo 3D")
+                            .on_hover_text("A manipulator instead of the action line in Move / Scale / Rotate · Y");
+                        note(ui, if ws.gizmo {
+                            "Arrows move along X / Y / Z, rings turn about them, the outer ring turns in the view, the circle moves freely, the square scales"
+                        } else {
+                            "Drag on the model to draw the action line · Y for Gizmo 3D"
+                        });
                     },
                 );
             }
@@ -3641,6 +3821,54 @@ pub fn sphere_image(kind: Option<BrushKind>, material: usize, sub: bool) -> Colo
 }
 
 // ---------------------------------------------------------------- widgets
+/// A Tablet Pressure curve: pressure across, output up. Drag a point, click empty space to
+/// add one, double-click a point to remove it. `live` marks the pen's pressure now.
+fn pressure_curve_editor(ui: &mut Ui, curve: &mut crate::pressure::PressureCurve, drag: &mut Option<usize>, live: Option<f32>) {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::click_and_drag());
+    let to_screen = |p: glam::Vec2| pos2(r.left() + p.x * r.width(), r.bottom() - p.y * r.height());
+    let to_curve = |q: Pos2| glam::Vec2::new((q.x - r.left()) / r.width(), (r.bottom() - q.y) / r.height());
+    let near = |q: Pos2| curve.points.iter().position(|&p| to_screen(p).distance(q) < 7.0);
+    if let Some(q) = resp.interact_pointer_pos() {
+        if resp.double_clicked() {
+            if let Some(i) = near(q) {
+                curve.remove(i);
+            }
+            *drag = None;
+        } else if resp.drag_started() || (resp.clicked() && drag.is_none()) {
+            *drag = near(q).or_else(|| curve.insert(to_curve(q)));
+        }
+        if resp.dragged() {
+            if let Some(i) = *drag {
+                curve.drag(i, to_curve(q));
+            }
+        }
+    }
+    if resp.drag_stopped() || resp.clicked() {
+        *drag = None;
+    }
+    let p = ui.painter();
+    p.rect_filled(r, 2, BG2);
+    p.rect_stroke(r, 2, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    for k in 1..4 {
+        let f = k as f32 / 4.0;
+        p.vline(r.left() + f * r.width(), r.y_range(), (1.0, LINE2));
+        p.hline(r.x_range(), r.bottom() - f * r.height(), (1.0, LINE2));
+    }
+    let line: Vec<Pos2> = (0..=48).map(|k| {
+        let x = k as f32 / 48.0;
+        to_screen(glam::Vec2::new(x, curve.eval(x)))
+    }).collect();
+    p.add(egui::Shape::line(line, Stroke::new(1.5, ACC)));
+    for (i, &q) in curve.points.iter().enumerate() {
+        p.circle_filled(to_screen(q), if *drag == Some(i) { 4.5 } else { 3.5 }, FG);
+    }
+    if let Some(x) = live {
+        let at = to_screen(glam::Vec2::new(x, curve.eval(x)));
+        p.vline(at.x, r.y_range(), (1.0, ACC_LINE));
+        p.circle_stroke(at, 4.0, Stroke::new(1.2, ACC_LINE));
+    }
+}
+
 /// ZBrush-style slider: label inside the bar, value on a neutral field at the
 /// right. `line` draws the shelf variant with a thin value line underneath.
 /// How a slider's position maps to its value.
@@ -4706,6 +4934,9 @@ mod tests {
                         subtool_path: &mut String::from("subtool.klay"),
                         import_path: &mut String::from("model.obj"),
                         morph_level: None,
+                        layers: Vec::new(),
+                        undo_names: &[],
+                        redo_names: Vec::new(),
                         groups: 1,
                         hidden: 0,
                         polyframe_supported: true,

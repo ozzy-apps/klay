@@ -1087,6 +1087,7 @@ impl Packed {
             active,
             budget,
             generation: next_generation(),
+            layers: crate::layers::Layers::default(),
         })
     }
 }
@@ -1186,6 +1187,9 @@ pub struct Multires {
     /// Unique per stack whose levels were built afresh (new, rebuilt, unpacked, or with
     /// levels deleted below), so the renderer knows its cached levels are someone else's.
     pub generation: u64,
+    /// Tool › Layers, on the highest level (not packed: a parked subtool keeps them with
+    /// its undo history).
+    pub layers: crate::layers::Layers,
 }
 
 fn next_generation() -> u64 {
@@ -1200,6 +1204,7 @@ impl Multires {
             active: 0,
             budget,
             generation: next_generation(),
+            layers: crate::layers::Layers::default(),
         }
     }
 
@@ -1484,6 +1489,76 @@ impl Multires {
             child.stale[t as usize] = true;
         }
         targets.len()
+    }
+
+    /// Show the highest level (layers live there), returning whether it changed.
+    fn show_top(&mut self) {
+        let top = self.top();
+        if self.active != top {
+            self.set_active(top);
+        }
+    }
+
+    /// Change the shape at the highest level by `f`, keeping its offsets right (as a stroke
+    /// over every chunk would).
+    fn reshape_top(&mut self, f: impl FnOnce(&mut SculptMesh, &mut crate::layers::Layers)) {
+        self.show_top();
+        let top = self.top();
+        let all: Vec<u32> = (0..self.mesh().chunks.len() as u32).collect();
+        let snapshot = self.mesh().snapshot_chunks(&all);
+        let mut layers = std::mem::take(&mut self.layers);
+        f(self.mesh_mut(), &mut layers);
+        self.layers = layers;
+        self.finish_stroke(top, snapshot);
+    }
+
+    /// Fold the recording layer's sculpting in (see [`crate::layers::Layers::freeze`]); only
+    /// at the highest level, where it records.
+    pub fn freeze_layers(&mut self) {
+        if self.active == self.top() {
+            let mut layers = std::mem::take(&mut self.layers);
+            layers.freeze(&self.mesh().positions);
+            self.layers = layers;
+        }
+    }
+
+    /// Replace the layers with `target`. With `reshape` the shape follows (the layers' part
+    /// of it becomes `target`'s); without, it stays as it is (Bake). Returns the state
+    /// replaced, which undoes it with the same `reshape`.
+    pub fn swap_layers(&mut self, target: crate::layers::Layers, reshape: bool) -> crate::layers::Layers {
+        if reshape {
+            let mut old = None;
+            self.reshape_top(|mesh, layers| old = Some(layers.swap(mesh, target)));
+            return old.unwrap();
+        }
+        self.show_top();
+        self.freeze_layers();
+        let mut target = target;
+        if let Some((_, base)) = target.rec.as_mut() {
+            *base = self.mesh().positions.clone();
+        }
+        std::mem::replace(&mut self.layers, target)
+    }
+
+    /// Set layer `index`'s intensity, the shape following; returns the old intensity.
+    pub fn set_layer_intensity(&mut self, index: usize, intensity: f32) -> f32 {
+        let mut old = intensity;
+        self.reshape_top(|mesh, layers| {
+            layers.freeze(&mesh.positions);
+            let Some(layer) = layers.list.get_mut(index) else { return };
+            old = layer.intensity;
+            if layer.delta.len() == mesh.vertex_count() {
+                let k = if layer.visible { intensity - layer.intensity } else { 0.0 };
+                mesh.positions.par_iter_mut().zip(layer.delta.par_iter()).for_each(|(p, d)| *p += *d * k);
+            }
+            layer.intensity = intensity;
+            if let Some((_, base)) = layers.rec.as_mut() {
+                base.copy_from_slice(&mesh.positions);
+            }
+            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+            mesh.finish_edit(&all);
+        });
+        old
     }
 
     /// Record a finished stroke at `level`: `snapshot` holds the positions of the touched

@@ -39,6 +39,8 @@ pub struct Parked {
     pub history: History,
     /// Vertices of its stand-in; 0 when the stand-in did not fit on the GPU.
     pub stand_in_vertices: usize,
+    /// Its sculpt layers (not part of the packed stack).
+    pub layers: crate::layers::Layers,
 }
 
 /// Deformation applied to the active subtool (ZBrush: Tool > Deformation).

@@ -305,11 +305,19 @@ pub enum UndoStep {
     /// Several steps made by one action (Ctrl + W on a mask: the new group and the cleared
     /// mask), applied in the order listed (the undo of the last change first).
     Steps(Vec<UndoStep>),
+    /// Tool › Layers before a change: the layers state, and whether the shape follows it
+    /// (new, delete, show / hide, record) or stays (bake).
+    Layers { state: Box<crate::layers::Layers>, reshape: bool },
+    /// A layer's intensity before it was changed.
+    LayerIntensity { index: usize, intensity: f32 },
 }
 
 pub struct History {
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
+    /// What each step was, for Edit › History (same order as `undo` / `redo`).
+    undo_names: Vec<String>,
+    redo_names: Vec<String>,
     pub limit: usize,
     /// Counts every push, undo, redo and clear: a curve stays bendable only while no other
     /// edit has happened since it was applied.
@@ -321,6 +329,8 @@ impl History {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_names: Vec::new(),
+            redo_names: Vec::new(),
             limit,
             edits: 0,
         }
@@ -358,10 +368,26 @@ impl History {
     pub fn push(&mut self, step: UndoStep) {
         self.edits += 1;
         self.redo.clear();
+        self.redo_names.clear();
+        self.undo_names.push(step_name(&step).to_string());
         self.undo.push(step);
         if self.undo.len() > self.limit {
             self.undo.remove(0);
+            self.undo_names.remove(0);
         }
+    }
+
+    /// Name the step just pushed (a stroke by its brush).
+    pub fn name_last(&mut self, name: &str) {
+        if let Some(n) = self.undo_names.last_mut() {
+            *n = name.to_string();
+        }
+    }
+
+    /// Edit › History: the steps that can be undone, oldest first, and those that can be
+    /// redone, next first.
+    pub fn names(&self) -> (&[String], Vec<&String>) {
+        (&self.undo_names, self.redo_names.iter().rev().collect())
     }
 
     pub fn undo(&mut self, doc: &mut Multires) {
@@ -369,6 +395,8 @@ impl History {
         if let Some(step) = self.undo.pop() {
             let inverse = apply_step(doc, step);
             self.redo.push(inverse);
+            let name = self.undo_names.pop().unwrap_or_default();
+            self.redo_names.push(name);
         }
     }
 
@@ -377,6 +405,8 @@ impl History {
         if let Some(step) = self.redo.pop() {
             let inverse = apply_step(doc, step);
             self.undo.push(inverse);
+            let name = self.redo_names.pop().unwrap_or_default();
+            self.undo_names.push(name);
         }
     }
 
@@ -384,6 +414,8 @@ impl History {
         self.edits += 1;
         self.undo.clear();
         self.redo.clear();
+        self.undo_names.clear();
+        self.redo_names.clear();
     }
 
     /// Drop the redo list, whose divide entries can hold whole levels. Used when a subtool
@@ -391,11 +423,30 @@ impl History {
     /// stack comes back with the same chunks.
     pub fn drop_redo(&mut self) {
         self.redo.clear();
+        self.redo_names.clear();
     }
 
     /// Approximate memory held by history, in bytes.
     pub fn bytes(&self) -> usize {
         self.undo.iter().chain(self.redo.iter()).map(step_bytes).sum()
+    }
+}
+
+/// A step's name in Edit › History until `name_last` gives a better one.
+fn step_name(s: &UndoStep) -> &'static str {
+    match s {
+        UndoStep::Stroke { .. } => "Stroke",
+        UndoStep::Divide(_) => "Divide",
+        UndoStep::Transform(_) | UndoStep::MaskedTransform { .. } => "Transform",
+        UndoStep::Visibility(_) => "Visibility",
+        UndoStep::Groups(_) => "Polygroups",
+        UndoStep::Replace(_) => "Remesh",
+        UndoStep::Part { .. } => "CurveTube",
+        UndoStep::Mask { .. } => "Mask",
+        UndoStep::Paint(_) => "Paint",
+        UndoStep::Steps(_) => "Group masked",
+        UndoStep::Layers { .. } => "Layers",
+        UndoStep::LayerIntensity { .. } => "Layer intensity",
     }
 }
 
@@ -412,6 +463,8 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Replace(packed) => packed.bytes(),
         UndoStep::Part { part, .. } => part.as_ref().map_or(0, |m| m.vertex_count() * 40 + m.triangle_count() * 14),
         UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
+        UndoStep::Layers { state, .. } => state.bytes(),
+        UndoStep::LayerIntensity { .. } => 0,
     }
 }
 
@@ -455,6 +508,14 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
         UndoStep::Part { keep, part } => UndoStep::Part {
             keep,
             part: doc.swap_part(keep, part.as_deref()).map(Box::new),
+        },
+        UndoStep::Layers { state, reshape } => UndoStep::Layers {
+            state: Box::new(doc.swap_layers(*state, reshape)),
+            reshape,
+        },
+        UndoStep::LayerIntensity { index, intensity } => UndoStep::LayerIntensity {
+            index,
+            intensity: doc.set_layer_intensity(index, intensity),
         },
         UndoStep::Steps(steps) => {
             // Applied in order; their inverses run the other way.

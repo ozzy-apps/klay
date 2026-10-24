@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0 — 2026-10-24
+
+- Gizmo 3D (Y): axis arrows, axis rings, view ring, free move and even scale, with live preview, one undo step, masks respected.
+- Mesh › Layers: New (recording), REC, show/hide, Intensity, Delete, Bake, Bake All; every change undoable; layers stay with parked subtools (not saved in projects yet).
+- Brush › Tablet pressure curves for Size and Intensity, with presets and live pressure.
+- Edit › History: named steps; click to undo or redo to any of them.
+- Preferences › QuickSave: rotating QuickSave_1–5.klay every N minutes when idle and changed, and QuickSave now.
+- New --gizmo flag.
+- Verification: 222 release tests (new: gizmo hit testing, drag maps and the input path; layer record/intensity/eye/delete/bake with undo and parking, layer state swaps; pressure curve shape and editing, curves in the brush; history names and jumps; QuickSave rotation); every native self-test passes on the GPU.
+
 ## 0.11.0 — 2026-10-24
 
 - The system pointer hides over the model while the brush ring is shown or a stroke is under way, as in ZBrush; a dot marks the brush centre. It shows over the interface, empty canvas, border and while drawing shape gestures.

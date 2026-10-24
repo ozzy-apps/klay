@@ -1,4 +1,4 @@
-# Klay 0.11.0
+# Klay 0.12.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -35,6 +35,7 @@ cargo run --release -- --selftest-materials                            # every m
 cargo run --release -- --selftest-document                             # Back gradient and Border on the GPU, the empty border zoomed in, Snapshot (--hold keeps it open)
 cargo run --release -- --segments 100 --selftest-symmetry              # Draw, Grab, Snake Hook, Inflate with Y + Radial Z 6 through the canvas, GPU readback, undo/redo
 cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # start with symmetry (x, y, z, r<axis><count>), save the canvas after start-up and quit
+cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
 cargo run --release -- --version                                     # application version
@@ -203,6 +204,29 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
   the current Draw Size until you release. The left shelf stroke thumbnail cycles Freehand /
   Curve / DragRect / DragDot.
 - **View › Camera › Angle of view** (perspective).
+
+### ZBrush tools added in 0.12
+
+- **Gizmo 3D** (`Y`, or Transform › Gizmo 3D): in Move / Scale / Rotate mode a manipulator at
+  the subtool's centre replaces the action line. Arrows move along X / Y / Z, rings turn
+  about them, the outer ring turns about the view axis, the white circle moves freely and the
+  yellow square scales evenly (drag up-right to grow). Live preview, one undo step on
+  release, masks respected, like Transpose.
+- **Mesh › Layers**: **New** adds a layer that records (**REC**) what you sculpt; the eye shows
+  or hides it, **Intensity** (-1..2) scales it live, **Delete** removes it and its effect,
+  **Bake** / **Bake All** keep the effect and remove the layer. Every change is an undo
+  step. Layers live on the highest subdivision level: Divide and Del Higher wait until they
+  are baked, and the level cannot change while one records. They stay with a subtool when
+  you switch subtools; they are not saved in projects yet (the shape is).
+- **Brush › Tablet pressure curves**: a Size and an Intensity curve (presets Linear, Soft,
+  Firm, S; drag points, click to add, double-click to remove) with the pen's live pressure
+  marked on them.
+- **Edit › History**: every step by name (strokes by their brush); click one to undo or
+  redo to just after it.
+- **Preferences › QuickSave**: every N minutes (default 10), when something changed and you
+  pause for a few seconds, every subtool goes to the oldest of `QuickSave_1–5.klay` in
+  `~/.local/share/klay/quicksave` (`$XDG_DATA_HOME`); **QuickSave now** saves at once. Open
+  one with Document › Open. Self-tests and scripted runs never QuickSave.
 
 ### Canvas and Document
 
@@ -442,6 +466,7 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line; the model stays |
 | `X` | Symmetry across X (Y, Z and Radial: Symmetry palette) |
 | `L` | LazyMouse |
+| `Y` | Gizmo 3D / action line in Move, Scale, Rotate |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
 | Alt + click another subtool | Select it (Alt + drag on the active one still carves) |

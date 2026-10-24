@@ -12,7 +12,10 @@ mod detail_brush;
 mod curve;
 mod curve_tube;
 mod deform;
+mod gizmo;
+mod layers;
 mod obj;
+mod pressure;
 mod subtool_ops;
 mod native_tests;
 mod mesh;
@@ -208,6 +211,22 @@ enum DocOp {
     ImportObj,
 }
 
+/// Mesh › Layers operations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LayerOp {
+    New,
+    Delete(usize),
+    Bake(usize),
+    BakeAll,
+    /// Start or stop recording into the layer.
+    Rec(usize),
+    /// Show or hide the layer.
+    Eye(usize),
+    /// Intensity while the slider moves, and on release with the value it started from.
+    Intensity(usize, f32),
+    IntensityDone(usize, f32),
+}
+
 /// Mesh › Morph Target operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MorphOp {
@@ -356,6 +375,13 @@ enum TransposeDrag {
         line: ActionLine,
         map: Affine,
     },
+    /// Dragging a Gizmo 3D handle; `centre` is where the gizmo stood at the press.
+    Gizmo {
+        handle: gizmo::Handle,
+        centre: Vec3,
+        press: Vec2,
+        map: Affine,
+    },
 }
 
 struct App {
@@ -404,6 +430,13 @@ struct App {
     subtool_path: String,
     /// Document › Import: OBJ file to import.
     import_path: String,
+    /// QuickSave: when the last input came, when the model was last QuickSaved, and the
+    /// (subtool id, edit count) it was saved at, so an unchanged model is not saved again.
+    last_input: Instant,
+    last_quicksave: Instant,
+    quicksaved_at: (u64, u64),
+    /// A self-test or scripted run: no QuickSave into the user's folder.
+    automated: bool,
     /// Mesh › Morph Target per subtool id: the level it was stored at and its positions.
     morph_targets: std::collections::HashMap<u64, (usize, std::sync::Arc<Vec<Vec3>>)>,
     /// `--open PATH`: project to open once the window exists.
@@ -561,6 +594,10 @@ impl App {
             subtool_path: "subtool.klay".to_string(),
             import_path: "model.obj".to_string(),
             morph_targets: std::collections::HashMap::new(),
+            last_input: Instant::now(),
+            last_quicksave: Instant::now(),
+            quicksaved_at: (0, 0),
+            automated: false,
             open_on_start: None,
             pending_doc: None,
             doc: Multires::new(mesh, budget),
@@ -662,7 +699,9 @@ impl App {
     /// made active. Returns the time taken in ms.
     fn park_active(&mut self) -> f32 {
         let t = Instant::now();
+        self.doc.freeze_layers();
         let mut doc = std::mem::replace(&mut self.doc, Self::placeholder());
+        let mut doc_layers = std::mem::take(&mut doc.layers);
         let stand_in = doc.stand_in(STAND_IN_VERTICES);
         let packed = doc.pack();
         let mut history = std::mem::replace(&mut self.history, History::new(32));
@@ -680,6 +719,7 @@ impl App {
             packed,
             history,
             stand_in_vertices,
+            layers: std::mem::take(&mut doc_layers),
         }));
         t.elapsed().as_secs_f32() * 1000.0
     }
@@ -690,11 +730,12 @@ impl App {
         let t = Instant::now();
         let tool = &mut self.subtools[i];
         let Parked {
-            packed, history, ..
+            packed, history, layers, ..
         } = *tool.parked.take().expect("only a parked subtool can be activated");
         tool.visible = true;
         let id = tool.id;
         self.doc = packed.unpack();
+        self.doc.layers = layers;
         self.history = history;
         self.active_tool = i;
         let ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -802,6 +843,7 @@ impl App {
                     packed,
                     history: History::new(32),
                     stand_in_vertices,
+                    layers: Default::default(),
                 })),
             },
         );
@@ -990,7 +1032,7 @@ impl App {
             stroke.snapshot_now(mesh, &all);
             mesh.positions.copy_from_slice(&new);
             mesh.finish_edit(&all);
-            self.commit_stroke(stroke, level);
+            self.commit_stroke_named(stroke, level, kind.label());
             self.subtools[self.active_tool].bounds = self.doc.bounds();
             self.update_hover();
             self.workspace.notify(format!("{} {:+.0} applied", kind.label(), value));
@@ -1158,6 +1200,9 @@ impl App {
                     end: follow(line.end, ends[1]),
                 });
             }
+            TransposeDrag::Gizmo { handle, centre, press, map } => {
+                *map = gizmo::drag_map(&view, *centre, *handle, *press, to);
+            }
             TransposeDrag::Act {
                 mode,
                 anchor,
@@ -1191,6 +1236,15 @@ impl App {
                 None
             }
             TransposeDrag::Line { .. } => None,
+            TransposeDrag::Gizmo { handle, map, .. } => {
+                if map.is_identity() {
+                    return None;
+                }
+                let ms = self.apply_transform(map);
+                self.status = format!("Gizmo {handle:?} applied in {ms:.0} ms");
+                log::info!("{}", self.status);
+                Some(ms)
+            }
             TransposeDrag::Act { mode, line, map, .. } => {
                 if map.is_identity() {
                     return None;
@@ -1215,9 +1269,74 @@ impl App {
     /// one is in progress.
     fn preview_map(&self) -> Affine {
         match self.transpose {
-            Some(TransposeDrag::Act { map, .. }) => map,
+            Some(TransposeDrag::Act { map, .. }) | Some(TransposeDrag::Gizmo { map, .. }) => map,
             _ => Affine::IDENTITY,
         }
+    }
+
+    /// Where Gizmo 3D stands: the centre of the active subtool.
+    fn gizmo_centre(&self) -> Vec3 {
+        let b = self.doc.bounds();
+        (b.min + b.max) * 0.5
+    }
+
+    /// A press in Move / Scale / Rotate mode with Gizmo 3D on: start dragging the handle
+    /// under it. Returns false when it is on none (the caller navigates).
+    fn begin_gizmo(&mut self) -> bool {
+        let centre = self.gizmo_centre();
+        let press = self.canvas_cursor();
+        let Some(handle) = gizmo::hit(&self.view(), centre, press) else {
+            return false;
+        };
+        self.transpose = Some(TransposeDrag::Gizmo { handle, centre, press, map: Affine::IDENTITY });
+        self.hover = None;
+        true
+    }
+
+    /// Draw Gizmo 3D: X red, Y green, Z blue; the handle under the cursor (or being dragged)
+    /// is lit.
+    fn paint_gizmo(&self, ctx: &egui::Context) {
+        if !self.workspace.gizmo || self.workspace.mode == Mode::Draw || !self.canvas_rect.is_positive() {
+            return;
+        }
+        let view = self.view();
+        let (centre, active) = match self.transpose {
+            Some(TransposeDrag::Gizmo { handle, centre, map, .. }) => (map.apply(centre), Some(handle)),
+            _ => (self.gizmo_centre(), None),
+        };
+        let lit = active.or_else(|| gizmo::hit(&view, centre, self.canvas_cursor()));
+        let to_pos = |p: Vec2| {
+            let px = p + self.canvas_origin();
+            egui::pos2(px.x / self.scale, px.y / self.scale)
+        };
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("gizmo")))
+            .with_clip_rect(self.workspace.canvas);
+        let colors = [egui::Color32::from_rgb(232, 72, 64), egui::Color32::from_rgb(110, 205, 90), egui::Color32::from_rgb(70, 140, 240)];
+        let width = |h: gizmo::Handle| if lit == Some(h) { 3.0 } else { 1.6 };
+        let shade = |c: egui::Color32, h: gizmo::Handle| if lit == Some(h) { egui::Color32::from_rgb(255, 230, 120) } else { c };
+        let line = |pts: Vec<Vec2>, stroke: egui::Stroke| {
+            painter.add(egui::Shape::line(pts.into_iter().map(to_pos).collect(), stroke));
+        };
+        let white = egui::Color32::from_rgb(235, 235, 235);
+        line(gizmo::ring(&view, centre, None, gizmo::VIEW_RING), egui::Stroke::new(width(gizmo::Handle::RotateView), shade(white, gizmo::Handle::RotateView)));
+        for a in 0..3 {
+            let h = gizmo::Handle::Rotate(a);
+            line(gizmo::ring(&view, centre, Some(a), gizmo::RING), egui::Stroke::new(width(h), shade(colors[a], h)));
+        }
+        let c = view.project(centre);
+        for a in 0..3 {
+            let h = gizmo::Handle::Move(a);
+            let tip = gizmo::arrow_tip(&view, centre, a);
+            let color = shade(colors[a], h);
+            line(vec![c, tip], egui::Stroke::new(width(h) + 0.6, color));
+            painter.circle_filled(to_pos(tip), 4.5, color);
+        }
+        let free = gizmo::Handle::Free;
+        painter.circle_stroke(to_pos(c), gizmo::FREE_RING / self.scale, egui::Stroke::new(width(free), shade(white, free)));
+        let scale = gizmo::Handle::Scale;
+        let half = gizmo::SCALE_BOX / self.scale;
+        painter.rect_filled(egui::Rect::from_center_size(to_pos(c), egui::vec2(half * 2.0, half * 2.0)), 1, shade(egui::Color32::from_rgb(240, 200, 60), scale));
     }
 
     /// Draw the action line in Move / Scale / Rotate mode: a line with start, middle and
@@ -1375,6 +1494,57 @@ impl App {
         self.workspace.notify(self.status.clone());
     }
 
+    /// The QuickSave folder: `$XDG_DATA_HOME/klay/quicksave`, else
+    /// `~/.local/share/klay/quicksave`.
+    fn quicksave_dir() -> std::path::PathBuf {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("klay/quicksave")
+    }
+
+    /// QuickSave (ZBrush): every subtool to the oldest of `QuickSave_1.klay` ..
+    /// `QuickSave_5.klay` in the QuickSave folder, leaving the project's own file alone.
+    fn quicksave(&mut self) {
+        self.quicksave_in(&Self::quicksave_dir());
+    }
+
+    /// [`quicksave`](Self::quicksave) into `dir`.
+    fn quicksave_in(&mut self, dir: &Path) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let result = std::fs::create_dir_all(dir).and_then(|()| {
+            let path = (1..=5)
+                .map(|n| dir.join(format!("QuickSave_{n}.klay")))
+                .min_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+                .unwrap();
+            self.with_project_tools(|tools| project::save(&path, tools, self.active_tool)).map(|_| path)
+        });
+        self.last_quicksave = Instant::now();
+        self.quicksaved_at = (self.subtools[self.active_tool].id, self.history.edits());
+        self.status = match result {
+            Ok(path) => format!("QuickSaved to {} in {:.1} s", path.display(), t.elapsed().as_secs_f32()),
+            Err(e) => format!("QuickSave failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// QuickSave when it is on, its interval has passed, something changed since the last
+    /// one, and nothing has been touched for a few seconds (so it never interrupts a stroke).
+    fn quicksave_when_due(&mut self) {
+        let ws = &self.workspace;
+        let due = ws.quicksave && self.last_quicksave.elapsed().as_secs_f32() >= ws.quicksave_minutes * 60.0;
+        let changed = self.quicksaved_at != (self.subtools[self.active_tool].id, self.history.edits()) && self.history.edits() > 0;
+        if due && changed && self.last_input.elapsed().as_secs_f32() > 3.0 && !self.busy() && !self.automated {
+            self.quicksave();
+        }
+    }
+
     /// Write the active subtool on its own, with all its levels, as a one-subtool project
     /// (SubTool › Save). It opens with Open, or joins another model with Load.
     fn save_subtool(&mut self) {
@@ -1454,6 +1624,7 @@ impl App {
                 packed: doc.pack(),
                 history: History::new(32),
                 stand_in_vertices,
+                layers: Default::default(),
             })),
         }
     }
@@ -1463,6 +1634,81 @@ impl App {
     fn morph_target(&self) -> Option<std::sync::Arc<Vec<Vec3>>> {
         let (level, t) = self.morph_targets.get(&self.subtools[self.active_tool].id)?;
         (*level == self.doc.active() && t.len() == self.doc.mesh().vertex_count()).then(|| t.clone())
+    }
+
+    /// Mesh › Layers (ZBrush: Tool › Layers). Every change is one undo step; the layers
+    /// live on the highest subdivision level, which has to be the one shown.
+    fn layer_op(&mut self, op: LayerOp) {
+        if self.busy() {
+            return;
+        }
+        if self.doc.active() != self.doc.top() {
+            self.workspace.notify("Layers work at the highest subdivision level · D or the SDiv slider");
+            return;
+        }
+        self.doc.freeze_layers();
+        let current = self.doc.layers.clone();
+        let mut target = current.clone();
+        let count = target.list.len();
+        let valid = |i: usize| i < count;
+        // Removing layer `i` shifts the recording index.
+        let without = |t: &mut layers::Layers, i: usize| {
+            t.list.remove(i);
+            t.rec = match t.rec.take() {
+                Some((r, _)) if r == i => None,
+                Some((r, b)) if r > i => Some((r - 1, b)),
+                other => other,
+            };
+        };
+        let (reshape, name) = match op {
+            LayerOp::New => {
+                let n = self.doc.mesh().vertex_count();
+                let number = (1..).find(|k| !target.list.iter().any(|l| l.name == format!("Layer {k}"))).unwrap();
+                target.list.push(layers::SculptLayer { name: format!("Layer {number}"), delta: vec![Vec3::ZERO; n], intensity: 1.0, visible: true });
+                target.rec = Some((target.list.len() - 1, Vec::new()));
+                self.workspace.layer_selected = target.list.len() - 1;
+                (true, "New layer")
+            }
+            LayerOp::Delete(i) if valid(i) => {
+                without(&mut target, i);
+                (true, "Delete layer")
+            }
+            LayerOp::Bake(i) if valid(i) => {
+                without(&mut target, i);
+                (false, "Bake layer")
+            }
+            LayerOp::BakeAll if count > 0 => {
+                target = layers::Layers::default();
+                (false, "Bake all layers")
+            }
+            LayerOp::Rec(i) if valid(i) => {
+                target.rec = if target.rec.as_ref().is_some_and(|(r, _)| *r == i) { None } else { Some((i, Vec::new())) };
+                (true, "Record")
+            }
+            LayerOp::Eye(i) if valid(i) => {
+                target.list[i].visible = !target.list[i].visible;
+                (true, "Show / hide layer")
+            }
+            LayerOp::Intensity(i, v) if valid(i) => {
+                self.doc.set_layer_intensity(i, v.clamp(-1.0, 2.0));
+                self.show_active_level();
+                return;
+            }
+            LayerOp::IntensityDone(i, start) if valid(i) => {
+                if (self.doc.layers.list[i].intensity - start).abs() > 1e-6 {
+                    self.history.push(UndoStep::LayerIntensity { index: i, intensity: start });
+                }
+                return;
+            }
+            _ => return,
+        };
+        let old = self.doc.swap_layers(target, reshape);
+        self.history.push(UndoStep::Layers { state: Box::new(old), reshape });
+        self.history.name_last(name);
+        let selected = &mut self.workspace.layer_selected;
+        *selected = (*selected).min(self.doc.layers.list.len().saturating_sub(1));
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.show_active_level();
     }
 
     /// Mesh › Morph Target › StoreMT: keep the shown level's shape (ZBrush: StoreMT).
@@ -1491,7 +1737,7 @@ impl App {
         let now = std::mem::replace(&mut mesh.positions, (*target).clone());
         mesh.finish_edit(&all);
         self.morph_targets.insert(id, (level, std::sync::Arc::new(now)));
-        self.commit_stroke(stroke, level);
+        self.commit_stroke_named(stroke, level, "Switch MT");
         self.subtools[self.active_tool].bounds = self.doc.bounds();
         self.update_hover();
         self.workspace.notify("Switched with the Morph Target");
@@ -2050,6 +2296,10 @@ impl App {
     /// Delete the levels above (`higher`) or below the shown one (ZBrush: Del Higher, Del
     /// Lower). Not undoable: the undo list, whose steps name levels, is cleared.
     fn delete_levels(&mut self, higher: bool) {
+        if higher && !self.doc.layers.list.is_empty() {
+            self.workspace.notify("Bake or delete the layers before Del Higher · Mesh › Layers");
+            return;
+        }
         let n = if higher { self.doc.delete_higher() } else { self.doc.delete_lower() };
         if n == 0 {
             self.workspace.notify(if higher { "No levels above this one" } else { "No levels below this one" });
@@ -3291,6 +3541,10 @@ impl App {
         if self.busy() {
             return;
         }
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify("Bake or delete the layers before Divide · Mesh › Layers");
+            return;
+        }
         if !self.doc.can_divide() {
             self.workspace.notify(format!(
                 "Next level would have {} vertices, over the budget of {}",
@@ -3316,6 +3570,10 @@ impl App {
     /// Show another subdivision level (ZBrush: D up, Shift + D down).
     fn set_level(&mut self, level: usize) {
         if self.busy() || level == self.doc.active() || level > self.doc.top() {
+            return;
+        }
+        if self.doc.layers.rec.is_some() {
+            self.workspace.notify("A layer is recording · stop REC to change the level (layers live on the highest one)");
             return;
         }
         let t = Instant::now();
@@ -3577,8 +3835,14 @@ impl App {
     }
 
     /// `brush` for one dab at the current pen pressure (Brush > Tablet pressure).
+    /// `brush` at the pen's pressure, through the Tablet Pressure curves (Size for Draw
+    /// Size, Intensity for Z and RGB Intensity).
     fn at_pressure(&self, brush: Brush) -> Brush {
-        brush.at_pressure(self.pressure, self.workspace.pressure_size, self.workspace.pressure_intensity)
+        let Some(p) = self.pressure else { return brush };
+        let ws = &self.workspace;
+        brush
+            .at_pressure(Some(ws.size_curve.eval(p)), ws.pressure_size, false)
+            .at_pressure(Some(ws.intensity_curve.eval(p)), false, ws.pressure_intensity)
     }
 
     fn apply_stroke(&mut self) {
@@ -3676,8 +3940,15 @@ impl App {
         }
     }
 
-    /// One undo step for a finished stroke at `level`: its positions and its paint.
-    fn commit_stroke(&mut self, mut stroke: Stroke, level: usize) {
+    /// One undo step for a finished stroke at `level`: its positions and its paint, named
+    /// after the brush in Edit › History.
+    fn commit_stroke(&mut self, stroke: Stroke, level: usize) {
+        let name = self.stroke_brush.kind.name();
+        self.commit_stroke_named(stroke, level, name);
+    }
+
+    /// [`commit_stroke`](Self::commit_stroke) under `name` in Edit › History.
+    fn commit_stroke_named(&mut self, mut stroke: Stroke, level: usize, name: &str) {
         let paint=stroke.take_paint();
         let mut steps=Vec::new();
         if let Some(snapshot) = stroke.end(self.doc.mesh_mut()) {
@@ -3686,9 +3957,36 @@ impl App {
         }
         if !paint.is_empty() {steps.push(UndoStep::Paint(self.doc.finish_paint(level,paint)));}
         match steps.len() {
-            0=>{},1=>self.history.push(steps.pop().unwrap()),
+            0=>return,1=>self.history.push(steps.pop().unwrap()),
             _=>self.history.push(UndoStep::Steps(steps.into_iter().rev().collect())),
         }
+        self.history.name_last(name);
+    }
+
+    /// Undo (`by` < 0) or redo (`by` > 0) that many steps (Ctrl + Z / Ctrl + Shift + Z, or a
+    /// click in Edit › History). Transforms go through the GPU map, as one step does.
+    fn history_jump(&mut self, by: i64) {
+        if self.busy() || by == 0 {
+            return;
+        }
+        for _ in 0..by.unsigned_abs() {
+            let (can, map) = if by < 0 {
+                (self.history.can_undo(), self.history.next_undo_map())
+            } else {
+                (self.history.can_redo(), self.history.next_redo_map())
+            };
+            if !can {
+                break;
+            }
+            match (map, by < 0) {
+                (Some(map), true) => self.transform_doc(&map, |app| app.history.undo(&mut app.doc)),
+                (Some(map), false) => self.transform_doc(&map, |app| app.history.redo(&mut app.doc)),
+                (None, true) => self.history.undo(&mut self.doc),
+                (None, false) => self.history.redo(&mut self.doc),
+            };
+        }
+        self.show_active_level();
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
     }
 
     /// Whether `kind` strokes along a curve (Stroke › Curve).
@@ -4599,8 +4897,12 @@ impl App {
                 self.begin_nav(MouseButton::Left);
                 return;
             }
-            if self.workspace.mode != Mode::Draw && self.begin_transpose() {
-                return;
+            if self.workspace.mode != Mode::Draw {
+                // Gizmo 3D (Y) replaces the action line; a press off its handles navigates.
+                let started = if self.workspace.gizmo { self.begin_gizmo() } else { self.begin_transpose() };
+                if started {
+                    return;
+                }
             }
             // ZBrush Curve mode: a press on the applied curve bends it.
             if self.workspace.mode == Mode::Draw && self.begin_curve_bend() {
@@ -4737,6 +5039,13 @@ impl App {
             KeyCode::Digit9 => self.workspace.select_brush(&mut self.brush,BrushKind::ClayBuildup),
             KeyCode::KeyQ => self.workspace.mode = Mode::Draw,
             KeyCode::KeyW => self.workspace.mode = Mode::Move,
+            // ZBrush: Y switches Move / Scale / Rotate between the action line and Gizmo 3D.
+            KeyCode::KeyY => {
+                self.workspace.gizmo = !self.workspace.gizmo;
+                if self.workspace.mode == Mode::Draw {
+                    self.workspace.mode = Mode::Move;
+                }
+            }
             KeyCode::KeyE => self.workspace.mode = Mode::Scale,
             KeyCode::KeyR => self.workspace.mode = Mode::Rotate,
             KeyCode::KeyX => self.workspace.symmetry = !self.workspace.symmetry,
@@ -4853,6 +5162,9 @@ impl App {
                 subtool_path: &mut self.subtool_path,
                 import_path: &mut self.import_path,
                 morph_level: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, _)| *l),
+                layers: self.doc.layers.list.iter().enumerate().map(|(i, l)| (l.name.clone(), l.visible, self.doc.layers.rec.as_ref().is_some_and(|(r, _)| *r == i), l.intensity)).collect(),
+                undo_names: self.history.names().0,
+                redo_names: self.history.names().1.into_iter().cloned().collect(),
                 groups,
                 hidden,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
@@ -4895,6 +5207,15 @@ impl App {
         }
         if actions.import_obj {
             self.pending_doc = Some(DocOp::ImportObj);
+        }
+        if let Some(by) = actions.history_jump {
+            self.history_jump(by);
+        }
+        if actions.quicksave {
+            self.quicksave();
+        }
+        if let Some(op) = actions.layer {
+            self.layer_op(op);
         }
         match actions.morph {
             Some(MorphOp::Store) => self.store_morph_target(),
@@ -4989,7 +5310,11 @@ impl App {
             self.camera.yaw = yaw;
             self.camera.pitch = pitch;
         }
-        self.paint_action_line(ui.ctx());
+        if self.workspace.gizmo {
+            self.paint_gizmo(ui.ctx());
+        } else {
+            self.paint_action_line(ui.ctx());
+        }
     }
 
     fn redraw(&mut self) {
@@ -5026,27 +5351,11 @@ impl App {
         }
         if self.pending_undo {
             self.pending_undo = false;
-            if !self.busy() {
-                match self.history.next_undo_map() {
-                    Some(map) => {
-                        self.transform_doc(&map, |app| app.history.undo(&mut app.doc));
-                    }
-                    None => self.history.undo(&mut self.doc),
-                }
-                self.show_active_level();
-            }
+            self.history_jump(-1);
         }
         if self.pending_redo {
             self.pending_redo = false;
-            if !self.busy() {
-                match self.history.next_redo_map() {
-                    Some(map) => {
-                        self.transform_doc(&map, |app| app.history.redo(&mut app.doc));
-                    }
-                    None => self.history.redo(&mut self.doc),
-                }
-                self.show_active_level();
-            }
+            self.history_jump(1);
         }
         if self.pending_divide {
             self.pending_divide = false;
@@ -5361,6 +5670,7 @@ impl App {
         gfx.render(&uniforms, &parked, self.workspace.polyframe, &jobs, full.textures_delta, full.pixels_per_point);
         self.render_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.save_snapshot();
+        self.quicksave_when_due();
         if self.stress.is_some() {
             self.stress_upload += self.upload_ms;
             self.stress_render += self.render_ms;
@@ -5443,6 +5753,13 @@ impl ApplicationHandler for App {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if matches!(
+            event,
+            WindowEvent::MouseInput { .. } | WindowEvent::KeyboardInput { .. } | WindowEvent::MouseWheel { .. }
+        ) || (matches!(event, WindowEvent::CursorMoved { .. }) && self.stroke.is_some())
+        {
+            self.last_input = Instant::now();
+        }
         if matches!(
             event,
             WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::RedrawRequested
@@ -6030,6 +6347,9 @@ fn main() {
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
+    app.automated = args.iter().any(|a| {
+        a.starts_with("--selftest") || matches!(a.as_str(), "--demo" | "--demo-brushes" | "--stress" | "--frames" | "--snapshot")
+    });
     // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).
     if let Some(spec) = flag("--symmetry") {
         for part in spec.split(',').map(str::trim) {
@@ -6055,6 +6375,11 @@ fn main() {
     // `--snapshot FILE`: after start-up (and `--demo-brushes`), save the canvas and quit.
     if let Some(path) = flag("--snapshot") {
         app.snapshot_to = Some((path.clone(), 30));
+    }
+    // `--gizmo`: start in Move mode with Gizmo 3D (Y).
+    if args.iter().any(|a| a == "--gizmo") {
+        app.workspace.gizmo = true;
+        app.workspace.mode = Mode::Move;
     }
     // `--polyf`: start with polygroup colours and the polygon frame shown (Shift + F).
     app.workspace.polyframe = args.iter().any(|a| a == "--polyf");
@@ -6240,6 +6565,25 @@ mod subtool_tests {
         let obj = std::fs::read_to_string(path.with_extension("obj")).unwrap();
         assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), app.doc.mesh().vertex_count());
         assert_eq!(obj.lines().filter(|l| l.starts_with("o ")).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quicksave_rotates_five_files_that_open_as_projects() {
+        let dir = std::env::temp_dir().join(format!("klay-quicksave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(10, false, usize::MAX);
+        app.append_primitive();
+        for _ in 0..7 {
+            app.quicksave_in(&dir);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(files.len(), 5, "{files:?}");
+        assert!(files.iter().all(|f| f.starts_with("QuickSave_") && f.ends_with(".klay")));
+        let project = project::open(&dir.join("QuickSave_1.klay")).unwrap();
+        assert_eq!(project.tools.len(), 2);
+        assert_eq!(app.quicksaved_at.1, app.history.edits());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7138,6 +7482,22 @@ mod pressure_tests {
     }
 
     #[test]
+    fn pressure_goes_through_the_tablet_pressure_curves() {
+        let mut app = App::new(8, false, usize::MAX);
+        let brush = Brush { kind: BrushKind::Draw, radius: 0.4, strength: 0.8, ..Brush::default() };
+        app.pressure = Some(0.5);
+        let linear = app.at_pressure(brush);
+        assert!((linear.radius - 0.2).abs() < 1e-5 && (linear.strength - 0.4).abs() < 1e-5);
+        app.workspace.size_curve = pressure::PressureCurve::preset("Soft");
+        app.workspace.intensity_curve = pressure::PressureCurve::preset("Firm");
+        let curved = app.at_pressure(brush);
+        assert!(curved.radius < linear.radius, "Soft: a half press gives less than half the size");
+        assert!(curved.strength > linear.strength, "Firm: a half press gives more than half the intensity");
+        app.pressure = None;
+        assert_eq!(app.at_pressure(brush).radius, 0.4, "a mouse ignores the curves");
+    }
+
+    #[test]
     fn mask_strokes_follow_pen_pressure() {
         let total = |p: Option<f32>| -> u64 {
             let mut app = app();
@@ -7665,6 +8025,143 @@ mod stroke_modifier_tests {
         // Shelf and Stroke palette offer every mode a dab brush has.
         assert_eq!(workspace::Workspace::stroke_modes(BrushKind::Draw), vec!["Freehand", "Curve", "DragRect", "DragDot"]);
         assert_eq!(workspace::Workspace::stroke_modes(BrushKind::Grab), vec!["Freehand"]);
+    }
+
+    #[test]
+    fn edit_history_names_steps_and_jumps_back_and_forth() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let mut states = vec![app.doc.mesh().positions.clone()];
+        for kind in [BrushKind::Draw, BrushKind::ClayBuildup, BrushKind::Inflate] {
+            app.workspace.select_brush(&mut app.brush, kind);
+            stroke(&mut app, c, &[c + Vec2::new(40.0, 10.0)]);
+            states.push(app.doc.mesh().positions.clone());
+        }
+        app.deform(Deform::Smooth, 30.0);
+        states.push(app.doc.mesh().positions.clone());
+        let (done, ahead) = app.history.names();
+        assert_eq!(done, ["Draw", "Clay Buildup", "Inflate", "Smooth"]);
+        assert!(ahead.is_empty());
+        // Back to just after the first stroke, then forward two.
+        app.history_jump(-3);
+        assert_eq!(app.doc.mesh().positions, states[1]);
+        let (done, ahead) = app.history.names();
+        assert_eq!((done.len(), ahead.iter().map(|s| s.as_str()).collect::<Vec<_>>()), (1, vec!["Clay Buildup", "Inflate", "Smooth"]));
+        app.history_jump(2);
+        assert!(app.doc.mesh().positions.iter().zip(&states[3]).all(|(a, b)| a.distance(*b) < 1e-6));
+        // Past either end it stops there.
+        app.history_jump(-10);
+        assert_eq!(app.doc.mesh().positions, states[0]);
+        // A new step drops the redo names.
+        stroke(&mut app, c, &[c + Vec2::new(30.0, 0.0)]);
+        assert_eq!(app.history.names().0.len(), 1);
+        assert!(app.history.names().1.is_empty());
+    }
+
+    #[test]
+    fn gizmo_arrows_move_rings_turn_and_presses_elsewhere_do_nothing() {
+        let mut app = app();
+        app.on_key(KeyCode::KeyY);
+        assert!(app.workspace.gizmo && app.workspace.mode == Mode::Move);
+        let before = app.doc.mesh().positions.clone();
+        let same = |app: &App| app.doc.mesh().positions.iter().zip(&before).all(|(p, q)| p.distance(*q) < 1e-5);
+        let drag = |app: &mut App, from: Vec2, to: Vec2| {
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=6 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 6.0), false);
+            }
+            app.left_release();
+        };
+        let origin = app.canvas_origin();
+        let view = app.view();
+        let centre = app.gizmo_centre();
+        let tip = gizmo::arrow_tip(&view, centre, 0) + origin;
+        let c = view.project(centre) + origin;
+        // X arrow: the whole subtool moves along X, nothing else.
+        drag(&mut app, c + (tip - c) * 0.8, c + (tip - c) * 1.3);
+        let d = app.doc.mesh().positions[0] - before[0];
+        assert!(d.x > 0.05 && d.y.abs() < 1e-4 && d.z.abs() < 1e-4, "{d:?}");
+        assert!(app.doc.mesh().positions.iter().zip(&before).all(|(p, q)| (*p - *q - d).length() < 1e-4));
+        app.history_jump(-1);
+        assert!(same(&app));
+        // Y ring: turns about Y through the centre.
+        let view = app.view();
+        let ring = gizmo::ring(&view, centre, Some(1), gizmo::RING);
+        let at = ring.iter().copied().find(|&p| gizmo::hit(&view, centre, p) == Some(gizmo::Handle::Rotate(1))).unwrap() + origin;
+        drag(&mut app, at, at + Vec2::new(40.0, 0.0));
+        let ys: Vec<f32> = app.doc.mesh().positions.iter().map(|p| p.y).collect();
+        assert!(ys.iter().zip(&before).all(|(y, q)| (y - q.y).abs() < 1e-4), "Y stays");
+        assert_ne!(app.doc.mesh().positions, before);
+        app.history_jump(-1);
+        // A press away from every handle leaves the model alone.
+        let undone = app.doc.mesh().positions.clone();
+        drag(&mut app, c + Vec2::new(400.0, 300.0), c + Vec2::new(450.0, 320.0));
+        assert_eq!(app.doc.mesh().positions, undone);
+        assert!(same(&app));
+    }
+
+    #[test]
+    fn layers_record_scale_hide_delete_bake_and_undo() {
+        let mut app = app();
+        assert!(app.doc.divide());
+        app.show_active_level();
+        let c = app.project(Vec3::ZERO);
+        let sculpt = |app: &mut App, kind: BrushKind| {
+            app.workspace.select_brush(&mut app.brush, kind);
+            app.brush.radius = 0.3;
+            app.brush.strength = 1.0;
+            stroke(app, c, &[c + Vec2::new(40.0, 0.0), c - Vec2::new(40.0, 0.0)]);
+        };
+        let start = app.doc.mesh().positions.clone();
+        let near = |a: &[Vec3], b: &[Vec3]| a.iter().zip(b).all(|(p, q)| p.distance(*q) < 1e-4);
+        // A new layer records what is sculpted.
+        app.layer_op(LayerOp::New);
+        assert!(app.doc.layers.rec.is_some());
+        sculpt(&mut app, BrushKind::Inflate);
+        let with_layer = app.doc.mesh().positions.clone();
+        assert!(!near(&with_layer, &start));
+        // Recording keeps the level; Divide waits for a bake.
+        app.set_level(0);
+        assert_eq!(app.doc.active(), 1);
+        app.divide();
+        assert_eq!(app.doc.count(), 2);
+        // Intensity 0 takes it out, 0.5 halfway, then back to 1 as one undo step.
+        app.layer_op(LayerOp::Intensity(0, 0.0));
+        assert!(near(&app.doc.mesh().positions, &start));
+        app.layer_op(LayerOp::Intensity(0, 1.0));
+        app.layer_op(LayerOp::IntensityDone(0, 1.0));
+        assert!(near(&app.doc.mesh().positions, &with_layer));
+        // Stop recording; a stroke now is not in the layer.
+        app.layer_op(LayerOp::Rec(0));
+        assert!(app.doc.layers.rec.is_none());
+        sculpt(&mut app, BrushKind::Draw);
+        let both = app.doc.mesh().positions.clone();
+        // Hide: only the layer's part goes.
+        app.layer_op(LayerOp::Eye(0));
+        let hidden = app.doc.mesh().positions.clone();
+        assert!(!near(&hidden, &both) && !near(&hidden, &start));
+        app.layer_op(LayerOp::Eye(0));
+        assert!(near(&app.doc.mesh().positions, &both));
+        // Delete takes it out; undo brings it back.
+        app.layer_op(LayerOp::Delete(0));
+        assert!(near(&app.doc.mesh().positions, &hidden) && app.doc.layers.list.is_empty());
+        app.history_jump(-1);
+        assert!(near(&app.doc.mesh().positions, &both) && app.doc.layers.list.len() == 1);
+        // Bake keeps the shape and removes the layer; undo, then hiding still works.
+        app.layer_op(LayerOp::Bake(0));
+        assert!(near(&app.doc.mesh().positions, &both) && app.doc.layers.list.is_empty());
+        app.history_jump(-1);
+        app.layer_op(LayerOp::Eye(0));
+        assert!(near(&app.doc.mesh().positions, &hidden));
+        app.layer_op(LayerOp::Eye(0));
+        // Parking the subtool keeps its layers.
+        app.append_primitive();
+        app.select_subtool(0);
+        assert_eq!(app.doc.layers.list.len(), 1);
+        assert!(near(&app.doc.mesh().positions, &both));
+        // Edit › History names the steps.
+        assert!(app.history.names().0.iter().any(|n| n == "New layer"));
     }
 
     #[test]
