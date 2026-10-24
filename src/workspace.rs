@@ -451,6 +451,10 @@ pub struct Model<'a> {
     pub project_path: &'a mut String,
     /// File for SubTool › Save / Load (and Export OBJ, as `.obj`).
     pub subtool_path: &'a mut String,
+    /// Document › Import: OBJ path.
+    pub import_path: &'a mut String,
+    /// Mesh › Morph Target: the level (0-based) of the active subtool's stored target.
+    pub morph_level: Option<usize>,
     /// Polygroups and hidden triangles at the shown level of the active subtool.
     pub groups: usize,
     pub hidden: usize,
@@ -504,6 +508,11 @@ pub struct Actions {
     pub toggle_subtool: Option<usize>,
     pub append: bool,
     pub duplicate: bool,
+    /// SubTool › Merge Down, Split Hidden, Groups Split, Extract.
+    pub merge_down: bool,
+    pub split_hidden: bool,
+    pub groups_split: bool,
+    pub extract: bool,
     pub delete: bool,
     /// Move the active subtool up (-1) or down (+1) in the list.
     pub move_subtool: i32,
@@ -523,6 +532,10 @@ pub struct Actions {
     pub save_subtool: bool,
     pub load_subtools: bool,
     pub export_subtool: bool,
+    /// Document › Import OBJ.
+    pub import_obj: bool,
+    /// Mesh › Morph Target: StoreMT, DelMT, Switch.
+    pub morph: Option<crate::MorphOp>,
     /// Polygroups: one new group of the visible polygons (Ctrl + W).
     pub group_visible: bool,
     /// Visibility: show everything / swap hidden and visible.
@@ -634,11 +647,20 @@ pub struct Workspace {
     /// Brushes in Curve mode (ZBrush: Stroke › Curve), how much a curve is smoothed
     /// (times the brush's screen radius) and the dab step along it (times Draw Size).
     pub curve_kinds: Vec<BrushKind>,
+    /// Brushes set to DragRect (true) or DragDot (false) (ZBrush: Stroke › DragRect,
+    /// DragDot).
+    pub drag_kinds: Vec<(BrushKind, bool)>,
     pub curve_smooth: f32,
     pub curve_step: f32,
     /// Stroke › Spacing (share of Draw Size between dabs), LazyMouse and LazyRadius
     /// (pixels the brush trails the cursor by).
     pub spacing: f32,
+    /// View › Camera: perspective angle of view, degrees (vertical).
+    pub fov: f32,
+    /// Document › Import: centre and scale the import to a new primitive's size.
+    pub import_fit: bool,
+    /// SubTool › Extract thickness, % of the subtool's size.
+    pub extract_thick: f32,
     /// Masking › Mask By Cavity sensitivity (1..=100) and Mask By Polygroups border width
     /// (rings).
     pub cavity_sensitivity: f32,
@@ -734,9 +756,13 @@ impl Workspace {
             radial_axis: crate::symmetry::Axis::Y,
             radial_count: 8.0,
             curve_kinds: crate::curve::CURVE_BY_DEFAULT.to_vec(),
+            drag_kinds: Vec::new(),
             curve_smooth: 0.5,
             curve_step: 0.16,
             spacing: crate::sculpt::SPACING,
+            fov: 45.0,
+            import_fit: true,
+            extract_thick: 2.0,
             cavity_sensitivity: 50.0,
             normals_angle: 20.0,
             group_border_width: 2.0,
@@ -1362,16 +1388,14 @@ impl Workspace {
                         let resp = thumb(ui, Thumb::Texture(tex), m.brush.kind.name(), true, false);
                         if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
                         let kind = m.brush.kind;
-                        let curve = (self.curve_kinds.contains(&kind) && crate::curve::capable(kind)) || crate::curve::always(kind);
-                        let resp = thumb(ui, Thumb::Glyph("stroke"), if curve { "Curve" } else { "Freehand" }, false, false);
-                        if crate::curve::always(kind) {
-                            resp.on_hover_text(format!("{} always strokes along a curve", kind.name()));
-                        } else if crate::curve::capable(kind) {
-                            if resp.on_hover_text("Click: Freehand / Curve for this brush").clicked() {
-                                self.set_curve_mode(kind, !curve);
-                            }
-                        } else {
-                            resp.on_hover_text(format!("{} strokes freehand only", kind.name()));
+                        let mode = self.stroke_mode(kind);
+                        let modes = Self::stroke_modes(kind);
+                        let resp = thumb(ui, Thumb::Glyph("stroke"), mode, false, false);
+                        if modes.len() < 2 {
+                            resp.on_hover_text(format!("{} strokes {} only", kind.name(), mode));
+                        } else if resp.on_hover_text(format!("Click for the next stroke: {}", modes.join(" / "))).clicked() {
+                            let at = modes.iter().position(|m| *m == mode).unwrap_or(0);
+                            self.set_stroke_mode(kind, modes[(at + 1) % modes.len()]);
                         }
                         self.asset_shelf(ui,false);
                         self.asset_shelf(ui,true);
@@ -2153,11 +2177,25 @@ impl Workspace {
                     id,
                     "import",
                     "Import",
-                    Some(NC),
+                    None,
                     false,
-                    false,
-                    &mut |_, ui| {
-                        full_button(ui, "Import OBJ…");
+                    true,
+                    &mut |ws, ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(m.import_path)
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::monospace(12.0)),
+                        );
+                        if ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Import OBJ"))
+                            .on_hover_text("Add the OBJ at this path as a new subtool")
+                            .clicked()
+                        {
+                            a.import_obj = true;
+                        }
+                        ui.checkbox(&mut ws.import_fit, "Fit")
+                            .on_hover_text("Centre it and scale it to a new primitive's size, so Draw Size suits it");
+                        note(ui, "OBJ groups become polygroups, vertex colours polypaint.");
                     },
                 );
             }
@@ -2367,6 +2405,40 @@ impl Workspace {
                         if clicked[5] {
                             ws.solo = !ws.solo;
                         }
+                        // Split, merge and extract (ZBrush: SubTool › Split, Merge, Extract).
+                        let mut clicked = [false; 3];
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                        let w = (r.width() - 6.0) / 3.0;
+                        for (col, (label, on, hint)) in [
+                            ("Merge Down", active + 1 < count, "Join the subtool below into this one · not undoable"),
+                            ("Split Hidden", m.hidden > 0, "The hidden polygons become their own subtool · not undoable"),
+                            ("Groups Split", m.groups > 1, "Each polygroup becomes its own subtool · not undoable"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                            child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                            if !on {
+                                child.disable();
+                            }
+                            clicked[col] = child.put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(hint).clicked();
+                        }
+                        a.merge_down |= clicked[0];
+                        a.split_hidden |= clicked[1];
+                        a.groups_split |= clicked[2];
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.38;
+                            if ui
+                                .add_sized([w, 20.0], egui::Button::new("Extract"))
+                                .on_hover_text("The masked surface becomes a new subtool, a shell Thick thick")
+                                .clicked()
+                            {
+                                a.extract = true;
+                            }
+                            zslider(ui, "Thick %", &mut ws.extract_thick, 0.2..=20.0, true, false, 1);
+                        });
                         // Single subtools to and from files (ZBrush: Tool › Export, Append).
                         ui.add_space(2.0);
                         ui.add(
@@ -2426,7 +2498,43 @@ impl Workspace {
                                 a.deform = Some((kind, v));
                             }
                         }
-                        note(ui, "Drag and release: applies to every level of the active subtool");
+                        note(ui, "Drag and release · Offset and Size move every level; the others reshape the shown level (masks hold, one undo step) · Twist and Taper about Y");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "morph",
+                    "Morph Target",
+                    None,
+                    false,
+                    true,
+                    &mut |_, ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                        let w = (r.width() - 6.0) / 3.0;
+                        for (col, (label, on, hint, op)) in [
+                            ("StoreMT", true, "Keep the shown level's shape as the Morph Target", crate::MorphOp::Store),
+                            ("Switch", m.morph_level.is_some(), "Swap the shape and the Morph Target", crate::MorphOp::Switch),
+                            ("DelMT", m.morph_level.is_some(), "Forget the Morph Target", crate::MorphOp::Delete),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                            child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                            if !on {
+                                child.disable();
+                            }
+                            if child.put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(hint).clicked() {
+                                a.morph = Some(op);
+                            }
+                        }
+                        match m.morph_level {
+                            Some(l) => kv(ui, "Stored at level", &(l + 1).to_string()),
+                            None => note(ui, "Store a target, sculpt, then brush back to it with the Morph brush or Switch."),
+                        }
                     },
                 );
                 self.sec(ui, h, id, "info", "Mesh", None, true, true, &mut |_, ui| {
@@ -2892,15 +3000,19 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         let kind = m.brush.kind;
-                        if crate::curve::always(kind) {
-                            note(ui, &format!("{} always strokes along a curve", kind.name()));
-                        } else if crate::curve::capable(kind) {
-                            let on = ws.curve_kinds.contains(&kind);
-                            if let Some(i) = seg(ui, &["Freehand", "Curve"], on as usize, false) {
-                                ws.set_curve_mode(kind, i == 1);
+                        let modes = Self::stroke_modes(kind);
+                        if modes.len() > 1 {
+                            let at = modes.iter().position(|x| *x == ws.stroke_mode(kind)).unwrap_or(0);
+                            if let Some(i) = seg(ui, &modes, at, false) {
+                                ws.set_stroke_mode(kind, modes[i]);
                             }
                         } else {
-                            note(ui, &format!("{} strokes freehand only", kind.name()));
+                            note(ui, &format!("{} strokes {} only", kind.name(), modes[0]));
+                        }
+                        match ws.stroke_mode(kind) {
+                            "DragRect" => note(ui, "Press where the stamp goes, drag to size and turn it"),
+                            "DragDot" => note(ui, "Press and drag to slide one stamp; it sets on release"),
+                            _ => {}
                         }
                         zslider(ui, "Curve smooth", &mut ws.curve_smooth, 0.0..=2.0, false, false, 2);
                         zslider(ui, "Curve step", &mut ws.curve_step, 0.16..=1.0, false, false, 2);
@@ -3000,9 +3112,8 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         ui.checkbox(&mut ws.perspective, "Perspective");
-                        ui.add_enabled_ui(false, |ui| {
-                            let mut fov = 45.0;
-                            zslider(ui, "Field of view", &mut fov, 20.0..=90.0, false, false, 0);
+                        ui.add_enabled_ui(ws.perspective, |ui| {
+                            zslider(ui, "Angle of view", &mut ws.fov, 10.0..=120.0, false, false, 0);
                         });
                         if ui
                             .add_sized(
@@ -3215,8 +3326,46 @@ impl Workspace {
     /// Turn Curve mode on or off for one brush (Stroke › Curve).
     pub fn set_curve_mode(&mut self, kind: BrushKind, on: bool) {
         self.curve_kinds.retain(|&k| k != kind);
+        self.drag_kinds.retain(|&(k, _)| k != kind);
         if on {
             self.curve_kinds.push(kind);
+        }
+    }
+
+    /// The stroke `kind` uses: "Freehand", "Curve", "DragRect" or "DragDot".
+    pub fn stroke_mode(&self, kind: BrushKind) -> &'static str {
+        if crate::curve::always(kind) || (crate::curve::capable(kind) && self.curve_kinds.contains(&kind)) {
+            return "Curve";
+        }
+        match self.drag_kinds.iter().find(|(k, _)| *k == kind) {
+            Some((_, true)) if kind.stamps() => "DragRect",
+            Some((_, false)) if kind.stamps() => "DragDot",
+            _ => "Freehand",
+        }
+    }
+
+    /// The strokes `kind` can use, in the order the stroke thumbnail cycles them.
+    pub fn stroke_modes(kind: BrushKind) -> Vec<&'static str> {
+        if crate::curve::always(kind) {
+            return vec!["Curve"];
+        }
+        let mut modes = vec!["Freehand"];
+        if crate::curve::capable(kind) {
+            modes.push("Curve");
+        }
+        if kind.stamps() {
+            modes.extend(["DragRect", "DragDot"]);
+        }
+        modes
+    }
+
+    /// Set the stroke `kind` uses (one of [`Workspace::stroke_modes`]).
+    pub fn set_stroke_mode(&mut self, kind: BrushKind, mode: &str) {
+        self.set_curve_mode(kind, mode == "Curve");
+        match mode {
+            "DragRect" => self.drag_kinds.push((kind, true)),
+            "DragDot" => self.drag_kinds.push((kind, false)),
+            _ => {}
         }
     }
 
@@ -4555,6 +4704,8 @@ mod tests {
                         stand_in_bytes: 0,
                         project_path: &mut String::from("untitled.klay"),
                         subtool_path: &mut String::from("subtool.klay"),
+                        import_path: &mut String::from("model.obj"),
+                        morph_level: None,
                         groups: 1,
                         hidden: 0,
                         polyframe_supported: true,

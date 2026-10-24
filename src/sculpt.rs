@@ -59,10 +59,11 @@ pub enum BrushKind {
     MalletFast,
     SmoothValleys,
     SmoothPeaks,
+    Morph,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 46] = [
+    pub const ALL: [BrushKind; 47] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -89,7 +90,7 @@ impl BrushKind {
         Self::Stitch, Self::Rake, Self::CurveTube,
         Self::ClayTubes, Self::HPolish, Self::TrimAdaptive, Self::Planar, Self::TrimSmoothBorder,
         Self::MoveTopological, Self::InflateBalloon, Self::Magnify, Self::OrbCracks,
-        Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks,
+        Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks, Self::Morph,
     ];
 
     pub fn name(self) -> &'static str {
@@ -127,6 +128,7 @@ impl BrushKind {
             Self::InflateBalloon => "Inflate Balloon", Self::Magnify => "Magnify",
             Self::OrbCracks => "Orb Cracks", Self::MalletFast => "MalletFast",
             Self::SmoothValleys => "SmoothValleys", Self::SmoothPeaks => "SmoothPeaks",
+            Self::Morph => "Morph",
         }
     }
 
@@ -146,6 +148,7 @@ impl BrushKind {
             Self::InflateBalloon|Self::OrbCracks=>"Standard",
             Self::Magnify=>"Pinch",
             Self::SmoothValleys|Self::SmoothPeaks=>"Smooth",
+            Self::Morph=>"Morph",
         }
     }
 
@@ -159,6 +162,10 @@ impl BrushKind {
     pub fn is_detail(self) -> bool { matches!(self,Self::Zipper|Self::Stitch|Self::Rake) }
     /// Adds geometry along a curve instead of moving the surface (ZBrush: curve insert brushes).
     pub fn is_insert(self) -> bool { matches!(self,Self::CurveTube) }
+    /// Strokes as one stamp you size and turn (DragRect) or slide (DragDot): the dab brushes.
+    pub fn stamps(self) -> bool {
+        !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_mask() && self != Self::ClipLine
+    }
 
     pub fn description(self) -> &'static str {
         match self {
@@ -201,6 +208,7 @@ impl BrushKind {
             Self::MalletFast=>"Hammer a flat-bottomed, square dent. Alt raises a flat plateau.",
             Self::SmoothValleys=>"Smooth only recessed areas; ridges stay sharp.",
             Self::SmoothPeaks=>"Smooth only raised areas; grooves stay sharp.",
+            Self::Morph=>"Brush the surface back to the stored Morph Target (Mesh › Morph Target › StoreMT).",
         }
     }
 }
@@ -519,6 +527,12 @@ pub struct Stroke {
     view: Vec3,
     /// Least distance between dabs, as a share of the radius (Stroke › Spacing).
     spacing: f32,
+    /// The Morph Target the Morph brush brushes towards: a position per vertex of the
+    /// level being sculpted.
+    morph: Option<std::sync::Arc<Vec<Vec3>>>,
+    /// DragRect: the direction the stamp's alpha is turned to (its "up" in the surface),
+    /// in the brush's own frame; `None` for the surface's own frame.
+    stamp_axis: Option<Vec3>,
 }
 
 /// Default Stroke › Spacing: a dab every 0.15 radius.
@@ -600,7 +614,55 @@ impl Stroke {
             paint_snapshotted: HashSet::new(),
             view: -Vec3::Z,
             spacing: SPACING,
+            morph: None,
+            stamp_axis: None,
         }
+    }
+
+    /// The stamp frame (across, along) at `normal`: turned to `stamp_axis` when set.
+    fn frame(&self, normal: Vec3) -> (Vec3, Vec3) {
+        match self.stamp_axis {
+            Some(a) => {
+                let n = normal.normalize_or(Vec3::Z);
+                let v = (a - n * a.dot(n)).normalize_or(tangent(n).1);
+                (v.cross(n), v)
+            }
+            None => tangent(normal),
+        }
+    }
+
+    /// DragRect / DragDot: make the stroke's single stamp again, from the surface (and
+    /// paint) as it was before the stroke, at `hit`, turned to `axis` when given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restamp(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, normal: Vec3, view_dir: Vec3, ray: (Vec3, Vec3), axis: Option<Vec3>) {
+        let chunks: Vec<u32> = self.snapshots.iter().map(|(c, _)| *c).collect();
+        for (c, orig) in &self.snapshots {
+            let start = mesh.chunks[*c as usize].vert_start as usize;
+            mesh.positions[start..start + orig.len()].copy_from_slice(orig);
+        }
+        if !chunks.is_empty() {
+            mesh.finish_edit(&chunks);
+        }
+        for (c, orig) in &self.paint_snapshots {
+            let (a, b) = mesh.chunks[*c as usize].range();
+            if mesh.colors.len() >= b {
+                mesh.colors[a..b].copy_from_slice(orig);
+                mesh.chunks[*c as usize].dirty_color = true;
+            }
+        }
+        self.last_dab = None;
+        self.layer_normal = None;
+        self.plane = None;
+        self.direction = axis;
+        self.stamp_axis = axis;
+        self.dabs = 0;
+        self.dab(mesh, brush, hit, normal, view_dir, ray);
+    }
+
+    /// The Morph Target for the Morph brush (positions of the level being sculpted).
+    pub fn with_morph(mut self, target: Option<std::sync::Arc<Vec<Vec3>>>) -> Self {
+        self.morph = target;
+        self
     }
 
     pub fn with_spacing(mut self, spacing: f32) -> Self {
@@ -650,7 +712,7 @@ impl Stroke {
     fn stamp_weight(&self,images:&Images,k:usize,p:Vec3,hit:Vec3,normal:Vec3,r:f32)->f32 {
         if self.assets.alpha==Pattern::Off && self.assets.texture==Pattern::Off {return 1.0;}
         let p=images.unmap(k,p);
-        let (u,v)=tangent(normal);
+        let (u,v)=self.frame(normal);
         let delta=p-hit;
         let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*r)+glam::Vec2::splat(0.5);
         let a=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
@@ -666,7 +728,7 @@ impl Stroke {
         if !brush.paint||brush.rgb_intensity<=0.0{return;}
         let fresh:Vec<_>=sel.chunks().into_iter().filter(|c|self.paint_snapshotted.insert(*c)).collect();
         self.paint_snapshots.extend(crate::paint::snapshot(mesh,&fresh));
-        let (u,v)=tangent(normal);let base=Vec3::from_array(brush.color.map(|x|x as f32/255.0));
+        let (u,v)=self.frame(normal);let base=Vec3::from_array(brush.color.map(|x|x as f32/255.0));
         let values=sel.par_map(|i,vert| {
             let p=images.unmap(copy.unwrap_or_else(||sel.image(i)),mesh.positions[vert as usize]);
             let delta=p-hit;
@@ -900,6 +962,16 @@ impl Stroke {
                         (nb.iter().map(|&n| mesh.positions[n as usize]).sum::<Vec3>() / nb.len() as f32 - p) * (0.25 * brush.strength * w[i])
                     };
                     p + relax + mesh.normal_at(v) * (amount * w[i].sqrt())
+                });
+            }
+            BrushKind::Morph => {
+                // Back toward the stored shape, as far as the weight says. Without a target
+                // (or one for another topology) nothing moves.
+                let target = self.morph.as_deref().filter(|t| t.len() == mesh.vertex_count());
+                let k = (brush.strength * 0.6).min(1.0);
+                sel.par_map_into(new, |i, v| {
+                    let p = mesh.positions[v as usize];
+                    target.map_or(p, |t| p.lerp(t[v as usize], (k * w[i]).min(1.0)))
                 });
             }
             BrushKind::Smooth | BrushKind::SmoothValleys | BrushKind::SmoothPeaks => {

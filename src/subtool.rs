@@ -48,10 +48,20 @@ pub enum Deform {
     OffsetY,
     OffsetZ,
     Size,
+    Smooth,
+    Polish,
+    Inflate,
+    Spherize,
+    Noise,
+    Twist,
+    Taper,
 }
 
 impl Deform {
-    pub const ALL: [Self; 4] = [Self::OffsetX, Self::OffsetY, Self::OffsetZ, Self::Size];
+    pub const ALL: [Self; 11] = [
+        Self::OffsetX, Self::OffsetY, Self::OffsetZ, Self::Size, Self::Smooth, Self::Polish,
+        Self::Inflate, Self::Spherize, Self::Noise, Self::Twist, Self::Taper,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -59,7 +69,20 @@ impl Deform {
             Self::OffsetY => "Offset Y",
             Self::OffsetZ => "Offset Z",
             Self::Size => "Size",
+            Self::Smooth => "Smooth",
+            Self::Polish => "Polish",
+            Self::Inflate => "Inflate",
+            Self::Spherize => "Spherize",
+            Self::Noise => "Noise",
+            Self::Twist => "Twist",
+            Self::Taper => "Taper",
         }
+    }
+
+    /// Offset and Size map every level exactly (`deform_map`); the others reshape the shown
+    /// level (`deform::shaped`).
+    pub fn is_map(self) -> bool {
+        matches!(self, Self::OffsetX | Self::OffsetY | Self::OffsetZ | Self::Size)
     }
 }
 
@@ -76,6 +99,7 @@ pub fn deform_map(kind: Deform, value: f32, bounds: Aabb) -> Affine {
         Deform::OffsetY => Affine::translation(Vec3::Y * step),
         Deform::OffsetZ => Affine::translation(Vec3::Z * step),
         Deform::Size => Affine::scaling(center, (value / 100.0).exp2()),
+        _ => Affine::IDENTITY,
     }
 }
 

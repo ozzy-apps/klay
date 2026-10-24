@@ -1166,6 +1166,27 @@ mod tests {
         assert_eq!(app.brush.strength, 0.4);
     }
 
+    #[test]
+    fn the_pointer_hides_while_the_brush_is_on_the_model() {
+        let mut app = app("pointer");
+        let over_canvas = vec![egui::Event::PointerMoved(pos2(800.0, 500.0))];
+        frame(&mut app, over_canvas.clone());
+        app.canvas_rect = app.workspace.canvas;
+        app.cursor = glam::Vec2::new(800.0, 500.0);
+        // Brush ring on the model: no system pointer (ZBrush).
+        app.hover = Some(glam::Vec3::Z);
+        let out = frame(&mut app, over_canvas.clone());
+        assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::None);
+        // Off the model, or in Move mode, the pointer shows.
+        app.hover = None;
+        let out = frame(&mut app, over_canvas.clone());
+        assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::None);
+        app.hover = Some(glam::Vec3::Z);
+        app.workspace.mode = Mode::Move;
+        let out = frame(&mut app, over_canvas);
+        assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::None);
+    }
+
     fn app(name: &str) -> crate::App {
         let mut app = crate::App::new(8, false, 200_000);
         let root = std::env::temp_dir().join(format!("klay-020-ui-{}-{name}", std::process::id()));

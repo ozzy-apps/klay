@@ -1,4 +1,4 @@
-# Klay 0.10.0
+# Klay 0.11.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -172,12 +172,37 @@ bar sliders. Long label/value rows wrap inside narrow trays.
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The 46 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
+The 47 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X / Y / Z and
 radial symmetry, Auto Masking, LazyMouse and Spacing, Transpose, Curve strokes and live
-statistics are connected to the engine. Zcut, OBJ import, parts of the Transform palette and
-reserved Local/Transp/Ghost toggles remain marked **Not connected**.
+statistics are connected to the engine. Zcut, parts of the Transform palette and reserved
+Local/Transp/Ghost toggles remain marked **Not connected**.
+
+### ZBrush tools added in 0.11
+
+- **Pointer**: over the model the brush is the cursor, as in ZBrush: the system pointer hides
+  while the brush ring is on the model or a stroke is under way (a small dot marks the
+  brush centre), and shows over the interface, the empty canvas and the border.
+- **Document › Import**: an OBJ as a new subtool (polygons of any size, `o` / `g` names as
+  polygroups, vertex colours as polypaint). **Fit** centres and scales it to a new
+  primitive's size, so Draw Size suits it.
+- **Mesh › Deformation**: besides Offset and Size, **Smooth, Polish** (keeps the volume),
+  **Inflate, Spherize, Noise, Twist** and **Taper** (about Y). Drag and release; they reshape
+  the shown level as one undo step and masks hold.
+- **Mesh › Morph Target**: **StoreMT** keeps the shown level's shape, **Switch** swaps it
+  with the current one (undoable), **DelMT** forgets it. The **Morph** brush brushes the
+  surface back to it. Kept per subtool for the session.
+- **Mesh › SubTool**: **Merge Down** joins the subtool below into this one (both keep their
+  polygroups), **Split Hidden** and **Groups Split** make subtools of the hidden polygons or
+  of each polygroup, **Extract** turns the masked surface into a new closed shell subtool,
+  **Thick** (% of the subtool's size) thick. Split and Merge need subtools without
+  subdivision levels and are not undoable (like Delete).
+- **Stroke › DragRect / DragDot** for every dab brush: DragRect places one stamp where you
+  press and sizes and turns it as you drag (alphas turn with it); DragDot slides one stamp of
+  the current Draw Size until you release. The left shelf stroke thumbnail cycles Freehand /
+  Curve / DragRect / DragDot.
+- **View › Camera › Angle of view** (perspective).
 
 ### Canvas and Document
 
@@ -226,7 +251,7 @@ large hover preview. The docked Brush palette
 uses a compact working set: one larger current-brush preview, two recent picks and twelve
 small paired brush cells. **Sculpt / Mask** tabs switch the working set and restore the last
 brush from that set. Layer, FormSoft, Zipper and Clip Line are directly available in Sculpt.
-**All Brushes (46)** opens the full library; selecting any brush
+**All Brushes (47)** opens the full library; selecting any brush
 puts it in the active preview and recent picks. This keeps the panel compact as the library
 grows. Previews are original 160 px sculpted clay studies in the
 current material, including the brush's subtract variant where applicable.

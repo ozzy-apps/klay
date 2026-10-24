@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0 — 2026-10-24
+
+- The system pointer hides over the model while the brush ring is shown or a stroke is under way, as in ZBrush; a dot marks the brush centre. It shows over the interface, empty canvas, border and while drawing shape gestures.
+- Document › Import OBJ as a new subtool (any polygons, groups as polygroups, vertex colours as polypaint, Fit to size).
+- Mesh › Deformation: Smooth, Polish, Inflate, Spherize, Noise, Twist and Taper, undoable, masks respected.
+- Mesh › Morph Target (StoreMT, Switch, DelMT) and the Morph brush (catalog: 47 tools).
+- Mesh › SubTool: Merge Down, Split Hidden, Groups Split and Extract (with Thick).
+- Stroke: DragRect and DragDot for every dab brush; the stroke thumbnail cycles the modes.
+- View › Camera › Angle of view.
+- Verification: 212 release tests (new: every deformation shape, masks and undo across levels; OBJ parsing, Klay export round trip and import as a subtool; Morph brush and Switch through the input path; merge, split, extract and their refusals; closed outward extract shells; DragRect sizing from the pre-stroke surface and DragDot sliding; the pointer rule); every native self-test passes on the GPU.
+
 ## 0.10.0 — 2026-10-24
 
 - Canvas border: models are drawn only inside the document frame, as in ZBrush; the border around it is always empty canvas, so there is somewhere to rotate, move and zoom however far you zoom in.

@@ -11,6 +11,9 @@ mod symmetry;
 mod detail_brush;
 mod curve;
 mod curve_tube;
+mod deform;
+mod obj;
+mod subtool_ops;
 mod native_tests;
 mod mesh;
 mod multires;
@@ -201,6 +204,16 @@ enum DocOp {
     SaveSubtool,
     LoadSubtools,
     ExportSubtool,
+    /// Document › Import: the OBJ at `App::import_path` as a new subtool.
+    ImportObj,
+}
+
+/// Mesh › Morph Target operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MorphOp {
+    Store,
+    Switch,
+    Delete,
 }
 
 /// Polygroup and visibility operations queued by the interface or a shortcut.
@@ -236,6 +249,11 @@ enum SubToolOp {
     Duplicate,
     Delete,
     Deform(Deform, f32),
+    /// SubTool › Merge Down, Split Hidden, Groups Split, Extract.
+    MergeDown,
+    SplitHidden,
+    GroupsSplit,
+    Extract,
 }
 
 /// A left press with Ctrl that has not yet become a drag: on the model a drag paints the
@@ -384,6 +402,10 @@ struct App {
     project_path: String,
     /// SubTool › Save / Load / Export OBJ: a file holding single subtools.
     subtool_path: String,
+    /// Document › Import: OBJ file to import.
+    import_path: String,
+    /// Mesh › Morph Target per subtool id: the level it was stored at and its positions.
+    morph_targets: std::collections::HashMap<u64, (usize, std::sync::Arc<Vec<Vec3>>)>,
     /// `--open PATH`: project to open once the window exists.
     open_on_start: Option<String>,
     pending_doc: Option<DocOp>,
@@ -475,6 +497,9 @@ struct App {
     /// Screen point (window pixels) the stroke has reached, and the LazyMouse brush point.
     stroke_from: Vec2,
     lazy_point: Option<Vec2>,
+    /// DragRect (true) / DragDot (false) stroke in progress: the press point (window
+    /// pixels) and the surface under it.
+    drag_stamp: Option<(bool, Vec2, Option<(Vec3, Vec3)>)>,
     last_dab_count: usize,
     demo: bool,
     /// `--demo-brushes`: stroke with the advanced brushes at start.
@@ -534,6 +559,8 @@ impl App {
             snapshot_to: None,
             project_path: "untitled.klay".to_string(),
             subtool_path: "subtool.klay".to_string(),
+            import_path: "model.obj".to_string(),
+            morph_targets: std::collections::HashMap::new(),
             open_on_start: None,
             pending_doc: None,
             doc: Multires::new(mesh, budget),
@@ -594,6 +621,7 @@ impl App {
             stroke_pending: false,
             stroke_from: Vec2::ZERO,
             lazy_point: None,
+            drag_stamp: None,
             last_dab_count: 0,
             demo,
             demo_brushes: false,
@@ -780,6 +808,129 @@ impl App {
         self.workspace.notify(format!("Duplicated as {name}"));
     }
 
+    /// Whether the active subtool has no subdivision levels, as SubTool › Split and Merge
+    /// need (it says so when it has).
+    fn without_levels(&mut self, what: &str) -> bool {
+        if self.doc.count() > 1 {
+            self.workspace.notify(format!("{what} needs a subtool without subdivision levels · Geometry: Del Higher / Del Lower"));
+            return false;
+        }
+        true
+    }
+
+    /// The active subtool becomes `mesh` (a new topology: undo history and its Morph Target
+    /// go).
+    fn replace_active_mesh(&mut self, mesh: SculptMesh) {
+        let budget = self.doc.budget;
+        self.doc = Multires::new(mesh, budget);
+        self.history = History::new(32);
+        let tool = &mut self.subtools[self.active_tool];
+        self.morph_targets.remove(&tool.id);
+        tool.bounds = self.doc.bounds();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+    }
+
+    /// SubTool › Merge Down: the subtool below joins the active one, which keeps its name;
+    /// both keep their polygroups. Not undoable.
+    fn merge_down(&mut self) {
+        if self.busy() || !self.without_levels("Merge Down") {
+            return;
+        }
+        let below = self.active_tool + 1;
+        let Some(parked) = self.subtools.get(below).and_then(|t| t.parked.as_ref()) else {
+            self.workspace.notify("Merge Down: there is no subtool below this one");
+            return;
+        };
+        let other = parked.packed.clone().unpack();
+        if other.count() > 1 {
+            self.workspace.notify(format!("Merge Down: {} has subdivision levels · Del Higher / Del Lower first", self.subtools[below].name));
+            return;
+        }
+        let mesh = subtool_ops::merged(self.doc.mesh(), other.mesh());
+        let removed = self.subtools.remove(below);
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.drop_stand_in(removed.id);
+        }
+        self.morph_targets.remove(&removed.id);
+        self.replace_active_mesh(mesh);
+        self.workspace.notify(format!("Merged {} into {}", removed.name, self.subtools[self.active_tool].name));
+    }
+
+    /// Put `meshes` (name, mesh) in as parked subtools right after the active one.
+    fn insert_after_active(&mut self, meshes: Vec<(String, SculptMesh)>) {
+        let budget = self.doc.budget;
+        for (k, (name, mesh)) in meshes.into_iter().enumerate() {
+            let tool = self.parked_subtool(name, true, Multires::new(mesh, budget));
+            self.subtools.insert(self.active_tool + 1 + k, tool);
+        }
+    }
+
+    /// SubTool › Split Hidden: the hidden polygons become a subtool of their own. Not undoable.
+    fn split_hidden(&mut self) {
+        if self.busy() || !self.without_levels("Split Hidden") {
+            return;
+        }
+        let mesh = self.doc.mesh();
+        if mesh.hidden.is_empty() {
+            self.workspace.notify("Split Hidden: nothing is hidden");
+            return;
+        }
+        let (Some(shown), Some(hidden)) = (subtool_ops::part(mesh, |t| mesh.visible(t)), subtool_ops::part(mesh, |t| !mesh.visible(t))) else {
+            self.workspace.notify("Split Hidden: everything is hidden");
+            return;
+        };
+        let name = format!("{} hidden", self.subtools[self.active_tool].name);
+        self.replace_active_mesh(shown);
+        self.insert_after_active(vec![(name.clone(), hidden)]);
+        self.workspace.notify(format!("Split the hidden polygons into {name}"));
+    }
+
+    /// SubTool › Groups Split: each polygroup becomes a subtool; the first stays active. Not
+    /// undoable.
+    fn groups_split(&mut self) {
+        if self.busy() || !self.without_levels("Groups Split") {
+            return;
+        }
+        let mesh = self.doc.mesh();
+        let mut ids: Vec<u16> = (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() < 2 {
+            self.workspace.notify("Groups Split: this subtool is one polygroup");
+            return;
+        }
+        let base = self.subtools[self.active_tool].name.clone();
+        let mut parts: Vec<(String, SculptMesh)> = ids
+            .iter()
+            .filter_map(|&g| subtool_ops::part(mesh, |t| mesh.group(t) == g).map(|m| (format!("{base} {g}"), m)))
+            .collect();
+        let first = parts.remove(0).1;
+        let count = parts.len() + 1;
+        self.replace_active_mesh(first);
+        self.insert_after_active(parts);
+        self.workspace.notify(format!("Split into {count} subtools, one per polygroup"));
+    }
+
+    /// SubTool › Extract: the masked surface of the shown level as a new shell subtool,
+    /// Thick (a share of the subtool's size) thick.
+    fn extract(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let b = self.doc.bounds();
+        let thickness = (b.max - b.min).max_element() * self.workspace.extract_thick / 100.0;
+        let Some(shell) = subtool_ops::extracted(self.doc.mesh(), thickness) else {
+            self.workspace.notify("Extract: mask the part to extract first (Ctrl + drag)");
+            return;
+        };
+        let name = format!("{} extract", self.subtools[self.active_tool].name);
+        self.insert_after_active(vec![(name.clone(), shell)]);
+        self.workspace.notify(format!("Extracted {name}"));
+    }
+
     /// Delete the active subtool and activate the one below it, or above it when it was
     /// the last (ZBrush: Delete). Not undoable.
     fn delete_subtool(&mut self) {
@@ -824,6 +975,25 @@ impl App {
     /// Offset or size the active subtool, undoably (ZBrush: Tool > Deformation).
     fn deform(&mut self, kind: Deform, value: f32) {
         if self.busy() || value.abs() < 0.5 {
+            return;
+        }
+        if !kind.is_map() {
+            // Reshape the shown level as one stroke (other levels follow, undo as usual).
+            let Some(new) = deform::shaped(self.doc.mesh(), kind, value) else {
+                self.workspace.notify(format!("{}: nothing to move", kind.label()));
+                return;
+            };
+            let level = self.doc.active();
+            let mesh = self.doc.mesh_mut();
+            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+            let mut stroke = Stroke::begin(false, false, false);
+            stroke.snapshot_now(mesh, &all);
+            mesh.positions.copy_from_slice(&new);
+            mesh.finish_edit(&all);
+            self.commit_stroke(stroke, level);
+            self.subtools[self.active_tool].bounds = self.doc.bounds();
+            self.update_hover();
+            self.workspace.notify(format!("{} {:+.0} applied", kind.label(), value));
             return;
         }
         self.apply_transform(subtool::deform_map(kind, value, self.doc.bounds()));
@@ -1286,6 +1456,94 @@ impl App {
                 stand_in_vertices,
             })),
         }
+    }
+
+    /// The active subtool's Morph Target when it fits the shown level (stored there, same
+    /// vertex count): what the Morph brush brushes toward.
+    fn morph_target(&self) -> Option<std::sync::Arc<Vec<Vec3>>> {
+        let (level, t) = self.morph_targets.get(&self.subtools[self.active_tool].id)?;
+        (*level == self.doc.active() && t.len() == self.doc.mesh().vertex_count()).then(|| t.clone())
+    }
+
+    /// Mesh › Morph Target › StoreMT: keep the shown level's shape (ZBrush: StoreMT).
+    fn store_morph_target(&mut self) {
+        let id = self.subtools[self.active_tool].id;
+        let level = self.doc.active();
+        self.morph_targets.insert(id, (level, std::sync::Arc::new(self.doc.mesh().positions.clone())));
+        self.workspace.notify(format!("Morph Target stored at level {}", level + 1));
+    }
+
+    /// Mesh › Morph Target › Switch: swap the shape and the stored Morph Target, undoably.
+    fn switch_morph_target(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(target) = self.morph_target() else {
+            self.workspace.notify("No Morph Target for this level · StoreMT first");
+            return;
+        };
+        let id = self.subtools[self.active_tool].id;
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+        let mut stroke = Stroke::begin(false, false, false);
+        stroke.snapshot_now(mesh, &all);
+        let now = std::mem::replace(&mut mesh.positions, (*target).clone());
+        mesh.finish_edit(&all);
+        self.morph_targets.insert(id, (level, std::sync::Arc::new(now)));
+        self.commit_stroke(stroke, level);
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.update_hover();
+        self.workspace.notify("Switched with the Morph Target");
+    }
+
+    /// Import the OBJ at `path` as a new subtool after the others and make it active
+    /// (Document › Import; ZBrush: Tool › Import into a new SubTool). With Fit on it is
+    /// centred and scaled to the size of a new primitive, so Draw Size suits it.
+    fn import_obj(&mut self, path: &str) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let parsed = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|text| obj::parse(&text));
+        let mut m = match parsed {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = format!("Import failed: {e}");
+                self.workspace.notify(self.status.clone());
+                return;
+            }
+        };
+        let scale = self.workspace.import_fit.then(|| obj::fit(&mut m.positions, 2.0));
+        let (verts, tris) = (m.positions.len(), m.indices.len() / 3);
+        let mesh = std::panic::catch_unwind(|| SculptMesh::from_raw_painted(m.positions, m.indices, m.groups, m.colors));
+        let Ok(mesh) = mesh else {
+            self.status = format!("Import failed: {path} is not a mesh Klay can sculpt");
+            self.workspace.notify(self.status.clone());
+            return;
+        };
+        let budget = self.doc.budget;
+        self.park_active();
+        self.doc = Multires::new(mesh, budget);
+        let id = self.new_tool_id();
+        let name = Path::new(path).file_stem().map_or_else(|| format!("Import {id}"), |s| s.to_string_lossy().to_string());
+        self.subtools.push(SubTool { id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.active_tool = self.subtools.len() - 1;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.frame_camera();
+        self.status = format!(
+            "Imported {name}: {} vertices, {} triangles{}{} in {:.1} s",
+            fmt_count(verts),
+            fmt_count(tris),
+            scale.map_or(String::new(), |s| format!(", scaled ×{s:.3} to fit")),
+            if m.skipped > 0 { format!(", {} bad faces left out", m.skipped) } else { String::new() },
+            t.elapsed().as_secs_f32()
+        );
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
     }
 
     /// The active subtool at its shown level as an OBJ, next to `subtool_path` with an
@@ -3276,11 +3534,28 @@ impl App {
         self.stroke = Some(
             Stroke::begin(invert, gpu, symmetry)
                 .with_assets(self.workspace.assets.clone())
-                .with_spacing(self.workspace.spacing),
+                .with_spacing(self.workspace.spacing)
+                .with_morph(self.morph_target()),
         );
+        if self.stroke_brush.kind == BrushKind::Morph && self.morph_target().is_none() {
+            self.workspace.notify("Morph brush: no Morph Target for this level · Mesh › Morph Target › StoreMT");
+        }
         self.stroke_from = self.cursor;
         // LazyMouse trails sculpt and paint brushes; drag brushes follow the cursor.
         self.lazy_point = (self.workspace.lazy_mouse && !self.stroke_brush.kind.is_drag()).then_some(self.cursor);
+        // DragRect / DragDot (Stroke): one stamp, placed and sized (or slid) by the drag.
+        let kind = self.brush.kind;
+        self.drag_stamp = match self.workspace.stroke_mode(kind) {
+            "DragRect" | "DragDot" if self.stroke_brush.kind == kind => {
+                let (o, d) = self.cursor_ray();
+                let under = self.doc.mesh().raycast(o, d).map(|h| (h.point, h.normal));
+                Some((self.workspace.stroke_mode(kind) == "DragRect", self.cursor, under))
+            }
+            _ => None,
+        };
+        if self.drag_stamp.is_some() {
+            self.lazy_point = None;
+        }
         self.apply_stroke();
     }
 
@@ -3315,6 +3590,32 @@ impl App {
         let Some(stroke) = self.stroke.as_mut() else {
             return;
         };
+        if let Some((rect, anchor, under)) = self.drag_stamp {
+            let mut brush = brush;
+            let (stamp, axis, ray) = if rect {
+                // DragRect: centred on the press, as wide as the drag, turned along it.
+                let Some((hit, normal)) = under else { return };
+                let drag = self.cursor - anchor;
+                if drag.length() < 2.0 {
+                    return;
+                }
+                brush.radius = drag.length() * self.camera.pixel_size_at(hit, self.viewport().y);
+                let axis = (self.camera.right() * drag.x - self.camera.up() * drag.y).normalize_or(Vec3::Y);
+                ((hit, normal), Some(axis), self.ray_at(anchor))
+            } else {
+                // DragDot: the stamp follows the pointer.
+                let ray = self.cursor_ray();
+                let Some(h) = self.doc.mesh().raycast(ray.0, ray.1) else { return };
+                ((h.point, h.normal), None, ray)
+            };
+            self.stroke_brush.radius = brush.radius;
+            self.hover = Some(stamp.0);
+            if let Some(stroke) = self.stroke.as_mut() {
+                stroke.restamp(self.doc.mesh_mut(), &brush, stamp.0, stamp.1, fwd, ray, axis);
+            }
+            self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
+            return;
+        }
         if stroke.grabbing() {
             stroke.dab(
                 self.doc.mesh_mut(),
@@ -3369,6 +3670,7 @@ impl App {
         }
         self.lazy_point = None;
         self.workspace.lazy_line = None;
+        self.drag_stamp = None;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.end_gpu_grab();
         }
@@ -3520,7 +3822,7 @@ impl App {
             return;
         }
         let (symmetry, assets) = (self.workspace.sym(), self.workspace.assets.clone());
-        let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone());
+        let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone()).with_morph(self.morph_target());
         let (fwd, step) = (self.camera.forward(), d.brush.radius * self.workspace.curve_step);
         apply_curve(&mut stroke, self.doc.mesh_mut(), &d.brush, &curve, fwd, step);
         let base = stroke.position_snapshots().iter().cloned().collect();
@@ -3751,7 +4053,7 @@ impl App {
             return false;
         }
         let reach = (total * 0.35).max(c.brush.radius * 2.0);
-        let stroke = Stroke::begin(c.invert, false, c.symmetry).with_assets(c.assets.clone());
+        let stroke = Stroke::begin(c.invert, false, c.symmetry).with_assets(c.assets.clone()).with_morph(self.morph_target());
         let grab = along[i];
         let press = self.cursor;
         let pieces = c.curve.pieces.clone();
@@ -4452,6 +4754,15 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        // ZBrush: over the model the brush is the cursor. The system pointer hides while the
+        // brush ring is drawn there or a stroke is under way; over the interface, the empty
+        // canvas and its border it shows, so navigating stays visible.
+        // Shape gestures (mask shapes, Clip Line) keep the pointer: it marks their corners.
+        let sculpting = self.stroke.is_some() || self.mask_stroke.is_some() || self.curve_draw.is_some();
+        let ring = self.hover.is_some() && self.workspace.mode == Mode::Draw && !self.in_canvas_border() && self.gesture.is_none() && !self.brush.kind.is_shape();
+        if (sculpting || ring) && !ui.ctx().is_pointer_over_egui() && !self.workspace.modal_open() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        }
         let levels = self.doc.vertex_counts();
         let (vertices, triangles, chunks) = {
             let m = self.mesh();
@@ -4540,6 +4851,8 @@ impl App {
                 stand_in_bytes,
                 project_path: &mut self.project_path,
                 subtool_path: &mut self.subtool_path,
+                import_path: &mut self.import_path,
+                morph_level: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, _)| *l),
                 groups,
                 hidden,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
@@ -4580,6 +4893,20 @@ impl App {
         if actions.export_subtool {
             self.pending_doc = Some(DocOp::ExportSubtool);
         }
+        if actions.import_obj {
+            self.pending_doc = Some(DocOp::ImportObj);
+        }
+        match actions.morph {
+            Some(MorphOp::Store) => self.store_morph_target(),
+            Some(MorphOp::Delete) => {
+                let id = self.subtools[self.active_tool].id;
+                if self.morph_targets.remove(&id).is_some() {
+                    self.workspace.notify("Morph Target deleted");
+                }
+            }
+            Some(MorphOp::Switch) => self.switch_morph_target(),
+            None => {}
+        }
         if let Some(i) = actions.select_subtool {
             self.pending_subtool = Some(SubToolOp::Select(i));
         }
@@ -4591,6 +4918,16 @@ impl App {
         }
         if actions.duplicate {
             self.pending_subtool = Some(SubToolOp::Duplicate);
+        }
+        for (on, op) in [
+            (actions.merge_down, SubToolOp::MergeDown),
+            (actions.split_hidden, SubToolOp::SplitHidden),
+            (actions.groups_split, SubToolOp::GroupsSplit),
+            (actions.extract, SubToolOp::Extract),
+        ] {
+            if on {
+                self.pending_subtool = Some(op);
+            }
         }
         if actions.delete {
             self.pending_subtool = Some(SubToolOp::Delete);
@@ -4733,6 +5070,10 @@ impl App {
             Some(DocOp::SaveSubtool) => self.save_subtool(),
             Some(DocOp::LoadSubtools) => self.load_subtools(),
             Some(DocOp::ExportSubtool) => self.export_subtool_obj(),
+            Some(DocOp::ImportObj) => {
+                let path = self.import_path.clone();
+                self.import_obj(&path);
+            }
             None => {}
         }
         match self.pending_subtool.take() {
@@ -4741,6 +5082,10 @@ impl App {
             Some(SubToolOp::Duplicate) => self.duplicate_subtool(),
             Some(SubToolOp::Delete) => self.delete_subtool(),
             Some(SubToolOp::Deform(kind, value)) => self.deform(kind, value),
+            Some(SubToolOp::MergeDown) => self.merge_down(),
+            Some(SubToolOp::SplitHidden) => self.split_hidden(),
+            Some(SubToolOp::GroupsSplit) => self.groups_split(),
+            Some(SubToolOp::Extract) => self.extract(),
             None => {}
         }
         if self.pending_export {
@@ -4941,6 +5286,7 @@ impl App {
         let vp = self.viewport();
         self.camera.aspect = vp.x / vp.y;
         self.camera.ortho = !self.workspace.perspective;
+        self.camera.fov_y = self.workspace.fov.clamp(10.0, 120.0).to_radians();
         let brush_pos = self.hover.unwrap_or(Vec3::ZERO);
         let show_brush = self.hover.is_some()
             && !ctx.is_pointer_over_egui()
@@ -5895,6 +6241,90 @@ mod subtool_tests {
         assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), app.doc.mesh().vertex_count());
         assert_eq!(obj.lines().filter(|l| l.starts_with("o ")).count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exported_obj_imports_as_a_new_active_subtool() {
+        let dir = std::env::temp_dir().join(format!("klay-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(12, false, usize::MAX);
+        app.primitive.kind = Primitive::Cube;
+        app.append_primitive();
+        let (verts, groups) = (app.doc.mesh().vertex_count(), app.doc.mesh().group_count());
+        app.subtool_path = dir.join("cube.klay").to_string_lossy().into_owned();
+        app.export_subtool_obj();
+        app.import_path = dir.join("cube.obj").to_string_lossy().into_owned();
+        app.import_obj(&app.import_path.clone());
+        assert_eq!(app.subtools.len(), 3);
+        assert_eq!(app.active_tool, 2);
+        assert_eq!(app.subtools[2].name, "cube");
+        assert_eq!(app.doc.mesh().vertex_count(), verts);
+        assert_eq!(app.doc.mesh().group_count(), groups);
+        // Fitted: the largest extent is 2.
+        let b = app.doc.bounds();
+        assert!(((b.max - b.min).max_element() - 2.0).abs() < 1e-4);
+        // A missing file adds nothing.
+        app.import_obj("/nonexistent/x.obj");
+        assert_eq!(app.subtools.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subtools_merge_split_and_extract() {
+        let mut app = App::new(12, false, usize::MAX);
+        app.primitive.kind = Primitive::Cube;
+        app.append_primitive();
+        app.select_subtool(0);
+        let (a, b) = (app.doc.mesh().triangle_count(), {
+            let p = app.subtools[1].parked.as_ref().unwrap().packed.clone().unpack();
+            p.mesh().triangle_count()
+        });
+        // Merge Down: one subtool with both meshes, the cube's six groups after the sphere's.
+        app.merge_down();
+        assert_eq!(app.subtools.len(), 1);
+        assert_eq!(app.doc.mesh().triangle_count(), a + b);
+        assert_eq!(app.doc.mesh().group_count(), 7);
+        // Groups Split: seven subtools again, the first one active.
+        app.groups_split();
+        assert_eq!(app.subtools.len(), 7);
+        assert_eq!(app.active_tool, 0);
+        assert_eq!(app.doc.mesh().triangle_count(), a);
+        // Split Hidden: hide half the sphere, split it off.
+        let mesh = app.doc.mesh();
+        let hidden: Vec<u8> = (0..mesh.triangle_count()).map(|t| (t % 2) as u8).collect();
+        let n = mesh.triangle_count();
+        app.doc.set_hidden(0, hidden);
+        app.split_hidden();
+        assert_eq!(app.subtools.len(), 8);
+        assert_eq!(app.doc.mesh().triangle_count(), n / 2);
+        assert!(app.doc.mesh().hidden.is_empty());
+        // Extract: nothing masked does nothing; a mask makes a shell subtool.
+        app.extract();
+        assert_eq!(app.subtools.len(), 8);
+        app.mask_op(MaskOp::All);
+        app.extract();
+        assert_eq!(app.subtools.len(), 9);
+        assert!(app.subtools[1].name.ends_with("extract"));
+        // Subdivided subtools are refused.
+        assert!(app.doc.divide());
+        app.groups_split();
+        assert_eq!(app.subtools.len(), 9);
+    }
+
+    #[test]
+    fn shape_deformations_reshape_the_shown_level_and_undo() {
+        let mut app = App::new(12, false, usize::MAX);
+        assert!(app.doc.divide());
+        let before = app.doc.mesh().positions.clone();
+        app.deform(Deform::Inflate, 60.0);
+        let after = app.doc.mesh().positions.clone();
+        let grew = after.iter().map(|p| p.length()).sum::<f32>() > before.iter().map(|p| p.length()).sum::<f32>();
+        assert!(grew, "Inflate grows the sphere");
+        // One undo step, exact.
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().positions, before);
+        app.history.redo(&mut app.doc);
+        assert!(app.doc.mesh().positions.iter().zip(&after).all(|(a, b)| a.distance(*b) < 1e-6));
     }
 
     #[test]
@@ -7158,6 +7588,83 @@ mod stroke_modifier_tests {
         app.workspace.spacing = 0.6;
         let sparse = stroke(&mut app, a, &[b]);
         assert!(sparse * 3 < dabs, "{sparse} vs {dabs}");
+    }
+
+    #[test]
+    fn the_morph_brush_brings_back_the_stored_shape_and_switch_swaps_it() {
+        let mut app = app();
+        app.brush.radius = 0.3;
+        let c = app.project(Vec3::ZERO);
+        let original = app.doc.mesh().positions.clone();
+        // Without a target the Morph brush moves nothing.
+        app.workspace.select_brush(&mut app.brush, BrushKind::Morph);
+        stroke(&mut app, c, &[c + Vec2::new(20.0, 0.0)]);
+        assert_eq!(app.doc.mesh().positions, original);
+        // Store, sculpt, then brush back.
+        app.store_morph_target();
+        app.workspace.select_brush(&mut app.brush, BrushKind::Inflate);
+        app.brush.strength = 1.0;
+        for _ in 0..3 {
+            stroke(&mut app, c, &[c + Vec2::new(30.0, 0.0), c - Vec2::new(30.0, 0.0)]);
+        }
+        let off = |app: &App| app.doc.mesh().positions.iter().zip(&original).map(|(a, b)| a.distance(*b)).sum::<f32>();
+        let sculpted = off(&app);
+        assert!(sculpted > 0.1);
+        let shaped = app.doc.mesh().positions.clone();
+        app.workspace.select_brush(&mut app.brush, BrushKind::Morph);
+        app.brush.strength = 1.0;
+        for _ in 0..4 {
+            stroke(&mut app, c, &[c + Vec2::new(30.0, 0.0), c - Vec2::new(30.0, 0.0)]);
+        }
+        assert!(off(&app) < sculpted * 0.3, "{} of {sculpted} left", off(&app));
+        // Switch: the stored shape comes back exactly, the sculpt becomes the target; undo.
+        app.history.undo(&mut app.doc);
+        let before_switch = app.doc.mesh().positions.clone();
+        app.switch_morph_target();
+        assert_eq!(app.doc.mesh().positions, original);
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().positions, before_switch);
+        assert_ne!(shaped, original);
+    }
+
+    #[test]
+    fn drag_rect_sizes_one_stamp_and_drag_dot_slides_it() {
+        let mut app = app();
+        app.brush.strength = 1.0;
+        app.workspace.set_stroke_mode(BrushKind::Draw, "DragRect");
+        assert_eq!(app.workspace.stroke_mode(BrushKind::Draw), "DragRect");
+        let c = app.project(Vec3::ZERO);
+        let original = app.doc.mesh().positions.clone();
+        let raised_at = |app: &App, p: Vec2| {
+            let (o, d) = app.ray_at(p);
+            let hit = app.doc.mesh().raycast(o, d).unwrap().point;
+            let v = (0..original.len()).min_by(|&a, &b| original[a].distance(hit).total_cmp(&original[b].distance(hit))).unwrap();
+            app.doc.mesh().positions[v].distance(original[v])
+        };
+        // Press, drag wide: the stamp reaches 60 px out; drag back in: only the middle stays.
+        app.cursor_moved(c, false);
+        app.left_press(false, false);
+        assert_eq!(app.doc.mesh().positions, original, "no stamp before the drag");
+        app.cursor_moved(c + Vec2::new(120.0, 0.0), false);
+        assert!(raised_at(&app, c + Vec2::new(0.0, 60.0)) > 1e-3);
+        app.cursor_moved(c + Vec2::new(30.0, 0.0), false);
+        assert!(raised_at(&app, c + Vec2::new(0.0, 60.0)) < 1e-6, "made again smaller, from the surface before");
+        assert!(raised_at(&app, c) > 1e-4);
+        app.left_release();
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.doc.mesh().positions, original, "one undo step");
+        // DragDot: the stamp slides with the pointer and sets where it is released.
+        app.workspace.set_stroke_mode(BrushKind::Draw, "DragDot");
+        app.brush.radius = 0.15;
+        app.cursor_moved(c, false);
+        app.left_press(false, false);
+        assert!(raised_at(&app, c) > 1e-4);
+        app.cursor_moved(c + Vec2::new(150.0, 40.0), false);
+        app.left_release();
+        assert!(raised_at(&app, c) < 1e-6 && raised_at(&app, c + Vec2::new(150.0, 40.0)) > 1e-4);
+        // Shelf and Stroke palette offer every mode a dab brush has.
+        assert_eq!(workspace::Workspace::stroke_modes(BrushKind::Draw), vec!["Freehand", "Curve", "DragRect", "DragDot"]);
+        assert_eq!(workspace::Workspace::stroke_modes(BrushKind::Grab), vec!["Freehand"]);
     }
 
     #[test]

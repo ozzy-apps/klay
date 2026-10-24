@@ -210,8 +210,11 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
         let px = u.params.z;
         let ring = smoothstep(px * 1.5, 0.0, abs(d - r));
         let inside = 1.0 - smoothstep(r * 0.95, r, d);
+        // A small dot at the brush centre stands in for the hidden pointer.
+        let dot = 1.0 - smoothstep(px * 1.2, px * 2.2, distance(in.world_pos, u.brush.xyz));
         color = mix(color, vec3<f32>(0.95, 0.25, 0.15), ring * 0.9);
         color = mix(color, vec3<f32>(0.95, 0.45, 0.25), inside * 0.12);
+        color = mix(color, vec3<f32>(1.0, 0.85, 0.75), dot * 0.9);
     }
 
     // Swapchain is non-sRGB, so encode gamma here.

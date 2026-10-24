@@ -133,6 +133,12 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                 -(dent(p - Vec2::new(-0.18, -0.12), 0.17) + dent(p - Vec2::new(0.2, 0.16), 0.13)) * 0.05 * sign
             }
             // Noise with its valleys (or its peaks) smoothed away inside the stroke.
+            // A swirl of detail with a band brushed back to the plain sphere.
+            Some(BrushKind::Morph) => {
+                let detail = (p.x * 26.0 + (p.y * 9.0).sin() * 2.0).sin() * 0.018;
+                let back = soft(d, 0.16);
+                detail * (1.0 - back)
+            }
             Some(k @ (BrushKind::SmoothValleys | BrushKind::SmoothPeaks)) => {
                 // Egg crate: inside the stroke only the bumps (or only the pits) are left.
                 let n = (p.x * 20.0).sin() * (p.y * 20.0).sin() * 0.022;
