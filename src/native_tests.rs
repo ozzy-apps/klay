@@ -302,3 +302,201 @@ impl App {
         false
     }
 }
+
+/// State of `--selftest-document`.
+#[derive(Default)]
+pub(super) struct DocumentTest {
+    frame: u32,
+    ok: bool,
+    probes: Vec<(Vec2, [f32; 3])>,
+    snapshot: Option<std::path::PathBuf>,
+}
+
+impl App {
+    /// `--selftest-document`: Document › Back (gradient) and Border drawn on the GPU match
+    /// `DocumentLook`; zoomed into the model, the border stays empty canvas; Snapshot writes
+    /// the canvas inside the frame as a PNG.
+    pub(super) fn selftest_document_frame(&mut self, t: &mut DocumentTest) -> bool {
+        let frame = t.frame;
+        t.frame += 1;
+        let check = |t: &mut DocumentTest, what: String, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-document: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let inset = crate::workspace::FRAME_INSET * self.scale;
+        let read = |app: &mut App, at: &[Vec2]| {
+            if let Some(g) = app.gfx.as_mut() {
+                g.capture = at.iter().map(|p| [p.x.round() as u32, p.y.round() as u32]).collect();
+            }
+        };
+        match frame {
+            18 => {
+                t.ok = true;
+                self.workspace.grid = false;
+                self.hover = None;
+                self.workspace.layout.document = crate::workspace::DocumentLook {
+                    back: [90, 60, 40],
+                    range: 1.0,
+                    center: 0.5,
+                    rate: 1.0,
+                    border: [10, 120, 200],
+                };
+            }
+            22 => {
+                // Off the model: a border pixel, and near the top and bottom of the frame.
+                let r = self.canvas_rect;
+                let (top, bottom) = (r.min.y + inset, r.max.y - inset);
+                // Above and below the model, clear of the view label in the top left corner.
+                let x = r.center().x;
+                let d = self.workspace.layout.document;
+                let back = |y: f32| d.back_at((y - top) / (bottom - top));
+                let border = d.border.map(|c| c as f32 / 255.0);
+                t.probes = vec![
+                    (Vec2::new(r.min.x + inset * 0.5, r.center().y), border),
+                    (Vec2::new(x, top + 6.0), back(top + 6.0)),
+                    (Vec2::new(x, bottom - 7.0), back(bottom - 7.0)),
+                ];
+                let at: Vec<Vec2> = t.probes.iter().map(|p| p.0).collect();
+                read(self, &at);
+            }
+            23 => {
+                let px = self.gfx.as_mut().map(|g| std::mem::take(&mut g.captured)).unwrap_or_default();
+                if px.len() != t.probes.len() {
+                    log::warn!("selftest-document: this surface cannot be read back; skipped");
+                    return true;
+                }
+                let error = t
+                    .probes
+                    .iter()
+                    .zip(&px)
+                    .map(|((_, want), got)| (0..3).map(|k| (want[k] * 255.0 - got[k] as f32).abs()).fold(0.0, f32::max))
+                    .fold(0.0, f32::max);
+                check(t, format!("Border and the Back gradient match, max error {error:.1}/255"), error <= 2.0);
+                check(t, format!("gradient runs light to dark: top {:?}, bottom {:?}", px[1], px[2]), px[1][0] > px[2][0] + 60);
+                // Zoom right into the model so it covers the whole canvas.
+                self.camera.distance *= 0.45;
+            }
+            27 => {
+                let r = self.canvas_rect;
+                let border = Vec2::new(r.min.x + inset * 0.5, r.center().y);
+                let inside = Vec2::new(r.center().x, r.center().y);
+                t.probes = vec![(border, [0.0; 3]), (inside, [0.0; 3])];
+                read(self, &[border, inside]);
+            }
+            28 => {
+                let px = self.gfx.as_mut().map(|g| std::mem::take(&mut g.captured)).unwrap_or_default();
+                let want = self.workspace.layout.document.border;
+                check(t, format!("zoomed in, the border stays empty canvas: {:?}", px[0]), px[0][..3] == want);
+                let back = self.workspace.layout.document.back_at(0.5).map(|c| (c * 255.0).round() as u8);
+                check(t, format!("and the model fills the frame: {:?}", px[1]), px[1][..3] != want && px[1][..3] != back);
+                self.request_snapshot();
+            }
+            30 => {
+                let stem = std::path::Path::new(&self.project_path).file_stem().unwrap().to_string_lossy().to_string();
+                let dir = std::path::Path::new(&self.project_path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")).to_path_buf();
+                let path = dir.join(format!("{stem} snapshot.png"));
+                let size = image::image_dimensions(&path).ok();
+                let r = self.canvas_rect.shrink(inset);
+                let want = (r.width().round() as u32, r.height().round() as u32);
+                check(t, format!("Snapshot wrote {} at {size:?}", path.display()), size == Some(want));
+                t.snapshot = Some(path);
+            }
+            31 => {
+                if let Some(p) = t.snapshot.take() {
+                    let _ = std::fs::remove_file(p);
+                }
+                self.workspace.layout.document = crate::workspace::DocumentLook::default();
+                assert!(t.ok, "document self-test failed");
+                log::info!("selftest-document: all passed");
+                // --hold: stay open, zoomed in, to look at the empty border.
+                return !self.selftest_hold;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+/// State of `--selftest-symmetry`.
+#[derive(Default)]
+pub(super) struct SymmetryTest {
+    frame: u32,
+    index: usize,
+    original: Vec<Vec3>,
+    edited: Vec<Vec3>,
+}
+
+impl App {
+    /// `--selftest-symmetry`: Draw, Grab and Snake Hook (GPU) strokes through the canvas
+    /// with Y mirror and Radial Z 6 on: every copy moves, the GPU copy matches the CPU,
+    /// undo and redo are exact.
+    pub(super) fn selftest_symmetry_frame(&mut self, t: &mut SymmetryTest) -> bool {
+        let kinds = [BrushKind::Draw, BrushKind::Grab, BrushKind::SnakeHook, BrushKind::Inflate];
+        let Some(&kind) = kinds.get(t.index) else {
+            log::info!("selftest-symmetry: all passed");
+            return true;
+        };
+        let frame = t.frame;
+        t.frame += 1;
+        let sym = crate::symmetry::Symmetry { y: true, radial: Some((crate::symmetry::Axis::Z, 6)), ..Default::default() };
+        let start = Vec3::new(0.55, 0.2, 0.81).normalize();
+        let check_gpu = |app: &App| {
+            let gpu = app.gfx.as_ref().and_then(Gfx::read_positions).unwrap_or_default();
+            let error = gpu.iter().zip(&app.mesh().positions).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
+            assert!(gpu.len() == app.mesh().vertex_count() && error < 1e-5, "{kind:?} CPU/GPU error {error}");
+        };
+        match frame {
+            20 => {
+                self.workspace.symmetry = false;
+                self.workspace.symmetry_y = sym.y;
+                self.workspace.radial = true;
+                self.workspace.radial_axis = crate::symmetry::Axis::Z;
+                self.workspace.radial_count = 6.0;
+                assert_eq!(self.workspace.sym(), sym);
+                t.original = self.mesh().positions.clone();
+                self.workspace.select_brush(&mut self.brush, kind);
+                self.brush.radius = 0.2;
+                self.brush.strength = 0.8;
+                self.on_key(KeyCode::KeyQ);
+                let p = self.project(start);
+                self.cursor_moved(p, false);
+                self.left_press(false, false);
+            }
+            21..=27 => {
+                let p = self.project(start) + Vec2::new((frame - 20) as f32 * 6.0, -((frame - 20) as f32) * 3.0);
+                self.cursor_moved(p, false);
+            }
+            28 => self.left_release(),
+            34 => {
+                t.edited = self.mesh().positions.clone();
+                let images = sym.images();
+                let moved = |q: Vec3| {
+                    let v = (0..t.original.len()).min_by(|&a, &b| t.original[a].distance(q).total_cmp(&t.original[b].distance(q))).unwrap();
+                    t.edited[v].distance(t.original[v])
+                };
+                let least = (0..images.len()).map(|k| moved(images.map(k, start))).fold(f32::INFINITY, f32::min);
+                assert!(least > 1e-4, "{kind:?}: every one of the {} copies moves (least {least})", images.len());
+                check_gpu(self);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+            }
+            40 => {
+                assert!(self.mesh().positions == t.original, "{kind:?} undo");
+                check_gpu(self);
+                self.history.redo(&mut self.doc);
+                self.show_active_level();
+            }
+            46 => {
+                assert!(self.mesh().positions.iter().zip(&t.edited).all(|(a, b)| a.distance(*b) < 1e-6), "{kind:?} redo");
+                check_gpu(self);
+                self.history.undo(&mut self.doc);
+                self.show_active_level();
+                log::info!("selftest-symmetry: {} with Y and Radial Z 6 ({} copies): canvas, GPU, undo and redo (ok)", kind.name(), sym.images().len());
+                t.index += 1;
+                t.frame = 18;
+            }
+            _ => {}
+        }
+        false
+    }
+}

@@ -33,6 +33,14 @@ pub struct Uniforms {
     pub material: [f32; 4],
     /// Camera up vector, for the view-space normal a MatCap is looked up by.
     pub cam_up: [f32; 4],
+    /// Document › Back: colour (sRGB 0..1) and Range; Center, Rate and the border width in
+    /// pixels; Border colour. The model is drawn only inside the border (the document frame).
+    pub back: [f32; 4],
+    pub back_shape: [f32; 4],
+    pub border: [f32; 4],
+    /// Symmetry for the brush ring: mirror bits (X 1, Y 2, Z 4), radial axis (0 X, 1 Y,
+    /// 2 Z; -1 off) and radial count.
+    pub sym: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -56,8 +64,10 @@ const NORMAL_CAP: f32 = (1u32 << 24) as f32;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GrabParams {
-    delta: [f32; 3],
     count: u32,
+    _pad: [u32; 3],
+    /// The move of every symmetry image (xyz), image 0 the brush's own.
+    deltas: [[f32; 4]; crate::symmetry::MAX_IMAGES],
 }
 
 #[repr(C)]
@@ -74,9 +84,9 @@ struct GpuGrab {
     count: u32,
     /// Chunk flags for the normal pass while the grab is active.
     flags: Vec<u32>,
-    pending: Option<[f32; 3]>,
+    pending: Option<Vec<glam::Vec3>>,
     // Kept alive for the bind group.
-    _buffers: [wgpu::Buffer; 3],
+    _buffers: [wgpu::Buffer; 4],
 }
 
 /// GPU copy of one subdivision level, plus a four-byte paint buffer per vertex.
@@ -171,6 +181,10 @@ pub struct Gfx {
     /// their RGBA once it is drawn.
     pub capture: Vec<[u32; 2]>,
     pub captured: Vec<[u8; 4]>,
+    /// Document › Snapshot: a rectangle (x, y, width, height, physical pixels) of the next
+    /// frame to copy before the interface is drawn over it, and its RGBA once drawn.
+    pub snapshot: Option<[u32; 4]>,
+    pub snapshot_image: Option<(u32, u32, Vec<u8>)>,
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
@@ -730,6 +744,7 @@ impl Gfx {
                 storage(1, true),
                 storage(2, true),
                 storage(3, true),
+                storage(5, true),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -818,6 +833,8 @@ impl Gfx {
             queue,
             capture: Vec::new(),
             captured: Vec::new(),
+            snapshot: None,
+            snapshot_image: None,
             config,
             depth_view,
             pipeline,
@@ -1074,6 +1091,49 @@ impl Gfx {
             );
         }
         Some(buffer)
+    }
+
+    fn copy_snapshot(&mut self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> Option<(wgpu::Buffer, u32, u32)> {
+        let [x, y, w, h] = self.snapshot.take()?;
+        if !self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            return None;
+        }
+        let x = x.min(self.config.width - 1);
+        let y = y.min(self.config.height - 1);
+        let (w, h) = (w.clamp(1, self.config.width - x), h.clamp(1, self.config.height - y));
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("snapshot"),
+            size: row as u64 * h as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        Some((buffer, w, h))
+    }
+
+    fn read_snapshot(&mut self, buffer: &wgpu::Buffer, w: u32, h: u32) {
+        buffer.map_async(wgpu::MapMode::Read, .., |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        let row = ((w * 4).div_ceil(256) * 256) as usize;
+        if let Ok(view) = buffer.get_mapped_range(..) {
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for line in view.chunks(row).take(h as usize) {
+                for p in line[..w as usize * 4].chunks(4) {
+                    rgba.extend_from_slice(&if bgra { [p[2], p[1], p[0], 255] } else { [p[0], p[1], p[2], 255] });
+                }
+            }
+            self.snapshot_image = Some((w, h, rgba));
+        }
+        buffer.unmap();
     }
 
     fn read_capture(&mut self, buffer: &wgpu::Buffer) {
@@ -1592,6 +1652,12 @@ impl Gfx {
         let sel = init("grab sel", bytemuck::cast_slice(setup.verts));
         let orig = init("grab orig", bytemuck::cast_slice(setup.orig));
         let weights = init("grab weights", bytemuck::cast_slice(setup.weights));
+        // Symmetry image of each vertex, four to a word (all 0 without symmetry).
+        let mut packed = vec![0u32; setup.verts.len().div_ceil(4).max(1)];
+        for (i, &k) in setup.images.iter().enumerate() {
+            packed[i >> 2] |= (k as u32) << ((i & 3) * 8);
+        }
+        let images = init("grab images", bytemuck::cast_slice(&packed));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("grab bg"),
             layout: &self.grab_bgl,
@@ -1616,6 +1682,10 @@ impl Gfx {
                     binding: 4,
                     resource: self.grab_params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: images.as_entire_binding(),
+                },
             ],
         });
         self.grab = Some(GpuGrab {
@@ -1623,14 +1693,14 @@ impl Gfx {
             count: setup.verts.len() as u32,
             flags,
             pending: None,
-            _buffers: [sel, orig, weights],
+            _buffers: [sel, orig, weights, images],
         });
     }
 
-    /// Queue a grab delta for the next frame.
-    pub fn gpu_grab_delta(&mut self, delta: glam::Vec3) {
+    /// Queue the grab's move of every symmetry image for the next frame.
+    pub fn gpu_grab_delta(&mut self, deltas: Vec<glam::Vec3>) {
         if let Some(g) = self.grab.as_mut() {
-            g.pending = Some(delta.to_array());
+            g.pending = Some(deltas);
         }
     }
 
@@ -1901,15 +1971,12 @@ impl Gfx {
 
         // GPU grab: move the selected vertices.
         if let Some(g) = self.grab.as_mut() {
-            if let Some(delta) = g.pending.take() {
-                self.queue.write_buffer(
-                    &self.grab_params,
-                    0,
-                    bytemuck::bytes_of(&GrabParams {
-                        delta,
-                        count: g.count,
-                    }),
-                );
+            if let Some(deltas) = g.pending.take() {
+                let mut params = GrabParams { count: g.count, _pad: [0; 3], deltas: [[0.0; 4]; crate::symmetry::MAX_IMAGES] };
+                for (slot, d) in params.deltas.iter_mut().zip(&deltas) {
+                    *slot = d.extend(0.0).to_array();
+                }
+                self.queue.write_buffer(&self.grab_params, 0, bytemuck::bytes_of(&params));
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("grab"),
                     timestamp_writes: None,
@@ -1977,6 +2044,12 @@ impl Gfx {
             pass.set_pipeline(&self.background_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            // The border around the document frame stays empty canvas: models are clipped
+            // to the frame, as in ZBrush, so it is always free to navigate on.
+            let inset = uniforms.back_shape[2].max(0.0).min(width.min(height) * 0.5 - 1.0).max(0.0);
+            let (fx, fy) = ((x + inset).round(), (y + inset).round());
+            let (fw, fh) = ((width - 2.0 * inset).round().max(1.0), (height - 2.0 * inset).round().max(1.0));
+            pass.set_scissor_rect(fx as u32, fy as u32, fw as u32, fh as u32);
             if let Some(m) = self.active_buffers() {
                 match (&self.group_pipeline, &m.groups, polyframe) {
                     (Some(pipeline), Some(g), true) => {
@@ -2008,6 +2081,9 @@ impl Gfx {
                 }
             }
         }
+
+        // Document › Snapshot: the canvas as drawn, before the interface goes over it.
+        let snapshot = self.copy_snapshot(&mut encoder, &frame.texture);
 
         // egui pass.
         let screen = egui_wgpu::ScreenDescriptor {
@@ -2054,6 +2130,9 @@ impl Gfx {
         );
         if let Some(buffer) = capture {
             self.read_capture(&buffer);
+        }
+        if let Some((buffer, w, h)) = snapshot {
+            self.read_snapshot(&buffer, w, h);
         }
         self.queue.present(frame);
         for id in textures_delta.free.drain() {

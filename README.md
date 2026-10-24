@@ -1,4 +1,4 @@
-# Klay 0.9.0
+# Klay 0.10.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -32,6 +32,9 @@ cargo run --release -- --segments 400 --selftest-tube                # CurveTube
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
+cargo run --release -- --selftest-document                             # Back gradient and Border on the GPU, the empty border zoomed in, Snapshot (--hold keeps it open)
+cargo run --release -- --segments 100 --selftest-symmetry              # Draw, Grab, Snake Hook, Inflate with Y + Radial Z 6 through the canvas, GPU readback, undo/redo
+cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # start with symmetry (x, y, z, r<axis><count>), save the canvas after start-up and quit
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
 cargo run --release -- --version                                     # application version
@@ -171,10 +174,49 @@ bar sliders. Long label/value rows wrap inside narrow trays.
 
 The 46 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
-Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X
-symmetry, Transpose, Curve strokes and live statistics are connected to the engine. Zcut, stroke
-spacing and stabilizer, Y / Z / radial symmetry, parts of the Transform palette and reserved
-Local/Transp/Ghost toggles remain marked **Not connected**.
+Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X / Y / Z and
+radial symmetry, Auto Masking, LazyMouse and Spacing, Transpose, Curve strokes and live
+statistics are connected to the engine. Zcut, OBJ import, parts of the Transform palette and
+reserved Local/Transp/Ghost toggles remain marked **Not connected**.
+
+### Canvas and Document
+
+The document frame is drawn inside the canvas, and the margin around it (the border) is
+always empty canvas: models are drawn only inside the frame, as in ZBrush, so however far you
+zoom in there is always somewhere to click and drag to rotate, move and zoom.
+
+**Document** palette: **New / Open / Save** use the path field; **Save As** saves to a new
+path and keeps working there; **Revert** opens the project again as it was last saved (it
+asks first); **Snapshot** saves the canvas inside the frame, without the interface, as
+`<project> snapshot.png` next to the project. **Back**: the **Back** colour of the canvas
+with a vertical gradient (**Range**: how strong, **Center**: where it crosses the Back
+colour, **Rate**: how soft) and the **Border** colour; Reset returns Klay's defaults. The
+colours are kept with the workspace layout (Workspace › Reset leaves them alone).
+
+### Sculpting helpers
+
+- **Brush › Auto Masking**: **BackfaceMask** leaves surface turned away from you alone (the
+  far side of a thin part); **Topological** keeps a stroke to the surface joined to the point
+  under the brush (the next finger or the other lip stays still). Every sculpt, drag, detail
+  and paint brush, with symmetry too.
+- **Stroke › Modifiers**: **Spacing** (dabs per Draw Size along a stroke; ZBrush's LazyStep).
+  Strokes are now followed point by point between pointer events, so a fast stroke leaves no
+  gaps. **LazyMouse** (`L`) makes the brush trail the cursor on a string of **LazyRadius**
+  pixels, drawn on the canvas, for steady lines; drag brushes follow the cursor directly.
+- **Masking**: **Grow / Shrink** move the mask by one ring of polygons (never across hidden
+  ones); **Mask By Cavity** masks recessed surface, more where deeper (**Cavity**
+  sensitivity); **Mask By Polygroups** masks the borders between polygroups (**Border
+  width**; Invert to mask their insides instead).
+- **Mesh › Visibility**: **Grow / Shrink** show one more ring of polygons or hide the outer
+  ring. **Mesh › Polygroups**: **Auto Groups** gives each connected piece its own group;
+  **Group By Normals** starts a new group wherever the surface turns by more than **Max
+  Angle** from where the group began (flat faces of a hard surface, patches of a curved one).
+- **Symmetry**: **X**, **Y** and **Z** mirrors and **Radial** about X, Y or Z with a
+  **RadialCount**, in any combination (up to 64 copies; the palette shows how many). Every
+  copy of a brush makes its own whole dab, one after another, so where copies overlap (a big
+  brush, a stroke on a symmetry plane) both apply and the surface stays whole; drag brushes
+  add up every copy's move there. Masks, mask shapes, curve reliefs and CurveTube follow
+  every copy and the brush ring is drawn at each. Clip Line mirrors across X only.
 
 ### Brushes, alphas and textures
 
@@ -373,7 +415,8 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | `E`, drag the line's end circle | Scale about the start circle by the change in distance to it (start circle: about the end) |
 | `R`, drag the line's end circle | Rotate about the start circle around the view axis (start circle: about the end) |
 | Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line; the model stays |
-| `X` | Symmetry across X |
+| `X` | Symmetry across X (Y, Z and Radial: Symmetry palette) |
+| `L` | LazyMouse |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
 | Alt + click another subtool | Select it (Alt + drag on the active one still carves) |

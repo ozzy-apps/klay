@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.0 — 2026-10-24
+
+- Canvas border: models are drawn only inside the document frame, as in ZBrush; the border around it is always empty canvas, so there is somewhere to rotate, move and zoom however far you zoom in.
+- Document palette: Save As, Revert (asks first) and Snapshot (the canvas inside the frame as a PNG, without the interface); Back: background colour with ZBrush's vertical gradient (Range, Center, Rate) and the Border colour, kept with the workspace.
+- Brush › Auto Masking: BackfaceMask and Topological, for every sculpt, drag, detail and paint brush.
+- Stroke › Modifiers: Spacing, and LazyMouse (L) with LazyRadius and the lazy string drawn on the canvas. Strokes now follow the pointer point by point, so fast strokes leave no gaps.
+- Masking: Grow, Shrink, Mask By Cavity (sensitivity) and Mask By Polygroups (group borders, width).
+- Mesh › Visibility: Grow and Shrink. Mesh › Polygroups: Auto Groups (one per connected piece) and Group By Normals (Max Angle).
+- Symmetry: Y and Z mirrors and Radial about X, Y or Z with RadialCount, combined freely (up to 64 copies), for every brush (each copy dabs in full, so overlapping copies no longer tear the surface; drag brushes add up overlapping copies on the CPU and stay on the GPU otherwise), masks, mask shapes, curve reliefs, CurveTube and the brush ring. Clip Line stays X only.
+- New flags: --selftest-document, --selftest-symmetry, --symmetry, --snapshot.
+- Verification: 200 release tests (new: document look encode/decode and gradient, auto masking, spacing and LazyMouse through the input path, mask grow/shrink/cavity/group borders, visibility grow/shrink, auto groups, group by normals, every symmetry combination for brushes, GPU grab, masks and tubes, overlapping copies stay whole); every native self-test passes on the GPU.
+
 ## 0.9.0 — 2026-10-24
 
 - Wedge is now called **Remesh** everywhere you see it: the Mesh › Remesh section, its Remesh (on/off) and Update buttons, notices and status lines. `--selftest-remesh` and `--remesh-resolution` are the new flags (the old ones still work); project and layout files are unchanged.

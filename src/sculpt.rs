@@ -6,6 +6,7 @@ use crate::multires::{ChunkData, Level, Multires};
 use crate::mask::MaskData;
 use crate::transform::Affine;
 use crate::brush_asset::{Pattern, tangent};
+use crate::symmetry::{Images, Symmetry};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -467,6 +468,11 @@ struct GrabState {
     delta: Vec3,
     kind: BrushKind,
     radius: f32,
+    /// Vertices several symmetry copies reach: index into `overlaps` per selected vertex
+    /// (`u32::MAX`: one copy only, its image and weight), each list holding every copy's
+    /// image and weight. Empty when no vertex is shared. Such a grab runs on the CPU.
+    overlap_of: Vec<u32>,
+    overlaps: Vec<Vec<(u8, f32)>>,
 }
 
 /// Data the renderer needs to run a grab on the GPU.
@@ -474,6 +480,9 @@ pub struct GpuGrabSetup<'a> {
     pub verts: &'a [u32],
     pub orig: &'a [Vec3],
     pub weights: &'a [f32],
+    /// Symmetry image of each vertex (empty: all the brush's own); the delta of each image
+    /// comes with [`Stroke::take_gpu_delta`].
+    pub images: &'a [u8],
     pub chunks: &'a [u32],
 }
 
@@ -499,13 +508,21 @@ pub struct Stroke {
     weights: Vec<f32>,
     /// Grab runs on the GPU when the renderer is available.
     gpu_grab: bool,
-    pending_delta: Option<Vec3>,
-    /// Mirror every dab across the X = 0 plane.
-    symmetry: bool,
+    /// The grab's move for every symmetry image, waiting for the GPU.
+    pending_delta: Option<Vec<Vec3>>,
+    /// Every dab is applied at each of these images of it (symmetry).
+    images: Images,
     assets: StampSettings,
     paint_snapshots: crate::paint::Chunks,
     paint_snapshotted: HashSet<u32>,
+    /// Camera forward of the latest dab (Auto Masking's BackfaceMask).
+    view: Vec3,
+    /// Least distance between dabs, as a share of the radius (Stroke › Spacing).
+    spacing: f32,
 }
+
+/// Default Stroke › Spacing: a dab every 0.15 radius.
+pub const SPACING: f32 = 0.15;
 
 #[derive(Clone, Debug)]
 pub struct StampSettings {
@@ -513,36 +530,53 @@ pub struct StampSettings {
     pub texture: Pattern,
     pub texture_strength: f32,
     pub texture_scale: f32,
+    /// Brush › Auto Masking.
+    pub auto: AutoMask,
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,auto:AutoMask::default()}}
 }
 
-/// Mirror image across the X = 0 plane.
-fn mirror_x(v: Vec3) -> Vec3 {
-    Vec3::new(-v.x, v.y, v.z)
+/// Brush › Auto Masking (ZBrush): surface the stroke leaves alone without a mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AutoMask {
+    /// BackfaceMask: surface turned away from the viewer (the far side of a thin part).
+    pub backface: bool,
+    /// Topological: surface not joined to the point under the brush inside the brush
+    /// (a finger next to the one being sculpted, the other lip).
+    pub topological: bool,
 }
 
-/// Offset of a grabbed vertex: `ws` is the falloff weight, negative on the mirrored side
-/// (same encoding as grab.wgsl).
-fn grab_offset(delta: Vec3, ws: f32) -> Vec3 {
-    Vec3::new(delta.x * ws, delta.y * ws.abs(), delta.z * ws.abs())
+/// Every symmetry copy that moves grabbed vertex `i`, with its weight: one, or all of
+/// them where copies overlap (their moves add up, as in ZBrush).
+fn grab_copies(g: &GrabState, i: usize) -> impl Iterator<Item = (usize, f32)> + '_ {
+    let shared = g.overlap_of.get(i).copied().filter(|&o| o != u32::MAX);
+    let one = shared.is_none().then(|| (g.sel.image(i), g.weights[i]));
+    one.into_iter().chain(shared.into_iter().flat_map(move |o| g.overlaps[o as usize].iter().map(|&(k, w)| (k as usize, w))))
 }
 
-fn drag_offset(g: &GrabState, i: usize) -> Vec3 {
-    let offset = grab_offset(g.delta, g.weights[i]);
-    if g.kind != BrushKind::Elastic { return offset; }
-    let side = g.sel.side(i);
-    let anchor = if side < 0.0 { mirror_x(g.anchor) } else { g.anchor };
-    let relative = (g.orig[i] - anchor) / g.radius;
-    let direction = grab_offset(g.delta, side);
-    // Directional coupling gives broad surrounding clay a softer, lateral response.
-    offset + relative * (relative.dot(direction) * 0.35 * g.weights[i].abs())
+/// Offset of grabbed vertex `i`: each copy's image of the move times its weight (as
+/// grab.wgsl does for a vertex one copy reaches).
+fn grab_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
+    grab_copies(g, i).map(|(k, w)| images.map(k, g.delta) * w).sum()
+}
+
+fn drag_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
+    if g.kind != BrushKind::Elastic { return grab_offset(images, g, i); }
+    grab_copies(g, i)
+        .map(|(k, w)| {
+            let anchor = images.map(k, g.anchor);
+            let relative = (g.orig[i] - anchor) / g.radius;
+            let direction = images.map(k, g.delta);
+            // Directional coupling gives broad surrounding clay a softer, lateral response.
+            direction * w + relative * (relative.dot(direction) * 0.35 * w)
+        })
+        .sum()
 }
 
 impl Stroke {
-    pub fn begin(invert: bool, gpu_grab: bool, symmetry: bool) -> Self {
+    pub fn begin(invert: bool, gpu_grab: bool, symmetry: impl Into<Symmetry>) -> Self {
         Self {
             invert,
             snapshots: Vec::new(),
@@ -560,19 +594,62 @@ impl Stroke {
             weights: Vec::new(),
             gpu_grab,
             pending_delta: None,
-            symmetry,
+            images: symmetry.into().images(),
             assets: StampSettings::default(),
             paint_snapshots: Vec::new(),
             paint_snapshotted: HashSet::new(),
+            view: -Vec3::Z,
+            spacing: SPACING,
         }
+    }
+
+    pub fn with_spacing(mut self, spacing: f32) -> Self {
+        self.spacing = spacing.max(0.01);
+        self
+    }
+
+    /// The camera forward a curve stroke is seen along (dabs set it themselves).
+    pub fn set_view(&mut self, view: Vec3) {
+        self.view = view;
+    }
+
+    /// Auto Masking's factor for every selected vertex, or `None` when it is off. The
+    /// mirrored half is judged against the mirrored view.
+    fn auto_weights(&self, mesh: &SculptMesh, sel: &Selection) -> Option<Vec<f32>> {
+        let a = self.assets.auto;
+        if !a.backface && !a.topological {
+            return None;
+        }
+        let joined = a.topological.then(|| connected(mesh, sel));
+        let view = self.view;
+        Some(
+            sel.verts
+                .par_iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    if joined.as_ref().is_some_and(|j| !j[i]) {
+                        return 0.0;
+                    }
+                    if !a.backface {
+                        return 1.0;
+                    }
+                    let view = self.images.map(sel.image(i), view);
+                    let facing = -mesh.normal_at(v).dot(view);
+                    let t = ((facing + 0.05) / 0.25).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                })
+                .collect(),
+        )
     }
 
     pub fn with_assets(mut self,assets:StampSettings)->Self {self.assets=assets;self}
     pub fn take_paint(&mut self)->crate::paint::Chunks {std::mem::take(&mut self.paint_snapshots)}
 
-    fn stamp_weight(&self,p:Vec3,hit:Vec3,normal:Vec3,r:f32,side:f32)->f32 {
+    /// Alpha and texture at `p`, a vertex of symmetry copy `k` of `images`, for a dab at
+    /// `hit` with `normal` in the brush's own frame (so every copy shows the same stamp).
+    fn stamp_weight(&self,images:&Images,k:usize,p:Vec3,hit:Vec3,normal:Vec3,r:f32)->f32 {
         if self.assets.alpha==Pattern::Off && self.assets.texture==Pattern::Off {return 1.0;}
-        let p=if side<0.0 {mirror_x(p)} else {p};
+        let p=images.unmap(k,p);
         let (u,v)=tangent(normal);
         let delta=p-hit;
         let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*r)+glam::Vec2::splat(0.5);
@@ -582,28 +659,31 @@ impl Stroke {
         a*(1.0-self.assets.texture_strength+h*self.assets.texture_strength)
     }
 
-    fn paint_selected(&mut self,mesh:&mut SculptMesh,sel:&Selection,brush:&Brush,hit:Vec3,normal:Vec3) {
+    /// Polypaint under a dab at `hit` with `normal` in the brush's own frame. Vertex `i`
+    /// belongs to symmetry copy `copy` of `images`, or with `None` to its selection image.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_selected(&mut self,mesh:&mut SculptMesh,sel:&Selection,brush:&Brush,hit:Vec3,normal:Vec3,auto:Option<&[f32]>,images:&Images,copy:Option<usize>) {
         if !brush.paint||brush.rgb_intensity<=0.0{return;}
         let fresh:Vec<_>=sel.chunks().into_iter().filter(|c|self.paint_snapshotted.insert(*c)).collect();
         self.paint_snapshots.extend(crate::paint::snapshot(mesh,&fresh));
         let (u,v)=tangent(normal);let base=Vec3::from_array(brush.color.map(|x|x as f32/255.0));
         let values=sel.par_map(|i,vert| {
-            let p=mesh.positions[vert as usize];let p=if sel.side(i)<0.0 {mirror_x(p)} else {p};
+            let p=images.unmap(copy.unwrap_or_else(||sel.image(i)),mesh.positions[vert as usize]);
             let delta=p-hit;
             let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*brush.radius)+glam::Vec2::splat(0.5);
             let tex=self.assets.texture.sample(uv*self.assets.texture_scale,true);
             let rgb=base*tex.truncate();
             let weight=focal_falloff(sel.dist[i],brush.radius,brush.focal_shift)
                 *if self.assets.alpha==Pattern::Off{1.0}else{self.assets.alpha.alpha(uv)}
-                *crate::mask::freedom(&mesh.mask,vert)*tex.w*brush.rgb_intensity*0.35;
+                *crate::mask::freedom(&mesh.mask,vert)*tex.w*brush.rgb_intensity*0.35*auto.map_or(1.0,|a|a[i]);
             crate::paint::blend(crate::paint::at(mesh,vert as usize),rgb.to_array(),weight)
         });
         crate::paint::scatter(mesh,sel,&values);
     }
 
     fn select(&self, mesh: &SculptMesh, hit: Vec3, radius: f32) -> Selection {
-        if self.symmetry {
-            mesh.select_sphere_mirror_x(hit, radius)
+        if self.images.len() > 1 {
+            mesh.select_sphere_images(hit, radius, &self.images)
         } else {
             mesh.select_sphere(hit, radius)
         }
@@ -620,12 +700,14 @@ impl Stroke {
             verts: &g.sel.verts,
             orig: &g.orig,
             weights: &g.weights,
+            images: &g.sel.image,
             chunks: &g.chunks,
         })
     }
 
-    /// The delta the GPU should apply this frame, if the grab moved.
-    pub fn take_gpu_delta(&mut self) -> Option<Vec3> {
+    /// The move the GPU should apply this frame for every symmetry image (index 0 the
+    /// brush's own), if the grab moved.
+    pub fn take_gpu_delta(&mut self) -> Option<Vec<Vec3>> {
         self.pending_delta.take()
     }
 
@@ -652,6 +734,7 @@ impl Stroke {
         ray: (Vec3, Vec3),
     ) {
         if brush.kind.is_mask() || brush.kind==BrushKind::ClipLine { return; }
+        self.view = view_dir;
         if brush.kind.is_detail() && brush.sculpt {
             let Some(previous)=self.last_dab else {self.last_dab=Some(hit);return;};
             if previous.distance(hit)<brush.radius*0.04 {return;}
@@ -665,14 +748,49 @@ impl Stroke {
         }
         // Dab spacing so stroke strength does not depend on event rate.
         if let Some(last) = self.last_dab {
-            if (hit - last).length() < brush.radius * 0.15 {
+            if (hit - last).length() < brush.radius * self.spacing {
                 return;
             }
         }
         let previous_hit = self.last_dab;
         self.last_dab = Some(hit);
         self.dabs += 1;
+        // Square footprints turn with the stroke: along the last dab-to-dab move, kept
+        // from the previous dab when there is none (the first dab of a stroke). Kept in
+        // the brush's own frame; every symmetry copy turns it with itself.
+        let fallback = self.direction.unwrap_or(tangent(hit_normal).0);
+        let moved = previous_hit.map_or(Vec3::ZERO, |p| hit - p);
+        let along = (moved - hit_normal * moved.dot(hit_normal)).normalize_or(fallback - hit_normal * fallback.dot(hit_normal)).normalize_or(tangent(hit_normal).0);
+        self.direction = Some(along);
+        // With symmetry every copy of the brush makes a whole dab of its own, one after
+        // another, as in ZBrush: where copies overlap (a big brush, a stroke on a symmetry
+        // plane) both apply, and the surface stays whole.
+        let images = std::mem::replace(&mut self.images, Images::identity());
+        for k in 0..images.len() {
+            self.view = images.map(k, view_dir);
+            self.dab_copy(mesh, brush, &images, k, hit, hit_normal, previous_hit, along);
+        }
+        self.images = images;
+    }
 
+    /// One symmetry copy (`k` of `images`) of a dab whose own hit, normal, previous hit and
+    /// stroke direction are given in the brush's frame. While it runs `self.images` is the
+    /// identity, so the selection is the copy's alone.
+    #[allow(clippy::too_many_arguments)]
+    fn dab_copy(
+        &mut self,
+        mesh: &mut SculptMesh,
+        brush: &Brush,
+        images: &Images,
+        k: usize,
+        own_hit: Vec3,
+        own_normal: Vec3,
+        own_previous: Option<Vec3>,
+        along: Vec3,
+    ) {
+        let hit = images.map(k, own_hit);
+        let hit_normal = images.map(k, own_normal);
+        let previous_hit = own_previous.map(|p| images.map(k, p));
         let sel = self.select(mesh, hit, brush.radius);
         if sel.is_empty() {
             return;
@@ -680,34 +798,32 @@ impl Stroke {
         self.last_count = sel.len();
         let chunks = sel.chunks();
         if brush.sculpt && brush.kind!=BrushKind::Paint {self.snapshot(mesh, &chunks);}
-        self.paint_selected(mesh,&sel,brush,hit,hit_normal);
+        let auto = self.auto_weights(mesh, &sel);
+        self.paint_selected(mesh,&sel,brush,own_hit,own_normal,auto.as_deref(),images,Some(k));
         if !brush.sculpt || brush.kind==BrushKind::Paint {return;}
         let sign = if self.invert { -1.0 } else { 1.0 };
         let r = brush.radius;
         // Masked vertices (Ctrl) are held still.
         let mask = &mesh.mask;
-        // Square footprints turn with the stroke: along the last dab-to-dab move, kept
-        // from the previous dab when there is none (the first dab of a stroke).
-        let fallback = self.direction.unwrap_or(tangent(hit_normal).0);
-        let moved = previous_hit.map_or(Vec3::ZERO, |p| hit - p);
-        let along = (moved - hit_normal * moved.dot(hit_normal)).normalize_or(fallback - hit_normal * fallback.dot(hit_normal)).normalize_or(tangent(hit_normal).0);
-        self.direction = Some(along);
         let square = brush.kind.is_square();
         let mut weights=std::mem::take(&mut self.weights);
         sel.dist
             .par_iter()
             .zip(sel.verts.par_iter())
             .enumerate()
-            .map(|(i,(&d, &v))| {
+            .map(|(_,(&d, &v))| {
                 let p = mesh.positions[v as usize];
                 let profile = if square {
-                    square_footprint(if sel.side(i) < 0.0 { mirror_x(p) } else { p }, hit, hit_normal, along, r, brush.kind == BrushKind::MalletFast)
+                    square_footprint(images.unmap(k, p), own_hit, own_normal, along, r, brush.kind == BrushKind::MalletFast)
                 } else {
                     focal_falloff(d, r, brush.focal_shift)
                 };
-                profile*self.stamp_weight(p,hit,hit_normal,r,sel.side(i))*crate::mask::freedom(mask, v)
+                profile*self.stamp_weight(images,k,p,own_hit,own_normal,r)*crate::mask::freedom(mask, v)
             })
             .collect_into_vec(&mut weights);
+        if let Some(a) = &auto {
+            weights.par_iter_mut().zip(a.par_iter()).for_each(|(w, a)| *w *= a);
+        }
         self.weights=weights;
         let w = &self.weights;
         let new = &mut self.scratch;
@@ -725,10 +841,10 @@ impl Stroke {
                     .map(|((i, &v), &wi)| if sel.side(i) > 0.0 { mesh.normal_at(v) * wi } else { Vec3::ZERO })
                     .reduce(|| Vec3::ZERO, |a, b| a + b)
                     .normalize_or(hit_normal);
-                let nm = mirror_x(n);
+                let images = &self.images;
                 let amount = brush.strength * r * match brush.kind {BrushKind::Blob=>0.13,BrushKind::FormSoft=>0.04,_=>0.06} * sign;
                 sel.par_map_into(new, |i, v| {
-                    let n = if sel.side(i) > 0.0 { n } else { nm };
+                    let n = images.map(sel.image(i), n);
                     let dome = if brush.kind==BrushKind::Blob {(1.0-(sel.dist[i]/r).powi(2)).max(0.0).sqrt()}else{1.0};
                     let p=mesh.positions[v as usize];
                     let relax=if brush.kind==BrushKind::FormSoft {
@@ -741,14 +857,13 @@ impl Stroke {
                 });
             }
             BrushKind::Layer => {
-                let n = *self.layer_normal.get_or_insert(hit_normal);
-                let normal_mirror = mirror_x(n);
+                // The layer's normal is fixed by the first dab, in the brush's own frame.
+                let n = images.map(k, *self.layer_normal.get_or_insert(own_normal));
                 let snapshots = &self.snapshots;
                 let index = &self.snapshot_index;
                 sel.par_map_into(new, |i,v| {
                     let c = mesh.vert_chunk[v as usize];
                     let old = snapshots[index[&c]].1[(v-mesh.chunks[c as usize].vert_start) as usize];
-                    let n = if sel.side(i)>0.0 {n}else{normal_mirror};
                     let p = mesh.positions[v as usize];
                     let remaining = (r*0.14 - (p-old).dot(n)*sign).max(0.0);
                     p+n*(remaining.min(r*0.06)*brush.strength*w[i]*sign)
@@ -757,8 +872,9 @@ impl Stroke {
             BrushKind::Nudge => {
                 let delta = (hit-previous_hit.unwrap_or(hit)).clamp_length_max(r*0.2);
                 let direction = (delta-hit_normal*delta.dot(hit_normal))*brush.strength*0.65*sign;
+                let images = &self.images;
                 sel.par_map_into(new,|i,v| {
-                    mesh.positions[v as usize]+if sel.side(i)>0.0 {direction}else{mirror_x(direction)}*w[i]
+                    mesh.positions[v as usize]+images.map(sel.image(i),direction)*w[i]
                 });
             }
             BrushKind::Sharpen => {
@@ -837,8 +953,14 @@ impl Stroke {
                 let c = if wsum > 1e-6 { c / wsum } else { hit };
                 let n = n.normalize_or(hit_normal);
                 // Planar keeps the plane of its first dab for the whole stroke.
-                let (c, n) = if brush.kind == BrushKind::Planar { *self.plane.get_or_insert((c, n)) } else { (c, n) };
-                let (cm, nm) = (mirror_x(c), mirror_x(n));
+                let (c, n) = if brush.kind == BrushKind::Planar {
+                    // Kept in the brush's own frame; every copy uses its image.
+                    let own = *self.plane.get_or_insert((images.unmap(k, c), images.unmap(k, n)));
+                    (images.map(k, own.0), images.map(k, own.1))
+                } else {
+                    (c, n)
+                };
+                let images = &self.images;
                 let k = brush.strength * match brush.kind {
                     BrushKind::Polish | BrushKind::Scrape => 0.7,
                     BrushKind::HPolish | BrushKind::MalletFast | BrushKind::Planar => 0.85,
@@ -847,7 +969,8 @@ impl Stroke {
                 let kind = brush.kind;
                 sel.par_map_into(new, |i, v| {
                     let p = mesh.positions[v as usize];
-                    let (c, n) = if sel.side(i) > 0.0 { (c, n) } else { (cm, nm) };
+                    let img = sel.image(i);
+                    let (c, n) = (images.map(img, c), images.map(img, n));
                     let d=(p-c).dot(n);
                     let amount=match kind {
                         BrushKind::FormHard => (r*0.18-d*sign).max(0.0).min(r*0.12)*sign*brush.strength*w[i],
@@ -875,9 +998,12 @@ impl Stroke {
             }
             BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::OrbCracks | BrushKind::Magnify => {
                 let kind = brush.kind;
+                let (copies, copy) = (images, k);
+                let images = &self.images;
                 sel.par_map_into(new,|i,v| {
                     let p=mesh.positions[v as usize];
-                    let (c,n)=if sel.side(i)>0.0 {(hit,hit_normal)}else{(mirror_x(hit),mirror_x(hit_normal))};
+                    let k=sel.image(i);
+                    let (c,n)=(images.map(k,hit),images.map(k,hit_normal));
                     let delta=c-p;let tangent=delta-n*delta.dot(n);
                     let width=if kind==BrushKind::OrbCracks {0.13}else{0.24};
                     let tight=(-((sel.dist[i]/r)/width).powi(2)).exp();
@@ -892,7 +1018,7 @@ impl Stroke {
                     // Orb Cracks: the depth wanders along the cut, so it reads as a crack,
                     // not a groove. Taken on the brush's own side so symmetry mirrors it.
                     let rough=if kind==BrushKind::OrbCracks {
-                        let q=(if sel.side(i)>0.0 {p}else{mirror_x(p)})*(9.0/r);
+                        let q=copies.unmap(copy,p)*(9.0/r);
                         0.7+0.3*((q.x*1.7+q.y).sin()*(q.y*1.3-q.z).sin()*(q.z*1.9+q.x*0.6).sin())
                     }else{1.0};
                     p+tangent*(pinch*brush.strength*w[i]*sign)
@@ -916,21 +1042,25 @@ impl Stroke {
         let sel=self.select(mesh,centre,r+length*0.5);
         if sel.is_empty(){return;}
         let chunks=sel.chunks();self.snapshot(mesh,&chunks);
-        self.paint_selected(mesh,&sel,brush,centre,normal);
+        let auto=self.auto_weights(mesh,&sel);
+        let images=self.images.clone();
+        self.paint_selected(mesh,&sel,brush,centre,normal,auto.as_deref(),&images,None);
         let phase=self.detail_distance;self.detail_distance+=length;
         let sign=if self.invert{-1.0}else{1.0};
         let next=sel.par_map(|i,v| {
             let actual=mesh.positions[v as usize];
-            let p=if sel.side(i)<0.0 {mirror_x(actual)}else{actual};
+            let k=sel.image(i);
+            let p=self.images.unmap(k,actual);
             let offset=p-start;let along=offset.dot(direction);let across=offset.dot(sideways);
             if along < -r*0.04 || along > length+r*0.04 || across.abs()>r || offset.dot(normal).abs()>r*0.65 {return actual;}
             let weight=focal_falloff(across.abs(),r,brush.focal_shift)
-                *self.stamp_weight(actual,centre,normal,r,sel.side(i))*crate::mask::freedom(&mesh.mask,v);
+                *self.stamp_weight(&self.images,k,actual,centre,normal,r)*crate::mask::freedom(&mesh.mask,v)
+                *auto.as_ref().map_or(1.0,|a|a[i]);
             if weight<=0.0 {return actual;}
             let height=crate::detail_brush::profile(brush.kind,across/r,(phase+along)/r)*r*0.12*brush.strength*sign*weight;
             let chunk=mesh.vert_chunk[v as usize];
             let old=self.snapshots[self.snapshot_index[&chunk]].1[(v-mesh.chunks[chunk as usize].vert_start) as usize];
-            let n=if sel.side(i)<0.0 {mirror_x(normal)}else{normal};
+            let n=self.images.map(k,normal);
             actual+n*(height-(actual-old).dot(n))
         });
         mesh.scatter_positions(&sel,&next);mesh.finish_edit(&chunks);
@@ -955,7 +1085,7 @@ impl Stroke {
             return;
         }
         let r = brush.radius;
-        let (sel, feet) = crate::curve::band(mesh, curve, r, self.symmetry);
+        let (sel, feet) = crate::curve::band(mesh, curve, r, &self.images);
         if sel.is_empty() {
             return;
         }
@@ -964,7 +1094,9 @@ impl Stroke {
             self.snapshot(mesh, &chunks);
         }
         let mid = curve.points.len() / 2;
-        self.paint_selected(mesh, &sel, brush, curve.points[mid], curve.normals[mid]);
+        let auto = self.auto_weights(mesh, &sel);
+        let images = self.images.clone();
+        self.paint_selected(mesh, &sel, brush, curve.points[mid], curve.normals[mid], auto.as_deref(), &images, None);
         self.last_count = sel.len();
         self.dabs += 1;
         if !brush.sculpt || !brush.kind.is_detail() {
@@ -976,8 +1108,9 @@ impl Stroke {
             let actual = mesh.positions[v as usize];
             // The foot is on the vertex's own side, so the stamp needs no mirroring.
             let weight = focal_falloff(f.across.abs(), r, brush.focal_shift)
-                * self.stamp_weight(actual, f.point, f.normal, r, 1.0)
-                * crate::mask::freedom(&mesh.mask, v);
+                * self.stamp_weight(&Images::identity(), 0, actual, f.point, f.normal, r)
+                * crate::mask::freedom(&mesh.mask, v)
+                * auto.as_ref().map_or(1.0, |a| a[i]);
             if weight <= 0.0 {
                 return actual;
             }
@@ -1032,35 +1165,61 @@ impl Stroke {
     fn grab_dab(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, view_dir: Vec3, ray: (Vec3, Vec3)) {
         if self.grab.is_none() {
             let sel = self.select(mesh, hit, brush.radius);
-            self.paint_selected(mesh,&sel,brush,hit,-view_dir);
+            let auto = self.auto_weights(mesh, &sel);
+            let images = self.images.clone();
+            self.paint_selected(mesh,&sel,brush,hit,-view_dir,auto.as_deref(),&images,None);
             let chunks = sel.chunks();
             self.snapshot(mesh, &chunks);
             let r = brush.radius;
-            // Signed by side: the mirrored half moves with a mirrored delta.
+            // Each symmetry copy moves with its own image of the delta (`grab_offset`).
             let mask = &mesh.mask;
-            let weights = sel
-                .dist
-                .par_iter()
-                .enumerate()
-                .map(|(i, &d)| {
-                    let f=focal_falloff(d,r,brush.focal_shift);
-                    let profile=match brush.kind {BrushKind::SnakeHook=>f.powi(3),BrushKind::Elastic=>f.sqrt(),_=>f};
-                    profile*self.stamp_weight(mesh.positions[sel.verts[i] as usize],hit,view_dir,r,sel.side(i))
-                        *sel.side(i)*crate::mask::freedom(mask, sel.verts[i])
-                })
-                .collect::<Vec<f32>>();
-            // Move Topological: only the surface joined to the click point moves.
-            let weights = if brush.kind == BrushKind::MoveTopological {
-                let joined = connected(mesh, &sel);
-                weights.into_iter().zip(joined).map(|(w, j)| if j { w } else { 0.0 }).collect()
-            } else {
-                weights
+            let weight = |i: usize, d: f32, k: usize| {
+                let f = focal_falloff(d, r, brush.focal_shift);
+                let profile = match brush.kind { BrushKind::SnakeHook => f.powi(3), BrushKind::Elastic => f.sqrt(), _ => f };
+                profile * self.stamp_weight(&self.images, k, mesh.positions[sel.verts[i] as usize], hit, view_dir, r)
+                    * crate::mask::freedom(mask, sel.verts[i])
             };
+            // Per vertex: Move Topological's and Auto Masking's factor.
+            let joined = (brush.kind == BrushKind::MoveTopological).then(|| connected(mesh, &sel));
+            let keep = |i: usize| joined.as_ref().map_or(1.0, |j| j[i] as u8 as f32) * auto.as_ref().map_or(1.0, |a| a[i]);
+            let weights: Vec<f32> = (0..sel.len()).into_par_iter().map(|i| weight(i, sel.dist[i], sel.image(i)) * keep(i)).collect();
+            // Vertices several copies reach get every copy's weight.
+            let (mut overlap_of, mut overlaps) = (Vec::new(), Vec::new());
+            if self.images.len() > 1 {
+                let centres = self.images.of(hit);
+                let shared: Vec<Option<Vec<(u8, f32)>>> = (0..sel.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let p = mesh.positions[sel.verts[i] as usize];
+                        let own = sel.image(i);
+                        let others: Vec<(u8, f32)> = centres
+                            .iter()
+                            .enumerate()
+                            .filter(|&(k, c)| k != own && p.distance(*c) <= r)
+                            .map(|(k, c)| (k as u8, weight(i, p.distance(*c), k) * keep(i)))
+                            .collect();
+                        (!others.is_empty()).then(|| std::iter::once((own as u8, weights[i])).chain(others).collect())
+                    })
+                    .collect();
+                if shared.iter().any(Option::is_some) {
+                    overlap_of = shared
+                        .into_iter()
+                        .map(|list| match list {
+                            Some(list) => {
+                                overlaps.push(list);
+                                (overlaps.len() - 1) as u32
+                            }
+                            None => u32::MAX,
+                        })
+                        .collect();
+                }
+            }
             let orig = sel.par_map(|_, v| mesh.positions[v as usize]);
             self.last_count = sel.len();
             // A brush smaller than the polygons under it picks up no vertex: nothing to
             // hand to the GPU (it would bind empty buffers), the stroke just does nothing.
-            let gpu = self.gpu_grab && brush.kind.gpu_drag() && !sel.is_empty();
+            // Overlapping copies add up on the CPU; the GPU kernel moves each vertex by one.
+            let gpu = self.gpu_grab && brush.kind.gpu_drag() && !sel.is_empty() && overlaps.is_empty();
             self.grab = Some(GrabState {
                 sel,
                 chunks,
@@ -1071,6 +1230,8 @@ impl Stroke {
                 delta: Vec3::ZERO,
                 kind: brush.kind,
                 radius: r,
+                overlap_of,
+                overlaps,
             });
             return;
         }
@@ -1088,11 +1249,12 @@ impl Stroke {
         self.dabs += 1;
         if g.gpu {
             // Nothing to do on the CPU per frame: the GPU kernel moves the vertices.
-            self.pending_delta = Some(delta);
+            self.pending_delta = Some((0..self.images.len()).map(|k| self.images.map(k, delta)).collect());
             return;
         }
         // Fused compute + write: no temporary buffer, one parallel pass per chunk.
-        mesh.scatter_positions_with(&g.sel, |i, _| g.orig[i] + drag_offset(g,i));
+        let images = &self.images;
+        mesh.scatter_positions_with(&g.sel, |i, _| g.orig[i] + drag_offset(images, g, i));
         mesh.finish_edit(&g.chunks);
     }
 
@@ -1101,8 +1263,8 @@ impl Stroke {
     pub fn end(mut self, mesh: &mut SculptMesh) -> Option<ChunkData> {
         if let Some(g) = self.grab.take() {
             if g.gpu && g.delta != Vec3::ZERO {
-                let delta = g.delta;
-                mesh.scatter_positions_with(&g.sel, |i, _| g.orig[i] + grab_offset(delta, g.weights[i]));
+                let images = &self.images;
+                mesh.scatter_positions_with(&g.sel, |i, _| g.orig[i] + grab_offset(images, &g, i));
                 mesh.finish_edit(&g.chunks);
             }
         }
@@ -1112,19 +1274,21 @@ impl Stroke {
 
 /// Which selected vertices the surface joins to the brush centre without leaving the
 /// brush: a flood over mesh edges from the vertex nearest the centre (and, with symmetry,
-/// from the one nearest its mirror image).
+/// from the one nearest each image of it).
 fn connected(mesh: &SculptMesh, sel: &Selection) -> Vec<bool> {
     let index: HashMap<u32, usize> = sel.verts.iter().enumerate().map(|(i, &v)| (v, i)).collect();
     let mut joined = vec![false; sel.len()];
     let mut stack = Vec::new();
-    for side in [1.0, -1.0] {
-        let seed = (0..sel.len())
-            .filter(|&i| sel.side(i) == side)
-            .min_by(|&a, &b| sel.dist[a].total_cmp(&sel.dist[b]));
-        if let Some(i) = seed {
-            joined[i] = true;
-            stack.push(i);
+    let mut seeds: HashMap<usize, usize> = HashMap::new();
+    for i in 0..sel.len() {
+        let seed = seeds.entry(sel.image(i)).or_insert(i);
+        if sel.dist[i] < sel.dist[*seed] {
+            *seed = i;
         }
+    }
+    for &i in seeds.values() {
+        joined[i] = true;
+        stack.push(i);
     }
     while let Some(i) = stack.pop() {
         for &n in mesh.neighbors(sel.verts[i]) {
@@ -1316,12 +1480,23 @@ mod brush_tests {
         }
     }
 
+    /// A Snake Hook pull on +X, clear of its mirror image.
+    fn hook_off_centre(m:&mut SculptMesh,gpu:bool)->Stroke {
+        let b=Brush{kind:BrushKind::SnakeHook,radius:0.3,strength:0.8,..Brush::default()};
+        let mut s=Stroke::begin(false,gpu,true);
+        for x in [0.5,0.58,0.66] {
+            let hit=Vec3::new(0.5,0.0,0.87);
+            s.dab(m,&b,hit,hit,-Vec3::Z,(Vec3::new(x,0.0,0.87)+Vec3::Z*4.0,-Vec3::Z));
+        }
+        s
+    }
+
     #[test]
     fn snake_hook_gpu_weights_match_cpu_and_elastic_uses_directional_deformation() {
         let mut cpu=mesh();let mut gpu=mesh();
-        stroke_path(&mut cpu,BrushKind::SnakeHook,false,true).end(&mut cpu);
+        hook_off_centre(&mut cpu,false).end(&mut cpu);
         let before=gpu.positions.clone();
-        let s=stroke_path(&mut gpu,BrushKind::SnakeHook,true,true);
+        let s=hook_off_centre(&mut gpu,true);
         assert_eq!(gpu.positions,before);assert!(s.gpu_grab_setup().is_some());
         s.end(&mut gpu);assert_eq!(gpu.positions,cpu.positions);
         let mut elastic=mesh();let s=stroke_path(&mut elastic,BrushKind::Elastic,true,false);
@@ -1673,11 +1848,12 @@ mod advanced_brush_tests {
 
     #[test]
     fn move_topological_on_the_gpu_matches_the_cpu_and_pen_pressure_leaves_it_alone() {
+        // Clear of the mirror image (copies that overlap run on the CPU).
         let mut cpu = sphere(24);
         let mut gpu = sphere(24);
-        stroke(&mut cpu, BrushKind::MoveTopological, false, false, true, Vec3::new(0.1, 0.0, 1.0)).end(&mut cpu);
+        stroke(&mut cpu, BrushKind::MoveTopological, false, false, true, Vec3::new(0.5, 0.0, 0.87)).end(&mut cpu);
         let before = gpu.positions.clone();
-        let s = stroke(&mut gpu, BrushKind::MoveTopological, false, true, true, Vec3::new(0.1, 0.0, 1.0));
+        let s = stroke(&mut gpu, BrushKind::MoveTopological, false, true, true, Vec3::new(0.5, 0.0, 0.87));
         assert_eq!(gpu.positions, before, "moved on the GPU during the stroke");
         assert!(s.gpu_grab_setup().is_some());
         s.end(&mut gpu);
@@ -1834,5 +2010,186 @@ mod advanced_brush_tests {
         let (dam_width, dam_spread) = profile(BrushKind::DamStandard);
         assert!(orb_width < dam_width, "Orb Cracks {orb_width} vs Dam Standard {dam_width}");
         assert!(orb_spread > dam_spread + 0.05, "Orb Cracks depth varies: {orb_spread} vs {dam_spread}");
+    }
+}
+
+#[cfg(test)]
+mod auto_mask_tests {
+    use super::*;
+    use crate::primitive::Primitive;
+
+    /// Two sheets `gap` apart, both inside a brush at the top one: the top faces +Z
+    /// (towards a viewer looking down -Z), the lower one faces +Z too (`flip` false) or -Z.
+    fn sheets(gap: f32, flip: bool) -> (SculptMesh, usize) {
+        let (p, i) = Primitive::Plane.build(40, 1.0);
+        let n = p.len();
+        let mut positions = p.clone();
+        positions.extend(p.iter().map(|q| *q - Vec3::Z * gap));
+        let mut indices = i.clone();
+        for t in i.chunks(3) {
+            let t = [t[0] + n as u32, t[1] + n as u32, t[2] + n as u32];
+            indices.extend(if flip { [t[0], t[2], t[1]] } else { t });
+        }
+        (SculptMesh::from_raw(positions, indices), n)
+    }
+
+    /// Vertices moved in the top sheet and in the lower one after a stroke of `kind`.
+    fn moved(kind: BrushKind, auto: AutoMask, gap: f32, flip: bool) -> (usize, usize) {
+        let (mut m, n) = sheets(gap, flip);
+        let before = m.positions.clone();
+        let b = Brush { kind, radius: 0.4, strength: 1.0, ..Brush::default() };
+        let mut s = Stroke::begin(false, false, false).with_assets(StampSettings { auto, ..StampSettings::default() });
+        for k in 0..3 {
+            let hit = Vec3::new(0.05 * k as f32, 0.0, 0.0);
+            s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::new(0.1 * k as f32, 0.0, 4.0), -Vec3::Z));
+        }
+        s.end(&mut m);
+        let count = |r: std::ops::Range<usize>| r.filter(|&v| m.positions[v] != before[v]).count();
+        (count(0..n), count(n..2 * n))
+    }
+
+    #[test]
+    fn backface_mask_leaves_the_far_side_of_a_thin_part_alone() {
+        // A thin slab: the lower sheet faces away from the viewer.
+        for kind in [BrushKind::Draw, BrushKind::Inflate, BrushKind::Grab, BrushKind::Zipper] {
+            let (top, far) = moved(kind, AutoMask::default(), 0.05, true);
+            assert!(top > 10 && far > 10, "{kind:?} without BackfaceMask reaches through: {top} {far}");
+            let (top, far) = moved(kind, AutoMask { backface: true, ..AutoMask::default() }, 0.05, true);
+            assert!(top > 10 && far == 0, "{kind:?} with BackfaceMask: {top} {far}");
+        }
+    }
+
+    #[test]
+    fn topological_masking_keeps_to_the_surface_under_the_brush() {
+        for kind in [BrushKind::Draw, BrushKind::ClayBuildup, BrushKind::Grab, BrushKind::Paint] {
+            let topological = AutoMask { topological: true, ..AutoMask::default() };
+            if kind == BrushKind::Paint {
+                // Paint changes colour, not positions: check the colours instead.
+                let (mut m, n) = sheets(0.1, false);
+                let b = Brush { kind, radius: 0.4, strength: 1.0, paint: true, sculpt: false, ..Brush::default() };
+                let mut s = Stroke::begin(false, false, false).with_assets(StampSettings { auto: topological, ..StampSettings::default() });
+                s.dab(&mut m, &b, Vec3::ZERO, Vec3::Z, -Vec3::Z, (Vec3::Z * 4.0, -Vec3::Z));
+                assert!(m.colors[..n].iter().any(|c| c[3] > 0));
+                assert!(m.colors[n..].iter().all(|c| c[3] == 0), "paint stays on the touched sheet");
+                continue;
+            }
+            let (top, other) = moved(kind, AutoMask::default(), 0.1, false);
+            assert!(top > 10 && other > 10, "{kind:?} reaches both sheets: {top} {other}");
+            let (top, other) = moved(kind, topological, 0.1, false);
+            assert!(top > 10 && other == 0, "{kind:?} with Topological: {top} {other}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod symmetry_group_tests {
+    use super::*;
+    use crate::symmetry::{Axis, Symmetry};
+
+    fn sphere() -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(40, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    fn nearest(m: &SculptMesh, p: Vec3) -> usize {
+        (0..m.vertex_count()).min_by(|&a, &b| m.positions[a].distance_squared(p).total_cmp(&m.positions[b].distance_squared(p))).unwrap()
+    }
+
+    /// One Draw dab at `hit` under `sym`: every image of the probe moves like the image of
+    /// the probe's move.
+    fn check_draw(sym: Symmetry, hit: Vec3) {
+        let mut m = sphere();
+        let before = m.positions.clone();
+        let b = Brush { kind: BrushKind::Draw, radius: 0.25, strength: 1.0, ..Brush::default() };
+        let mut s = Stroke::begin(false, false, sym);
+        s.dab(&mut m, &b, hit, hit, -Vec3::Z, (hit * 3.0, -hit));
+        let images = sym.images();
+        let a = nearest(&m, hit);
+        let da = m.positions[a] - before[a];
+        assert!(da.length() > 1e-3, "{sym:?}: the brush itself moved nothing");
+        for k in 1..images.len() {
+            let b = nearest(&m, images.map(k, hit));
+            let db = m.positions[b] - before[b];
+            let expect = images.map(k, da);
+            assert!((db - expect).length() < da.length() * 0.25, "{sym:?} image {k}: {db:?} vs {expect:?}");
+        }
+    }
+
+    #[test]
+    fn draw_follows_every_mirror_and_radial_copy() {
+        let hit = Vec3::new(0.45, 0.35, 0.82).normalize();
+        check_draw(Symmetry { y: true, ..Default::default() }, hit);
+        check_draw(Symmetry { z: true, ..Default::default() }, Vec3::new(0.3, 0.2, 0.93).normalize());
+        check_draw(Symmetry { x: true, y: true, z: true, radial: None }, hit);
+        check_draw(Symmetry { radial: Some((Axis::Z, 6)), ..Default::default() }, Vec3::new(0.6, 0.1, 0.79).normalize());
+        check_draw(Symmetry { x: true, radial: Some((Axis::Y, 5)), ..Default::default() }, Vec3::new(0.3, 0.5, 0.81).normalize());
+    }
+
+    #[test]
+    fn a_gpu_grab_with_radial_symmetry_ends_where_the_cpu_grab_does() {
+        let sym = Symmetry { y: true, radial: Some((Axis::Z, 6)), ..Default::default() };
+        let run = |gpu: bool| {
+            let mut m = sphere();
+            // Between the copies of the dihedral group: none overlap.
+            let b = Brush { kind: BrushKind::Grab, radius: 0.15, strength: 1.0, ..Brush::default() };
+            let mut s = Stroke::begin(false, gpu, sym);
+            let a = 15f32.to_radians();
+            let hit = Vec3::new(0.63 * a.cos(), 0.63 * a.sin(), 0.777).normalize();
+            s.dab(&mut m, &b, hit, hit, -Vec3::Z, (hit + Vec3::Z * 5.0, -Vec3::Z));
+            s.dab(&mut m, &b, hit, hit, -Vec3::Z, (hit + Vec3::new(0.1, 0.05, 5.0), -Vec3::Z));
+            if gpu {
+                let setup = s.gpu_grab_setup().unwrap();
+                assert_eq!(setup.images.len(), setup.verts.len());
+                assert!(setup.images.iter().any(|&k| k > 0));
+                assert_eq!(s.take_gpu_delta().unwrap().len(), sym.images().len());
+            }
+            s.end(&mut m);
+            m.positions
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn overlapping_copies_add_up_and_keep_the_surface_whole() {
+        // A big Grab on the symmetry plane pulling sideways: the copies overlap, their
+        // moves add up (on the CPU), and vertices on the plane do not move across it.
+        let mut m = sphere();
+        let before = m.positions.clone();
+        let b = Brush { kind: BrushKind::Grab, radius: 0.6, strength: 1.0, ..Brush::default() };
+        let mut s = Stroke::begin(false, true, true);
+        let hit = Vec3::Z;
+        s.dab(&mut m, &b, hit, hit, -Vec3::Z, (hit + Vec3::Z * 5.0, -Vec3::Z));
+        assert!(s.gpu_grab_setup().is_none(), "overlapping copies run on the CPU");
+        s.dab(&mut m, &b, hit, hit, -Vec3::Z, (hit + Vec3::new(0.2, 0.15, 5.0), -Vec3::Z));
+        s.end(&mut m);
+        for (p, q) in m.positions.iter().zip(&before) {
+            if q.x.abs() < 1e-6 && q.distance(hit) < 0.6 {
+                assert!(p.x.abs() < 1e-5, "on the plane, sideways moves cancel: {q:?} -> {p:?}");
+            }
+        }
+        // Both sides moved up (the Y part adds), mirror images of each other.
+        let (a, c) = (nearest(&m, Vec3::new(0.2, 0.0, 0.98)), nearest(&m, Vec3::new(-0.2, 0.0, 0.98)));
+        let (da, dc) = (m.positions[a] - before[a], m.positions[c] - before[c]);
+        assert!(da.y > 0.05 && (da.y - dc.y).abs() < 1e-4 && (da.x + dc.x).abs() < 1e-4, "{da:?} {dc:?}");
+        // Neighbours across the plane stay close: no tear.
+        let worst = (0..m.vertex_count() as u32)
+            .flat_map(|v| m.neighbors(v).iter().map(move |&n| (v, n)))
+            .map(|(v, n)| m.positions[v as usize].distance(m.positions[n as usize]) / before[v as usize].distance(before[n as usize]))
+            .fold(0.0f32, f32::max);
+        assert!(worst < 4.0, "edges stretch at most {worst}×");
+    }
+
+    #[test]
+    fn masks_and_mask_shapes_follow_every_copy() {
+        use crate::mask::MaskStroke;
+        let sym = Symmetry { radial: Some((Axis::Z, 4)), ..Default::default() };
+        let mut m = sphere();
+        let b = Brush { kind: BrushKind::MaskPen, radius: 0.2, strength: 1.0, ..Brush::default() };
+        let hit = Vec3::new(0.6, 0.1, 0.79).normalize();
+        let mut s = MaskStroke::begin(false, sym);
+        s.dab(&mut m, &b, hit);
+        for q in sym.images().of(hit) {
+            assert!(m.mask[nearest(&m, q)] > 200, "masked at {q:?}");
+        }
     }
 }

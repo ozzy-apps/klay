@@ -7,6 +7,7 @@ mod camera;
 mod mask;
 mod matcap;
 mod surface_tools;
+mod symmetry;
 mod detail_brush;
 mod curve;
 mod curve_tube;
@@ -103,6 +104,7 @@ const CURVE_GRAB_PX: f32 = 10.0;
 /// The brush along `curve`: detail reliefs as one pattern in the curve's frame, other
 /// brushes as dabs every `step` of arc length.
 fn apply_curve(stroke: &mut Stroke, mesh: &mut SculptMesh, brush: &Brush, curve: &curve::Curve, view_dir: Vec3, step: f32) {
+    stroke.set_view(view_dir);
     if brush.kind.is_detail() {
         stroke.detail_curve(mesh, brush, curve);
     } else {
@@ -133,7 +135,7 @@ struct CurveTool {
     curve: curve::Curve,
     brush: Brush,
     invert: bool,
-    symmetry: bool,
+    symmetry: symmetry::Symmetry,
     assets: sculpt::StampSettings,
     level: usize,
     tool: usize,
@@ -207,6 +209,12 @@ enum VisOp {
     GroupVisible,
     ShowAll,
     Invert,
+    /// Visibility › Grow / Shrink (one ring of polygons).
+    Grow,
+    Shrink,
+    /// Polygroups › Auto Groups, Group By Normals (max angle, degrees).
+    AutoGroups,
+    ByNormals(u8),
 }
 
 /// Geometry operations queued by the interface or a gesture.
@@ -366,6 +374,12 @@ struct App {
     selftest_surface: Option<native_tests::SurfaceTest>,
     /// `--selftest-materials`: every material drawn and read back, then polypaint under a MatCap.
     selftest_materials: Option<native_tests::MaterialTest>,
+    /// `--selftest-document`: Back / Border on the GPU, the empty border, Snapshot.
+    selftest_document: Option<native_tests::DocumentTest>,
+    /// `--snapshot FILE`: frames left, then the canvas is saved to FILE and the app quits.
+    snapshot_to: Option<(String, u32)>,
+    /// `--selftest-symmetry`: brushes with Y and radial symmetry on the GPU.
+    selftest_symmetry: Option<native_tests::SymmetryTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// SubTool › Save / Load / Export OBJ: a file holding single subtools.
@@ -458,6 +472,9 @@ struct App {
     stroke_ms: f32,
     /// A grab update is waiting for the next frame (grab is applied once per frame).
     stroke_pending: bool,
+    /// Screen point (window pixels) the stroke has reached, and the LazyMouse brush point.
+    stroke_from: Vec2,
+    lazy_point: Option<Vec2>,
     last_dab_count: usize,
     demo: bool,
     /// `--demo-brushes`: stroke with the advanced brushes at start.
@@ -512,6 +529,9 @@ impl App {
             selftest_brushes: None,
             selftest_surface: None,
             selftest_materials: None,
+            selftest_document: None,
+            selftest_symmetry: None,
+            snapshot_to: None,
             project_path: "untitled.klay".to_string(),
             subtool_path: "subtool.klay".to_string(),
             open_on_start: None,
@@ -572,6 +592,8 @@ impl App {
             fps: 0.0,
             stroke_ms: 0.0,
             stroke_pending: false,
+            stroke_from: Vec2::ZERO,
+            lazy_point: None,
             last_dab_count: 0,
             demo,
             demo_brushes: false,
@@ -1140,6 +1162,49 @@ impl App {
         self.workspace.notify(self.status.clone());
     }
 
+    /// Document › Snapshot: ask the renderer for the canvas inside the document frame of
+    /// the next frame; `save_snapshot` writes it once drawn.
+    fn request_snapshot(&mut self) {
+        let inset = workspace::FRAME_INSET * self.scale;
+        let r = self.canvas_rect.shrink(inset);
+        log::debug!("snapshot requested: {r:?}");
+        if let Some(gfx) = self.gfx.as_mut() {
+            if !gfx.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+                self.workspace.notify("Snapshot: this GPU's window surface cannot be read back");
+                return;
+            }
+            gfx.snapshot = Some([r.min.x.round() as u32, r.min.y.round() as u32, r.width().round() as u32, r.height().round() as u32]);
+        }
+    }
+
+    /// Write a drawn snapshot as `<project> snapshot N.png` next to the project file.
+    fn save_snapshot(&mut self) {
+        let Some((w, h, rgba)) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
+            return;
+        };
+        if let Some((path, _)) = self.snapshot_to.take() {
+            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                Ok(()) => log::info!("snapshot {w}×{h} saved to {path}"),
+                Err(e) => log::error!("snapshot to {path} failed: {e}"),
+            }
+            self.quit = true;
+            return;
+        }
+        let project = Path::new(&self.project_path);
+        let stem = project.file_stem().map_or_else(|| "untitled".into(), |s| s.to_string_lossy().to_string());
+        let dir = project.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let path = (1..)
+            .map(|n| dir.join(if n == 1 { format!("{stem} snapshot.png") } else { format!("{stem} snapshot {n}.png") }))
+            .find(|p| !p.exists())
+            .unwrap();
+        self.status = match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+            Ok(()) => format!("Snapshot {w}×{h} saved to {}", path.display()),
+            Err(e) => format!("Snapshot failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
     /// Write the active subtool on its own, with all its levels, as a one-subtool project
     /// (SubTool › Save). It opens with Open, or joins another model with Load.
     fn save_subtool(&mut self) {
@@ -1507,6 +1572,24 @@ impl App {
         self.apply_hidden(hidden, if hide { "Hide rectangle" } else { "Select rectangle" });
     }
 
+    /// Set the polygroups of the shown level (and through it every level) to `groups`,
+    /// undoably.
+    fn apply_groups(&mut self, groups: Vec<u16>, what: &str) {
+        let t = Instant::now();
+        let before = self.doc.group_runs();
+        let level = self.doc.active();
+        self.doc.set_groups(level, groups);
+        self.history.push(UndoStep::Groups(before));
+        self.status = format!(
+            "{what}: {} polygroups ({:.0} ms over {} levels)",
+            self.doc.mesh().group_count(),
+            t.elapsed().as_secs_f32() * 1000.0,
+            self.doc.count()
+        );
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
     /// Make one new polygroup of the visible polygons (ZBrush: Ctrl + W, Group Visible).
     /// With a mask, make one new polygroup of the visible masked polygons and clear the
     /// mask (ZBrush: Ctrl + W, Group Masked); without one, of the visible polygons (Group
@@ -1564,6 +1647,30 @@ impl App {
             Some(VisOp::GroupVisible) => self.group_visible(),
             Some(VisOp::ShowAll) => self.show_all(),
             Some(VisOp::Invert) => self.invert_visibility(),
+            Some(VisOp::Grow) => {
+                if self.doc.mesh().hidden.is_empty() {
+                    self.workspace.notify("Nothing is hidden · nothing to grow");
+                } else {
+                    let hidden = polygroup::grown_visibility(self.doc.mesh());
+                    self.apply_hidden(hidden, "Grow visibility");
+                }
+            }
+            Some(VisOp::Shrink) => {
+                if self.doc.mesh().hidden.is_empty() {
+                    self.workspace.notify("Nothing is hidden · hide something first to shrink from it");
+                } else {
+                    let hidden = polygroup::shrunk_visibility(self.doc.mesh());
+                    self.apply_hidden(hidden, "Shrink visibility");
+                }
+            }
+            Some(VisOp::AutoGroups) => {
+                let groups = polygroup::auto_groups(self.doc.mesh());
+                self.apply_groups(groups, "Auto Groups");
+            }
+            Some(VisOp::ByNormals(angle)) => {
+                let groups = polygroup::groups_by_normals(self.doc.mesh(), angle as f32);
+                self.apply_groups(groups, "Group By Normals");
+            }
             None => {}
         }
     }
@@ -3115,9 +3222,35 @@ impl App {
     }
 
     fn cursor_ray(&self) -> (Vec3, Vec3) {
+        self.ray_at(self.cursor)
+    }
+
+    /// The camera ray through window point `p`.
+    fn ray_at(&self, p: Vec2) -> (Vec3, Vec3) {
         let vp = self.viewport();
-        let cursor = self.cursor - self.canvas_origin();
-        self.camera.ray(cursor.x, cursor.y, vp.x, vp.y)
+        let p = p - self.canvas_origin();
+        self.camera.ray(p.x, p.y, vp.x, vp.y)
+    }
+
+    /// Where the stroke goes next, in window pixels: the cursor, or with LazyMouse the
+    /// brush point pulled along behind it on a string of LazyRadius (it stays put while the
+    /// cursor moves inside the string). The points from the last one reached to it, a few
+    /// pixels apart, so a fast stroke leaves no gaps (Stroke › Spacing thins the dabs).
+    fn stroke_path(&mut self) -> Vec<Vec2> {
+        let target = match self.lazy_point.as_mut() {
+            Some(lazy) => {
+                let d = self.cursor - *lazy;
+                let r = self.workspace.lazy_radius * self.scale;
+                if d.length() > r {
+                    *lazy += d * ((d.length() - r) / d.length());
+                }
+                *lazy
+            }
+            None => self.cursor,
+        };
+        let from = std::mem::replace(&mut self.stroke_from, target);
+        let steps = ((target.distance(from) / 3.0).ceil() as usize).clamp(1, 96);
+        (1..=steps).map(|k| from.lerp(target, k as f32 / steps as f32)).collect()
     }
 
     fn effective_brush(&self) -> Brush {
@@ -3138,9 +3271,16 @@ impl App {
         let gpu = self.gfx.is_some() && self.stroke_brush.kind.gpu_drag();
         // Alt is ZBrush's alternate (ZSub) modifier.
         let invert = self.modifiers.alt_key() ^ self.workspace.subtract;
-        let symmetry = self.workspace.symmetry;
-        log::trace!("stroke {:?} invert={invert} symmetry={symmetry}", self.stroke_brush.kind);
-        self.stroke = Some(Stroke::begin(invert, gpu, symmetry).with_assets(self.workspace.assets.clone()));
+        let symmetry = self.workspace.sym();
+        log::trace!("stroke {:?} invert={invert} symmetry={}", self.stroke_brush.kind, symmetry.label());
+        self.stroke = Some(
+            Stroke::begin(invert, gpu, symmetry)
+                .with_assets(self.workspace.assets.clone())
+                .with_spacing(self.workspace.spacing),
+        );
+        self.stroke_from = self.cursor;
+        // LazyMouse trails sculpt and paint brushes; drag brushes follow the cursor.
+        self.lazy_point = (self.workspace.lazy_mouse && !self.stroke_brush.kind.is_drag()).then_some(self.cursor);
         self.apply_stroke();
     }
 
@@ -3184,16 +3324,21 @@ impl App {
                 fwd,
                 ray,
             );
-        } else if let Some(hit) = self.doc.mesh().raycast(ray.0, ray.1) {
-            self.hover = Some(hit.point);
-            stroke.dab(
-                self.doc.mesh_mut(),
-                &brush,
-                hit.point,
-                hit.normal,
-                fwd,
-                ray,
-            );
+        } else {
+            for p in self.stroke_path() {
+                let ray = self.ray_at(p);
+                let Some(hit) = self.doc.mesh().raycast(ray.0, ray.1) else {
+                    continue;
+                };
+                self.hover = Some(hit.point);
+                if let Some(stroke) = self.stroke.as_mut() {
+                    stroke.dab(self.doc.mesh_mut(), &brush, hit.point, hit.normal, fwd, ray);
+                }
+            }
+            self.workspace.lazy_line = self.lazy_point.map(|l| {
+                let (a, b) = (l / self.scale, self.cursor / self.scale);
+                (egui::pos2(a.x, a.y), egui::pos2(b.x, b.y))
+            });
         }
         // Hand a GPU grab to the renderer: buffers once, then one delta per frame.
         if let (Some(stroke), Some(gfx)) = (self.stroke.as_mut(), self.gfx.as_mut()) {
@@ -3222,6 +3367,8 @@ impl App {
             let level = self.doc.active();
             self.commit_stroke(stroke, level);
         }
+        self.lazy_point = None;
+        self.workspace.lazy_line = None;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.end_gpu_grab();
         }
@@ -3372,7 +3519,7 @@ impl App {
             self.add_tube(curve, d, t);
             return;
         }
-        let (symmetry, assets) = (self.workspace.symmetry, self.workspace.assets.clone());
+        let (symmetry, assets) = (self.workspace.sym(), self.workspace.assets.clone());
         let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone());
         let (fwd, step) = (self.camera.forward(), d.brush.radius * self.workspace.curve_step);
         apply_curve(&mut stroke, self.doc.mesh_mut(), &d.brush, &curve, fwd, step);
@@ -3408,7 +3555,7 @@ impl App {
             self.workspace.notify(why);
             return;
         }
-        let (symmetry, shape) = (self.workspace.symmetry, self.tube_shape(d.brush.radius));
+        let (symmetry, shape) = (self.workspace.sym(), self.tube_shape(d.brush.radius));
         let keep = self.mesh().extent();
         let group = self.mesh().max_group().saturating_add(1);
         let Some(part) = curve_tube::tubes(&curve, shape, symmetry, group) else {
@@ -3936,7 +4083,7 @@ impl App {
                 self.history.push(UndoStep::Stroke {level,chunks});
                 self.subtools[self.active_tool].bounds=self.doc.bounds();
             }
-        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.symmetry) {
+        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.sym()) {
             let old=mask::replace(self.doc.mesh_mut(),new);
             self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
         }
@@ -4000,7 +4147,7 @@ impl App {
         }
         // A drag on the model: paint from the press point on.
         self.mask_press = None;
-        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.symmetry)
+        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.sym())
             .with_brush(press.kind,self.workspace.assets.clone());
         let brush = self.at_pressure(self.workspace.brush_for(&self.brush, press.kind));
         stroke.dab_normal(self.doc.mesh_mut(), &brush, hit, press.normal);
@@ -4022,7 +4169,7 @@ impl App {
         };
         if press.direct && !press.moved {
             if let Some(hit)=press.hit {
-                let mut stroke=mask::MaskStroke::begin(press.alt,self.workspace.symmetry)
+                let mut stroke=mask::MaskStroke::begin(press.alt,self.workspace.sym())
                     .with_brush(press.kind,self.workspace.assets.clone());
                 stroke.dab_normal(self.doc.mesh_mut(),&self.brush,hit,press.normal);
                 if let Some(chunks)=stroke.end() {self.history.push(UndoStep::Mask {level:self.doc.active(),data:MaskData::Chunks(chunks)});}
@@ -4056,7 +4203,7 @@ impl App {
     fn cursor_moved(&mut self, pos: Vec2, over_ui: bool) {
         self.last_cursor = self.cursor;
         self.cursor = pos;
-        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+        if self.workspace.modal_open() || self.workspace.brush_catalog_open() {
             self.hover = None;
             return;
         }
@@ -4096,7 +4243,7 @@ impl App {
     /// Left button pressed. `consumed`: egui took the event; `over_ui`: the cursor is off
     /// the canvas.
     fn left_press(&mut self, consumed: bool, over_ui: bool) {
-        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+        if self.workspace.modal_open() || self.workspace.brush_catalog_open() {
             return;
         }
         let border = self.in_canvas_border();
@@ -4237,7 +4384,7 @@ impl App {
             self.gesture=None;self.workspace.gesture_preview=None;return;
         }
         if self.gesture.is_some() {return;}
-        if self.workspace.about_open || self.workspace.brush_catalog_open() {
+        if self.workspace.modal_open() || self.workspace.brush_catalog_open() {
             return;
         }
         let ctrl = self.modifiers.control_key();
@@ -4291,6 +4438,11 @@ impl App {
             KeyCode::KeyE => self.workspace.mode = Mode::Scale,
             KeyCode::KeyR => self.workspace.mode = Mode::Rotate,
             KeyCode::KeyX => self.workspace.symmetry = !self.workspace.symmetry,
+            // ZBrush: L toggles LazyMouse.
+            KeyCode::KeyL => {
+                self.workspace.lazy_mouse = !self.workspace.lazy_mouse;
+                self.workspace.notify(if self.workspace.lazy_mouse { "LazyMouse on" } else { "LazyMouse off" });
+            }
             KeyCode::KeyS => self.workspace.toggle_popup(QuickPopup::Size, self.cursor_pos()),
             KeyCode::KeyU => self.workspace.toggle_popup(QuickPopup::Intensity, self.cursor_pos()),
             KeyCode::KeyI => self.workspace.toggle_popup(QuickPopup::Rgb, self.cursor_pos()),
@@ -4409,6 +4561,16 @@ impl App {
         if actions.save {
             self.pending_doc = Some(DocOp::Save);
         }
+        if let Some(path) = actions.save_as {
+            self.project_path = path;
+            self.pending_doc = Some(DocOp::Save);
+        }
+        if actions.revert {
+            self.pending_doc = Some(DocOp::Open);
+        }
+        if actions.snapshot {
+            self.request_snapshot();
+        }
         if actions.save_subtool {
             self.pending_doc = Some(DocOp::SaveSubtool);
         }
@@ -4453,6 +4615,15 @@ impl App {
         }
         if actions.invert_visibility {
             self.pending_vis = Some(VisOp::Invert);
+        }
+        if let Some(grow) = actions.grow_visibility {
+            self.pending_vis = Some(if grow { VisOp::Grow } else { VisOp::Shrink });
+        }
+        if actions.auto_groups {
+            self.pending_vis = Some(VisOp::AutoGroups);
+        }
+        if let Some(angle) = actions.group_by_normals {
+            self.pending_vis = Some(VisOp::ByNormals(angle));
         }
         if actions.move_subtool != 0 {
             self.move_subtool(actions.move_subtool);
@@ -4690,6 +4861,24 @@ impl App {
                 self.selftest_project = Some(left - 1);
             }
         }
+        let snapshot_now = match self.snapshot_to.as_mut() {
+            Some((_, frames)) => {
+                *frames = frames.saturating_sub(1);
+                *frames == 0
+            }
+            None => false,
+        };
+        if snapshot_now {
+            self.request_snapshot();
+        }
+        if let Some(mut t) = self.selftest_symmetry.take() {
+            if self.selftest_symmetry_frame(&mut t) { self.quit = true; }
+            else { self.selftest_symmetry = Some(t); }
+        }
+        if let Some(mut t) = self.selftest_document.take() {
+            if self.selftest_document_frame(&mut t) { self.quit = true; }
+            else { self.selftest_document = Some(t); }
+        }
         if let Some(mut t) = self.selftest_materials.take() {
             if self.selftest_materials_frame(&mut t) { self.quit = true; }
             else { self.selftest_materials = Some(t); }
@@ -4788,7 +4977,7 @@ impl App {
             ],
             display: [
                 if self.workspace.grid { 1.0 } else { 0.0 },
-                if self.workspace.symmetry { 1.0 } else { 0.0 },
+                if self.workspace.sym().is_on() { 1.0 } else { 0.0 },
                 if self.workspace.show_mask { 1.0 } else { 0.0 },
                 if self.doc.mesh().mask.is_empty() { 0.0 } else { 1.0 },
             ],
@@ -4797,6 +4986,25 @@ impl App {
             xf_move: preview.translate.extend(preview.scale).to_array(),
             material: self.material_uniform(),
             cam_up: self.camera.up().extend(0.0).to_array(),
+            back: {
+                let d = &self.workspace.layout.document;
+                let c = d.back.map(|c| c as f32 / 255.0);
+                [c[0], c[1], c[2], d.range]
+            },
+            back_shape: {
+                let d = &self.workspace.layout.document;
+                [d.center, d.rate, workspace::FRAME_INSET * self.scale, 0.0]
+            },
+            border: {
+                let c = self.workspace.layout.document.border.map(|c| c as f32 / 255.0);
+                [c[0], c[1], c[2], 1.0]
+            },
+            sym: {
+                let s = self.workspace.sym();
+                let bits = s.x as u32 | (s.y as u32) << 1 | (s.z as u32) << 2;
+                let (axis, count) = s.radial.map_or((-1.0, 1.0), |(a, n)| (symmetry::Axis::ALL.iter().position(|x| *x == a).unwrap() as f32, n as f32));
+                [bits as f32, axis, count, 0.0]
+            },
         };
         let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
@@ -4806,6 +5014,7 @@ impl App {
         let t = Instant::now();
         gfx.render(&uniforms, &parked, self.workspace.polyframe, &jobs, full.textures_delta, full.pixels_per_point);
         self.render_ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.save_snapshot();
         if self.stress.is_some() {
             self.stress_upload += self.upload_ms;
             self.stress_render += self.render_ms;
@@ -4898,7 +5107,7 @@ impl ApplicationHandler for App {
             Some(state) => state.on_window_event(&window, &event).consumed,
             None => false,
         };
-        let over_ui = self.workspace.about_open || self.workspace.brush_catalog_open()
+        let over_ui = self.workspace.modal_open() || self.workspace.brush_catalog_open()
             || self.egui_ctx.is_pointer_over_egui()
             || (self.canvas_rect.is_positive()
                 && !self
@@ -4985,7 +5194,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let typing = self.egui_ctx.egui_wants_keyboard_input() || self.workspace.about_open || self.workspace.brush_catalog_open();
+                let typing = self.egui_ctx.egui_wants_keyboard_input() || self.workspace.modal_open() || self.workspace.brush_catalog_open();
                 if let PhysicalKey::Code(KeyCode::Space) = event.physical_key {
                     // ZBrush quick menu: shown while Space is held.
                     match event.state {
@@ -5447,6 +5656,14 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-surface") {
         app.selftest_surface = Some(native_tests::SurfaceTest::default());
     }
+    if args.iter().any(|a| a == "--selftest-symmetry") {
+        app.selftest_symmetry = Some(native_tests::SymmetryTest::default());
+    }
+    if args.iter().any(|a| a == "--selftest-document") {
+        app.selftest_document = Some(native_tests::DocumentTest::default());
+        // Snapshots go next to the project: keep them out of the working directory.
+        app.project_path = std::env::temp_dir().join(format!("klay-document-{}.klay", std::process::id())).to_string_lossy().into_owned();
+    }
     if args.iter().any(|a| a == "--selftest-materials") {
         app.selftest_materials = Some(native_tests::MaterialTest::default());
     }
@@ -5467,6 +5684,32 @@ fn main() {
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
+    // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).
+    if let Some(spec) = flag("--symmetry") {
+        for part in spec.split(',').map(str::trim) {
+            match part {
+                "x" => app.workspace.symmetry = true,
+                "y" => app.workspace.symmetry_y = true,
+                "z" => app.workspace.symmetry_z = true,
+                p if p.len() > 2 && p.starts_with('r') => {
+                    let axis = symmetry::Axis::ALL.into_iter().find(|a| a.name().eq_ignore_ascii_case(&p[1..2]));
+                    match (axis, p[2..].parse::<f32>()) {
+                        (Some(axis), Ok(n)) => {
+                            app.workspace.radial = true;
+                            app.workspace.radial_axis = axis;
+                            app.workspace.radial_count = n.clamp(2.0, 64.0);
+                        }
+                        _ => eprintln!("--symmetry: unknown part {p} (x, y, z, or r<axis><count> like rz8)"),
+                    }
+                }
+                p => eprintln!("--symmetry: unknown part {p} (x, y, z, or r<axis><count> like rz8)"),
+            }
+        }
+    }
+    // `--snapshot FILE`: after start-up (and `--demo-brushes`), save the canvas and quit.
+    if let Some(path) = flag("--snapshot") {
+        app.snapshot_to = Some((path.clone(), 30));
+    }
     // `--polyf`: start with polygroup colours and the polygon frame shown (Shift + F).
     app.workspace.polyframe = args.iter().any(|a| a == "--polyf");
     // `--material <name or number>`: start in that material (e.g. "MatCap Red Wax").
@@ -6857,5 +7100,89 @@ mod curve_input_tests {
         assert_eq!((a.mesh().vertex_count(), a.history.edits()), (verts, edits));
         assert!(a.curve.is_none() && a.curve_draw.is_none());
         assert!(a.status.contains("subdivision levels"));
+    }
+}
+
+#[cfg(test)]
+mod stroke_modifier_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new(60, false, usize::MAX);
+        app.workspace.assets = sculpt::StampSettings::default();
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app.workspace.select_brush(&mut app.brush, BrushKind::Draw);
+        app.brush.radius = 0.06;
+        app
+    }
+
+    /// Press at `from`, move through `path`, release; returns the stroke's dab count.
+    fn stroke(app: &mut App, from: Vec2, path: &[Vec2]) -> u32 {
+        app.cursor_moved(from, false);
+        app.left_press(false, false);
+        for &p in path {
+            app.cursor_moved(p, false);
+        }
+        let dabs = app.stroke.as_ref().map_or(0, |s| s.dabs);
+        app.left_release();
+        dabs
+    }
+
+    /// How far each of `n` points along the screen line from `a` to `b` was raised.
+    fn raised_along(app: &App, before: &[Vec3], a: Vec2, b: Vec2, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|k| {
+                let p = a.lerp(b, (k as f32 + 0.5) / n as f32);
+                let (o, d) = app.ray_at(p);
+                let hit = app.doc.mesh().raycast(o, d).unwrap();
+                let v = (0..before.len()).min_by(|&x, &y| before[x].distance(hit.point).total_cmp(&before[y].distance(hit.point))).unwrap();
+                (app.doc.mesh().positions[v] - before[v]).length()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fast_stroke_leaves_no_gaps_and_spacing_sets_the_dab_count() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        let (a, b) = (c - Vec2::new(150.0, 0.0), c + Vec2::new(150.0, 0.0));
+        let before = app.doc.mesh().positions.clone();
+        // One big jump: before, a single dab at each end.
+        let dabs = stroke(&mut app, a, &[b]);
+        assert!(dabs > 10, "{dabs} dabs along the jump");
+        let raised = raised_along(&app, &before, a, b, 12);
+        assert!(raised.iter().all(|&h| h > 1e-4), "a continuous ridge: {raised:?}");
+        // Wider spacing, fewer dabs over the same path.
+        app.history.undo(&mut app.doc);
+        app.workspace.spacing = 0.6;
+        let sparse = stroke(&mut app, a, &[b]);
+        assert!(sparse * 3 < dabs, "{sparse} vs {dabs}");
+    }
+
+    #[test]
+    fn lazy_mouse_trails_the_cursor_by_its_radius() {
+        let mut app = app();
+        app.workspace.lazy_mouse = true;
+        app.workspace.lazy_radius = 60.0;
+        let c = app.project(Vec3::ZERO);
+        // Inside the string the brush stays put: only the press dabs.
+        app.cursor_moved(c, false);
+        app.left_press(false, false);
+        app.cursor_moved(c + Vec2::new(40.0, 20.0), false);
+        assert_eq!(app.stroke.as_ref().unwrap().dabs, 1);
+        assert!(app.workspace.lazy_line.is_some(), "the string is drawn");
+        // Pulled 200 px, it follows to 60 px behind the cursor.
+        app.cursor_moved(c + Vec2::new(200.0, 0.0), false);
+        let lazy = app.lazy_point.unwrap();
+        assert!((app.cursor.distance(lazy) - 60.0).abs() < 1e-3);
+        let brush = app.project(app.hover.unwrap());
+        assert!(brush.distance(lazy) < 2.0, "the brush is at the lazy point: {brush:?} {lazy:?}");
+        assert!(app.stroke.as_ref().unwrap().dabs > 5);
+        app.left_release();
+        assert!(app.workspace.lazy_line.is_none() && app.lazy_point.is_none());
+        // L toggles it (ZBrush).
+        app.on_key(KeyCode::KeyL);
+        assert!(!app.workspace.lazy_mouse);
     }
 }

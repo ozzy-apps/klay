@@ -120,14 +120,16 @@ impl Gesture {
     }
 }
 
-/// Shape masks select all visible vertices through the view depth, with X mirroring.
+/// Shape masks select all visible vertices through the view depth; with symmetry a vertex
+/// is inside when any image of it is.
 pub fn mask_shape(
     mesh: &SculptMesh,
     screen: Screen,
     gesture: &Gesture,
     strength: f32,
-    symmetry: bool,
+    symmetry: impl Into<crate::symmetry::Symmetry>,
 ) -> Option<Vec<u8>> {
+    let images = symmetry.into().images();
     if gesture.start.distance(gesture.end) < 3.0 && gesture.kind != BrushKind::MaskLasso {
         return None;
     }
@@ -154,11 +156,7 @@ pub fn mask_shape(
             if !mesh.shown.is_empty() && mesh.shown[v] == 0 {
                 return old;
             }
-            let inside = screen.project(p).is_some_and(contains)
-                || (symmetry
-                    && screen
-                        .project(Vec3::new(-p.x, p.y, p.z))
-                        .is_some_and(contains));
+            let inside = (0..images.len()).any(|k| screen.project(images.unmap(k, p)).is_some_and(contains));
             if inside {
                 (old as i16 + step).clamp(0, 255) as u8
             } else {

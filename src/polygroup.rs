@@ -235,3 +235,176 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- Grow / Shrink, Auto Groups
+
+/// Corners of triangle `t`.
+fn corners(mesh: &SculptMesh, t: u32) -> [u32; 3] {
+    let i = 3 * t as usize;
+    [mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2]]
+}
+
+/// Visibility › Grow: hidden polygons touching a visible one become visible (one ring).
+pub fn grown_visibility(mesh: &SculptMesh) -> Vec<u8> {
+    if mesh.hidden.is_empty() {
+        return Vec::new();
+    }
+    (0..mesh.triangle_count() as u32)
+        .into_par_iter()
+        .map(|t| (!mesh.visible(t) && !corners(mesh, t).iter().any(|&v| mesh.shown[v as usize] != 0)) as u8)
+        .collect()
+}
+
+/// Visibility › Shrink: visible polygons touching a hidden one are hidden (one ring). With
+/// nothing hidden there is no edge to shrink from.
+pub fn shrunk_visibility(mesh: &SculptMesh) -> Vec<u8> {
+    if mesh.hidden.is_empty() {
+        return Vec::new();
+    }
+    let touches_hidden: Vec<bool> = (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| mesh.incident(v).iter().any(|&t| !mesh.visible(t)))
+        .collect();
+    (0..mesh.triangle_count() as u32)
+        .into_par_iter()
+        .map(|t| (!mesh.visible(t) || corners(mesh, t).iter().any(|&v| touches_hidden[v as usize])) as u8)
+        .collect()
+}
+
+/// Number visible regions from 0 in the order they are found, keeping hidden polygons'
+/// groups; `joins(a, b)` says whether neighbouring visible triangles `a`, `b` (sharing an
+/// edge) belong together, `seed` is the first triangle of the region. More regions than
+/// group ids share the last id.
+fn regions(mesh: &SculptMesh, joins: impl Fn(u32, u32, u32) -> bool) -> Vec<u16> {
+    let n = mesh.triangle_count();
+    const NONE: u32 = u32::MAX;
+    let mut region = vec![NONE; n];
+    let mut count = 0u32;
+    let mut stack = Vec::new();
+    for seed in 0..n as u32 {
+        if region[seed as usize] != NONE || !mesh.visible(seed) {
+            continue;
+        }
+        region[seed as usize] = count;
+        stack.push(seed);
+        while let Some(t) = stack.pop() {
+            let c = corners(mesh, t);
+            for k in 0..3 {
+                let (a, b) = (c[k], c[(k + 1) % 3]);
+                for &u in mesh.incident(a) {
+                    if u == t || region[u as usize] != NONE || !mesh.visible(u) || !corners(mesh, u).contains(&b) {
+                        continue;
+                    }
+                    if joins(seed, t, u) {
+                        region[u as usize] = count;
+                        stack.push(u);
+                    }
+                }
+            }
+        }
+        count += 1;
+    }
+    region
+        .iter()
+        .enumerate()
+        .map(|(t, &r)| if r == NONE { mesh.group(t as u32) } else { r.min(u16::MAX as u32) as u16 })
+        .collect()
+}
+
+/// Polygroups › Auto Groups: one polygroup per connected piece of visible polygons.
+pub fn auto_groups(mesh: &SculptMesh) -> Vec<u16> {
+    regions(mesh, |_, _, _| true)
+}
+
+/// Polygroups › Group By Normals: regions whose polygons all face within `max_angle`
+/// degrees of the region's first polygon, grown across shared edges (flat faces of a hard
+/// surface each become a group; a curved surface splits into patches).
+pub fn groups_by_normals(mesh: &SculptMesh, max_angle: f32) -> Vec<u16> {
+    let normals: Vec<Vec3> = (0..mesh.triangle_count() as u32)
+        .into_par_iter()
+        .map(|t| {
+            let [a, b, c] = corners(mesh, t).map(|v| mesh.positions[v as usize]);
+            (b - a).cross(c - a).normalize_or_zero()
+        })
+        .collect();
+    let cos = max_angle.to_radians().cos();
+    regions(mesh, |seed, _, u| normals[seed as usize].dot(normals[u as usize]) >= cos)
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::primitive::{Primitive, Settings};
+
+    fn sphere() -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(12, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    fn visible(hidden: &[u8]) -> usize {
+        hidden.iter().filter(|&&h| h == 0).count()
+    }
+
+    #[test]
+    fn grow_and_shrink_visibility_move_by_one_ring() {
+        let mut m = sphere();
+        assert!(grown_visibility(&m).is_empty() && shrunk_visibility(&m).is_empty(), "nothing hidden");
+        // Only the polygons around vertex 0 visible.
+        let star = m.incident(0).to_vec();
+        m.set_hidden((0..m.triangle_count() as u32).map(|t| (!star.contains(&t)) as u8).collect());
+        let grown = grown_visibility(&m);
+        assert!(visible(&grown) > star.len());
+        // Every newly shown polygon touches the old visible ones.
+        for t in 0..m.triangle_count() as u32 {
+            if grown[t as usize] == 0 && !star.contains(&t) {
+                assert!(corners(&m, t).iter().any(|&v| m.shown[v as usize] != 0));
+            }
+        }
+        m.set_hidden(grown);
+        let back = shrunk_visibility(&m);
+        assert!(visible(&back) < visible(&m.hidden) && visible(&back) <= star.len());
+    }
+
+    #[test]
+    fn auto_groups_give_each_piece_its_own_group() {
+        let (p, i) = crate::mesh::cube_sphere(8, 1.0);
+        let n = p.len() as u32;
+        let mut positions = p.clone();
+        positions.extend(p.iter().map(|q| *q + Vec3::X * 3.0));
+        let mut indices = i.clone();
+        indices.extend(i.iter().map(|k| k + n));
+        let m = SculptMesh::from_raw(positions, indices);
+        let groups = auto_groups(&m);
+        let mut ids: Vec<u16> = groups.clone();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
+        // Each piece is one group: its triangles share a side of X = 1.5.
+        for t in 0..m.triangle_count() as u32 {
+            let right = m.positions[corners(&m, t)[0] as usize].x > 1.5;
+            assert_eq!(groups[t as usize], groups[0] ^ (right != (m.positions[corners(&m, 0)[0] as usize].x > 1.5)) as u16);
+        }
+    }
+
+    #[test]
+    fn group_by_normals_splits_a_cube_by_face_and_a_sphere_into_patches() {
+        let (p, i, _) = Settings { kind: Primitive::Cube, ..Default::default() }.build(1.0);
+        let cube = SculptMesh::from_raw(p, i);
+        let count = |g: &[u16]| {
+            let mut ids = g.to_vec();
+            ids.sort();
+            ids.dedup();
+            ids.len()
+        };
+        assert_eq!(count(&groups_by_normals(&cube, 20.0)), 6);
+        let s = sphere();
+        let (fine, coarse) = (count(&groups_by_normals(&s, 15.0)), count(&groups_by_normals(&s, 60.0)));
+        assert!(fine > coarse && coarse > 1, "{fine} {coarse}");
+        // Hidden polygons keep their group.
+        let mut s = sphere();
+        s.set_groups(vec![7; s.triangle_count()]);
+        s.set_hidden((0..s.triangle_count()).map(|t| (t % 2) as u8).collect());
+        let g = groups_by_normals(&s, 30.0);
+        assert!((0..s.triangle_count()).filter(|t| t % 2 == 1).all(|t| g[t] == 7));
+    }
+}

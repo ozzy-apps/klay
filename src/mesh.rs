@@ -137,9 +137,9 @@ pub struct Selection {
     pub verts: Vec<u32>,
     pub dist: Vec<f32>,
     pub groups: Vec<Group>,
-    /// +1 for vertices selected by the brush itself, -1 for those selected by its mirror
-    /// image. Empty when the selection has no mirror (every vertex is +1).
-    pub side: Vec<f32>,
+    /// Which symmetry image of the brush selected each vertex (0: the brush itself; see
+    /// [`crate::symmetry::Images`]). Empty without symmetry (every vertex is image 0).
+    pub image: Vec<u8>,
 }
 
 impl Selection {
@@ -147,8 +147,15 @@ impl Selection {
         self.verts.len()
     }
 
+    /// +1 for vertices selected by the brush itself, -1 for those of another image.
     pub fn side(&self, i: usize) -> f32 {
-        if self.side.is_empty() { 1.0 } else { self.side[i] }
+        if self.image(i) == 0 { 1.0 } else { -1.0 }
+    }
+
+    /// The symmetry image vertex `i` belongs to (0: the brush itself).
+    #[inline]
+    pub fn image(&self, i: usize) -> usize {
+        if self.image.is_empty() { 0 } else { self.image[i] as usize }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -695,34 +702,41 @@ impl SculptMesh {
                     ds[i] = *d;
                 }
             });
-        Selection { verts, dist, groups, side: Vec::new() }
+        Selection { verts, dist, groups, image: Vec::new() }
     }
 
-    /// Vertices within `r` of `c` or of its mirror image across the X = 0 plane. Each
-    /// vertex is listed once, with the distance to the nearer centre and `side` telling
-    /// which one (see [`Selection::side`]), so the two sides never race on a vertex.
+    /// Vertices within `r` of any image of `c` under `images` (symmetry). Each vertex is
+    /// listed once, with the distance to the nearest image and which image that is (see
+    /// [`Selection::image`]; the brush itself wins a tie), so images never race on a vertex.
     /// Kept separate from [`select_sphere`](Self::select_sphere) so the common path stays
     /// as tight as it is.
-    pub fn select_sphere_mirror_x(&self, c: Vec3, r: f32) -> Selection {
-        let m = Vec3::new(-c.x, c.y, c.z);
+    pub fn select_sphere_images(&self, c: Vec3, r: f32, images: &crate::symmetry::Images) -> Selection {
+        let centres = images.of(c);
         let r2 = r * r;
         let shown = &self.shown;
-        let per_chunk: Vec<(u32, Vec<(u32, f32, f32)>)> = self
+        let per_chunk: Vec<(u32, Vec<(u32, f32, u8)>)> = self
             .chunks
             .par_iter()
             .enumerate()
-            .filter(|(_, ch)| ch.aabb.intersects_sphere(c, r) || ch.aabb.intersects_sphere(m, r))
+            .filter(|(_, ch)| centres.iter().any(|&m| ch.aabb.intersects_sphere(m, r)))
             .map(|(ci, ch)| {
-                let hits: Vec<(u32, f32, f32)> = (ch.vert_start..ch.vert_end)
+                let near: Vec<(usize, Vec3)> = centres
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, m)| ch.aabb.intersects_sphere(*m, r))
+                    .collect();
+                let hits: Vec<(u32, f32, u8)> = (ch.vert_start..ch.vert_end)
                     .filter_map(|v| {
                         if !shown.is_empty() && shown[v as usize] == 0 {
                             return None;
                         }
                         let p = self.positions[v as usize];
-                        let a = (p - c).length_squared();
-                        let b = (p - m).length_squared();
-                        let (d2, side) = if a <= b { (a, 1.0) } else { (b, -1.0) };
-                        if d2 <= r2 { Some((v, d2.sqrt(), side)) } else { None }
+                        let (k, d2) = near
+                            .iter()
+                            .map(|&(k, m)| (k, (p - m).length_squared()))
+                            .fold((usize::MAX, f32::INFINITY), |best, x| if x.1 < best.1 { x } else { best });
+                        if d2 <= r2 { Some((v, d2.sqrt(), k as u8)) } else { None }
                     })
                     .collect();
                 (ci as u32, hits)
@@ -741,24 +755,24 @@ impl SculptMesh {
         }
         let mut verts = vec![0u32; total as usize];
         let mut dist = vec![0f32; total as usize];
-        let mut side = vec![0f32; total as usize];
+        let mut image = vec![0u8; total as usize];
         let ranges = || groups.iter().map(|g| (g.start as usize, g.end as usize));
         let vslices = split_ranges(&mut verts, ranges());
         let dslices = split_ranges(&mut dist, ranges());
-        let sslices = split_ranges(&mut side, ranges());
+        let islices = split_ranges(&mut image, ranges());
         vslices
             .into_par_iter()
             .zip(dslices.into_par_iter())
-            .zip(sslices.into_par_iter())
+            .zip(islices.into_par_iter())
             .zip(per_chunk.par_iter())
-            .for_each(|(((vs, ds), ss), (_, hits))| {
-                for (i, (v, d, s)) in hits.iter().enumerate() {
+            .for_each(|(((vs, ds), is), (_, hits))| {
+                for (i, (v, d, k)) in hits.iter().enumerate() {
                     vs[i] = *v;
                     ds[i] = *d;
-                    ss[i] = *s;
+                    is[i] = *k;
                 }
             });
-        Selection { verts, dist, groups, side }
+        Selection { verts, dist, groups, image }
     }
 
     /// Write new positions for a selection, in parallel per chunk.

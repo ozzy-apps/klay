@@ -185,6 +185,68 @@ pub struct PaletteState {
     pub open: bool,
 }
 
+/// Document › Back and Border (ZBrush): the canvas background colour with a vertical
+/// gradient, and the colour of the border around the document frame. Colours are sRGB.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DocumentLook {
+    pub back: [u8; 3],
+    /// Gradient strength: 0 is flat, 1 the strongest light-to-dark ramp.
+    pub range: f32,
+    /// Height (0 top, 1 bottom) where the gradient crosses the back colour.
+    pub center: f32,
+    /// Softness of the gradient: 0 is a hard edge, 1 a ramp over the whole height.
+    pub rate: f32,
+    pub border: [u8; 3],
+}
+
+impl Default for DocumentLook {
+    fn default() -> Self {
+        Self { back: [24, 25, 28], range: 0.2, center: 0.5, rate: 1.0, border: [12, 13, 14] }
+    }
+}
+
+impl DocumentLook {
+    /// The background at `v` (0 top to 1 bottom of the document), 0..1 sRGB; the shader
+    /// (`fs_background`) does the same.
+    pub fn back_at(&self, v: f32) -> [f32; 3] {
+        let half = (self.rate * 0.5).max(1e-3);
+        let t = ((v - (self.center - half)) / (2.0 * half)).clamp(0.0, 1.0);
+        let light = 1.0 - t * t * (3.0 - 2.0 * t);
+        self.back.map(|c| (c as f32 / 255.0 + (light - 0.5) * self.range * 0.5).clamp(0.0, 1.0))
+    }
+
+    fn encode(&self) -> String {
+        let rgb = |c: [u8; 3]| format!("{},{},{}", c[0], c[1], c[2]);
+        format!("document|{}|{:.3}|{:.3}|{:.3}|{}\n", rgb(self.back), self.range, self.center, self.rate, rgb(self.border))
+    }
+
+    fn decode(parts: &[&str]) -> Option<Self> {
+        let rgb = |s: &str| -> Option<[u8; 3]> {
+            let v: Vec<u8> = s.split(',').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+            v.try_into().ok()
+        };
+        let unit = |s: &str| s.parse::<f32>().ok().map(|x| x.clamp(0.0, 1.0));
+        match parts {
+            [back, range, center, rate, border] => Some(Self {
+                back: rgb(back)?,
+                range: unit(range)?,
+                center: unit(center)?,
+                rate: unit(rate)?,
+                border: rgb(border)?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Document dialogs (see `Workspace::doc_dialog`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DocDialog {
+    /// Save As, with the path being typed.
+    SaveAs(String),
+    Revert,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockLayout {
     /// Order within a tray is the order in this list.
@@ -194,6 +256,8 @@ pub struct DockLayout {
     pub left_tray: bool,
     pub right_tray: bool,
     pub tray_width: f32,
+    /// Document › Back / Border, saved with the workspace (ZBrush: Save As Startup Doc).
+    pub document: DocumentLook,
 }
 
 impl Default for DockLayout {
@@ -210,6 +274,7 @@ impl Default for DockLayout {
             left_tray: true,
             right_tray: true,
             tray_width: 262.0,
+            document: DocumentLook::default(),
         }
     }
 }
@@ -284,6 +349,9 @@ impl DockLayout {
         for (key, open) in &self.sections {
             text.push_str(&format!("section|{key}|{open}\n"));
         }
+        if self.document != DocumentLook::default() {
+            text.push_str(&self.document.encode());
+        }
         text
     }
 
@@ -319,6 +387,11 @@ impl DockLayout {
                 ["section", key, open] => {
                     if let Ok(open) = open.parse() {
                         result.sections.insert((*key).to_string(), open);
+                    }
+                }
+                ["document", rest @ ..] => {
+                    if let Some(d) = DocumentLook::decode(rest) {
+                        result.document = d;
                     }
                 }
                 _ => {}
@@ -441,6 +514,10 @@ pub struct Actions {
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
+    /// Document › Save As (to this path, which becomes the project's), Revert, Snapshot.
+    pub save_as: Option<String>,
+    pub revert: bool,
+    pub snapshot: bool,
     /// SubTool: save the active subtool alone, add the subtools of a file, export the
     /// active subtool as OBJ.
     pub save_subtool: bool,
@@ -451,6 +528,11 @@ pub struct Actions {
     /// Visibility: show everything / swap hidden and visible.
     pub show_all: bool,
     pub invert_visibility: bool,
+    /// Visibility › Grow (true) / Shrink (false).
+    pub grow_visibility: Option<bool>,
+    /// Polygroups › Auto Groups / Group By Normals (max angle, degrees).
+    pub auto_groups: bool,
+    pub group_by_normals: Option<u8>,
     /// Wedge: turn on (remeshing) or off / remesh now.
     pub wedge_toggle: bool,
     pub wedge_now: bool,
@@ -531,6 +613,8 @@ pub struct Workspace {
     pub focus: bool,
     /// A true modal: the app also uses this to suspend canvas input and shortcuts.
     pub about_open: bool,
+    /// Document › Save As or Revert waiting for an answer.
+    pub doc_dialog: Option<DocDialog>,
     logo: Option<TextureHandle>,
     pub subtract: bool,
     pub material: usize,
@@ -541,11 +625,30 @@ pub struct Workspace {
     pub perspective: bool,
     /// Mirror strokes across X: `X`.
     pub symmetry: bool,
+    /// Symmetry › Y and Z mirrors, and Radial (axis, count).
+    pub symmetry_y: bool,
+    pub symmetry_z: bool,
+    pub radial: bool,
+    pub radial_axis: crate::symmetry::Axis,
+    pub radial_count: f32,
     /// Brushes in Curve mode (ZBrush: Stroke › Curve), how much a curve is smoothed
     /// (times the brush's screen radius) and the dab step along it (times Draw Size).
     pub curve_kinds: Vec<BrushKind>,
     pub curve_smooth: f32,
     pub curve_step: f32,
+    /// Stroke › Spacing (share of Draw Size between dabs), LazyMouse and LazyRadius
+    /// (pixels the brush trails the cursor by).
+    pub spacing: f32,
+    /// Masking › Mask By Cavity sensitivity (1..=100) and Mask By Polygroups border width
+    /// (rings).
+    pub cavity_sensitivity: f32,
+    pub group_border_width: f32,
+    /// Polygroups › Group By Normals: Max Angle Tolerance, degrees.
+    pub normals_angle: f32,
+    pub lazy_mouse: bool,
+    pub lazy_radius: f32,
+    /// LazyMouse string while stroking: brush point to cursor, logical pixels.
+    pub lazy_line: Option<(Pos2, Pos2)>,
     /// CurveTube shape (Stroke › Curve): taper toward the end, vertices around each ring.
     pub tube_taper: f32,
     pub tube_sides: u32,
@@ -617,6 +720,7 @@ impl Workspace {
             canvas: Rect::NOTHING,
             focus: false,
             about_open: false,
+            doc_dialog: None,
             logo: None,
             subtract: false,
             material: 0,
@@ -624,9 +728,21 @@ impl Workspace {
             grid: true,
             perspective: true,
             symmetry: false,
+            symmetry_y: false,
+            symmetry_z: false,
+            radial: false,
+            radial_axis: crate::symmetry::Axis::Y,
+            radial_count: 8.0,
             curve_kinds: crate::curve::CURVE_BY_DEFAULT.to_vec(),
             curve_smooth: 0.5,
             curve_step: 0.16,
+            spacing: crate::sculpt::SPACING,
+            cavity_sensitivity: 50.0,
+            normals_angle: 20.0,
+            group_border_width: 2.0,
+            lazy_mouse: false,
+            lazy_radius: 40.0,
+            lazy_line: None,
             tube_taper: 0.0,
             tube_sides: 12,
             curve_preview: None,
@@ -676,7 +792,7 @@ impl Workspace {
         if let Some(text) = self.pending_notice.take() {
             self.flash(ui.ctx(), text);
         }
-        if !self.about_open && !self.brush_catalog_open()
+        if !self.modal_open() && !self.brush_catalog_open()
             && !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
@@ -739,6 +855,7 @@ impl Workspace {
             self.saved = encoded;
         }
         self.about_dialog(ui.ctx());
+        self.doc_dialog(ui.ctx(), m, &mut a);
         m.brush.color=self.color.to_srgb();
         self.save_brush_assets();
         a
@@ -911,6 +1028,67 @@ impl Workspace {
         self.logo
             .get_or_insert_with(|| crate::branding::texture(ctx))
             .id()
+    }
+
+    /// The symmetry every brush strokes with (Symmetry palette, X key).
+    pub fn sym(&self) -> crate::symmetry::Symmetry {
+        crate::symmetry::Symmetry {
+            x: self.symmetry,
+            y: self.symmetry_y,
+            z: self.symmetry_z,
+            radial: self.radial.then(|| (self.radial_axis, self.radial_count.round().clamp(2.0, 64.0) as u8)),
+        }
+    }
+
+    /// A dialog is up: canvas input waits (About, Save As, Revert).
+    pub fn modal_open(&self) -> bool {
+        self.about_open || self.doc_dialog.is_some()
+    }
+
+    /// Document › Save As (a path, prefilled) and Revert (asks first: unsaved work is lost).
+    fn doc_dialog(&mut self, ctx: &Context, m: &mut Model<'_>, a: &mut Actions) {
+        let Some(dialog) = self.doc_dialog.as_mut() else {
+            return;
+        };
+        let mut close = false;
+        let response = egui::Modal::new(Id::unique("document-dialog"))
+            .backdrop_color(Color32::from_black_alpha(120))
+            .frame(Frame::NONE.fill(BG1).stroke(Stroke::new(1.0, BG4)).inner_margin(16))
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                match dialog {
+                    DocDialog::SaveAs(path) => {
+                        ui.label(RichText::new("Save As").size(14.0).strong());
+                        let field = ui.add(
+                            egui::TextEdit::singleline(path).desired_width(f32::INFINITY).font(FontId::monospace(12.0)),
+                        );
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!path.trim().is_empty(), egui::Button::new("Save")).clicked() || (enter && !path.trim().is_empty()) {
+                                a.save_as = Some(path.trim().to_string());
+                                close = true;
+                            }
+                            close |= ui.button("Cancel").clicked();
+                        });
+                        note(ui, "Saves every subtool there; later saves go to the new file.");
+                    }
+                    DocDialog::Revert => {
+                        ui.label(RichText::new("Revert").size(14.0).strong());
+                        ui.label(format!("Open {} again as it was last saved? Changes since then are lost.", m.project_path));
+                        ui.horizontal(|ui| {
+                            if ui.button("Revert").clicked() {
+                                a.revert = true;
+                                close = true;
+                            }
+                            close |= ui.button("Cancel").clicked();
+                        });
+                    }
+                }
+            });
+        if close || response.should_close() {
+            self.doc_dialog = None;
+        }
     }
 
     fn about_dialog(&mut self, ctx: &Context) {
@@ -1820,14 +1998,17 @@ impl Workspace {
                     h,
                     id,
                     "auto",
-                    "Auto masking",
-                    Some(NC),
+                    "Auto Masking",
+                    None,
                     false,
-                    false,
-                    &mut |_, ui| {
-                        let (mut bf, mut topo) = (false, false);
-                        ui.checkbox(&mut bf, "Backface mask");
-                        ui.checkbox(&mut topo, "Topological");
+                    true,
+                    &mut |ws, ui| {
+                        let auto = &mut ws.assets.auto;
+                        ui.checkbox(&mut auto.backface, "BackfaceMask")
+                            .on_hover_text("Leave surface turned away from you alone: the far side of thin parts");
+                        ui.checkbox(&mut auto.topological, "Topological")
+                            .on_hover_text("Only the surface joined to the point under the brush, inside the brush: the next finger or the other lip stays");
+                        note(ui, "Every sculpt and paint brush, with symmetry too.");
                     },
                 );
             }
@@ -1841,7 +2022,7 @@ impl Workspace {
                     None,
                     true,
                     true,
-                    &mut |_, ui| {
+                    &mut |ws, ui| {
                         let name = std::path::Path::new(m.project_path.as_str())
                             .file_name()
                             .map_or_else(String::new, |n| n.to_string_lossy().to_string());
@@ -1852,26 +2033,83 @@ impl Workspace {
                                 .desired_width(f32::INFINITY)
                                 .font(FontId::monospace(12.0)),
                         );
-                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-                        let w = (r.width() - 6.0) / 3.0;
-                        for (col, (label, hint)) in [
-                            ("New", "Start over with one subtool from Mesh › Initialize"),
-                            ("Open", "Open the project at this path · Ctrl + O"),
-                            ("Save", "Save every subtool to this path · Ctrl + S"),
+                        let saved = std::path::Path::new(m.project_path.as_str()).is_file();
+                        let mut clicked = [false; 6];
+                        for (row, cells) in [
+                            [
+                                ("New", true, "Start over with one subtool from Mesh › Initialize"),
+                                ("Open", true, "Open the project at this path · Ctrl + O"),
+                                ("Save", true, "Save every subtool to this path · Ctrl + S"),
+                            ],
+                            [
+                                ("Save As", true, "Save every subtool to a new path and keep working there"),
+                                ("Revert", saved, "Open this project again as it was last saved"),
+                                ("Snapshot", true, "Save the canvas inside the document frame as a PNG next to the project"),
+                            ],
                         ]
                         .into_iter()
                         .enumerate()
                         {
-                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
-                            if ui.put(cell, egui::Button::new(label)).on_hover_text(hint).clicked() {
-                                match col {
-                                    0 => a.new_project = true,
-                                    1 => a.open = true,
-                                    _ => a.save = true,
+                            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                            let w = (r.width() - 6.0) / 3.0;
+                            for (col, (label, on, hint)) in cells.into_iter().enumerate() {
+                                let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                                child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                                if !on {
+                                    child.disable();
                                 }
+                                clicked[row * 3 + col] = child
+                                    .put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate())
+                                    .on_hover_text(hint)
+                                    .clicked();
                             }
                         }
+                        a.new_project |= clicked[0];
+                        a.open |= clicked[1];
+                        a.save |= clicked[2];
+                        if clicked[3] {
+                            ws.doc_dialog = Some(DocDialog::SaveAs(m.project_path.clone()));
+                        }
+                        if clicked[4] {
+                            ws.doc_dialog = Some(DocDialog::Revert);
+                        }
+                        a.snapshot |= clicked[5];
                         note(ui, "Saves every subtool with its levels and sculpting; undo history is not saved.");
+                    },
+                );
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "back",
+                    "Back",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        let d = &mut ws.layout.document;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            egui::widgets::color_picker::color_edit_button_srgb(ui, &mut d.back)
+                                .on_hover_text("Canvas background colour");
+                            ui.label("Back");
+                            ui.add_space(12.0);
+                            egui::widgets::color_picker::color_edit_button_srgb(ui, &mut d.border)
+                                .on_hover_text("Colour of the border around the document frame");
+                            ui.label("Border");
+                        });
+                        zslider(ui, "Range", &mut d.range, 0.0..=1.0, false, false, 2);
+                        zslider(ui, "Center", &mut d.center, 0.0..=1.0, false, false, 2);
+                        zslider(ui, "Rate", &mut d.rate, 0.0..=1.0, false, false, 2);
+                        if ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Reset"))
+                            .on_hover_text("Klay's default background and border")
+                            .clicked()
+                        {
+                            *d = DocumentLook::default();
+                        }
+                        note(ui, "Range: gradient strength · Center: where it crosses the Back colour · Rate: its softness. Kept with the workspace.");
                     },
                 );
                 self.sec(
@@ -1988,16 +2226,29 @@ impl Workspace {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             for (label, op, hint) in [
                                 ("Blur", MaskOp::Blur, "Ctrl + click the model"),
                                 ("Sharpen", MaskOp::Sharpen, "Ctrl + Alt + click the model"),
+                                ("Grow", MaskOp::Grow, "Spread the mask one ring of polygons"),
+                                ("Shrink", MaskOp::Shrink, "Pull the mask back one ring of polygons"),
                             ] {
                                 if ui.button(label).on_hover_text(hint).clicked() {
                                     a.mask = Some(op);
                                 }
                             }
                         });
+                        let full = |ui: &mut Ui, label: &str, hint: &str| {
+                            ui.add_sized([ui.available_width(), 20.0], egui::Button::new(label)).on_hover_text(hint).clicked()
+                        };
+                        if full(ui, "Mask By Cavity", "Mask the recessed surface, more where it is deeper") {
+                            a.mask = Some(MaskOp::Cavity(ws.cavity_sensitivity.round() as u8));
+                        }
+                        zslider(ui, "Cavity", &mut ws.cavity_sensitivity, 1.0..=100.0, false, false, 0);
+                        if full(ui, "Mask By Polygroups", "Mask the borders between polygroups · Invert to mask their insides") {
+                            a.mask = Some(MaskOp::GroupBorders(ws.group_border_width.round() as u8));
+                        }
+                        zslider(ui, "Border width", &mut ws.group_border_width, 1.0..=12.0, false, false, 0);
                         ui.checkbox(&mut ws.show_mask, "View mask").on_hover_text("Ctrl + H");
                         note(ui, "Ctrl + drag paints · Ctrl + Alt + drag erases");
                     },
@@ -2350,6 +2601,23 @@ impl Workspace {
                                     a.invert_visibility = true;
                                 }
                             });
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 4.0) * 0.5;
+                                if ui
+                                    .add(egui::Button::new("Grow").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Show one more ring of polygons around the visible ones")
+                                    .clicked()
+                                {
+                                    a.grow_visibility = Some(true);
+                                }
+                                if ui
+                                    .add(egui::Button::new("Shrink").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Hide the outer ring of the visible polygons")
+                                    .clicked()
+                                {
+                                    a.grow_visibility = Some(false);
+                                }
+                            });
                         });
                         note(ui, "Ctrl + Shift + drag: keep the rectangle (Alt: hide it) · click a group to isolate it (Alt: hide it)");
                     },
@@ -2392,6 +2660,21 @@ impl Workspace {
                                 }
                             });
                         });
+                        if ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Auto Groups"))
+                            .on_hover_text("One polygroup per connected piece of the visible polygons")
+                            .clicked()
+                        {
+                            a.auto_groups = true;
+                        }
+                        if ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Group By Normals"))
+                            .on_hover_text("New polygroups where the surface turns by more than Max Angle")
+                            .clicked()
+                        {
+                            a.group_by_normals = Some(ws.normals_angle.round() as u8);
+                        }
+                        zslider(ui, "Max Angle", &mut ws.normals_angle, 1.0..=90.0, false, false, 0);
                     },
                 );
                 self.sec(
@@ -2585,6 +2868,7 @@ impl Workspace {
                             ("Drag circle", "middle: move · end: scale / rotate"),
                             ("Drag ring / line", "move the action line"),
                             ("X", "symmetry"),
+                            ("L", "LazyMouse"),
                             ("Ctrl + D", "divide (add a subdivision level)"),
                             ("D / Shift + D", "higher / lower subdivision level"),
                             ("F / Home", "frame mesh / reset view"),
@@ -2637,14 +2921,17 @@ impl Workspace {
                     id,
                     "mods",
                     "Modifiers",
-                    Some(NC),
+                    None,
                     true,
-                    false,
-                    &mut |_, ui| {
-                        let (mut spacing, mut stab) = (0.12, 0.0);
-                        zslider(ui, "Spacing", &mut spacing, 0.0..=1.0, false, false, 2);
-                        zslider(ui, "Stabilizer", &mut stab, 0.0..=1.0, false, false, 2);
-                        note(ui, "Pen pressure: Brush › Tablet pressure");
+                    true,
+                    &mut |ws, ui| {
+                        zslider(ui, "Spacing", &mut ws.spacing, 0.03..=1.0, false, false, 2);
+                        ui.checkbox(&mut ws.lazy_mouse, "LazyMouse")
+                            .on_hover_text("The brush trails the cursor on a string, for steady lines · L");
+                        ui.add_enabled_ui(ws.lazy_mouse, |ui| {
+                            zslider(ui, "LazyRadius", &mut ws.lazy_radius, 5.0..=300.0, true, false, 0);
+                        });
+                        note(ui, "Spacing: dabs per Draw Size along the stroke (ZBrush: LazyStep) · LazyRadius in pixels · pen pressure: Brush › Tablet pressure");
                     },
                 );
             }
@@ -2659,20 +2946,29 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
-                        let (mut y, mut z, mut radial, mut count) = (false, false, false, 8.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 16.0;
-                            ui.checkbox(&mut ws.symmetry, "X").on_hover_text("X");
-                            ui.add_enabled_ui(false, |ui| {
-                                ui.checkbox(&mut y, "Y");
-                                ui.checkbox(&mut z, "Z");
+                            ui.checkbox(&mut ws.symmetry, "X").on_hover_text("Mirror across X · X");
+                            ui.checkbox(&mut ws.symmetry_y, "Y").on_hover_text("Mirror across Y");
+                            ui.checkbox(&mut ws.symmetry_z, "Z").on_hover_text("Mirror across Z");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut ws.radial, "Radial").on_hover_text("Copies turned evenly about an axis");
+                            ui.add_enabled_ui(ws.radial, |ui| {
+                                let axes = crate::symmetry::Axis::ALL;
+                                let names: Vec<&str> = axes.iter().map(|a| a.name()).collect();
+                                let at = axes.iter().position(|a| *a == ws.radial_axis).unwrap_or(1);
+                                if let Some(i) = seg(ui, &names, at, false) {
+                                    ws.radial_axis = axes[i];
+                                }
                             });
                         });
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.checkbox(&mut radial, "Radial");
-                            zslider(ui, "Radial count", &mut count, 2.0..=24.0, false, false, 0);
+                        ui.add_enabled_ui(ws.radial, |ui| {
+                            zslider(ui, "RadialCount", &mut ws.radial_count, 2.0..=64.0, false, false, 0);
                         });
-                        note(ui, "Y, Z and radial are not connected");
+                        let sym = ws.sym();
+                        kv(ui, "Copies", &sym.images().len().to_string());
+                        note(ui, "Brushes, masks and curves follow every copy · Clip Line mirrors across X only");
                     },
                 );
             }
@@ -2779,7 +3075,10 @@ impl Workspace {
                                 .add(egui::Button::new("Reset").min_size(vec2(w, 20.0)))
                                 .clicked()
                             {
+                                // The document colours are not layout: they stay.
+                                let document = ws.layout.document;
                                 ws.layout = DockLayout::default();
+                                ws.layout.document = document;
                                 ws.flash(ui.ctx(), "Layout reset".to_string());
                             }
                             if ui
@@ -2959,6 +3258,12 @@ impl Workspace {
                 },
             }
             p.text(end+vec2(8.0,8.0),Align2::LEFT_TOP,g.kind.name(),FontId::proportional(12.0),color);
+        }
+        if let Some((brush, cursor)) = self.lazy_line {
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("lazy-line")));
+            let color = Color32::from_rgb(235, 80, 55);
+            p.line_segment([brush, cursor], Stroke::new(1.0, color));
+            p.circle_stroke(brush, 3.0, Stroke::new(1.2, color));
         }
         if let Some((r, hide)) = self.select_rect {
             // ZBrush SelectRect: green keeps what it covers, red (Alt) hides it.
@@ -4688,6 +4993,25 @@ mod tests {
         let a = click(&mut workspace, &mut settings, text_position(&out, "Rebuild") + vec2(4.0, 4.0));
         assert!(a.rebuild);
         let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn the_document_look_saves_with_the_layout_and_ramps_light_to_dark() {
+        let mut layout = DockLayout::default();
+        // Klay's default look adds nothing to the file.
+        assert!(!layout.encode().contains("document|"));
+        layout.document = DocumentLook { back: [90, 60, 40], range: 0.8, center: 0.3, rate: 0.5, border: [1, 2, 3] };
+        let back = DockLayout::decode(&layout.encode());
+        assert_eq!(back.document, layout.document);
+        // A broken line keeps the default.
+        assert_eq!(DockLayout::decode("document|1,2|x\n").document, DocumentLook::default());
+        // Light at the top, dark at the bottom, the Back colour at Center; flat without Range.
+        let d = layout.document;
+        let (top, mid, bottom) = (d.back_at(0.0), d.back_at(d.center), d.back_at(1.0));
+        assert!(top[0] > mid[0] && mid[0] > bottom[0]);
+        assert!((mid[0] - 90.0 / 255.0).abs() < 1e-3);
+        let flat = DocumentLook { range: 0.0, ..d };
+        assert_eq!(flat.back_at(0.0), flat.back_at(1.0));
     }
 
     #[test]

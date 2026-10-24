@@ -22,6 +22,16 @@ pub enum MaskOp {
     All,
     Blur,
     Sharpen,
+    /// GrowMask / ShrinkMask: one ring of polygons more or less (never across hidden
+    /// polygons).
+    Grow,
+    Shrink,
+    /// Mask By Cavity: mask the recessed surface, more where it is deeper; the value is
+    /// the sensitivity, 1..=100.
+    Cavity(u8),
+    /// Mask By Polygroups: mask the borders between polygroups, `width` rings wide (Invert
+    /// masks the insides instead).
+    GroupBorders(u8),
 }
 
 /// The mask `op` makes of the current one.
@@ -32,7 +42,98 @@ pub fn apply(mesh: &SculptMesh, op: MaskOp) -> Vec<u8> {
         MaskOp::All => vec![255; mesh.vertex_count()],
         MaskOp::Blur => blurred(mesh, 1.0),
         MaskOp::Sharpen => sharpened(mesh, 1.0),
+        MaskOp::Grow => spread(mesh, true),
+        MaskOp::Shrink => spread(mesh, false),
+        MaskOp::Cavity(sensitivity) => cavity(mesh, sensitivity),
+        MaskOp::GroupBorders(width) => group_borders(mesh, width),
     }
+}
+
+/// Whether `v` has a visible polygon (every vertex while nothing is hidden).
+fn shown(mesh: &SculptMesh, v: u32) -> bool {
+    mesh.shown.is_empty() || mesh.shown[v as usize] != 0
+}
+
+/// Grow (`grow`) or shrink the mask by one ring: each shown vertex takes the largest (or
+/// smallest) value among itself and its shown neighbours, so soft edges move too.
+pub fn spread(mesh: &SculptMesh, grow: bool) -> Vec<u8> {
+    if mesh.mask.is_empty() {
+        return Vec::new();
+    }
+    spread_values(mesh, &mesh.mask, grow)
+}
+
+/// [`spread`] of the values `m` (one per vertex of `mesh`).
+fn spread_values(mesh: &SculptMesh, m: &[u8], grow: bool) -> Vec<u8> {
+    (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            let own = m[v as usize];
+            if !shown(mesh, v) {
+                return own;
+            }
+            let near = mesh.neighbors(v).iter().filter(|&&n| shown(mesh, n)).map(|&n| m[n as usize]);
+            if grow { near.fold(own, u8::max) } else { near.fold(own, u8::min) }
+        })
+        .collect()
+}
+
+/// Mask By Cavity: how far each vertex sits below its neighbours, along its normal and
+/// relative to their spacing, mapped through `sensitivity` (1..=100) and softened once.
+/// Hidden polygons keep their mask.
+pub fn cavity(mesh: &SculptMesh, sensitivity: u8) -> Vec<u8> {
+    let gain = sensitivity.clamp(1, 100) as f32 / 100.0 * 16.0;
+    let raw: Vec<f32> = (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            let nb = mesh.neighbors(v);
+            if nb.is_empty() {
+                return 0.0;
+            }
+            let p = mesh.positions[v as usize];
+            let mean = nb.iter().map(|&n| mesh.positions[n as usize]).sum::<Vec3>() / nb.len() as f32;
+            let spacing = nb.iter().map(|&n| mesh.positions[n as usize].distance(p)).sum::<f32>() / nb.len() as f32;
+            ((mean - p).dot(mesh.normal_at(v)) / spacing.max(1e-12) * gain).clamp(0.0, 1.0)
+        })
+        .collect();
+    let old = &mesh.mask;
+    (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            if !shown(mesh, v) {
+                return old.get(v as usize).copied().unwrap_or(0);
+            }
+            let nb = mesh.neighbors(v);
+            let soft = (raw[v as usize] + nb.iter().map(|&n| raw[n as usize]).sum::<f32>()) / (nb.len() + 1) as f32;
+            (soft * 255.0).round() as u8
+        })
+        .collect()
+}
+
+/// Mask By Polygroups: the vertices where polygroups meet, grown `width - 1` rings, fully
+/// masked, everything else free. Nothing is masked on a single-group mesh.
+pub fn group_borders(mesh: &SculptMesh, width: u8) -> Vec<u8> {
+    if mesh.groups.is_empty() {
+        return Vec::new();
+    }
+    let border: Vec<u8> = (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            let mut tris = mesh.incident(v).iter().map(|&t| mesh.groups[t as usize]);
+            let first = tris.next();
+            (shown(mesh, v) && first.is_some_and(|g| tris.any(|h| h != g))) as u8 * 255
+        })
+        .collect();
+    let mut grown = border;
+    for _ in 1..width.max(1) {
+        grown = spread_values(mesh, &grown, true);
+    }
+    let old = &mesh.mask;
+    grown
+        .into_par_iter()
+        .enumerate()
+        .map(|(v, m)| if shown(mesh, v as u32) { m } else { old.get(v).copied().unwrap_or(0) })
+        .collect()
 }
 
 /// Mask values of whole chunks (their owned ranges), saved for undo.
@@ -153,7 +254,8 @@ pub fn restore_chunks(mesh: &mut SculptMesh, saved: MaskChunks) -> MaskChunks {
 /// A Ctrl + drag on the model: paints (or with Alt erases) the mask under the brush.
 pub struct MaskStroke {
     erase: bool,
-    symmetry: bool,
+    /// Every dab is applied at each of these images of it (symmetry).
+    images: crate::symmetry::Images,
     snapshots: MaskChunks,
     snapshotted: HashSet<u32>,
     last_dab: Option<Vec3>,
@@ -163,10 +265,10 @@ pub struct MaskStroke {
 }
 
 impl MaskStroke {
-    pub fn begin(erase: bool, symmetry: bool) -> Self {
+    pub fn begin(erase: bool, symmetry: impl Into<crate::symmetry::Symmetry>) -> Self {
         Self {
             erase,
-            symmetry,
+            images: symmetry.into().images(),
             snapshots: Vec::new(),
             snapshotted: HashSet::new(),
             last_dab: None,
@@ -194,21 +296,30 @@ impl MaskStroke {
             }
         }
         self.last_dab = Some(hit);
-        let sel = if self.symmetry {
-            mesh.select_sphere_mirror_x(hit, brush.radius)
-        } else {
-            mesh.select_sphere(hit, brush.radius)
-        };
-        if sel.is_empty() {
-            return;
+        // Every symmetry copy masks a whole dab of its own, in turn (as in ZBrush), so
+        // overlapping copies both apply.
+        let mut any = false;
+        for k in 0..self.images.len() {
+            any |= self.dab_copy(mesh, brush, k, hit, normal);
         }
-        self.dabs += 1;
+        if any {
+            self.dabs += 1;
+        }
+    }
+
+    /// One symmetry copy `k` of a dab at `hit` (the brush's own frame). Returns whether it
+    /// reached any vertex.
+    fn dab_copy(&mut self, mesh: &mut SculptMesh, brush: &Brush, k: usize, hit: Vec3, normal: Vec3) -> bool {
+        let sel = mesh.select_sphere(self.images.map(k, hit), brush.radius);
+        if sel.is_empty() {
+            return false;
+        }
         let chunks = sel.chunks();
         let fresh: Vec<u32> = chunks.iter().copied().filter(|c| self.snapshotted.insert(*c)).collect();
         self.snapshots.extend(snapshot_chunks(mesh, &fresh));
         if mesh.mask.is_empty() {
             if self.erase {
-                return;
+                return true;
             }
             mesh.mask = vec![0; mesh.vertex_count()];
         }
@@ -217,7 +328,8 @@ impl MaskStroke {
         let r = brush.radius;
         let (u,tangent_v)=tangent(normal);
         let values = sel.par_map(|i, v| {
-            let p=mesh.positions[v as usize];let p=if sel.side(i)<0.0 {Vec3::new(-p.x,p.y,p.z)}else{p};
+            // The alpha is placed in the brush's own frame, so every copy shows it alike.
+            let p=self.images.unmap(k,mesh.positions[v as usize]);
             let delta=p-hit;
             let uv=glam::Vec2::new(delta.dot(u),-delta.dot(tangent_v))/(2.0*r)+glam::Vec2::splat(0.5);
             let alpha=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
@@ -232,6 +344,7 @@ impl MaskStroke {
         for c in chunks {
             mesh.chunks[c as usize].dirty_mask = true;
         }
+        true
     }
 
     /// The values the stroke replaced, if it changed anything.
@@ -336,5 +449,86 @@ mod brush_tool_tests {
             StampSettings{alpha:Pattern::Image(std::sync::Arc::new(image)),..StampSettings::default()});
         stroke.dab_normal(&mut blocked,&brush,Vec3::Z,Vec3::Z);
         assert!(blocked.mask.iter().all(|&m|m==0));assert_eq!(blocked.positions,positions);
+    }
+}
+
+#[cfg(test)]
+mod mask_op_tests {
+    use super::*;
+    use crate::primitive::Primitive;
+
+    fn sphere() -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(16, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    #[test]
+    fn grow_and_shrink_move_the_mask_one_ring_and_stop_at_hidden_polygons() {
+        let mut m = sphere();
+        let v = 0usize;
+        let mut mask = vec![0u8; m.vertex_count()];
+        mask[v] = 255;
+        m.mask = mask;
+        let grown = apply(&m, MaskOp::Grow);
+        let ring: Vec<u32> = m.neighbors(v as u32).to_vec();
+        assert!(ring.iter().all(|&n| grown[n as usize] == 255));
+        assert_eq!(grown.iter().filter(|&&x| x == 255).count(), ring.len() + 1);
+        m.mask = grown;
+        let back = apply(&m, MaskOp::Shrink);
+        assert_eq!(back.iter().filter(|&&x| x == 255).count(), 1);
+        assert_eq!(back[v], 255);
+        // Nothing masked: nothing to grow.
+        m.mask = Vec::new();
+        assert!(apply(&m, MaskOp::Grow).is_empty());
+        // Hidden polygons stop the growth: hide everything around the masked vertex.
+        let mut m = sphere();
+        let mut mask = vec![0u8; m.vertex_count()];
+        mask[v] = 255;
+        m.mask = mask;
+        let hidden: Vec<u8> = (0..m.triangle_count() as u32).map(|t| (!m.incident(v as u32).contains(&t)) as u8).collect();
+        m.set_hidden(hidden);
+        let mut grown = m.mask.clone();
+        for _ in 0..4 {
+            m.mask = grown;
+            grown = apply(&m, MaskOp::Grow);
+        }
+        let reached = grown.iter().enumerate().filter(|(_, x)| **x == 255).map(|(i, _)| i as u32).collect::<Vec<_>>();
+        assert!(reached.iter().all(|&r| r == v as u32 || ring.contains(&r)), "{} masked", reached.len());
+    }
+
+    #[test]
+    fn mask_by_cavity_masks_grooves_not_ridges_or_flats() {
+        let (p, i) = Primitive::Plane.build(80, 1.0);
+        let p: Vec<Vec3> = p
+            .into_iter()
+            .map(|q| q + Vec3::Z * (0.03 * (-((q.y - 0.3) / 0.04).powi(2)).exp() - 0.03 * (-((q.y + 0.3) / 0.04).powi(2)).exp()))
+            .collect();
+        let m = SculptMesh::from_raw(p, i);
+        // Chunking reorders vertices: look them up in the mesh.
+        let p = &m.positions;
+        let near = |y: f32| (0..p.len()).min_by(|&a, &b| (p[a].truncate() - glam::Vec2::new(0.0, y)).length().total_cmp(&(p[b].truncate() - glam::Vec2::new(0.0, y)).length())).unwrap();
+        let mask = apply(&m, MaskOp::Cavity(50));
+        let (groove, ridge, flat) = (mask[near(-0.3)], mask[near(0.3)], mask[near(0.0)]);
+        assert!(groove > 128 && ridge == 0 && flat < 8, "groove {groove} ridge {ridge} flat {flat}");
+        // More sensitivity reaches the shallower sides of the groove.
+        let more = apply(&m, MaskOp::Cavity(100));
+        let side = near(-0.34);
+        assert!(more[side] >= mask[side]);
+    }
+
+    #[test]
+    fn mask_by_polygroups_masks_the_borders_between_groups() {
+        let (p, i, g) = crate::primitive::Settings { kind: Primitive::Cube, ..Default::default() }.build(1.0);
+        let m = SculptMesh::from_raw_with_groups(p, i, g);
+        let mask = apply(&m, MaskOp::GroupBorders(1));
+        // Cube edges are group borders; face centres are not.
+        for (v, q) in m.positions.iter().enumerate() {
+            let on_edge = [q.x.abs(), q.y.abs(), q.z.abs()].iter().filter(|c| **c > 0.999 * m.positions.iter().map(|p| p.x.abs()).fold(0.0, f32::max)).count() >= 2;
+            assert_eq!(mask[v] == 255, on_edge, "{q:?}");
+        }
+        let wider = apply(&m, MaskOp::GroupBorders(3));
+        assert!(wider.iter().filter(|&&x| x == 255).count() > mask.iter().filter(|&&x| x == 255).count());
+        // One group: no borders, no mask.
+        assert!(apply(&sphere(), MaskOp::GroupBorders(2)).is_empty());
     }
 }

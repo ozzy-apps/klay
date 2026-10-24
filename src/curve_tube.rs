@@ -106,12 +106,13 @@ pub fn tube(points: &[Vec3], up: Vec3, shape: Tube) -> (Vec<Vec3>, Vec<u32>) {
     (positions, indices)
 }
 
-/// Every tube of a curve: one per piece, and with `symmetry` one per piece of its mirror
-/// image across X = 0, as one mesh in polygroup `group`.
-pub fn tubes(curve: &Curve, shape: Tube, symmetry: bool, group: u16) -> Option<SculptMesh> {
-    let mirrored = symmetry.then(|| curve.mirrored());
+/// Every tube of a curve: one per piece, and with symmetry one per piece of each image of
+/// the curve, as one mesh in polygroup `group`.
+pub fn tubes(curve: &Curve, shape: Tube, symmetry: impl Into<crate::symmetry::Symmetry>, group: u16) -> Option<SculptMesh> {
+    let images = symmetry.into().images();
+    let others: Vec<Curve> = (1..images.len()).map(|k| curve.transformed(&images.0[k])).collect();
     let (mut positions, mut indices) = (Vec::new(), Vec::new());
-    for c in std::iter::once(curve).chain(mirrored.as_ref()) {
+    for c in std::iter::once(curve).chain(others.iter()) {
         for piece in &c.pieces {
             if piece.len() < 2 {
                 continue;
@@ -240,6 +241,11 @@ mod tests {
         // The mirror image is closed and faces outward as well.
         assert!(volume(&two.positions, &two.indices) > 1.9 * volume(&one.positions, &one.indices));
         assert!(tubes(&Curve::default(), shape(), true, 1).is_none());
+        // Radial symmetry: one closed, outward tube per copy.
+        let radial = crate::symmetry::Symmetry { radial: Some((crate::symmetry::Axis::Y, 5)), ..Default::default() };
+        let five = tubes(&curve, shape(), radial, 1).unwrap();
+        assert_eq!(five.vertex_count(), 5 * one.vertex_count());
+        assert!(volume(&five.positions, &five.indices) > 4.9 * volume(&one.positions, &one.indices));
     }
 
     #[test]

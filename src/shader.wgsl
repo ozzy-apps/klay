@@ -18,6 +18,12 @@ struct Uniforms {
     // MatCaps (matcap.rs): unpainted colour; w = MatCap index, negative for the clays.
     material: vec4<f32>,
     cam_up: vec4<f32>,
+    // Document › Back: rgb, w = Range; Center, Rate, border width (px); Border rgb.
+    back: vec4<f32>,
+    back_shape: vec4<f32>,
+    border: vec4<f32>,
+    // Symmetry (symmetry.rs): mirror bits X 1 Y 2 Z 4; radial axis (-1 off); radial count.
+    sym: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -62,8 +68,19 @@ fn fs_background(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     let grid_line = 1.0 - min(min(lines.x, lines.y), 1.0);
     let fade = exp(-length(point.xz) * 0.30) * smoothstep(0.02, 0.25, abs(direction.y));
     let visible = select(0.0, 1.0, t > 0.0 && u.display.x > 0.5);
-    let vignette = max(0.0, 1.0 - length((uv - 0.5) * 1.2));
-    var color = vec3<f32>(24.0, 25.0, 28.0) / 255.0 + vignette * 0.014;
+    // The border around the document frame: flat Border colour, nothing drawn on it.
+    let inset = u.back_shape.z;
+    let inner = position.xy - u.viewport.xy - vec2<f32>(inset);
+    let size = u.viewport.zw - vec2<f32>(2.0 * inset);
+    if (any(inner < vec2<f32>(0.0)) || any(inner >= size)) {
+        return vec4<f32>(u.border.rgb, 1.0);
+    }
+    // Document › Back with its vertical gradient (DocumentLook::back_at).
+    let v = inner.y / max(size.y, 1.0);
+    let half = max(u.back_shape.y * 0.5, 0.001);
+    let g = clamp((v - (u.back_shape.x - half)) / (2.0 * half), 0.0, 1.0);
+    let light = 1.0 - g * g * (3.0 - 2.0 * g);
+    var color = clamp(u.back.rgb + vec3<f32>((light - 0.5) * u.back.w * 0.5), vec3<f32>(0.0), vec3<f32>(1.0));
     color += vec3<f32>(grid_line * fade * visible * 0.045);
     return vec4<f32>(color, 1.0);
 }
@@ -185,10 +202,9 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
     // Brush ring projected onto the surface.
     if (u.params.x > 0.5 && in.parked == 0u) {
         var d = distance(in.world_pos, u.brush.xyz);
-        // Symmetry: a second ring at the mirror image across X = 0.
+        // Symmetry: a ring at every image of the brush (as symmetry.rs makes them).
         if (u.display.y > 0.5) {
-            let mirrored = vec3<f32>(-u.brush.x, u.brush.y, u.brush.z);
-            d = min(d, distance(in.world_pos, mirrored));
+            d = min(d, symmetric_distance(in.world_pos, u.brush.xyz));
         }
         let r = u.brush.w;
         let px = u.params.z;
@@ -217,4 +233,36 @@ fn matcap(n: vec3<f32>, v: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
     let diffuse = textureSampleLevel(matcaps, matcap_sampler, uv, layer, 0.0).rgb;
     let specular = textureSampleLevel(matcaps, matcap_sampler, uv, layer + 1, 0.0).rgb;
     return base * diffuse + specular;
+}
+
+// The distance from `p` to the nearest symmetry image of `c`: every combination of the
+// enabled mirrors, turned by each step of the radial symmetry.
+fn symmetric_distance(p: vec3<f32>, c: vec3<f32>) -> f32 {
+    let bits = u32(u.sym.x + 0.5);
+    let axis = i32(round(u.sym.y));
+    var turns = 1u;
+    if (axis >= 0) {
+        turns = max(u32(u.sym.z + 0.5), 1u);
+    }
+    var d = 1e9;
+    for (var m = 0u; m < 8u; m = m + 1u) {
+        if ((m & bits) != m) {
+            continue;
+        }
+        var q = c;
+        if ((m & 1u) != 0u) { q.x = -q.x; }
+        if ((m & 2u) != 0u) { q.y = -q.y; }
+        if ((m & 4u) != 0u) { q.z = -q.z; }
+        for (var k = 0u; k < turns; k = k + 1u) {
+            var r = q;
+            if (axis >= 0) {
+                var n = vec3<f32>(0.0, 1.0, 0.0);
+                if (axis == 0) { n = vec3<f32>(1.0, 0.0, 0.0); }
+                if (axis == 2) { n = vec3<f32>(0.0, 0.0, 1.0); }
+                r = rotate(q, n, 6.2831853 * f32(k) / f32(turns));
+            }
+            d = min(d, distance(p, r));
+        }
+    }
+    return d;
 }

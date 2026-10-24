@@ -257,9 +257,9 @@ impl Curve {
         self.pieces.iter().flat_map(|p| p.start..p.end.saturating_sub(1))
     }
 
-    /// The same curve mirrored across X = 0.
-    pub fn mirrored(&self) -> Curve {
-        let m = |v: &Vec3| Vec3::new(-v.x, v.y, v.z);
+    /// The curve under an orthogonal map through the origin (a symmetry image).
+    pub fn transformed(&self, map: &glam::Mat3) -> Curve {
+        let m = |v: &Vec3| *map * *v;
         Curve {
             points: self.points.iter().map(m).collect(),
             normals: self.normals.iter().map(m).collect(),
@@ -315,12 +315,14 @@ fn foot(curve: &Curve, segs: &[usize], p: Vec3, reach: f32, depth: f32, overhang
     Some(Foot { along, across, point, normal })
 }
 
-/// The vertices within `reach` across `curve` (and across its mirror image with
-/// `symmetry`), each with its [`Foot`] (measured on the mirrored side for side -1).
+/// The vertices within `reach` across `curve` (and across each of its symmetry `images`),
+/// each with its [`Foot`] measured on the image it belongs to (the selection's image).
 /// Chunks far from the curve are skipped by their bounds; each vertex looks only at the
 /// segments near its chunk.
-pub fn band(mesh: &SculptMesh, curve: &Curve, reach: f32, symmetry: bool) -> (Selection, Vec<Foot>) {
-    let mirror = symmetry.then(|| curve.mirrored());
+pub fn band(mesh: &SculptMesh, curve: &Curve, reach: f32, images: &crate::symmetry::Images) -> (Selection, Vec<Foot>) {
+    let curves: Vec<Curve> = std::iter::once(curve.clone())
+        .chain((1..images.len()).map(|k| curve.transformed(&images.0[k])))
+        .collect();
     let (depth, overhang) = (reach * 0.65, reach * 0.04);
     let shown = &mesh.shown;
     let near = |c: &Curve, ch: &crate::mesh::Chunk| -> Vec<usize> {
@@ -331,37 +333,35 @@ pub fn band(mesh: &SculptMesh, curve: &Curve, reach: f32, symmetry: bool) -> (Se
             })
             .collect()
     };
-    let per_chunk: Vec<(u32, Vec<(u32, f32, Foot)>)> = mesh
+    let per_chunk: Vec<(u32, Vec<(u32, u8, Foot)>)> = mesh
         .chunks
         .par_iter()
         .enumerate()
         .filter_map(|(ci, ch)| {
-            let own = near(curve, ch);
-            let other = mirror.as_ref().map(|m| near(m, ch)).unwrap_or_default();
-            if own.is_empty() && other.is_empty() {
+            let lists: Vec<Vec<usize>> = curves.iter().map(|c| near(c, ch)).collect();
+            if lists.iter().all(|l| l.is_empty()) {
                 return None;
             }
-            let hits: Vec<(u32, f32, Foot)> = (ch.vert_start..ch.vert_end)
+            let hits: Vec<(u32, u8, Foot)> = (ch.vert_start..ch.vert_end)
                 .filter_map(|v| {
                     if !shown.is_empty() && shown[v as usize] == 0 {
                         return None;
                     }
                     let p = mesh.positions[v as usize];
-                    let a = (!own.is_empty()).then(|| foot(curve, &own, p, reach, depth, overhang)).flatten();
-                    let b = mirror
-                        .as_ref()
-                        .filter(|_| !other.is_empty())
-                        .and_then(|m| foot(m, &other, p, reach, depth, overhang))
-                        // A mirror flips handedness: negate across so the pattern is the
-                        // mirror image of the original side's (point and normal stay on
-                        // the mirrored side, where the vertex moves).
-                        .map(|f| Foot { across: -f.across, ..f });
-                    match (a, b) {
-                        (Some(a), Some(b)) => Some(if a.point.distance(p) <= b.point.distance(p) { (v, 1.0, a) } else { (v, -1.0, b) }),
-                        (Some(a), None) => Some((v, 1.0, a)),
-                        (None, Some(b)) => Some((v, -1.0, b)),
-                        (None, None) => None,
-                    }
+                    curves
+                        .iter()
+                        .zip(&lists)
+                        .enumerate()
+                        .filter(|(_, (_, l))| !l.is_empty())
+                        .filter_map(|(k, (c, l))| {
+                            // A mirror flips handedness: negate across so the pattern is the
+                            // mirror image of the original's (point and normal stay on the
+                            // image, where the vertex moves).
+                            foot(c, l, p, reach, depth, overhang)
+                                .map(|f| (k, if images.mirrors(k) { Foot { across: -f.across, ..f } } else { f }))
+                        })
+                        .min_by(|a, b| a.1.point.distance(p).total_cmp(&b.1.point.distance(p)))
+                        .map(|(k, f)| (v, k as u8, f))
                 })
                 .collect();
             (!hits.is_empty()).then_some((ci as u32, hits))
@@ -374,25 +374,25 @@ pub fn band(mesh: &SculptMesh, curve: &Curve, reach: f32, symmetry: bool) -> (Se
         total += hits.len() as u32;
     }
     let n = total as usize;
-    let (mut verts, mut dist, mut side) = (vec![0u32; n], vec![0f32; n], vec![0f32; n]);
+    let (mut verts, mut dist, mut image) = (vec![0u32; n], vec![0f32; n], vec![0u8; n]);
     let mut feet = vec![Foot { along: 0.0, across: 0.0, point: Vec3::ZERO, normal: Vec3::Z }; n];
     let ranges = || groups.iter().map(|g| (g.start as usize, g.end as usize));
     split_ranges(&mut verts, ranges())
         .into_par_iter()
         .zip(split_ranges(&mut dist, ranges()).into_par_iter())
-        .zip(split_ranges(&mut side, ranges()).into_par_iter())
+        .zip(split_ranges(&mut image, ranges()).into_par_iter())
         .zip(split_ranges(&mut feet, ranges()).into_par_iter())
         .zip(per_chunk.par_iter())
         .for_each(|((((vs, ds), ss), fs), (_, hits))| {
-            for (i, (v, s, f)) in hits.iter().enumerate() {
+            for (i, (v, k, f)) in hits.iter().enumerate() {
                 vs[i] = *v;
                 ds[i] = f.across.abs();
-                ss[i] = *s;
+                ss[i] = *k;
                 fs[i] = *f;
             }
         });
-    let side = if symmetry { side } else { Vec::new() };
-    (Selection { verts, dist, groups, side }, feet)
+    let image = if images.len() > 1 { image } else { Vec::new() };
+    (Selection { verts, dist, groups, image }, feet)
 }
 
 #[cfg(test)]
@@ -486,7 +486,7 @@ mod tests {
         let (p, i) = crate::primitive::Primitive::Plane.build(80, 1.0);
         let mesh = SculptMesh::from_raw(p, i);
         let c = line(-0.5, 0.5);
-        let (sel, feet) = band(&mesh, &c, 0.1, false);
+        let (sel, feet) = band(&mesh, &c, 0.1, &crate::symmetry::Images::identity());
         assert!(!sel.is_empty());
         let mut seen = std::collections::HashSet::new();
         for (k, &v) in sel.verts.iter().enumerate() {
@@ -501,7 +501,7 @@ mod tests {
         assert!(sel.len() >= expect);
         // With symmetry, a curve on +X also selects its mirror image on -X, side -1.
         let c = line(0.3, 0.7);
-        let (sel, feet) = band(&mesh, &c, 0.05, true);
+        let (sel, feet) = band(&mesh, &c, 0.05, &crate::symmetry::Symmetry::from(true).images());
         let mirrored: Vec<usize> = (0..sel.len()).filter(|&k| sel.side(k) < 0.0).collect();
         assert!(!mirrored.is_empty() && mirrored.len() < sel.len());
         for k in mirrored {
