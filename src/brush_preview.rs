@@ -11,7 +11,9 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
     } else {
         0.84f32
     };
-    let c = crate::workspace::MATERIALS[material % 4].0;
+    let table = &crate::workspace::MATERIALS;
+    let c = table[material.min(table.len() - 1)].0;
+    let matcap = crate::matcap::of_material(material);
     let base = Vec3::new(c.r() as f32, c.g() as f32, c.b() as f32) / 255.0;
     let sign = if invert { -1.0 } else { 1.0 };
     let spiral: Vec<Vec2> = (0..90)
@@ -45,7 +47,7 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
     let warp = |p: Vec2| {
         if !matches!(
             kind,
-            Some(BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook)
+            Some(BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::MoveTopological)
         ) {
             return p;
         }
@@ -53,6 +55,7 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
         let (amount, width) = match kind {
             Some(BrushKind::SnakeHook) => (0.75, 0.13),
             Some(BrushKind::Elastic) => (0.28, 0.7),
+            Some(BrushKind::MoveTopological) => (0.26, 0.34),
             _ => (0.33, 0.22),
         };
         let pull = amount
@@ -77,8 +80,66 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
         let h = match kind {
             None
             | Some(
-                BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::Paint,
+                BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::MoveTopological | BrushKind::Paint,
             ) => 0.0,
+            // A strip of flat-topped clay with square ends, and a second laid over it.
+            Some(BrushKind::ClayTubes) => {
+                let strip = |q: Vec2| {
+                    let side = ((0.12 - distance(q, &curve)) * 45.0).clamp(0.0, 1.0);
+                    let ends = ((0.46 - q.x.abs()) * 45.0).clamp(0.0, 1.0);
+                    side * ends
+                };
+                (strip(p) * 0.055 + strip(p - Vec2::new(0.06, 0.15)) * 0.045) * sign
+            }
+            // Planes with hard square edges.
+            Some(BrushKind::HPolish) => {
+                let square = ((0.42 - p.x.abs().max((p.y + 0.05).abs())) * 40.0).clamp(0.0, 1.0);
+                (z.min(0.71 + p.x * 0.10 - p.y * 0.12) - z) * square
+            }
+            // A facet that follows the curvature under each part of the stroke.
+            Some(BrushKind::TrimAdaptive) => {
+                let plane = if p.x < -0.18 {
+                    0.66 - p.x * 0.30
+                } else if p.x < 0.18 {
+                    0.74
+                } else {
+                    0.66 + p.x * 0.30
+                };
+                (z.min(plane - p.y * 0.05) - z) * ((0.62 - p.length()) * 10.0).clamp(0.0, 1.0)
+            }
+            // One plane across the whole form.
+            Some(BrushKind::Planar) => z.min(0.60 + p.y * 0.05) - z,
+            Some(BrushKind::TrimSmoothBorder) => {
+                let fade = ((0.62 - p.length()) * 3.2).clamp(0.0, 1.0);
+                (z.min(0.66 + p.x * 0.10) - z) * fade * fade * (3.0 - 2.0 * fade)
+            }
+            // A round swell along the stroke.
+            Some(BrushKind::InflateBalloon) => {
+                (1.0 - (p.distance(Vec2::new(-0.05, 0.02)) / 0.42).powi(2)).max(0.0).sqrt() * 0.13 * sign
+            }
+            // Spread from the centre: a raised ring around a swollen middle.
+            Some(BrushKind::Magnify) => {
+                let l = p.length();
+                (soft(l, 0.26) * 0.05 + soft(l - 0.30, 0.07) * 0.035) * sign
+            }
+            // A narrow crack whose depth wanders, with sharp lips.
+            Some(BrushKind::OrbCracks) => {
+                let rough = 0.65 + 0.35 * noise(p * 1.7).abs();
+                -soft(s, 0.020) * 0.12 * rough * sign + soft(s - 0.035, 0.015) * 0.014 * sign
+            }
+            // Square dents with flat bottoms.
+            Some(BrushKind::MalletFast) => {
+                let dent = |q: Vec2, half: f32| ((half - q.x.abs().max(q.y.abs())) * 45.0).clamp(0.0, 1.0);
+                -(dent(p - Vec2::new(-0.18, -0.12), 0.17) + dent(p - Vec2::new(0.2, 0.16), 0.13)) * 0.05 * sign
+            }
+            // Noise with its valleys (or its peaks) smoothed away inside the stroke.
+            Some(k @ (BrushKind::SmoothValleys | BrushKind::SmoothPeaks)) => {
+                // Egg crate: inside the stroke only the bumps (or only the pits) are left.
+                let n = (p.x * 20.0).sin() * (p.y * 20.0).sin() * 0.022;
+                let inside = 1.0 - (((0.40 - p.distance(Vec2::new(-0.05, 0.0))) * 12.0).clamp(0.0, 1.0));
+                let kept = if (k == BrushKind::SmoothValleys) == (n < 0.0) { inside } else { 1.0 };
+                n * kept
+            }
             Some(BrushKind::Draw) => soft(s, 0.10) * 0.085 * sign,
             Some(BrushKind::DamStandard) => {
                 -soft(d, 0.042) * 0.10 * sign + soft(d - 0.065, 0.03) * 0.012 * sign
@@ -194,8 +255,20 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                 color *= 1.0 - coverage * 0.82;
             }
             let ao = (0.84 + z * 0.18).min(1.0);
-            let lit = (color * (0.23 + diff * 0.77 + fill) * ao + Vec3::splat(spec))
-                .clamp(Vec3::ZERO, Vec3::ONE);
+            let lit = match matcap {
+                // The viewport's MatCap, in linear light, then encoded like the swapchain.
+                // The thumbnail's rows run down, view space runs up.
+                Some(look) => {
+                    let paint = (color / base.max(Vec3::splat(1e-4))).powf(2.2);
+                    let surface = look.base() * paint;
+                    let view_normal = Vec3::new(normal.x, -normal.y, normal.z);
+                    (crate::matcap::shade(look, surface, view_normal) * ao)
+                        .clamp(Vec3::ZERO, Vec3::ONE)
+                        .powf(1.0 / 2.2)
+                }
+                None => (color * (0.23 + diff * 0.77 + fill) * ao + Vec3::splat(spec))
+                    .clamp(Vec3::ZERO, Vec3::ONE),
+            };
             let i = (y * n + x) * 4;
             pixels[i] = (lit.x * 255.0) as u8;
             pixels[i + 1] = (lit.y * 255.0) as u8;
@@ -238,6 +311,17 @@ mod tests {
                 .unwrap();
             }
             images.push(i);
+        }
+        // Every material's plain sphere and Draw stroke, for looking them over.
+        if let Ok(root) = std::env::var("KLAY_EXPORT_PREVIEWS") {
+            for m in 0..crate::workspace::MATERIALS.len() {
+                for (kind, tag) in [(None, "sphere"), (Some(BrushKind::Draw), "draw")] {
+                    let i = image(kind, m, false);
+                    let bytes: Vec<u8> = i.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                    let path = std::path::Path::new(&root).join(format!("material-{m}-{tag}.png"));
+                    image::save_buffer(path, &bytes, 160, 160, image::ColorType::Rgba8).unwrap();
+                }
+            }
         }
     }
 }

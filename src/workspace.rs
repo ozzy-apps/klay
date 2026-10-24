@@ -452,11 +452,20 @@ pub struct Actions {
     pub del_lower: bool,
 }
 
-pub const MATERIALS: [(Color32, &str); 4] = [
+/// Materials: Klay's procedural clays, then the MatCaps from `matcap::FIRST` on (in
+/// `matcap::Look::ALL` order; the colour is each one's unpainted colour, sRGB).
+pub const MATERIALS: [(Color32, &str); 11] = [
     (Color32::from_rgb(199, 158, 128), "Warm clay"),
     (Color32::from_rgb(156, 163, 171), "Cool clay"),
     (Color32::from_rgb(182, 112, 90), "Terracotta"),
     (Color32::from_rgb(184, 174, 152), "Polished bronze"),
+    (Color32::from_rgb(199, 85, 71), "MatCap Red Wax"),
+    (Color32::from_rgb(230, 186, 168), "MatCap Skin"),
+    (Color32::from_rgb(186, 186, 188), "MatCap Gray"),
+    (Color32::from_rgb(241, 239, 237), "MatCap White"),
+    (Color32::from_rgb(211, 208, 205), "MatCap Form"),
+    (Color32::from_rgb(246, 247, 249), "MatCap Chrome"),
+    (Color32::from_rgb(71, 133, 228), "MatCap Toy Plastic"),
 ];
 
 /// Top-shelf edit mode (ZBrush: Q / W / E / R). Draw sculpts; Move, Scale and Rotate drive the
@@ -3113,7 +3122,7 @@ impl Workspace {
         let kind_index = kind
             .map(|k| BrushKind::ALL.iter().position(|x| *x == k).unwrap())
             .unwrap_or(usize::MAX);
-        let flips = matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate | BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Blob | BrushKind::Layer | BrushKind::Nudge | BrushKind::Sharpen | BrushKind::FormSoft | BrushKind::FormHard | BrushKind::Zipper | BrushKind::Stitch | BrushKind::Rake));
+        let flips = matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate | BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Blob | BrushKind::Layer | BrushKind::Nudge | BrushKind::Sharpen | BrushKind::FormSoft | BrushKind::FormHard | BrushKind::Zipper | BrushKind::Stitch | BrushKind::Rake | BrushKind::ClayTubes | BrushKind::InflateBalloon | BrushKind::Magnify | BrushKind::OrbCracks | BrushKind::MalletFast));
         let key = (kind_index, self.material, sub && flips);
         let material = self.material;
         self.textures

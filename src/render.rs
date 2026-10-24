@@ -28,6 +28,11 @@ pub struct Uniforms {
     pub xf_center: [f32; 4],
     pub xf_rotation: [f32; 4],
     pub xf_move: [f32; 4],
+    /// MatCap materials (see `matcap.rs`): the unpainted colour (linear) and the MatCap's
+    /// index, w < 0 for Klay's procedural clays.
+    pub material: [f32; 4],
+    /// Camera up vector, for the view-space normal a MatCap is looked up by.
+    pub cam_up: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -162,6 +167,10 @@ pub struct Gfx {
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Pixels (physical) to read back from the next presented frame (self-tests), and
+    /// their RGBA once it is drawn.
+    pub capture: Vec<[u32; 2]>,
+    pub captured: Vec<[u8; 4]>,
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
@@ -258,6 +267,10 @@ impl Gfx {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface unsupported");
         config.format = format;
+        // `--selftest-materials` reads pixels of a presented frame back.
+        if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         config.present_mode = if vsync {
             wgpu::PresentMode::AutoVsync
         } else {
@@ -279,26 +292,96 @@ impl Gfx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // MatCaps: every image in one sRGB texture array, written once (see `matcap.rs`).
+        let size = crate::matcap::SIZE as u32;
+        let matcap_size = wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: crate::matcap::layer_count(),
+        };
+        let matcap_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("matcaps"),
+            size: matcap_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &matcap_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crate::matcap::gpu_layers(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4),
+                rows_per_image: Some(size),
+            },
+            matcap_size,
+        );
+        let matcap_view = matcap_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let matcap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("matcap sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uniform bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniform bg"),
             layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&matcap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&matcap_sampler),
+                },
+            ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("uniform layout"),
@@ -733,6 +816,8 @@ impl Gfx {
             surface,
             device,
             queue,
+            capture: Vec::new(),
+            captured: Vec::new(),
             config,
             depth_view,
             pipeline,
@@ -951,6 +1036,58 @@ impl Gfx {
         };
         self.pick_readback.unmap();
         id
+    }
+
+    /// Copy the pixels asked for in `capture` from the finished frame (self-tests): one
+    /// pixel per 256-byte row, the copy alignment.
+    fn copy_capture(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> Option<wgpu::Buffer> {
+        if self.capture.is_empty() || !self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            return None;
+        }
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame capture"),
+            size: self.capture.len() as u64 * 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (k, &[x, y]) in self.capture.iter().enumerate() {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: x.min(self.config.width - 1),
+                        y: y.min(self.config.height - 1),
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: k as u64 * 256,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+        }
+        Some(buffer)
+    }
+
+    fn read_capture(&mut self, buffer: &wgpu::Buffer) {
+        buffer.map_async(wgpu::MapMode::Read, .., |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        if let Ok(view) = buffer.get_mapped_range(..) {
+            self.captured = view
+                .chunks(256)
+                .map(|p| if bgra { [p[2], p[1], p[0], p[3]] } else { [p[0], p[1], p[2], p[3]] })
+                .collect();
+        }
+        buffer.unmap();
+        self.capture.clear();
     }
 
     /// Read the shown level's positions back from the GPU (self-tests).
@@ -1909,11 +2046,15 @@ impl Gfx {
                 .forget_lifetime();
             self.egui_renderer.render(&mut pass, paint_jobs, &screen);
         }
+        let capture = self.copy_capture(&mut encoder, &frame.texture);
         self.queue.submit(
             egui_cmds
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
+        if let Some(buffer) = capture {
+            self.read_capture(&buffer);
+        }
         self.queue.present(frame);
         for id in textures_delta.free.drain() {
             self.egui_renderer.free_texture(&id);

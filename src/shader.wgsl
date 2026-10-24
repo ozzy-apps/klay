@@ -15,9 +15,15 @@ struct Uniforms {
     xf_center: vec4<f32>,
     xf_rotation: vec4<f32>,
     xf_move: vec4<f32>,
+    // MatCaps (matcap.rs): unpainted colour; w = MatCap index, negative for the clays.
+    material: vec4<f32>,
+    cam_up: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// Two layers per MatCap: diffuse (times the surface colour), then specular (added).
+@group(0) @binding(1) var matcaps: texture_2d_array<f32>;
+@group(0) @binding(2) var matcap_sampler: sampler;
 // Mask of the active subtool, one byte per vertex packed in words.
 @group(1) @binding(0) var<storage, read> mask: array<u32>;
 
@@ -133,6 +139,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (u.params.w > 0.5 && u.params.w < 1.5) { base = vec3<f32>(0.52, 0.58, 0.66); }
     if (u.params.w > 1.5 && u.params.w < 2.5) { base = vec3<f32>(0.62, 0.29, 0.20); }
     if (u.params.w > 2.5) { base = vec3<f32>(0.55, 0.43, 0.25); }
+    if (u.material.w >= 0.0) { base = u.material.rgb; }
     if (in.color.a > 0.0001) {
         let rgb=clamp(in.color.rgb/in.color.a,vec3<f32>(0.0),vec3<f32>(1.0));
         base=mix(base,pow(rgb,vec3<f32>(2.2)),in.color.a);
@@ -156,6 +163,9 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
     let spec = pow(max(dot(n, h), 0.0), 40.0) * polish;
     let rim = pow(1.0 - max(dot(n, v), 0.0), 3.0) * 0.12;
     var color = base * (ambient + diff * 0.75 + fill) + vec3<f32>(spec + rim);
+    if (u.material.w >= 0.0) {
+        color = matcap(n, v, base);
+    }
 
     if (u.params.y > 0.5) {
         let slope = pow(1.0 - max(dot(n, v), 0.0), 2.0);
@@ -190,4 +200,21 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
 
     // Swapchain is non-sRGB, so encode gamma here.
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 1.0);
+}
+
+// A MatCap looked up by the view-space normal. The frame is built around this fragment's
+// own view direction, so perspective does not slide the lighting across the model.
+fn matcap(n: vec3<f32>, v: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
+    let right = normalize(cross(u.cam_up.xyz, v));
+    let up = cross(v, right);
+    var p = vec2<f32>(dot(n, right), dot(n, up));
+    let len = length(p);
+    if (len > 1.0) {
+        p = p / len;
+    }
+    let uv = vec2<f32>(0.5 + 0.5 * p.x, 0.5 - 0.5 * p.y);
+    let layer = i32(u.material.w + 0.5) * 2;
+    let diffuse = textureSampleLevel(matcaps, matcap_sampler, uv, layer, 0.0).rgb;
+    let specular = textureSampleLevel(matcaps, matcap_sampler, uv, layer + 1, 0.0).rgb;
+    return base * diffuse + specular;
 }

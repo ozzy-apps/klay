@@ -1,4 +1,4 @@
-# Klay 0.6.3
+# Klay 0.7.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -31,6 +31,8 @@ cargo run --release -- --segments 400 --selftest-clip                # three cro
 cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
+cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
+cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
 cargo run --release -- --version                                     # application version
 cargo run --release -- --wedge-resolution 256                        # start with this Wedge resolution
@@ -166,7 +168,7 @@ bar sliders. Long label/value rows wrap inside narrow trays.
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The 33 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
+The 46 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Wedge remeshing, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X
 symmetry, Transpose, Curve strokes and live statistics are connected to the engine. Zcut, stroke
@@ -181,10 +183,10 @@ large hover preview. The docked Brush palette
 uses a compact working set: one larger current-brush preview, two recent picks and twelve
 small paired brush cells. **Sculpt / Mask** tabs switch the working set and restore the last
 brush from that set. Layer, FormSoft, Zipper and Clip Line are directly available in Sculpt.
-**All Brushes (33)** opens the full library; selecting any brush
+**All Brushes (46)** opens the full library; selecting any brush
 puts it in the active preview and recent picks. This keeps the panel compact as the library
-grows. Previews are original 160 px sculpted clay studies in Klay's
-material colors, including the brush's subtract variant where applicable.
+grows. Previews are original 160 px sculpted clay studies in the
+current material, including the brush's subtract variant where applicable.
 
 - Draw, Smooth, Grab, Flatten and Inflate retain shortcuts **1–5**.
 - **6–9** select Dam Standard, Pinch, Clay and Clay Buildup. The catalog also provides
@@ -202,6 +204,16 @@ material colors, including the brush's subtract variant where applicable.
   two staggered tooth rows and a recessed seam; **Stitch** draws thread-like marks; **Rake**
   draws parallel grooves. These are relief on the existing mesh, with stroke-distance spacing.
   **Divide** for finer detail; they do not insert a separate zipper or thread mesh.
+- ZBrush's advanced brushes (0.7): **ClayTubes** lays square, flat-topped clay strips that
+  turn with the stroke; **hPolish** flattens with a square, hard edge; **TrimAdaptive** trims
+  to the plane right under the brush centre, so it follows curved forms; **Planar** flattens
+  onto the plane where the stroke started, so one stroke cuts one facet; **TrimSmoothBorder**
+  trims and softens the edge of the cut; **MalletFast** hammers flat-bottomed square dents
+  (Alt raises a plateau). **Move Topological** pulls only the surface connected to the click
+  point (lips, fingers and eyelids next to each other stay apart) and runs on the GPU like
+  Grab. **Inflate Balloon** swells round, **Magnify** spreads and swells (Alt contracts),
+  **Orb Cracks** cuts a sharp crack whose depth wanders. **SmoothValleys** / **SmoothPeaks**
+  smooth only recessed / raised areas and leave the rest sharp.
 - **Layer** builds a capped thickness per stroke. It is now in the compact Sculpt working
   set; release and start another stroke to add another layer.
 - **Clip Line**: choose it, drag a guide across the model and release to push one side onto
@@ -225,6 +237,19 @@ material colors, including the brush's subtract variant where applicable.
 - **Focal Shift** changes the falloff from a soft center to a broad plateau. Its neutral
   value retains the original falloff. The Space palette places **Draw Size → Z Intensity →
   Focal Shift → RGB Intensity → brushes**, with a color picker on the left.
+
+### Materials and MatCaps
+
+Click the material thumbnail on the left shelf, or open the Material palette. Klay's four
+procedural clays (Warm clay, Cool clay, Terracotta, Polished bronze) are joined by seven
+MatCaps: **Red Wax**, **Skin**, **Gray**, **White**, **Form** (hard key, dark shadow side and a
+cool rim, for reading planes), **Chrome** and **Toy Plastic**. A MatCap is a picture of a lit
+sphere looked up by the view-space normal, as in ZBrush, so the lighting stays fixed to the
+view while the model turns. Each one is two 256 px images painted by Klay at start-up
+(`src/matcap.rs`, no borrowed artwork): a diffuse layer that the surface colour multiplies,
+and a specular layer added on top. Polypaint and polygroup colours therefore tint a MatCap
+the way they tint clay, and the highlight stays white. Brush thumbnails are shaded with the
+current material.
 
 ### Masking brushes
 

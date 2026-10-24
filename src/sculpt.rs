@@ -46,10 +46,22 @@ pub enum BrushKind {
     Stitch,
     Rake,
     CurveTube,
+    ClayTubes,
+    HPolish,
+    TrimAdaptive,
+    Planar,
+    TrimSmoothBorder,
+    MoveTopological,
+    InflateBalloon,
+    Magnify,
+    OrbCracks,
+    MalletFast,
+    SmoothValleys,
+    SmoothPeaks,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 34] = [
+    pub const ALL: [BrushKind; 46] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -74,6 +86,9 @@ impl BrushKind {
         Self::MaskPen, Self::MaskSoft, Self::MaskRect, Self::MaskLasso, Self::MaskCircle,
         Self::MaskLine, Self::ClipLine, Self::FormSoft, Self::FormHard, Self::Zipper,
         Self::Stitch, Self::Rake, Self::CurveTube,
+        Self::ClayTubes, Self::HPolish, Self::TrimAdaptive, Self::Planar, Self::TrimSmoothBorder,
+        Self::MoveTopological, Self::InflateBalloon, Self::Magnify, Self::OrbCracks,
+        Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks,
     ];
 
     pub fn name(self) -> &'static str {
@@ -105,6 +120,12 @@ impl BrushKind {
             Self::ClipLine => "Clip Line", Self::FormSoft => "FormSoft", Self::FormHard => "FormHard",
             Self::Zipper => "Zipper", Self::Stitch => "Stitch", Self::Rake => "Rake",
             Self::CurveTube => "CurveTube",
+            Self::ClayTubes => "ClayTubes", Self::HPolish => "hPolish",
+            Self::TrimAdaptive => "TrimAdaptive", Self::Planar => "Planar",
+            Self::TrimSmoothBorder => "TrimSmoothBorder", Self::MoveTopological => "Move Topological",
+            Self::InflateBalloon => "Inflate Balloon", Self::Magnify => "Magnify",
+            Self::OrbCracks => "Orb Cracks", Self::MalletFast => "MalletFast",
+            Self::SmoothValleys => "SmoothValleys", Self::SmoothPeaks => "SmoothPeaks",
         }
     }
 
@@ -118,11 +139,20 @@ impl BrushKind {
             Self::ClipLine=>"Clip",Self::FormSoft|Self::FormHard=>"Clay",
             Self::Zipper|Self::Stitch|Self::Rake=>"Detail",
             Self::CurveTube=>"Curve",
+            Self::ClayTubes=>"Clay",
+            Self::HPolish|Self::TrimAdaptive|Self::Planar|Self::TrimSmoothBorder|Self::MalletFast=>"Planar",
+            Self::MoveTopological=>"Move",
+            Self::InflateBalloon|Self::OrbCracks=>"Standard",
+            Self::Magnify=>"Pinch",
+            Self::SmoothValleys|Self::SmoothPeaks=>"Smooth",
         }
     }
 
-    pub fn is_drag(self) -> bool { matches!(self,Self::Grab|Self::Elastic|Self::SnakeHook) }
-    pub fn gpu_drag(self) -> bool { matches!(self,Self::Grab|Self::SnakeHook) }
+    pub fn is_drag(self) -> bool { matches!(self,Self::Grab|Self::Elastic|Self::SnakeHook|Self::MoveTopological) }
+    pub fn gpu_drag(self) -> bool { matches!(self,Self::Grab|Self::SnakeHook|Self::MoveTopological) }
+    /// A square footprint turned along the stroke (ZBrush: the square alphas of ClayTubes,
+    /// hPolish and MalletFast) instead of a round falloff.
+    pub fn is_square(self) -> bool { matches!(self,Self::ClayTubes|Self::HPolish|Self::MalletFast) }
     pub fn is_mask(self) -> bool { self.base_type()=="Mask" }
     pub fn is_shape(self) -> bool { matches!(self,Self::MaskRect|Self::MaskLasso|Self::MaskCircle|Self::MaskLine|Self::ClipLine) }
     pub fn is_detail(self) -> bool { matches!(self,Self::Zipper|Self::Stitch|Self::Rake) }
@@ -158,6 +188,18 @@ impl BrushKind {
             Self::Stitch=>"Draw spaced stitches along a seam. Divide for fine detail.",
             Self::Rake=>"Draw parallel grooves in the stroke direction. Alt raises ridges.",
             Self::CurveTube=>"Draw a curve to add a tube along it as a new polygroup. Drag the curve to bend the tube; Draw Size sets its radius. Needs a subtool without subdivision levels.",
+            Self::ClayTubes=>"Lay square, flat-topped clay strips along the stroke. Alt carves.",
+            Self::HPolish=>"Flatten to the local plane with a square, hard edge.",
+            Self::TrimAdaptive=>"Trim raised areas to the plane right under the brush centre.",
+            Self::Planar=>"Flatten onto the plane where the stroke started.",
+            Self::TrimSmoothBorder=>"Trim raised areas to a local plane and soften the edge of the cut.",
+            Self::MoveTopological=>"Pull only the surface connected to the click point; nearby separate surfaces stay still.",
+            Self::InflateBalloon=>"Swell the surface round, like a balloon. Alt deflates.",
+            Self::Magnify=>"Spread the surface outward and swell it. Alt contracts.",
+            Self::OrbCracks=>"Cut a sharp, uneven crack. Alt raises a sharp ridge.",
+            Self::MalletFast=>"Hammer a flat-bottomed, square dent. Alt raises a flat plateau.",
+            Self::SmoothValleys=>"Smooth only recessed areas; ridges stay sharp.",
+            Self::SmoothPeaks=>"Smooth only raised areas; grooves stay sharp.",
         }
     }
 }
@@ -442,6 +484,10 @@ pub struct Stroke {
     snapshotted: HashSet<u32>,
     snapshot_index: HashMap<u32, usize>,
     layer_normal: Option<Vec3>,
+    /// Planar: the plane (centre, normal) set by the stroke's first dab.
+    plane: Option<(Vec3, Vec3)>,
+    /// Stroke direction in the surface, for square footprints.
+    direction: Option<Vec3>,
     detail_distance: f32,
     last_dab: Option<Vec3>,
     grab: Option<GrabState>,
@@ -503,6 +549,8 @@ impl Stroke {
             snapshotted: HashSet::new(),
             snapshot_index: HashMap::new(),
             layer_normal: None,
+            plane: None,
+            direction: None,
             detail_distance: 0.0,
             last_dab: None,
             grab: None,
@@ -638,14 +686,27 @@ impl Stroke {
         let r = brush.radius;
         // Masked vertices (Ctrl) are held still.
         let mask = &mesh.mask;
+        // Square footprints turn with the stroke: along the last dab-to-dab move, kept
+        // from the previous dab when there is none (the first dab of a stroke).
+        let fallback = self.direction.unwrap_or(tangent(hit_normal).0);
+        let moved = previous_hit.map_or(Vec3::ZERO, |p| hit - p);
+        let along = (moved - hit_normal * moved.dot(hit_normal)).normalize_or(fallback - hit_normal * fallback.dot(hit_normal)).normalize_or(tangent(hit_normal).0);
+        self.direction = Some(along);
+        let square = brush.kind.is_square();
         let mut weights=std::mem::take(&mut self.weights);
         sel.dist
             .par_iter()
             .zip(sel.verts.par_iter())
             .enumerate()
-            .map(|(i,(&d, &v))| focal_falloff(d, r, brush.focal_shift)
-                *self.stamp_weight(mesh.positions[v as usize],hit,hit_normal,r,sel.side(i))
-                *crate::mask::freedom(mask, v))
+            .map(|(i,(&d, &v))| {
+                let p = mesh.positions[v as usize];
+                let profile = if square {
+                    square_footprint(if sel.side(i) < 0.0 { mirror_x(p) } else { p }, hit, hit_normal, along, r, brush.kind == BrushKind::MalletFast)
+                } else {
+                    focal_falloff(d, r, brush.focal_shift)
+                };
+                profile*self.stamp_weight(p,hit,hit_normal,r,sel.side(i))*crate::mask::freedom(mask, v)
+            })
             .collect_into_vec(&mut weights);
         self.weights=weights;
         let w = &self.weights;
@@ -712,8 +773,22 @@ impl Stroke {
                 let amount = brush.strength * r * 0.06 * sign;
                 sel.par_map_into(new, |i, v| mesh.positions[v as usize] + mesh.normal_at(v) * (amount * w[i]));
             }
-            BrushKind::Smooth => {
+            BrushKind::InflateBalloon => {
+                // A broad, even swell along each normal, relaxed so the bulge stays round
+                // instead of following the creases under it.
+                let amount = brush.strength * r * 0.07 * sign;
+                sel.par_map_into(new, |i, v| {
+                    let p = mesh.positions[v as usize];
+                    let nb = mesh.neighbors(v);
+                    let relax = if nb.is_empty() { Vec3::ZERO } else {
+                        (nb.iter().map(|&n| mesh.positions[n as usize]).sum::<Vec3>() / nb.len() as f32 - p) * (0.25 * brush.strength * w[i])
+                    };
+                    p + relax + mesh.normal_at(v) * (amount * w[i].sqrt())
+                });
+            }
+            BrushKind::Smooth | BrushKind::SmoothValleys | BrushKind::SmoothPeaks => {
                 let k = brush.strength * 0.5;
+                let kind = brush.kind;
                 sel.par_map_into(new, |i, v| {
                     let nb = mesh.neighbors(v);
                     let p = mesh.positions[v as usize];
@@ -724,62 +799,108 @@ impl Stroke {
                     for &n in nb {
                         avg += mesh.positions[n as usize];
                     }
-                    p.lerp(avg / nb.len() as f32, (k * w[i]).min(1.0))
+                    let avg = avg / nb.len() as f32;
+                    // A vertex below its neighbours' mean sits in a valley, above it on a
+                    // peak; the gate fades in with how clearly it is one or the other.
+                    let gate = match kind {
+                        BrushKind::Smooth => 1.0,
+                        _ => {
+                            let delta = avg - p;
+                            let lean = delta.dot(mesh.normal_at(v)) / delta.length().max(1e-12);
+                            let lean = if kind == BrushKind::SmoothValleys { lean } else { -lean };
+                            (lean * 4.0).clamp(0.0, 1.0)
+                        }
+                    };
+                    p.lerp(avg, (k * w[i] * gate).min(1.0))
                 });
             }
-            BrushKind::Flatten | BrushKind::TrimDynamic | BrushKind::Polish | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Fill | BrushKind::Scrape | BrushKind::FormHard => {
+            BrushKind::Flatten | BrushKind::TrimDynamic | BrushKind::Polish | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Fill | BrushKind::Scrape | BrushKind::FormHard
+            | BrushKind::ClayTubes | BrushKind::HPolish | BrushKind::TrimAdaptive | BrushKind::Planar | BrushKind::TrimSmoothBorder | BrushKind::MalletFast => {
                 // Fit a plane through the weighted centre with the average normal (own side
                 // only), pull towards it; the mirrored side uses the mirrored plane.
+                // TrimAdaptive fits only the surface right under the brush centre.
+                let adaptive = brush.kind == BrushKind::TrimAdaptive;
                 let (c, n, wsum) = sel
                     .verts
                     .par_iter()
                     .enumerate()
                     .zip(w.par_iter())
                     .filter(|((i, _), _)| sel.side(*i) > 0.0)
-                    .map(|((_, &v), &wi)| (mesh.positions[v as usize] * wi, mesh.normal_at(v) * wi, wi))
+                    .map(|((i, &v), &wi)| {
+                        let wi = if adaptive { wi * (-(sel.dist[i] / (r * 0.3)).powi(2)).exp() } else { wi };
+                        (mesh.positions[v as usize] * wi, mesh.normal_at(v) * wi, wi)
+                    })
                     .reduce(
                         || (Vec3::ZERO, Vec3::ZERO, 0.0),
                         |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
                     );
-                let c = c / wsum.max(1e-6);
+                let c = if wsum > 1e-6 { c / wsum } else { hit };
                 let n = n.normalize_or(hit_normal);
+                // Planar keeps the plane of its first dab for the whole stroke.
+                let (c, n) = if brush.kind == BrushKind::Planar { *self.plane.get_or_insert((c, n)) } else { (c, n) };
                 let (cm, nm) = (mirror_x(c), mirror_x(n));
-                let k = brush.strength * if matches!(brush.kind,BrushKind::Polish|BrushKind::Scrape) {0.7}else{0.5};
+                let k = brush.strength * match brush.kind {
+                    BrushKind::Polish | BrushKind::Scrape => 0.7,
+                    BrushKind::HPolish | BrushKind::MalletFast | BrushKind::Planar => 0.85,
+                    _ => 0.5,
+                };
+                let kind = brush.kind;
                 sel.par_map_into(new, |i, v| {
                     let p = mesh.positions[v as usize];
                     let (c, n) = if sel.side(i) > 0.0 { (c, n) } else { (cm, nm) };
                     let d=(p-c).dot(n);
-                    let amount=match brush.kind {
+                    let amount=match kind {
                         BrushKind::FormHard => (r*0.18-d*sign).max(0.0).min(r*0.12)*sign*brush.strength*w[i],
-                        BrushKind::Clay | BrushKind::ClayBuildup => {
-                            let buildup=if brush.kind==BrushKind::ClayBuildup {1.8}else{1.0};
+                        BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::ClayTubes => {
+                            let buildup=match kind {BrushKind::ClayBuildup=>1.8,BrushKind::ClayTubes=>0.8,_=>1.0};
                             ((r*0.12*sign-d)*sign).max(0.0).min(r*0.08*buildup)*sign*k*w[i]
                         },
-                        BrushKind::TrimDynamic=>-((d*sign).max(0.0).min(r*0.2))*sign*k*w[i],
+                        BrushKind::TrimDynamic | BrushKind::TrimAdaptive | BrushKind::TrimSmoothBorder=>-((d*sign).max(0.0).min(r*0.2))*sign*k*w[i],
                         BrushKind::Fill=>(-d*sign).max(0.0).min(r*0.2)*sign*k*w[i],
                         BrushKind::Scrape=>-(d*sign+r*0.035).max(0.0).min(r*0.2)*sign*k*w[i],
+                        BrushKind::MalletFast=>-(d*sign+r*0.10).max(0.0).min(r*0.25)*sign*k*w[i],
                         _=>-d*k*w[i],
                     };
-                    p+n*amount
+                    // TrimSmoothBorder relaxes the ring where the cut fades out, so it leaves
+                    // no ledge.
+                    let border = if kind == BrushKind::TrimSmoothBorder {
+                        let nb = mesh.neighbors(v);
+                        if nb.is_empty() { Vec3::ZERO } else {
+                            let ring = 4.0 * w[i] * (1.0 - w[i]);
+                            (nb.iter().map(|&q| mesh.positions[q as usize]).sum::<Vec3>() / nb.len() as f32 - p) * (0.6 * brush.strength * ring)
+                        }
+                    } else { Vec3::ZERO };
+                    p+n*amount+border
                 });
             }
-            BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease => {
+            BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::OrbCracks | BrushKind::Magnify => {
+                let kind = brush.kind;
                 sel.par_map_into(new,|i,v| {
                     let p=mesh.positions[v as usize];
                     let (c,n)=if sel.side(i)>0.0 {(hit,hit_normal)}else{(mirror_x(hit),mirror_x(hit_normal))};
                     let delta=c-p;let tangent=delta-n*delta.dot(n);
-                    let tight=(-((sel.dist[i]/r)/0.24).powi(2)).exp();
-                    let (pinch,cut)=match brush.kind {
+                    let width=if kind==BrushKind::OrbCracks {0.13}else{0.24};
+                    let tight=(-((sel.dist[i]/r)/width).powi(2)).exp();
+                    let (pinch,cut)=match kind {
                         BrushKind::Pinch=>(0.28,0.0),
                         BrushKind::Crease=>(0.15,0.055),
+                        BrushKind::OrbCracks=>(0.12,0.16),
+                        // Spread outward and swell: Pinch turned inside out.
+                        BrushKind::Magnify=>(-0.22,-0.025),
                         _=>(0.06,0.1),
                     };
+                    // Orb Cracks: the depth wanders along the cut, so it reads as a crack,
+                    // not a groove. Taken on the brush's own side so symmetry mirrors it.
+                    let rough=if kind==BrushKind::OrbCracks {
+                        let q=(if sel.side(i)>0.0 {p}else{mirror_x(p)})*(9.0/r);
+                        0.7+0.3*((q.x*1.7+q.y).sin()*(q.y*1.3-q.z).sin()*(q.z*1.9+q.x*0.6).sin())
+                    }else{1.0};
                     p+tangent*(pinch*brush.strength*w[i]*sign)
-                        -n*(cut*r*brush.strength*w[i]*tight*sign)
+                        -n*(cut*r*brush.strength*w[i]*tight*rough*sign)
                 });
             }
             BrushKind::Paint=>unreachable!(),
-            BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook => unreachable!(),
+            BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::MoveTopological => unreachable!(),
             _ => unreachable!("gesture and detail tools are handled before normal dabs"),
         }
         mesh.scatter_positions(&sel, new);
@@ -927,7 +1048,14 @@ impl Stroke {
                     profile*self.stamp_weight(mesh.positions[sel.verts[i] as usize],hit,view_dir,r,sel.side(i))
                         *sel.side(i)*crate::mask::freedom(mask, sel.verts[i])
                 })
-                .collect();
+                .collect::<Vec<f32>>();
+            // Move Topological: only the surface joined to the click point moves.
+            let weights = if brush.kind == BrushKind::MoveTopological {
+                let joined = connected(mesh, &sel);
+                weights.into_iter().zip(joined).map(|(w, j)| if j { w } else { 0.0 }).collect()
+            } else {
+                weights
+            };
             let orig = sel.par_map(|_, v| mesh.positions[v as usize]);
             self.last_count = sel.len();
             // A brush smaller than the polygons under it picks up no vertex: nothing to
@@ -980,6 +1108,52 @@ impl Stroke {
         }
         if self.snapshots.is_empty() { None } else { Some(self.snapshots) }
     }
+}
+
+/// Which selected vertices the surface joins to the brush centre without leaving the
+/// brush: a flood over mesh edges from the vertex nearest the centre (and, with symmetry,
+/// from the one nearest its mirror image).
+fn connected(mesh: &SculptMesh, sel: &Selection) -> Vec<bool> {
+    let index: HashMap<u32, usize> = sel.verts.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+    let mut joined = vec![false; sel.len()];
+    let mut stack = Vec::new();
+    for side in [1.0, -1.0] {
+        let seed = (0..sel.len())
+            .filter(|&i| sel.side(i) == side)
+            .min_by(|&a, &b| sel.dist[a].total_cmp(&sel.dist[b]));
+        if let Some(i) = seed {
+            joined[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        for &n in mesh.neighbors(sel.verts[i]) {
+            if let Some(&j) = index.get(&n) {
+                if !joined[j] {
+                    joined[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    joined
+}
+
+/// Square footprint of side 1.4 `r` centred on `hit`, turned to run along `along` in the
+/// surface. Its sides have a short soft edge. A stamp (`hard_ends`, MalletFast) has hard
+/// ends too; a stroked strip (ClayTubes, hPolish) fades smoothly front to back so
+/// overlapping dabs blend into one even strip instead of leaving a ridge per dab.
+fn square_footprint(p: Vec3, hit: Vec3, normal: Vec3, along: Vec3, r: f32, hard_ends: bool) -> f32 {
+    let delta = p - hit;
+    let across = normal.cross(along);
+    let half = r * 0.7;
+    let edge = |t: f32| {
+        let e = ((1.0 - t) / 0.18).clamp(0.0, 1.0);
+        e * e * (3.0 - 2.0 * e)
+    };
+    let t_along = delta.dot(along).abs() / half;
+    let ends = if hard_ends { edge(t_along) } else { falloff(t_along, 1.0) };
+    edge(delta.dot(across).abs() / half) * ends
 }
 
 /// Smooth falloff from 1 at the centre to 0 at the radius.
@@ -1064,7 +1238,7 @@ mod brush_tests {
     fn drag_brushes_smaller_than_a_polygon_do_nothing() {
         // A coarse cube sphere: faces far wider than the brush, pressed mid-face.
         let (p,i)=crate::mesh::cube_sphere(2,1.0);
-        for kind in [BrushKind::Grab,BrushKind::SnakeHook,BrushKind::Elastic] {
+        for kind in [BrushKind::Grab,BrushKind::SnakeHook,BrushKind::Elastic,BrushKind::MoveTopological] {
             for gpu in [false,true] {
                 let mut m=SculptMesh::from_raw(p.clone(),i.clone());
                 let before=m.positions.clone();
@@ -1354,5 +1528,311 @@ mod curve_tests {
         assert_eq!(s.dabs, 21);
         let raised = |x: f32| m.positions.iter().zip(&before).filter(|(_, q)| (q.x - x).abs() < 0.01 && q.y.abs() < 0.02).all(|(p, q)| p.z > q.z);
         assert!(raised(-0.45) && raised(0.0) && raised(0.45));
+    }
+}
+
+#[cfg(test)]
+mod advanced_brush_tests {
+    use super::*;
+    use crate::primitive::Primitive;
+
+    /// The twelve brushes added in 0.7.
+    const ADDED: [BrushKind; 12] = [
+        BrushKind::ClayTubes, BrushKind::HPolish, BrushKind::TrimAdaptive, BrushKind::Planar,
+        BrushKind::TrimSmoothBorder, BrushKind::MoveTopological, BrushKind::InflateBalloon,
+        BrushKind::Magnify, BrushKind::OrbCracks, BrushKind::MalletFast, BrushKind::SmoothValleys,
+        BrushKind::SmoothPeaks,
+    ];
+
+    fn sphere(n: u32) -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(n, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    /// A bumpy dome over [-1, 1]² whose triangles are exact mirror images across X = 0
+    /// (each cell's diagonal flips with the side), so symmetric strokes can be compared
+    /// vertex for vertex.
+    fn symmetric_dome(n: u32) -> SculptMesh {
+        let at = |i: u32, j: u32| {
+            let (x, y) = (-1.0 + 2.0 * i as f32 / n as f32, -1.0 + 2.0 * j as f32 / n as f32);
+            let bumps = 0.01 * (x.abs() * 23.0).sin() * (y * 19.0).sin();
+            Vec3::new(x, y, 1.0 - 0.35 * (x * x + y * y) + bumps)
+        };
+        let positions = (0..=n).flat_map(|j| (0..=n).map(move |i| (i, j))).map(|(i, j)| at(i, j)).collect();
+        let id = |i: u32, j: u32| j * (n + 1) + i;
+        let mut indices = Vec::new();
+        for j in 0..n {
+            for i in 0..n {
+                let (a, b, c, d) = (id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1));
+                if 2 * i + 1 > n {
+                    indices.extend([a, b, c, a, c, d]);
+                } else {
+                    indices.extend([a, b, d, b, c, d]);
+                }
+            }
+        }
+        SculptMesh::from_raw(positions, indices)
+    }
+
+    /// A sphere with small bumps and dips (so it has valleys as well as peaks), the same on
+    /// both sides of X = 0.
+    fn bumpy(n: u32) -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(n, 1.0);
+        let p = p
+            .into_iter()
+            .map(|q| q * (1.0 + 0.015 * (q.x.abs() * 23.0).sin() * (q.y * 19.0 + q.z * 7.0).sin()))
+            .collect();
+        SculptMesh::from_raw(p, i)
+    }
+
+    fn nearest(m: &SculptMesh, p: Vec3) -> usize {
+        (0..m.vertex_count()).min_by(|&a, &b| m.positions[a].distance_squared(p).total_cmp(&m.positions[b].distance_squared(p))).unwrap()
+    }
+
+    /// A short stroke across the top of the model along +X (drag brushes pull with it).
+    fn stroke(m: &mut SculptMesh, kind: BrushKind, invert: bool, gpu: bool, symmetry: bool, start: Vec3) -> Stroke {
+        let b = Brush { kind, radius: 0.4, strength: 0.8, ..Brush::default() };
+        let mut s = Stroke::begin(invert, gpu, symmetry);
+        for k in 0..4 {
+            let hit = start + Vec3::X * (0.08 * k as f32);
+            let n = hit.normalize_or(Vec3::Z);
+            s.dab(m, &b, hit, n, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+        }
+        s
+    }
+
+    #[test]
+    fn every_added_brush_is_listed_named_and_described() {
+        for k in ADDED {
+            assert!(BrushKind::ALL.contains(&k), "{k:?}");
+            assert!(!k.name().is_empty() && k.description().ends_with('.'), "{k:?}");
+        }
+        assert!(BrushKind::MoveTopological.is_drag() && BrushKind::MoveTopological.gpu_drag());
+    }
+
+    #[test]
+    fn added_brushes_sculpt_and_round_trip_undo_and_redo_across_levels() {
+        for kind in ADDED {
+            for invert in [false, true] {
+                let mut doc = Multires::new(bumpy(24), 100_000);
+                assert!(doc.divide());
+                let before = doc.mesh().positions.clone();
+                let s = stroke(doc.mesh_mut(), kind, invert, false, false, Vec3::new(-0.1, 0.05, 1.0));
+                let snapshot = s.end(doc.mesh_mut()).unwrap();
+                let data = doc.finish_stroke(1, snapshot);
+                let after = doc.mesh().positions.clone();
+                assert_ne!(before, after, "{kind:?} invert {invert}");
+                assert!(after.iter().all(|p| p.is_finite()), "{kind:?}");
+                let mut h = History::new(8);
+                h.push(UndoStep::Stroke { level: 1, chunks: data });
+                doc.set_active(0);
+                h.undo(&mut doc);
+                doc.set_active(1);
+                assert_eq!(doc.mesh().positions, before, "{kind:?} undo");
+                h.redo(&mut doc);
+                assert!(doc.mesh().positions.iter().zip(&after).all(|(a, b)| a.distance(*b) < 1e-6), "{kind:?} redo");
+            }
+        }
+    }
+
+    #[test]
+    fn added_brushes_leave_masked_and_hidden_surface_alone() {
+        for kind in ADDED {
+            for hidden in [false, true] {
+                let mut m = bumpy(24);
+                let before = m.positions.clone();
+                if hidden {
+                    m.set_hidden(vec![1; m.triangle_count()]);
+                } else {
+                    m.mask = vec![255; m.vertex_count()];
+                }
+                stroke(&mut m, kind, false, false, false, Vec3::new(-0.1, 0.05, 1.0)).end(&mut m);
+                assert_eq!(m.positions, before, "{kind:?} hidden {hidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn added_brushes_mirror_across_x_with_symmetry() {
+        for kind in ADDED {
+            let mut m = symmetric_dome(80);
+            let before = m.positions.clone();
+            // Wholly on +X, so the mirror image is a separate stroke on -X.
+            let start = m.positions[nearest(&m, Vec3::new(0.45, 0.2, 1.0))];
+            stroke(&mut m, kind, false, false, true, start).end(&mut m);
+            let most = m.positions.iter().zip(&before).map(|(a, b)| a.distance(*b)).fold(0.0, f32::max);
+            assert!(most > 1e-4, "{kind:?} moved nothing");
+            for probe in [start, start + Vec3::new(0.1, 0.05, 0.0), start + Vec3::new(0.2, -0.08, 0.0), start + Vec3::new(0.05, 0.3, 0.0)] {
+                let (a, b) = (nearest(&m, probe), nearest(&m, Vec3::new(-probe.x, probe.y, probe.z)));
+                let (da, db) = (m.positions[a] - before[a], m.positions[b] - before[b]);
+                let expect = Vec3::new(-da.x, da.y, da.z);
+                assert!((db - expect).length() <= most * 0.01 + 1e-6, "{kind:?}: {da:?} mirrored {db:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn move_topological_on_the_gpu_matches_the_cpu_and_pen_pressure_leaves_it_alone() {
+        let mut cpu = sphere(24);
+        let mut gpu = sphere(24);
+        stroke(&mut cpu, BrushKind::MoveTopological, false, false, true, Vec3::new(0.1, 0.0, 1.0)).end(&mut cpu);
+        let before = gpu.positions.clone();
+        let s = stroke(&mut gpu, BrushKind::MoveTopological, false, true, true, Vec3::new(0.1, 0.0, 1.0));
+        assert_eq!(gpu.positions, before, "moved on the GPU during the stroke");
+        assert!(s.gpu_grab_setup().is_some());
+        s.end(&mut gpu);
+        assert_eq!(gpu.positions, cpu.positions);
+        let b = Brush { kind: BrushKind::MoveTopological, radius: 0.4, strength: 0.8, ..Brush::default() }.at_pressure(Some(0.3), true, true);
+        assert_eq!((b.radius, b.strength), (0.4, 0.8));
+        let b = Brush { kind: BrushKind::ClayTubes, radius: 0.4, strength: 0.8, ..Brush::default() }.at_pressure(Some(0.5), true, true);
+        assert!((b.radius - 0.2).abs() < 1e-6 && (b.strength - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn move_topological_leaves_a_separate_surface_inside_the_brush_still() {
+        // Two parallel sheets 0.1 apart; the brush reaches both.
+        let (p, i) = Primitive::Plane.build(40, 1.0);
+        let n = p.len() as u32;
+        let mut positions = p.clone();
+        positions.extend(p.iter().map(|q| *q + Vec3::Z * 0.1));
+        let mut indices = i.clone();
+        indices.extend(i.iter().map(|k| k + n));
+        let run = |kind: BrushKind| {
+            let mut m = SculptMesh::from_raw(positions.clone(), indices.clone());
+            let before = m.positions.clone();
+            let b = Brush { kind, radius: 0.4, strength: 1.0, ..Brush::default() };
+            let mut s = Stroke::begin(false, false, false);
+            let hit = Vec3::new(0.0, 0.0, 0.1);
+            s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+            s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::new(0.2, 0.0, 4.0), -Vec3::Z));
+            s.end(&mut m);
+            let moved = |range: std::ops::Range<usize>| range.filter(|&v| m.positions[v] != before[v]).count();
+            (moved(0..n as usize), moved(n as usize..2 * n as usize))
+        };
+        let (lower, upper) = run(BrushKind::MoveTopological);
+        assert!(upper > 10 && lower == 0, "Move Topological moved {upper} on the clicked sheet, {lower} on the other");
+        let (lower, upper) = run(BrushKind::Grab);
+        assert!(upper > 10 && lower > 10, "Grab moves both sheets");
+    }
+
+    /// A plane with one groove along y = -0.15 and one ridge along y = 0.15.
+    fn ridged_plane() -> SculptMesh {
+        let (p, i) = Primitive::Plane.build(80, 1.0);
+        let p = p
+            .into_iter()
+            .map(|q| q + Vec3::Z * (0.04 * (-((q.y - 0.15) / 0.04).powi(2)).exp() - 0.04 * (-((q.y + 0.15) / 0.04).powi(2)).exp()))
+            .collect();
+        SculptMesh::from_raw(p, i)
+    }
+
+    #[test]
+    fn smooth_valleys_and_peaks_smooth_only_their_side() {
+        let groove = Vec3::new(0.0, -0.15, -0.04);
+        let ridge = Vec3::new(0.0, 0.15, 0.04);
+        for kind in [BrushKind::SmoothValleys, BrushKind::SmoothPeaks, BrushKind::Smooth] {
+            let mut m = ridged_plane();
+            let (g, r) = (nearest(&m, groove), nearest(&m, ridge));
+            let (gz, rz) = (m.positions[g].z, m.positions[r].z);
+            let b = Brush { kind, radius: 0.5, strength: 1.0, ..Brush::default() };
+            let mut s = Stroke::begin(false, false, false);
+            for k in 0..6 {
+                let hit = Vec3::new(-0.1 + 0.04 * k as f32, 0.0, 0.0);
+                s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+            }
+            let (filled, flattened) = (m.positions[g].z - gz, rz - m.positions[r].z);
+            match kind {
+                BrushKind::SmoothValleys => assert!(filled > 1e-3 && flattened.abs() < 1e-4, "{filled} {flattened}"),
+                BrushKind::SmoothPeaks => assert!(flattened > 1e-3 && filled.abs() < 1e-4, "{filled} {flattened}"),
+                _ => assert!(filled > 1e-3 && flattened > 1e-3),
+            }
+        }
+    }
+
+    #[test]
+    fn planar_keeps_the_plane_of_its_first_dab() {
+        // Along a sphere, Flatten refits a lower, tilted plane each dab; Planar keeps the
+        // plane at the top, so the far end of its stroke is lifted toward it.
+        let end = |kind: BrushKind| {
+            let mut m = sphere(40);
+            let far = nearest(&m, Vec3::new(0.32, 0.0, 0.95).normalize());
+            let z = m.positions[far].z;
+            stroke(&mut m, kind, false, false, false, Vec3::Z).end(&mut m);
+            m.positions[far].z - z
+        };
+        let (planar, flatten) = (end(BrushKind::Planar), end(BrushKind::Flatten));
+        assert!(planar > flatten + 1e-3, "Planar {planar} vs Flatten {flatten}");
+    }
+
+    #[test]
+    fn trims_only_cut_and_magnify_spreads_where_pinch_gathers() {
+        for kind in [BrushKind::TrimAdaptive, BrushKind::TrimDynamic] {
+            let mut m = sphere(40);
+            let before = m.positions.clone();
+            stroke(&mut m, kind, false, false, false, Vec3::Z).end(&mut m);
+            let dz: Vec<f32> = m.positions.iter().zip(&before).map(|(a, b)| (*a - *b).dot(b.normalize())).collect();
+            assert!(dz.iter().all(|&d| d <= 1e-6) && dz.iter().any(|&d| d < -1e-4), "{kind:?}");
+        }
+        let mut a = sphere(24);
+        let mut b = sphere(24);
+        let i = nearest(&a, Vec3::new(0.18, 0.0, 0.98));
+        let r = a.positions[i].truncate().length();
+        for (m, kind) in [(&mut a, BrushKind::Magnify), (&mut b, BrushKind::Pinch)] {
+            let mut s = Stroke::begin(false, false, false);
+            s.dab(m, &Brush { kind, radius: 0.4, strength: 1.0, ..Brush::default() }, Vec3::Z, Vec3::Z, -Vec3::Z, (Vec3::Z * 5.0, -Vec3::Z));
+        }
+        assert!(a.positions[i].truncate().length() > r && b.positions[i].truncate().length() < r);
+    }
+
+    #[test]
+    fn square_brushes_reach_the_corners_of_their_square() {
+        let r = 1.0;
+        // Along +X: a corner of the square is fully on, where a round falloff has faded.
+        let corner = Vec3::new(0.45, 0.45, 0.0);
+        assert_eq!(square_footprint(corner, Vec3::ZERO, Vec3::Z, Vec3::X, r, true), 1.0);
+        // A strip fades front to back but keeps its hard sides.
+        let side = Vec3::new(0.0, 0.5, 0.0);
+        assert_eq!(square_footprint(side, Vec3::ZERO, Vec3::Z, Vec3::X, r, false), 1.0);
+        assert!(square_footprint(Vec3::new(0.5, 0.0, 0.0), Vec3::ZERO, Vec3::Z, Vec3::X, r, false) < 0.5);
+        assert!(falloff(corner.length(), r) < 0.4);
+        // Turned 45 degrees, a point near the corner is past the square's edge.
+        let diagonal = Vec3::new(1.0, 1.0, 0.0).normalize();
+        let near_corner = Vec3::new(0.6, 0.6, 0.0);
+        assert!(square_footprint(near_corner, Vec3::ZERO, Vec3::Z, Vec3::X, r, true) > 0.5);
+        assert_eq!(square_footprint(near_corner, Vec3::ZERO, Vec3::Z, diagonal, r, true), 0.0);
+        // A ClayTubes stroke follows its direction: a dab after moving along +Y turns the
+        // square with it.
+        let mut s = Stroke::begin(false, false, false);
+        let mut m = Primitive::Plane.build(60, 1.0);
+        let mut mesh = SculptMesh::from_raw(std::mem::take(&mut m.0), std::mem::take(&mut m.1));
+        let b = Brush { kind: BrushKind::ClayTubes, radius: 0.3, strength: 1.0, ..Brush::default() };
+        for y in [0.0, 0.1] {
+            let hit = Vec3::new(0.0, y, 0.0);
+            s.dab(&mut mesh, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+        }
+        assert!(s.direction.unwrap().distance(Vec3::Y) < 1e-5);
+    }
+
+    #[test]
+    fn orb_cracks_cut_narrower_and_more_unevenly_than_dam_standard() {
+        let profile = |kind: BrushKind| {
+            let (p, i) = Primitive::Plane.build(120, 1.0);
+            let mut m = SculptMesh::from_raw(p, i);
+            let b = Brush { kind, radius: 0.4, strength: 1.0, ..Brush::default() };
+            let mut s = Stroke::begin(false, false, false);
+            for k in 0..12 {
+                let hit = Vec3::new(-0.3 + 0.06 * k as f32, 0.0, 0.0);
+                s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+            }
+            let depth = |x: f32, y: f32| -m.positions[nearest(&m, Vec3::new(x, y, 0.0))].z;
+            let along: Vec<f32> = (0..8).map(|k| depth(-0.1 + 0.03 * k as f32, 0.0)).collect();
+            let mean = along.iter().sum::<f32>() / along.len() as f32;
+            assert!(mean > 0.005, "{kind:?} cuts into the surface: {mean}");
+            let spread = along.iter().map(|d| (d - mean).abs()).fold(0.0, f32::max) / mean;
+            (depth(0.05, 0.08) / depth(0.05, 0.0), spread)
+        };
+        let (orb_width, orb_spread) = profile(BrushKind::OrbCracks);
+        let (dam_width, dam_spread) = profile(BrushKind::DamStandard);
+        assert!(orb_width < dam_width, "Orb Cracks {orb_width} vs Dam Standard {dam_width}");
+        assert!(orb_spread > dam_spread + 0.05, "Orb Cracks depth varies: {orb_spread} vs {dam_spread}");
     }
 }

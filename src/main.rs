@@ -5,6 +5,7 @@ mod brush_preview;
 mod paint;
 mod camera;
 mod mask;
+mod matcap;
 mod surface_tools;
 mod detail_brush;
 mod curve;
@@ -270,6 +271,9 @@ struct PaintTest {
 struct BrushTest {
     frame: u32,
     index: usize,
+    /// The model has been rippled for SmoothValleys / SmoothPeaks (a smooth sphere has no
+    /// valleys or peaks to smooth).
+    rippled: bool,
     original: Vec<Vec3>,
     edited: Vec<Vec3>,
 }
@@ -355,6 +359,8 @@ struct App {
     selftest_paint: Option<PaintTest>,
     selftest_brushes: Option<BrushTest>,
     selftest_surface: Option<native_tests::SurfaceTest>,
+    /// `--selftest-materials`: every material drawn and read back, then polypaint under a MatCap.
+    selftest_materials: Option<native_tests::MaterialTest>,
     /// Project file shown in the Document palette, used by Save and Open.
     project_path: String,
     /// `--open PATH`: project to open once the window exists.
@@ -447,6 +453,8 @@ struct App {
     stroke_pending: bool,
     last_dab_count: usize,
     demo: bool,
+    /// `--demo-brushes`: stroke with the advanced brushes at start.
+    demo_brushes: bool,
     vsync: bool,
     /// Frames left in `--stress` mode (a large grab moved every frame), plus accumulators.
     stress: Option<(u32, f32, f32)>,
@@ -496,6 +504,7 @@ impl App {
             selftest_paint: None,
             selftest_brushes: None,
             selftest_surface: None,
+            selftest_materials: None,
             project_path: "untitled.klay".to_string(),
             open_on_start: None,
             pending_doc: None,
@@ -557,6 +566,7 @@ impl App {
             stroke_pending: false,
             last_dab_count: 0,
             demo,
+            demo_brushes: false,
             vsync: true,
             stress: None,
             upload_ms: 0.0,
@@ -1047,6 +1057,16 @@ impl App {
     }
 
     /// Parked subtools that are drawn: `(gpu key, list index)`.
+    /// The shader's `material` uniform: a MatCap's unpainted colour and index, or w = -1
+    /// for the procedural clays.
+    fn material_uniform(&self) -> [f32; 4] {
+        let material = self.workspace.material;
+        match matcap::of_material(material) {
+            Some(look) => look.base().extend((material - matcap::FIRST) as f32).to_array(),
+            None => [0.0, 0.0, 0.0, -1.0],
+        }
+    }
+
     fn drawn_parked(&self) -> Vec<(u64, usize)> {
         if self.workspace.solo {
             return Vec::new();
@@ -2077,6 +2097,18 @@ impl App {
             BrushKind::Zipper,
             BrushKind::Stitch,
             BrushKind::Rake,
+            BrushKind::ClayTubes,
+            BrushKind::HPolish,
+            BrushKind::TrimAdaptive,
+            BrushKind::Planar,
+            BrushKind::TrimSmoothBorder,
+            BrushKind::MoveTopological,
+            BrushKind::InflateBalloon,
+            BrushKind::Magnify,
+            BrushKind::OrbCracks,
+            BrushKind::MalletFast,
+            BrushKind::SmoothValleys,
+            BrushKind::SmoothPeaks,
         ];
         if t.index >= kinds.len() {
             return self.selftest_tiny_drag_frame(t, t.index - kinds.len());
@@ -2101,6 +2133,17 @@ impl App {
             assert!(error < 1e-5, "{kind:?} CPU/GPU error {error}");
         };
         match frame {
+            19 if matches!(kind, BrushKind::SmoothValleys | BrushKind::SmoothPeaks) && !t.rippled => {
+                t.rippled = true;
+                let mesh = self.doc.mesh_mut();
+                let sel = mesh.select_sphere(Vec3::ZERO, f32::MAX.sqrt());
+                let rippled = sel.par_map(|_, v| {
+                    let p = mesh.positions[v as usize];
+                    p * (1.0 + 0.02 * (p.x * 23.0).sin() * (p.y * 19.0 + p.z * 7.0).sin())
+                });
+                mesh.scatter_positions(&sel, &rippled);
+                mesh.finish_edit(&sel.chunks());
+            }
             20 => {
                 t.original = self.mesh().positions.clone();
                 self.workspace.select_brush(&mut self.brush, kind);
@@ -2153,11 +2196,11 @@ impl App {
         false
     }
 
-    /// End of `--selftest-brushes`: Grab and Snake Hook (`which` 0, 1) with a brush smaller
+    /// End of `--selftest-brushes`: Grab, Snake Hook and Move Topological (`which` 0..3) with a brush smaller
     /// than the polygons under it, so the press selects no vertex. The stroke must do
     /// nothing, add no undo step and keep the GPU copy in step, not crash.
     fn selftest_tiny_drag_frame(&mut self, t: &mut BrushTest, which: usize) -> bool {
-        let kinds = [BrushKind::Grab, BrushKind::SnakeHook];
+        let kinds = [BrushKind::Grab, BrushKind::SnakeHook, BrushKind::MoveTopological];
         let Some(&kind) = kinds.get(which) else {
             log::info!("selftest-brushes: all passed");
             return true;
@@ -2855,12 +2898,25 @@ impl App {
         self.update_hover();
     }
 
+    /// `--demo-brushes`: a stroke with each of the advanced brushes added in 0.7, for
+    /// looking at them (through the same input path as `--demo`).
+    fn advanced_strokes(&mut self) -> Vec<(String, f32, u32, usize)> {
+        let still = |p: Vec2, n: usize| vec![p; n];
+        self.run_scripts(vec![
+            (BrushKind::ClayTubes, 0.13, 0.9, false, line(Vec2::new(-0.75, -0.55), Vec2::new(-0.1, -0.68), 30)),
+            (BrushKind::ClayTubes, 0.13, 0.9, false, line(Vec2::new(-0.78, -0.36), Vec2::new(-0.12, -0.47), 30)),
+            (BrushKind::OrbCracks, 0.09, 1.0, false, line(Vec2::new(0.15, -0.75), Vec2::new(0.72, -0.25), 40)),
+            (BrushKind::MalletFast, 0.12, 1.0, false, still(Vec2::new(0.42, 0.12), 6)),
+            (BrushKind::MalletFast, 0.09, 1.0, false, still(Vec2::new(0.62, 0.36), 6)),
+            (BrushKind::InflateBalloon, 0.2, 0.9, false, arc(0.0, 6.2, 0.05, 30).into_iter().map(|p| p + Vec2::new(-0.5, 0.32)).collect()),
+            (BrushKind::Planar, 0.3, 1.0, false, line(Vec2::new(-0.05, -0.1), Vec2::new(0.1, 0.0), 12)),
+            (BrushKind::Magnify, 0.13, 0.8, false, still(Vec2::new(0.1, 0.62), 10)),
+            (BrushKind::MoveTopological, 0.25, 0.6, false, line(Vec2::new(0.92, -0.1), Vec2::new(1.12, -0.25), 15)),
+        ])
+    }
+
     /// Scripted strokes through the real input path: used by `--demo` and `--bench`.
     fn scripted_strokes(&mut self) -> Vec<(String, f32, u32, usize)> {
-        let vp = self.viewport();
-        let c = self.canvas_origin() + vp * 0.5;
-        let r = vp.y * 0.33;
-        let mut report = Vec::new();
         let scripts: Vec<(BrushKind, f32, f32, bool, Vec<Vec2>)> = vec![
             // kind, radius, strength, invert, path (unit circle coords)
             (BrushKind::Draw, 0.18, 0.8, false, arc(0.2, 1.4, 0.55, 60)),
@@ -2891,6 +2947,16 @@ impl App {
                 line(Vec2::new(0.3, -0.3), Vec2::new(0.5, -0.1), 30),
             ),
         ];
+        self.run_scripts(scripts)
+    }
+
+    /// Strokes of `(kind, radius, strength, invert, path in units of a third of the canvas
+    /// height from its centre)`, each through the real input path.
+    fn run_scripts(&mut self, scripts: Vec<(BrushKind, f32, f32, bool, Vec<Vec2>)>) -> Vec<(String, f32, u32, usize)> {
+        let vp = self.viewport();
+        let c = self.canvas_origin() + vp * 0.5;
+        let r = vp.y * 0.33;
+        let mut report = Vec::new();
         for (kind, radius, strength, invert, path) in scripts {
             self.brush = Brush {
                 kind,
@@ -4505,6 +4571,10 @@ impl App {
                 self.selftest_project = Some(left - 1);
             }
         }
+        if let Some(mut t) = self.selftest_materials.take() {
+            if self.selftest_materials_frame(&mut t) { self.quit = true; }
+            else { self.selftest_materials = Some(t); }
+        }
         if let Some(mut t) = self.selftest_surface.take() {
             if self.selftest_surface_frame(&mut t) {self.quit=true;}
             else{self.selftest_surface=Some(t);}
@@ -4606,6 +4676,8 @@ impl App {
             xf_center: preview.center.extend(if preview.is_identity() { 0.0 } else { 1.0 }).to_array(),
             xf_rotation: preview_axis.extend(preview_angle).to_array(),
             xf_move: preview.translate.extend(preview.scale).to_array(),
+            material: self.material_uniform(),
+            cam_up: self.camera.up().extend(0.0).to_array(),
         };
         let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
@@ -4673,6 +4745,11 @@ impl ApplicationHandler for App {
         );
         if self.demo {
             for (name, ms, dabs, count) in self.scripted_strokes() {
+                log::info!("demo stroke {name}: {dabs} dabs over {count} verts in {ms:.1} ms");
+            }
+        }
+        if self.demo_brushes {
+            for (name, ms, dabs, count) in self.advanced_strokes() {
                 log::info!("demo stroke {name}: {dabs} dabs over {count} verts in {ms:.1} ms");
             }
         }
@@ -5251,6 +5328,9 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-surface") {
         app.selftest_surface = Some(native_tests::SurfaceTest::default());
     }
+    if args.iter().any(|a| a == "--selftest-materials") {
+        app.selftest_materials = Some(native_tests::MaterialTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-transpose") {
         app.selftest_transpose = Some(TransposeTest::default());
     }
@@ -5267,6 +5347,15 @@ fn main() {
         app.selftest_tube = Some((0, 20));
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
+    app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
+    // `--material <name or number>`: start in that material (e.g. "MatCap Red Wax").
+    if let Some(m) = flag("--material") {
+        let names = workspace::MATERIALS.iter().map(|(_, n)| n.to_lowercase()).collect::<Vec<_>>();
+        match m.parse::<usize>().ok().or_else(|| names.iter().position(|n| *n == m.to_lowercase())) {
+            Some(i) if i < names.len() => app.workspace.material = i,
+            _ => eprintln!("unknown material {m}; one of: {}", workspace::MATERIALS.map(|(_, n)| n).join(", ")),
+        }
+    }
     if args.iter().any(|a| a == "--selftest-clip") {
         app.selftest_clip = Some(20);
     }
