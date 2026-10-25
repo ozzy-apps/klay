@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.0 — 2026-10-25
 
 - File dialogs: Document › Open (Ctrl + O), Save As, SubTool › Save / Load / Export OBJ and Document › Import / Export OBJ open the desktop's own file dialog (the XDG portal, so GNOME's or KDE's; zenity where there is no portal) instead of reading a typed path. Save (Ctrl + S) saves straight to the project's file once it has one and asks the first time. Dialogs start in the folder of the file they are about, else where the last file was picked; SubTool › Save offers the subtool's name; Load and Import take several files at once; a saved name without `.klay` / `.obj` gets it. The canvas keeps drawing while a dialog is open. The Document palette shows the project's folder instead of a path field.
 - Alpha and Texture popups (the shelf thumbnails and the Alpha / Texture menus) have their controls at the top, above the grid, and the shelf popup is taller (up to 680 points). Alpha rotation (Fixed / Follow / Random and Angle) moved from Stroke › Modifiers to above the alphas; the Texture popup has Relief, Tiling and a new Rotate that turns the texture on its own inside the brush (saved with the brush assets).
