@@ -937,7 +937,9 @@ case.
 | 15.4M vertices, close up (0.35×) | 3.9 ms | 1.1 ms | 1.1 ms (12 chunks, all triangles) |
 | 15.4M vertices, framed (1×) | 3.9 ms | 2.2 ms | 1.1 ms (1 529 chunks, 5.7M points) |
 | 15.4M vertices, far (4×) | 3.9 ms | 2.8 ms | 1.2 ms (1 978 chunks, 7.4M points) |
-| 61.4M vertices, framed (1×) | 15.2 ms | 8.0 ms | 1.6 ms (5 862 chunks, 22M points) |
+| 61.4M vertices, framed (1×) | 15.2 ms | 8.0 ms | 1.4 ms (5 862 chunks, 22M points) |
+| 61.4M vertices, far (4×) | 15.2 ms | 10.3 ms | 1.5 ms (7 732 chunks, 29M points) |
+| 61.4M vertices, very far (8×) | 15.2 ms | – | 1.6 ms (8 042 chunks, 30M points) |
 
 About 1 ms of every frame is the rest of the frame (interface, present). Against triangles,
 `--selftest-splat` finds no empty model pixels on the framed sphere (5 of 252 438 at the
