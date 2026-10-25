@@ -387,6 +387,26 @@ impl Workspace {
             .id()
     }
 
+    /// The controls above the alpha or texture grid: how the stamp turns (alpha), or
+    /// Relief, Tiling and the texture's own turn (texture).
+    pub(super) fn asset_controls(&mut self, ui: &mut Ui, texture: bool) {
+        if texture {
+            zslider(ui, "Relief", &mut self.assets.texture_strength, 0.0..=1.0, false, false, 2);
+            zslider(ui, "Tiling", &mut self.assets.texture_scale, 0.25..=16.0, true, false, 2);
+            zslider(ui, "Rotate", &mut self.assets.texture_angle, -180.0..=180.0, false, false, 0);
+        } else {
+            // The same setting as Stroke › Modifiers › Alpha rotation.
+            let turns = crate::sculpt::AlphaTurn::ALL;
+            let names: Vec<&str> = turns.iter().map(|t| t.name()).collect();
+            let at = turns.iter().position(|t| *t == self.assets.turn).unwrap_or(0);
+            if let Some(i) = seg(ui, &names, at, false) {
+                self.assets.turn = turns[i];
+            }
+            zslider(ui, "Rotate", &mut self.assets.angle, -180.0..=180.0, false, false, 0);
+        }
+        ui.add_space(2.0);
+    }
+
     pub(super) fn asset_grid(&mut self, ui: &mut Ui, texture: bool) {
         let selected = if texture {
             self.assets.texture.clone()
@@ -468,26 +488,6 @@ impl Workspace {
         {
             self.start_import(texture);
         }
-        if texture {
-            zslider(
-                ui,
-                "Relief",
-                &mut self.assets.texture_strength,
-                0.0..=1.0,
-                false,
-                false,
-                2,
-            );
-            zslider(
-                ui,
-                "Tiling",
-                &mut self.assets.texture_scale,
-                0.25..=16.0,
-                true,
-                false,
-                2,
-            );
-        }
     }
 
     pub(super) fn asset_shelf(&mut self, ui: &mut Ui, texture: bool) {
@@ -516,10 +516,12 @@ impl Workspace {
             .frame(popup_frame())
             .show(|ui| {
                 ui.set_width(280.0);
+                // The sliders stay above the grid while it scrolls.
+                self.asset_controls(ui, texture);
                 ScrollArea::vertical()
                     .id_salt(("shelf-assets", texture))
                     .scroll_source(egui::scroll_area::ScrollSource::ALL)
-                    .max_height((ui.ctx().content_rect().height() - 40.0).min(480.0))
+                    .max_height((ui.ctx().content_rect().height() - 140.0).min(680.0))
                     .show(ui, |ui| self.asset_grid(ui, texture));
             });
     }

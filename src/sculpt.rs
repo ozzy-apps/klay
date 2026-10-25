@@ -823,6 +823,9 @@ pub struct StampSettings {
     pub texture: Pattern,
     pub texture_strength: f32,
     pub texture_scale: f32,
+    /// Texture › Rotate: the texture's own turn inside the stamp (degrees), on top of the
+    /// alpha rotation that turns the whole stamp.
+    pub texture_angle: f32,
     /// Brush › Auto Masking.
     pub auto: AutoMask,
     /// Stroke › Alpha rotation and its angle (degrees).
@@ -831,7 +834,17 @@ pub struct StampSettings {
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0}}
+}
+
+impl StampSettings {
+    /// Where the texture is sampled for stamp coordinates `uv` (0..1 across the dab):
+    /// turned by `texture_angle` about the dab's centre, then tiled `texture_scale` times.
+    pub fn texture_uv(&self, uv: glam::Vec2) -> glam::Vec2 {
+        let c = uv - glam::Vec2::splat(0.5);
+        let turned = glam::Vec2::from_angle(self.texture_angle.to_radians()).rotate(c);
+        (turned + glam::Vec2::splat(0.5)) * self.texture_scale
+    }
 }
 
 /// How the alpha (and texture) of each dab is turned (ZBrush: Stroke › Roll for Follow,
@@ -1059,7 +1072,7 @@ impl Stroke {
         let delta=p-hit;
         let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*r)+glam::Vec2::splat(0.5);
         let a=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
-        let t=self.assets.texture.sample(uv*self.assets.texture_scale,true);
+        let t=self.assets.texture.sample(self.assets.texture_uv(uv),true);
         let h=t.truncate().dot(Vec3::new(0.2126,0.7152,0.0722))*t.w;
         a*(1.0-self.assets.texture_strength+h*self.assets.texture_strength)
     }
@@ -1076,7 +1089,7 @@ impl Stroke {
             let p=images.unmap(copy.unwrap_or_else(||sel.image(i)),mesh.positions[vert as usize]);
             let delta=p-hit;
             let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*brush.radius)+glam::Vec2::splat(0.5);
-            let tex=self.assets.texture.sample(uv*self.assets.texture_scale,true);
+            let tex=self.assets.texture.sample(self.assets.texture_uv(uv),true);
             let rgb=base*tex.truncate();
             let weight=focal_falloff(sel.dist[i],brush.radius,brush.focal_shift)
                 *if self.assets.alpha==Pattern::Off{1.0}else{self.assets.alpha.alpha(uv)}
@@ -2838,5 +2851,24 @@ mod alpha_turn_tests {
             let b = height(&y, Vec3::new(-k, 0.12, 0.0));
             assert!((a - b).abs() < 2e-3, "{k}: {a} vs {b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod texture_turn_tests {
+    use super::*;
+
+    #[test]
+    fn texture_rotate_turns_the_texture_about_the_dab_centre() {
+        let mut s = StampSettings { texture_scale: 2.0, ..Default::default() };
+        let uv = glam::Vec2::new(0.25, 0.5);
+        assert!(s.texture_uv(uv).distance(uv * 2.0) < 1e-6);
+        s.texture_angle = 180.0;
+        assert!(s.texture_uv(uv).distance(glam::Vec2::new(1.5, 1.0)) < 1e-5);
+        s.texture_angle = 90.0;
+        // A quarter turn takes the left of the dab to its top (v grows downwards in the stamp).
+        assert!(s.texture_uv(uv).distance(glam::Vec2::new(1.0, 0.5)) < 1e-5);
+        // The centre stays put.
+        assert!(s.texture_uv(glam::Vec2::splat(0.5)).distance(glam::Vec2::splat(1.0)) < 1e-6);
     }
 }

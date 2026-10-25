@@ -89,6 +89,13 @@ impl Library {
                                 }
                             }
                         }
+                        "rotate" => {
+                            if let Ok(x) = v.parse::<f32>() {
+                                if x.is_finite() {
+                                    l.settings.texture_angle = x.clamp(-180.0, 180.0)
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -119,11 +126,12 @@ impl Library {
 
     fn encode(&self, s: &StampSettings) -> String {
         let mut out = format!(
-            "# Klay brush assets v1\nalpha\t{}\ntexture\t{}\nstrength\t{}\nscale\t{}\n",
+            "# Klay brush assets v1\nalpha\t{}\ntexture\t{}\nstrength\t{}\nscale\t{}\nrotate\t{}\n",
             escape(&s.alpha.locator()),
             escape(&s.texture.locator()),
             s.texture_strength,
-            s.texture_scale
+            s.texture_scale,
+            s.texture_angle
         );
         for (key, items) in [
             ("alpha-file", &self.alphas),
@@ -176,11 +184,13 @@ mod tests {
         s.alpha = p;
         s.texture = Pattern::Marble;
         s.texture_scale = 3.0;
+        s.texture_angle = -35.0;
         l.save(&s);
         let back = Library::load(path);
         assert_eq!(back.settings.alpha.locator(), s.alpha.locator());
         assert_eq!(back.settings.texture, Pattern::Marble);
         assert_eq!(back.settings.texture_scale, 3.0);
+        assert_eq!(back.settings.texture_angle, -35.0);
         assert_eq!(unescape(&escape("a\\b\tc\nd\r")), "a\\b\tc\nd\r");
         let _ = std::fs::remove_dir_all(root);
     }

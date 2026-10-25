@@ -2441,10 +2441,10 @@ impl Workspace {
     ) {
         match id {
             PaletteId::Alpha => {
-                self.sec(ui,h,id,"alpha","Alphas",None,true,true,&mut |ws,ui|ws.asset_grid(ui,false));
+                self.sec(ui,h,id,"alpha","Alphas",None,true,true,&mut |ws,ui|{ws.asset_controls(ui,false);ws.asset_grid(ui,false)});
             }
             PaletteId::Texture => {
-                self.sec(ui,h,id,"textures","Textures",None,true,true,&mut |ws,ui|ws.asset_grid(ui,true));
+                self.sec(ui,h,id,"textures","Textures",None,true,true,&mut |ws,ui|{ws.asset_controls(ui,true);ws.asset_grid(ui,true)});
             }
             PaletteId::Brush => {
                 self.sec(
