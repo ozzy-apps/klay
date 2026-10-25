@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- STL: **Document › Import** reads binary and ASCII STL as well as OBJ (the dialog lists both) and welds corners at the same position into one connected, closed mesh (flat and repeated triangles are left out); Fit applies as for OBJ. **Export STL** (Document › Export and the new 3D Print palette) writes every visible subtool at its shown level as one binary STL through the desktop's file dialog.
+- **3D Print** palette (ZBrush: 3D Print Hub): the print's width, depth and height in mm, cm or inches, scaled evenly by typing any one of them (the model is not changed, files are written in mm), Z Up so the model stands on the bed as on screen; Export STL; Send to a slicer found on the computer (PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio, UltiMaker Cura, Creality Print and others, from their menu entries, including Flatpaks and AppImages) or a custom command; Check Mesh counts holes, open, non-manifold and flipped edges, shells and triangles per visible subtool, with Close Holes and Remesh at hand. Unit, size, Z Up and slicer are kept with the workspace. Export STL, Send to Slicer and Check Mesh can go on a shelf.
+- New flag: --print-check (runs Check Mesh at start, for snapshots).
+- Verification: 296 release tests (new: binary and ASCII STL round trips that weld back to the closed cube, a binary header that starts with "solid", welding, short and empty files, patching the count; the mesh check on closed, holed, doubled, flipped and finned meshes; printer placement and the settings line; slicer command lines and desktop entries; the palette's buttons, sizes and units; export, check, send through a custom command and import back at print size in the app).
+
 ## 0.26.0 — 2026-10-25
 
 - File dialogs: Document › Open (Ctrl + O), Save As, SubTool › Save / Load / Export OBJ and Document › Import / Export OBJ open the desktop's own file dialog (the XDG portal, so GNOME's or KDE's; zenity where there is no portal) instead of reading a typed path. Save (Ctrl + S) saves straight to the project's file once it has one and asks the first time. Dialogs start in the folder of the file they are about, else where the last file was picked; SubTool › Save offers the subtool's name; Load and Import take several files at once; a saved name without `.klay` / `.obj` gets it. The canvas keeps drawing while a dialog is open. The Document palette shows the project's folder instead of a path field.

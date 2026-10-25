@@ -46,6 +46,9 @@ const ACTIONS: &[(&str, &str, &str)] = &[
     ("cmd:show-all", "Show all", "Show every polygon"),
     ("cmd:invert-visibility", "Invert", "Swap hidden and visible"),
     ("cmd:fullscreen", "Fullscreen", "F11"),
+    ("cmd:export-stl", "Export STL", "The visible subtools as one STL, sized by 3D Print"),
+    ("cmd:send-slicer", "Send to Slicer", "Open the visible subtools in the 3D Print slicer"),
+    ("cmd:print-check", "Check Mesh", "Look for holes and non-manifold edges before printing"),
 ];
 
 fn brush_of(id: &str) -> Option<BrushKind> {
@@ -184,6 +187,9 @@ impl Workspace {
             "cmd:show-all" => a.show_all = true,
             "cmd:invert-visibility" => a.invert_visibility = true,
             "cmd:fullscreen" => a.fullscreen = true,
+            "cmd:export-stl" => a.export_stl = true,
+            "cmd:send-slicer" => a.send_slicer = true,
+            "cmd:print-check" => a.print_check = true,
             _ => {}
         }
     }

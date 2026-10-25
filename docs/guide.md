@@ -47,6 +47,7 @@ cargo run --release -- --space-menu                                  # start wit
 cargo run --release -- --brush-catalog                               # start with the B catalog open
 cargo run --release -- --theme "Graphite Blue"                       # start in an interface theme (Preferences › Theme)
 cargo run --release -- --menu Preferences --ui-scale 0.8             # start with a palette's menu open, at an interface scale
+cargo run --release -- --menu "3D Print" --print-check               # 3D Print open with Check Mesh already run
 cargo run --release -- --fake-update 0.30.0                          # show the update card for a pretend release (no network)
 cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
@@ -199,9 +200,11 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 - **Pointer**: over the model the brush is the cursor, as in ZBrush: the system pointer hides
   while the brush ring is on the model or a stroke is under way (a small dot marks the
   brush centre), and shows over the interface, the empty canvas and the border.
-- **Document › Import**: an OBJ as a new subtool (polygons of any size, `o` / `g` names as
-  polygroups, vertex colours as polypaint). **Fit** centres and scales it to a new
-  primitive's size, so Draw Size suits it.
+- **Document › Import**: an OBJ or STL as a new subtool (OBJ: polygons of any size, `o` / `g`
+  names as polygroups, vertex colours as polypaint; STL: binary or ASCII, corners at the same
+  position welded into one closed mesh, flat and repeated triangles left out, turned from
+  Z up to Y up while **3D Print › Z Up** is on). **Fit** centres and scales it to a new
+  primitive's size, so Draw Size suits it. **Document › Export** writes OBJ or STL.
 - **Mesh › Deformation**: besides Offset and Size, **Smooth, Polish** (keeps the volume),
   **Inflate, Spherize, Noise, Twist** and **Taper** (about Y). Drag and release; they reshape
   the shown level as one undo step and masks hold.
@@ -428,6 +431,33 @@ asks first); **Snapshot** saves the canvas inside the frame, without the interfa
 with a vertical gradient (**Range**: how strong, **Center**: where it crosses the Back
 colour, **Rate**: how soft) and the **Border** colour; Reset returns Klay's defaults. The
 colours are kept with the workspace layout (Workspace › Reset leaves them alone).
+
+### 3D printing
+
+**3D Print** palette (ZBrush: 3D Print Hub), for sending a sculpt to a slicer:
+
+- **Size**: the print's **Width**, **Depth** and **Height** in **mm**, **cm** or **in**.
+  Drag or type any one and the print scales evenly; **1 unit** is how many of them a Klay
+  unit becomes. The model itself does not change, only what is written. **Z Up** turns
+  Klay's Y up into the printer's Z up, so the model stands on the bed as it stands on
+  screen. STL files are always in millimetres. Kept with the workspace.
+- **Export**: **Export STL** writes every visible subtool at its shown level as one binary
+  STL (also Document › Export). **Send to …** writes it to `~/.cache/klay/print/` and opens
+  it in the slicer.
+- **Slicer**: the slicers found on this computer from their menu entries (packages,
+  Flatpaks, Snaps, AppImages added to the menu) and `PATH`: PrusaSlicer, SuperSlicer,
+  OrcaSlicer, Bambu Studio, UltiMaker Cura, Creality Print and a few others; two installs of
+  one slicer are told apart (Flatpak, AppImage). **Custom** runs a command of your own,
+  `{file}` standing for the STL (added at the end without it). **Rescan** looks again.
+- **Check Mesh**: what a slicer wants is one closed, manifold surface. The check counts
+  triangles, shells, holes (and their open edges), non-manifold edges (three or more
+  triangles on one edge) and flipped edges (neighbours wound against each other), for all
+  visible subtools and each one. When something is wrong, **Close Holes** and **Remesh** (the
+  Mesh palette's tools, on the active subtool) are right there; Subtract / Intersect
+  subtools are written as they are, so Make Boolean Mesh carves them first. The result says
+  when the model changed since.
+
+Export STL, Send to Slicer and Check Mesh can go on a shelf.
 
 ### Sculpting helpers
 
@@ -848,6 +878,19 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   subtool once to bake its stand-in and swaps the model only when all of them succeeded.
   Undo history is not saved. Export OBJ writes every visible subtool at its shown level as
   its own object, rebuilding parked ones one at a time.
+- `stl.rs`: STL in and out. `parse` reads binary (the size matches the header's count, even
+  when the header starts with `solid`) or ASCII and welds corners by exact position (−0 as 0)
+  into an indexed mesh, dropping flat and repeated triangles. `BinaryWriter` writes binary
+  STL to any `Write` one triangle or mesh at a time (each point through a placing function),
+  `patch_count` fixes the count afterwards for seekable files, `write_binary` does a mesh in
+  one call. Meant to be reused by other tools (a slicer).
+- `print.rs`: the 3D Print palette's logic. `Settings` (unit, mm per Klay unit, Z up, slicer,
+  custom command; a `print|…` workspace line) with `place` (Klay point → printer mm);
+  `check` counts edges per vertex in parallel (each edge at its lower vertex: one triangle
+  open, three or more non-manifold, two running the same way flipped) and holes and shells
+  with union-find; `detect` reads desktop entries; `command_for` fills `%f %F` (path),
+  `%u %U` (`file://` URL, which Flatpak's `--file-forwarding` needs) or `{file}`; `launch`
+  starts the slicer and reaps it on a thread.
 - `render.rs`: positions, packed normals, indices and fixed-point normal accumulators live
   on the GPU, with a separate four-byte vertex-paint buffer (about 57 bytes per vertex total), one set per subdivision level that has been shown, so
   stepping between levels is a pointer swap. Levels that are not shown keep their copies up

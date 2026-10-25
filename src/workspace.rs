@@ -314,6 +314,8 @@ impl Place {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PaletteId {
+    /// 3D Print (ZBrush: 3D Print Hub): real-world size, STL export, slicer, checks.
+    Print,
     Alpha,
     Brush,
     Document,
@@ -334,7 +336,8 @@ pub enum PaletteId {
 
 impl PaletteId {
     /// Alphabetical, which is also the menu bar order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
+        Self::Print,
         Self::Alpha,
         Self::Brush,
         Self::Document,
@@ -354,6 +357,7 @@ impl PaletteId {
     ];
     pub fn name(self) -> &'static str {
         match self {
+            Self::Print => "3D Print",
             Self::Alpha => "Alpha",
             Self::Brush => "Brush",
             Self::Document => "Document",
@@ -487,6 +491,8 @@ pub struct DockLayout {
     pub document: DocumentLook,
     /// Performance › Drawing: dense parts of the model drawn as points.
     pub dense_points: bool,
+    /// 3D Print: unit, print scale, Z up and the slicer.
+    pub print: crate::print::Settings,
 }
 
 impl Default for DockLayout {
@@ -512,6 +518,7 @@ impl Default for DockLayout {
             skip_version: String::new(),
             document: DocumentLook::default(),
             dense_points: true,
+            print: crate::print::Settings::default(),
         }
     }
 }
@@ -626,6 +633,9 @@ impl DockLayout {
         if self.document != DocumentLook::default() {
             text.push_str(&self.document.encode());
         }
+        if self.print != crate::print::Settings::default() {
+            text.push_str(&self.print.encode());
+        }
         text
     }
 
@@ -700,6 +710,11 @@ impl DockLayout {
                 ["document", rest @ ..] => {
                     if let Some(d) = DocumentLook::decode(rest) {
                         result.document = d;
+                    }
+                }
+                ["print", rest @ ..] => {
+                    if let Some(p) = crate::print::Settings::decode(rest) {
+                        result.print = p;
                     }
                 }
                 _ => {}
@@ -782,6 +797,11 @@ pub struct Model<'a> {
     pub wedge_on: bool,
     pub wedge_refusal: Option<&'a str>,
     pub wedge_estimate: usize,
+    /// 3D Print: the box around the visible subtools (Klay units), the last check, and
+    /// whether the model changed since.
+    pub print_extent: Option<glam::Vec3>,
+    pub print_report: Option<&'a crate::print::Report>,
+    pub print_stale: bool,
     /// The pen in use or found, or why pen pressure is unavailable.
     pub tablet: &'a str,
     /// Whether pen pressure is being read.
@@ -858,8 +878,12 @@ pub struct Actions {
     pub save_subtool: bool,
     pub load_subtools: bool,
     pub export_subtool: bool,
-    /// Document › Import OBJ.
-    pub import_obj: bool,
+    /// Document › Import OBJ or STL.
+    pub import_mesh: bool,
+    /// Export STL (Document, 3D Print); 3D Print › Send to the slicer, Check.
+    pub export_stl: bool,
+    pub send_slicer: bool,
+    pub print_check: bool,
     /// Mesh › Morph Target: StoreMT, DelMT, Switch.
     pub morph: Option<crate::MorphOp>,
     /// Edit › History: undo (negative) or redo (positive) this many steps.
@@ -1017,6 +1041,9 @@ pub struct Workspace {
     pub fov: f32,
     /// Document › Import: centre and scale the import to a new primitive's size.
     pub import_fit: bool,
+    /// 3D Print › Slicer: the slicers found on this computer (looked for when the palette
+    /// is first drawn, and again on Rescan).
+    pub slicers: Option<Vec<crate::print::Slicer>>,
     /// SubTool › Extract thickness, % of the subtool's size.
     pub extract_thick: f32,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
@@ -1218,6 +1245,7 @@ impl Workspace {
             spacing: crate::sculpt::SPACING,
             fov: 45.0,
             import_fit: true,
+            slicers: None,
             extract_thick: 2.0,
             quicksave: true,
             quicksave_minutes: 10.0,
@@ -2442,6 +2470,199 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ palette contents
+    /// The chosen slicer's name and command line: the custom command, the stored slicer,
+    /// else the first one found.
+    pub fn chosen_slicer(&mut self) -> Option<(String, String)> {
+        let settings = self.layout.print.clone();
+        if settings.slicer == crate::print::CUSTOM {
+            let cmd = settings.command.trim();
+            return (!cmd.is_empty()).then(|| ("the custom command".to_string(), cmd.to_string()));
+        }
+        let found = self.slicers.get_or_insert_with(crate::print::detect);
+        found.iter().find(|s| s.id == settings.slicer).or(found.first()).map(|s| (s.name.clone(), s.exec.clone()))
+    }
+
+    /// 3D Print (ZBrush: 3D Print Hub).
+    fn print_palette(&mut self, ui: &mut Ui, h: bool, m: &mut Model<'_>, a: &mut Actions) {
+        use crate::print::{CUSTOM, Unit};
+        let id = PaletteId::Print;
+        self.sec(ui, h, id, "size", "Size", None, true, true, &mut |ws, ui| {
+            let ps = &mut ws.layout.print;
+            let at = Unit::ALL.iter().position(|u| *u == ps.unit).unwrap_or(0);
+            let names: Vec<&str> = Unit::ALL.iter().map(|u| u.name()).collect();
+            if let Some(i) = seg(ui, &names, at, false) {
+                ps.unit = Unit::ALL[i];
+            }
+            let unit = ps.unit;
+            match m.print_extent.filter(|e| e.max_element() > 0.0) {
+                Some(extent) => {
+                    let size = ps.printed_size(extent) / unit.mm();
+                    // Typing any one size scales the whole print evenly.
+                    for (k, label) in ["Width", "Depth", "Height"].into_iter().enumerate() {
+                        let mut v = size[k];
+                        if print_size_row(ui, label, &mut v, unit) && v > 0.0 {
+                            let model = ps.printed_size(extent)[k] / ps.scale;
+                            if model > 0.0 {
+                                ps.scale = (v * unit.mm() / model).clamp(1e-4, 1e6);
+                            }
+                        }
+                    }
+                }
+                None => note(ui, "Nothing visible to print."),
+            }
+            let mut per = ps.scale / unit.mm();
+            if print_size_row(ui, "1 unit", &mut per, unit) && per > 0.0 {
+                ps.scale = (per * unit.mm()).clamp(1e-4, 1e6);
+            }
+            ui.checkbox(&mut ps.z_up, "Z Up")
+                .on_hover_text("Stand the model on the bed as it stands on screen (Klay is Y up, printers Z up)");
+            note(ui, "Typing a size scales the print evenly; the model is not changed. Files are written in mm. Kept with the workspace.");
+        });
+        self.sec(ui, h, id, "export", "Export", None, true, true, &mut |ws, ui| {
+            a.export_stl |= ui
+                .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Export STL").truncate())
+                .on_hover_text("Every visible subtool at its shown level as one binary STL, at the size above")
+                .shelf(ui, "cmd:export-stl")
+                .clicked();
+            let target = ws.chosen_slicer().map(|(name, _)| name);
+            let label = match &target {
+                Some(_) if ws.layout.print.slicer == CUSTOM => "Send to Custom".to_string(),
+                Some(name) => format!("Send to {name}"),
+                None => "Send to Slicer".to_string(),
+            };
+            ui.add_enabled_ui(target.is_some(), |ui| {
+                a.send_slicer |= ui
+                    .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(label).truncate())
+                    .on_hover_text("Write the STL to a temporary file and open it in the slicer")
+                    .on_disabled_hover_text("No slicer found: pick Custom below and type its command")
+                    .shelf(ui, "cmd:send-slicer")
+                    .clicked();
+            });
+            if !m.status.is_empty() && (m.status.starts_with("Export") || m.status.starts_with("Sent") || m.status.starts_with("Send")) {
+                note(ui, m.status);
+            }
+        });
+        self.sec(ui, h, id, "slicer", "Slicer", None, true, true, &mut |ws, ui| {
+            let found = ws.slicers.get_or_insert_with(crate::print::detect).clone();
+            let ps = &mut ws.layout.print;
+            let chosen = if ps.slicer == CUSTOM {
+                None
+            } else {
+                found.iter().position(|s| s.id == ps.slicer).or((!found.is_empty()).then_some(0))
+            };
+            for (i, s) in found.iter().enumerate() {
+                if ui
+                    .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(&s.name).selected(chosen == Some(i)).truncate())
+                    .on_hover_text(&s.exec)
+                    .clicked()
+                {
+                    ps.slicer = s.id.clone();
+                }
+            }
+            if found.is_empty() {
+                note(ui, "No slicer found (PrusaSlicer, OrcaSlicer, Bambu Studio, Cura, Creality Print…).");
+            }
+            let custom = ps.slicer == CUSTOM;
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 4.0) * 0.5;
+                if ui
+                    .add_sized([w, CONTROL_H], egui::Button::new("Custom").selected(custom).truncate())
+                    .on_hover_text("Open the STL with a command of your own")
+                    .clicked()
+                {
+                    ps.slicer = if custom { String::new() } else { CUSTOM.to_string() };
+                }
+                if ui
+                    .add_sized([w, CONTROL_H], egui::Button::new("Rescan").truncate())
+                    .on_hover_text("Look for installed slicers again")
+                    .clicked()
+                {
+                    ws.slicers = None;
+                }
+            });
+            let ps = &mut ws.layout.print;
+            if ps.slicer == CUSTOM {
+                ui.add(egui::TextEdit::singleline(&mut ps.command).hint_text("my-slicer {file}").desired_width(f32::INFINITY))
+                    .on_hover_text("{file} is the STL; without it the file goes at the end. Quotes keep words with spaces together.");
+            }
+            note(ui, "Send writes the STL to Klay's cache folder and opens it there. The choice is kept with the workspace.");
+        });
+        self.sec(ui, h, id, "check", "Check", None, true, true, &mut |_, ui| {
+            a.print_check |= ui
+                .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Check Mesh").truncate())
+                .on_hover_text("Look for holes, non-manifold and flipped edges in every visible subtool at its shown level")
+                .shelf(ui, "cmd:print-check")
+                .clicked();
+            let Some(r) = m.print_report else {
+                note(ui, "Slicers want one closed, manifold surface: no holes, no edges shared by three or more triangles.");
+                return;
+            };
+            let c = &r.total;
+            let (verdict, color) = if c.watertight() { ("Watertight", ACC_TEXT()) } else { ("Not watertight", Color32::from_rgb(230, 120, 90)) };
+            ui.label(RichText::new(verdict).font(font(13.0, Weight::SemiBold)).color(color));
+            kv(ui, "Triangles", &crate::fmt_count(c.triangles));
+            kv(ui, "Shells", &c.shells.to_string());
+            kv(ui, "Holes", &format!("{} ({} open edges)", c.holes, crate::fmt_count(c.open_edges)));
+            kv(ui, "Non-manifold edges", &crate::fmt_count(c.non_manifold));
+            kv(ui, "Flipped edges", &crate::fmt_count(c.flipped));
+            if r.rows.len() > 1 {
+                for (name, sc) in &r.rows {
+                    let count = |n: usize, one: &str, many: &str| format!("{} {}", crate::fmt_count(n), if n == 1 { one } else { many });
+                    let mut parts = Vec::new();
+                    if sc.holes > 0 || sc.open_edges > 0 {
+                        parts.push(count(sc.holes, "hole", "holes"));
+                    }
+                    if sc.non_manifold > 0 {
+                        parts.push(count(sc.non_manifold, "non-manifold", "non-manifold"));
+                    }
+                    if sc.flipped > 0 {
+                        parts.push(count(sc.flipped, "flipped", "flipped"));
+                    }
+                    let what = if parts.is_empty() { "closed".to_string() } else { parts.join(" · ") };
+                    kv(ui, name, &what);
+                }
+            }
+            if m.print_stale {
+                note(ui, "The model changed since this check.");
+            }
+            let top = m.levels.len().saturating_sub(1);
+            if c.open_edges > 0 {
+                ui.add_enabled_ui(top == 0, |ui| {
+                    a.close_holes |= ui
+                        .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Close Holes").truncate())
+                        .on_hover_text("Cap every hole of the active subtool (Mesh › Geometry › Close Holes)")
+                        .on_disabled_hover_text("Needs a subtool without subdivision levels (Mesh › Del Higher)")
+                        .clicked();
+                });
+            }
+            if c.non_manifold > 0 || c.flipped > 0 || c.open_edges > 0 {
+                ui.add_enabled_ui(m.wedge_refusal.is_none(), |ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Remesh").truncate())
+                        .on_hover_text("Rebuild the active subtool as one even, closed surface (Mesh › Remesh)");
+                    let r = match m.wedge_refusal {
+                        Some(why) => r.on_disabled_hover_text(why),
+                        None => r,
+                    };
+                    if r.clicked() {
+                        if m.wedge_on {
+                            a.wedge_now = true;
+                        } else {
+                            a.wedge_toggle = true;
+                        }
+                    }
+                });
+                note(ui, "Close Holes caps holes; Remesh rebuilds a closed surface and also fixes non-manifold and flipped parts. Both act on the active subtool.");
+            }
+            if c.shells > 1 {
+                note(ui, "Several shells: most slicers join overlapping shells; Remesh or SubTool › Merge Down + Remesh makes one.");
+            }
+            if r.booleans > 0 {
+                note(ui, "Subtract / Intersect subtools are written as they are: SubTool › Make Boolean Mesh carves them first.");
+            }
+        });
+    }
+
     fn palette_body(
         &mut self,
         ui: &mut Ui,
@@ -2629,6 +2850,7 @@ impl Workspace {
                     },
                 );
             }
+            PaletteId::Print => self.print_palette(ui, h, m, a),
             PaletteId::Document => {
                 self.sec(
                     ui,
@@ -2739,16 +2961,17 @@ impl Workspace {
                     true,
                     true,
                     &mut |_, ui| {
-                        if ui
-                            .add_sized(
-                                [ui.available_width(), 20.0],
-                                egui::Button::new("Export OBJ"),
-                            )
-                            .on_hover_text("Every visible subtool at its shown level, one OBJ object each")
-                            .clicked()
-                        {
-                            a.export = true;
-                        }
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            a.export |= ui
+                                .add_sized([w, 20.0], egui::Button::new("Export OBJ").truncate())
+                                .on_hover_text("Every visible subtool at its shown level, one OBJ object each")
+                                .clicked();
+                            a.export_stl |= ui
+                                .add_sized([w, 20.0], egui::Button::new("Export STL").truncate())
+                                .on_hover_text("Every visible subtool at its shown level as one binary STL, sized and turned by 3D Print")
+                                .clicked();
+                        });
                         if m.status.is_empty() {
                             note(
                                 ui,
@@ -2770,15 +2993,15 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         if ui
-                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Import OBJ"))
-                            .on_hover_text("Pick OBJ files and add each as a new subtool")
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Import OBJ / STL"))
+                            .on_hover_text("Pick OBJ or STL files and add each as a new subtool")
                             .clicked()
                         {
-                            a.import_obj = true;
+                            a.import_mesh = true;
                         }
                         ui.checkbox(&mut ws.import_fit, "Fit")
                             .on_hover_text("Centre it and scale it to a new primitive's size, so Draw Size suits it");
-                        note(ui, "OBJ groups become polygroups, vertex colours polypaint.");
+                        note(ui, "OBJ groups become polygroups, vertex colours polypaint. STL corners are welded; with 3D Print › Z Up the file is turned to stand up.");
                     },
                 );
             }
@@ -5278,6 +5501,27 @@ fn tag_colored(p: &egui::Painter, right_center: Pos2, text: &str, accent: bool) 
     );
 }
 
+/// 3D Print › Size: a name and a number to drag or type, in `unit`. True when changed.
+fn print_size_row(ui: &mut Ui, label: &str, value: &mut f32, unit: crate::print::Unit) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.set_height(CONTROL_H);
+        ui.label(RichText::new(label).font(font(13.0, Weight::Regular)).color(FG2()));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let decimals = if unit == crate::print::Unit::Mm { 1 } else { 2 };
+            let speed = (value.abs() * 0.005).max(0.01) as f64;
+            changed = ui
+                .add_sized(
+                    [110.0, CONTROL_H - 2.0],
+                    egui::DragValue::new(value).speed(speed).range(0.0..=1e6).fixed_decimals(decimals).suffix(format!(" {}", unit.name())),
+                )
+                .on_hover_text("Drag, or click and type")
+                .changed();
+        });
+    });
+    changed
+}
+
 fn note(ui: &mut Ui, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).font(font(12.0, Weight::Regular)).color(FG3())).wrap());
 }
@@ -5791,6 +6035,8 @@ mod tests {
         workspace.saved = workspace.layout.encode();
         workspace.persistence_path =
             std::env::temp_dir().join(format!("klay-test-{}-{name}.layout", std::process::id()));
+        // The same layout on every computer, whatever slicers it has.
+        workspace.slicers = Some(Vec::new());
         let ctx = egui::Context::default();
         theme(&ctx);
         (workspace, ctx)
@@ -5891,6 +6137,9 @@ mod tests {
                         wedge_on: false,
                         wedge_refusal: None,
                         wedge_estimate: 75_000,
+                        print_extent: Some(glam::Vec3::splat(2.0)),
+                        print_report: None,
+                        print_stale: false,
                         tablet: "UGTABLET 15.6 inch PenDisplay Pen (0)",
                         tablet_on: true,
                         pressure: Some(0.42),
@@ -5938,6 +6187,47 @@ mod tests {
         frame(workspace, ctx, size, vec![egui::Event::PointerMoved(pos)]);
         frame(workspace, ctx, size, vec![pointer(pos, true)]);
         frame(workspace, ctx, size, vec![pointer(pos, false)])
+    }
+
+    #[test]
+    fn print_palette_buttons_raise_their_actions_and_sizes_follow_the_scale() {
+        let (mut workspace, ctx) = test_workspace("print");
+        workspace.slicers = Some(vec![crate::print::Slicer { id: "test.desktop".into(), name: "TestSlicer".into(), exec: "true %F".into() }]);
+        let size = vec2(1600.0, 1000.0);
+        let subtools = [row("Sphere 1", true)];
+        let mut primitive = crate::primitive::Settings::default();
+        let mut run = |ws: &mut Workspace, events: Vec<egui::Event>| frame_full(ws, &ctx, size, events, &subtools, &mut primitive);
+        // Click the text `label` in the 3D Print dropdown (which closes on a click): the
+        // dropdown as it was, and the actions of the click.
+        let mut press = |ws: &mut Workspace, label: &str| -> (egui::FullOutput, Actions) {
+            ws.open_menu("3D Print");
+            run(ws, vec![]);
+            let (out, _) = run(ws, vec![]);
+            let pos = text_position(&out, label);
+            run(ws, vec![egui::Event::PointerMoved(pos)]);
+            run(ws, vec![pointer(pos, true)]);
+            (out, run(ws, vec![pointer(pos, false)]).1)
+        };
+        let (out, a) = press(&mut workspace, "Export STL");
+        assert!(a.export_stl);
+        // The test model is 2 units across at 25 mm a unit.
+        // (The number and the unit are drawn apart.)
+        assert_eq!(text_count(&out, "50.0"), 3, "width, depth and height");
+        assert_eq!(text_count(&out, "25.0"), 1, "1 unit");
+        assert!(press(&mut workspace, "Send to TestSlicer").1.send_slicer);
+        assert!(press(&mut workspace, "Check Mesh").1.print_check);
+        press(&mut workspace, "cm");
+        assert_eq!(workspace.layout.print.unit, crate::print::Unit::Cm);
+        let (out, _) = press(&mut workspace, "Check Mesh");
+        assert_eq!(text_count(&out, "5.00"), 3);
+        press(&mut workspace, "Custom");
+        assert_eq!(workspace.layout.print.slicer, crate::print::CUSTOM);
+        // Kept with the workspace.
+        workspace.layout.print.command = "my-slicer --open {file}".into();
+        let back = DockLayout::decode(&workspace.layout.encode());
+        assert_eq!(back.print, workspace.layout.print);
+        assert_eq!(workspace.chosen_slicer().unwrap().1, "my-slicer --open {file}");
+        let _ = std::fs::remove_file(&workspace.persistence_path);
     }
 
     #[test]

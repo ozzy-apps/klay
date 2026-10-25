@@ -20,8 +20,10 @@ pub enum Ask {
     ExportSubtoolObj,
     /// Document › Export OBJ.
     ExportObj,
-    /// Document › Import OBJ (several files at once).
-    ImportObj,
+    /// Document › Export STL and 3D Print › Export STL.
+    ExportStl,
+    /// Document › Import: OBJ or STL files (several at once).
+    ImportMesh,
 }
 
 impl Ask {
@@ -33,24 +35,43 @@ impl Ask {
             Ask::LoadSubtools => "Load SubTools",
             Ask::ExportSubtoolObj => "Export SubTool as OBJ",
             Ask::ExportObj => "Export OBJ",
-            Ask::ImportObj => "Import OBJ",
+            Ask::ExportStl => "Export STL",
+            Ask::ImportMesh => "Import OBJ or STL",
         }
     }
 
-    /// The file extension this dialog is for, without the dot.
+    /// The file extension this dialog is for, without the dot (the first of
+    /// [`extensions`](Self::extensions)).
     pub fn extension(self) -> &'static str {
+        self.extensions()[0]
+    }
+
+    /// Every extension the dialog lists files with.
+    pub fn extensions(self) -> &'static [&'static str] {
         match self {
-            Ask::OpenProject | Ask::SaveProject | Ask::SaveSubtool | Ask::LoadSubtools => "klay",
-            Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ImportObj => "obj",
+            Ask::OpenProject | Ask::SaveProject | Ask::SaveSubtool | Ask::LoadSubtools => &["klay"],
+            Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
+            Ask::ExportStl => &["stl"],
+            Ask::ImportMesh => &["obj", "stl"],
+        }
+    }
+
+    /// The kind of file, for the dialog's filter.
+    fn kind(self) -> &'static str {
+        match self.extensions() {
+            ["klay"] => "Klay project",
+            ["obj"] => "Wavefront OBJ",
+            ["stl"] => "STL",
+            _ => "Meshes (OBJ, STL)",
         }
     }
 
     pub fn saves(self) -> bool {
-        matches!(self, Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj)
+        matches!(self, Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl)
     }
 
     fn many(self) -> bool {
-        matches!(self, Ask::LoadSubtools | Ask::ImportObj)
+        matches!(self, Ask::LoadSubtools | Ask::ImportMesh)
     }
 }
 
@@ -74,8 +95,9 @@ impl Pending {
 /// Open the dialog for `ask` in `dir`, offering `file_name` when it saves, on top of `parent`.
 pub fn open(ask: Ask, dir: &Path, file_name: &str, parent: Option<&winit::window::Window>) -> Pending {
     let ext = ask.extension();
-    let kind = if ext == "klay" { "Klay project" } else { "Wavefront OBJ" };
-    let mut dialog = rfd::FileDialog::new().set_title(ask.title()).set_directory(dir).add_filter(kind, &[ext]);
+    // Both cases: some file choosers match extensions case-sensitively (MODEL.STL).
+    let exts: Vec<String> = ask.extensions().iter().flat_map(|e| [e.to_string(), e.to_uppercase()]).collect();
+    let mut dialog = rfd::FileDialog::new().set_title(ask.title()).set_directory(dir).add_filter(ask.kind(), &exts);
     if ask.saves() {
         dialog = dialog.set_file_name(file_name).set_can_create_directories(true);
     } else {
@@ -146,6 +168,9 @@ mod tests {
         assert_eq!(with_extension("/a/head.KLAY".into(), "klay"), PathBuf::from("/a/head.KLAY"));
         assert_eq!(with_extension("/a/head.v2".into(), "klay"), PathBuf::from("/a/head.v2.klay"));
         assert_eq!(with_extension("/a/head.obj".into(), "obj"), PathBuf::from("/a/head.obj"));
+        assert_eq!(with_extension("/a/head".into(), Ask::ExportStl.extension()), PathBuf::from("/a/head.stl"));
+        assert_eq!(Ask::ImportMesh.extensions(), ["obj", "stl"]);
+        assert!(Ask::ExportStl.saves() && !Ask::ImportMesh.saves());
     }
 
     #[test]

@@ -25,6 +25,8 @@ mod zmodeler;
 mod layers;
 mod obj;
 mod pressure;
+mod print;
+mod stl;
 mod subtool_ops;
 mod native_tests;
 mod mesh;
@@ -217,8 +219,10 @@ enum DocOp {
     SaveSubtool,
     LoadSubtools,
     ExportSubtool,
-    /// Document › Import: the OBJ at `App::import_path` as a new subtool.
-    ImportObj,
+    /// Document › Import: the OBJ or STL at `App::import_path` as a new subtool.
+    ImportMesh,
+    /// Export STL: the visible subtools to `App::stl_path`.
+    ExportStl,
 }
 
 /// Mesh › Layers operations.
@@ -498,8 +502,14 @@ struct App {
     project_path: String,
     /// SubTool › Save / Load / Export OBJ: a file holding single subtools.
     subtool_path: String,
-    /// Document › Import: OBJ file to import.
+    /// Document › Import: OBJ or STL file to import.
     import_path: String,
+    /// Export STL (Document and 3D Print): where the STL goes.
+    stl_path: String,
+    /// 3D Print › Check: the last result, and the model it was for (see `print_stamp`).
+    print_report: Option<print::Report>,
+    /// `--print-check`: run the check once the model is built.
+    print_check_on_start: bool,
     /// The desktop's Open / Save dialog while it is open, the folder of the last file picked
     /// in one, and whether `project_path` is a file this project was opened from or saved to
     /// (Save asks for a file until it is).
@@ -708,6 +718,9 @@ impl App {
             project_path: "untitled.klay".to_string(),
             subtool_path: "subtool.klay".to_string(),
             import_path: "model.obj".to_string(),
+            stl_path: "klay_export.stl".to_string(),
+            print_report: None,
+            print_check_on_start: false,
             file_dialog: None,
             last_dir: None,
             project_has_file: false,
@@ -1934,7 +1947,8 @@ impl App {
                 Ask::SaveSubtool => DocOp::SaveSubtool,
                 Ask::LoadSubtools => DocOp::LoadSubtools,
                 Ask::ExportSubtoolObj => DocOp::ExportSubtool,
-                Ask::ImportObj => DocOp::ImportObj,
+                Ask::ImportMesh => DocOp::ImportMesh,
+                Ask::ExportStl => DocOp::ExportStl,
                 Ask::ExportObj => {
                     self.pending_export = true;
                     return;
@@ -1956,7 +1970,9 @@ impl App {
             Ask::ExportSubtoolObj => (&self.subtool_path, file_dialog::file_name(&tool, "obj")),
             Ask::ExportObj if self.project_has_file => (&self.export_path, file_dialog::file_name(&project_stem, "obj")),
             Ask::ExportObj => (&self.export_path, file_of(&self.export_path).unwrap_or_else(|| "export.obj".into())),
-            Ask::ImportObj => (&self.import_path, String::new()),
+            Ask::ExportStl if self.project_has_file => (&self.stl_path, file_dialog::file_name(&project_stem, "stl")),
+            Ask::ExportStl => (&self.stl_path, file_of(&self.stl_path).unwrap_or_else(|| "export.stl".into())),
+            Ask::ImportMesh => (&self.import_path, String::new()),
         };
         // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
         let dir = file_dialog::start_dir(near, self.last_dir.as_deref());
@@ -2003,10 +2019,14 @@ impl App {
                 self.export_path = text(first);
                 self.export_obj_all();
             }
-            Ask::ImportObj => {
+            Ask::ExportStl => {
+                self.stl_path = text(first);
+                self.export_stl();
+            }
+            Ask::ImportMesh => {
                 for path in &paths {
                     self.import_path = text(path);
-                    self.import_obj(&text(path));
+                    self.import_mesh(&text(path));
                 }
             }
         }
@@ -2348,15 +2368,30 @@ impl App {
         self.workspace.notify("Switched with the Morph Target");
     }
 
-    /// Import the OBJ at `path` as a new subtool after the others and make it active
-    /// (Document › Import; ZBrush: Tool › Import into a new SubTool). With Fit on it is
-    /// centred and scaled to the size of a new primitive, so Draw Size suits it.
-    fn import_obj(&mut self, path: &str) {
+    /// Import the OBJ or STL at `path` (by its extension) as a new subtool after the others
+    /// and make it active (Document › Import; ZBrush: Tool › Import into a new SubTool).
+    /// STL corners are welded into shared vertices, and with 3D Print › Z Up on the file is
+    /// turned from Z up to Klay's Y up. With Fit on it is centred and scaled to the size of a
+    /// new primitive, so Draw Size suits it.
+    fn import_mesh(&mut self, path: &str) {
         if self.busy() {
             return;
         }
         let t = Instant::now();
-        let parsed = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|text| obj::parse(&text));
+        let is_stl = Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("stl"));
+        let parsed = if is_stl {
+            let z_up = self.workspace.layout.print.z_up;
+            std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|bytes| stl::parse(&bytes)).map(|mut m| {
+                if z_up {
+                    for p in &mut m.positions {
+                        *p = Vec3::new(p.x, p.z, -p.y);
+                    }
+                }
+                m
+            })
+        } else {
+            std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|text| obj::parse(&text))
+        };
         let mut m = match parsed {
             Ok(m) => m,
             Err(e) => {
@@ -2390,7 +2425,11 @@ impl App {
             fmt_count(verts),
             fmt_count(tris),
             scale.map_or(String::new(), |s| format!(", scaled ×{s:.3} to fit")),
-            if m.skipped > 0 { format!(", {} bad faces left out", m.skipped) } else { String::new() },
+            match (m.skipped, is_stl) {
+                (0, _) => String::new(),
+                (n, true) => format!(", {n} flat or repeated triangles left out"),
+                (n, false) => format!(", {n} bad faces left out"),
+            },
             t.elapsed().as_secs_f32()
         );
         log::info!("{}", self.status);
@@ -2579,6 +2618,140 @@ impl App {
             Err(e) => format!("Export failed: {e}"),
         };
         log::info!("{}", self.status);
+    }
+
+    /// Every visible subtool at its shown level as one binary STL at `path`, placed by the
+    /// 3D Print settings (millimetres, Z up). Parked subtools are rebuilt one at a time, as
+    /// for OBJ. Returns the subtools and triangles written.
+    fn write_stl(&self, path: &Path) -> std::io::Result<(usize, u64)> {
+        let settings = &self.workspace.layout.print;
+        let place = |p: Vec3| settings.place(p);
+        let file = std::fs::File::create(path)?;
+        let buf = std::io::BufWriter::with_capacity(8 << 20, file);
+        let stem = Path::new(&self.project_path).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let mut out = stl::BinaryWriter::new(buf, &format!("Klay {} {stem} (mm)", env!("CARGO_PKG_VERSION")), 0)?;
+        let mut count = 0;
+        for (i, tool) in self.subtools.iter().enumerate() {
+            if i == self.active_tool {
+                let m = self.doc.mesh();
+                out.mesh(&m.positions, &m.indices, place)?;
+            } else if let (true, Some(p)) = (tool.visible, &tool.parked) {
+                let doc = p.packed.clone().unpack();
+                out.mesh(&doc.mesh().positions, &doc.mesh().indices, place)?;
+            } else {
+                continue;
+            }
+            count += 1;
+        }
+        let (buf, tris) = out.finish()?;
+        let mut file = buf.into_inner().map_err(|e| e.into_error())?;
+        stl::patch_count(&mut file, tris)?;
+        Ok((count, tris))
+    }
+
+    /// Export STL (Document › Export, 3D Print): the visible subtools to `stl_path`.
+    fn export_stl(&mut self) {
+        let t = Instant::now();
+        let path = self.stl_path.clone();
+        self.status = match self.write_stl(Path::new(&path)) {
+            Ok((count, tris)) => format!(
+                "Exported {count} subtools ({} triangles) to {path} in {:.1} s",
+                fmt_count(tris as usize),
+                t.elapsed().as_secs_f32()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// 3D Print › Send: write the visible subtools as an STL in [`print::send_dir`] and open
+    /// it in the chosen slicer (the first one found when none is chosen yet).
+    fn send_to_slicer(&mut self) {
+        self.send_to_slicer_in(&print::send_dir());
+    }
+
+    fn send_to_slicer_in(&mut self, dir: &Path) {
+        if self.busy() {
+            return;
+        }
+        let (name, exec) = match self.workspace.chosen_slicer() {
+            Some(s) => s,
+            None => {
+                self.status = "Send: no slicer found; pick Custom and type its command".into();
+                self.workspace.notify(self.status.clone());
+                return;
+            }
+        };
+        let stem = Path::new(&self.project_path).file_stem().map_or_else(|| "klay".into(), |s| s.to_string_lossy().into_owned());
+        let path = dir.join(file_dialog::file_name(&stem, "stl"));
+        let result = std::fs::create_dir_all(dir)
+            .and_then(|()| self.write_stl(&path))
+            .and_then(|(_, tris)| print::launch(&print::command_for(&exec, &path)).map(|()| tris));
+        self.status = match result {
+            Ok(tris) => format!("Sent {} triangles to {name}: {}", fmt_count(tris as usize), path.display()),
+            Err(e) => format!("Send to {name} failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// The size of the box around the visible subtools (what Export STL writes), `None`
+    /// when nothing is shown.
+    fn print_extent(&self) -> Option<Vec3> {
+        let mut b = Aabb::empty();
+        for (i, t) in self.subtools.iter().enumerate() {
+            let tb = if i == self.active_tool { self.doc.bounds() } else if t.visible { t.bounds } else { continue };
+            b.grow(tb.min);
+            b.grow(tb.max);
+        }
+        (b.max.cmpge(b.min).all()).then(|| b.max - b.min)
+    }
+
+    /// What the 3D Print check result is for: the subtools, which are shown, the active one,
+    /// its level and its edits.
+    fn print_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in &self.subtools {
+            (t.id, t.visible).hash(&mut h);
+        }
+        (self.active_tool, self.doc.active(), self.history.edits()).hash(&mut h);
+        h.finish()
+    }
+
+    /// 3D Print › Check: holes, non-manifold and flipped edges and shells of every visible
+    /// subtool at its shown level (what Export STL writes).
+    fn print_check(&mut self) {
+        let t = Instant::now();
+        let mut report = print::Report { stamp: self.print_stamp(), ..Default::default() };
+        for (i, tool) in self.subtools.iter().enumerate() {
+            let check = if i == self.active_tool {
+                print::check(&self.doc.mesh().indices)
+            } else if let (true, Some(p)) = (tool.visible, &tool.parked) {
+                print::check(&p.packed.clone().unpack().mesh().indices)
+            } else {
+                continue;
+            };
+            report.total.add(&check);
+            report.booleans += (tool.boolean != boolean::BoolOp::Add) as usize;
+            report.rows.push((tool.name.clone(), check));
+        }
+        let c = &report.total;
+        self.status = if c.watertight() {
+            format!("Check: watertight, {} triangles, {} shells ({:.2} s)", fmt_count(c.triangles), c.shells, t.elapsed().as_secs_f32())
+        } else {
+            format!(
+                "Check: {} holes, {} open, {} non-manifold, {} flipped edges ({:.2} s)",
+                c.holes,
+                c.open_edges,
+                c.non_manifold,
+                c.flipped,
+                t.elapsed().as_secs_f32()
+            )
+        };
+        log::info!("{}", self.status);
+        self.print_report = Some(report);
     }
 
     /// `--selftest-project`: save the model, open it again, and check that every subtool
@@ -6711,6 +6884,8 @@ impl App {
         };
         self.workspace.curve_preview = self.curve_preview();
         self.workspace.held_brush = self.held_brush();
+        let print_extent = self.print_extent();
+        let print_stale = self.print_report.as_ref().is_some_and(|r| r.stamp != self.print_stamp());
         let actions = self.workspace.show(
             ui,
             &mut workspace::Model {
@@ -6760,6 +6935,9 @@ impl App {
                 wedge_on,
                 wedge_refusal: wedge_refusal.as_deref(),
                 wedge_estimate,
+                print_extent,
+                print_report: self.print_report.as_ref(),
+                print_stale,
                 tablet: &tablet,
                 tablet_on: self.tablet.is_some(),
                 pressure: self.pressure,
@@ -6792,8 +6970,17 @@ impl App {
         if actions.export_subtool {
             self.ask_file(file_dialog::Ask::ExportSubtoolObj);
         }
-        if actions.import_obj {
-            self.ask_file(file_dialog::Ask::ImportObj);
+        if actions.import_mesh {
+            self.ask_file(file_dialog::Ask::ImportMesh);
+        }
+        if actions.export_stl {
+            self.ask_file(file_dialog::Ask::ExportStl);
+        }
+        if actions.send_slicer {
+            self.send_to_slicer();
+        }
+        if actions.print_check {
+            self.print_check();
         }
         if actions.export {
             self.ask_file(file_dialog::Ask::ExportObj);
@@ -7002,10 +7189,11 @@ impl App {
             Some(DocOp::SaveSubtool) => self.save_subtool(),
             Some(DocOp::LoadSubtools) => self.load_subtools(),
             Some(DocOp::ExportSubtool) => self.export_subtool_obj(),
-            Some(DocOp::ImportObj) => {
+            Some(DocOp::ImportMesh) => {
                 let path = self.import_path.clone();
-                self.import_obj(&path);
+                self.import_mesh(&path);
             }
+            Some(DocOp::ExportStl) => self.export_stl(),
             None => {}
         }
         match self.pending_subtool.take() {
@@ -7454,6 +7642,9 @@ impl ApplicationHandler for App {
         }
         if let Some(k) = self.camera_distance {
             self.camera.distance *= k;
+        }
+        if std::mem::take(&mut self.print_check_on_start) {
+            self.print_check();
         }
     }
 
@@ -8123,6 +8314,9 @@ fn main() {
     }
     // `--about`: start with About Klay open (for snapshots of it).
     app.workspace.about_open = args.iter().any(|a| a == "--about");
+    // `--print-check`: run 3D Print › Check Mesh once the model is built (snapshots of
+    // its result).
+    app.print_check_on_start = args.iter().any(|a| a == "--print-check");
     // `--menu NAME`: start with that palette's menu-bar dropdown open (snapshots).
     if let Some(name) = flag("--menu") {
         app.workspace.open_menu(&name);
@@ -8673,7 +8867,7 @@ mod subtool_tests {
         app.subtool_path = dir.join("cube.klay").to_string_lossy().into_owned();
         app.export_subtool_obj();
         app.import_path = dir.join("cube.obj").to_string_lossy().into_owned();
-        app.import_obj(&app.import_path.clone());
+        app.import_mesh(&app.import_path.clone());
         assert_eq!(app.subtools.len(), 3);
         assert_eq!(app.active_tool, 2);
         assert_eq!(app.subtools[2].name, "cube");
@@ -8683,8 +8877,74 @@ mod subtool_tests {
         let b = app.doc.bounds();
         assert!(((b.max - b.min).max_element() - 2.0).abs() < 1e-4);
         // A missing file adds nothing.
-        app.import_obj("/nonexistent/x.obj");
+        app.import_mesh("/nonexistent/x.obj");
         assert_eq!(app.subtools.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stl_exports_checks_sends_and_imports_back_at_print_size() {
+        let dir = std::env::temp_dir().join(format!("klay-stl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(12, false, usize::MAX);
+        app.primitive.kind = Primitive::Cube;
+        app.append_primitive();
+        app.workspace.layout.print.scale = 10.0;
+        let extent = app.print_extent().unwrap();
+        let tris = app.doc.mesh().triangle_count() + app.subtools[0].parked.as_ref().unwrap().packed.clone().unpack().mesh().triangle_count();
+        // Export: both subtools in one binary STL, in mm, Z up.
+        app.stl_path = dir.join("model.stl").to_string_lossy().into_owned();
+        app.export_stl();
+        let bytes = std::fs::read(&app.stl_path).unwrap();
+        assert_eq!(bytes.len(), 84 + 50 * tris, "{}", app.status);
+        let file = stl::parse(&bytes).unwrap();
+        let (lo, hi) = file.positions.iter().fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(a, b), &p| (a.min(p), b.max(p)));
+        let printed = hi - lo;
+        assert!((printed - Vec3::new(extent.x, extent.z, extent.y) * 10.0).abs().max_element() < 1e-3, "{printed} vs {extent}");
+        let c = print::check(&file.indices);
+        assert!(c.watertight() && c.shells == 2, "{c:?}");
+        // Check: two closed subtools; it goes stale when the model changes.
+        app.print_check();
+        let report = app.print_report.clone().unwrap();
+        assert_eq!(report.rows.len(), 2);
+        assert!(report.total.watertight() && report.total.triangles == tris);
+        assert_eq!(report.stamp, app.print_stamp());
+        app.subtools[0].visible = false;
+        assert_ne!(report.stamp, app.print_stamp());
+        app.subtools[0].visible = true;
+        // Send: a custom command gets the STL.
+        let copied = dir.join("copied.stl");
+        app.workspace.layout.print.slicer = print::CUSTOM.into();
+        app.workspace.layout.print.command = format!("sh -c 'cp \"$1\" \"$2\"' sh {{file}} '{}'", copied.display());
+        app.send_to_slicer_in(&dir.join("send"));
+        assert!(app.status.starts_with("Sent"), "{}", app.status);
+        let t = Instant::now();
+        while !copied.exists() && t.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(std::fs::read(&copied).unwrap(), bytes);
+        // Import without Fit: back in Klay's frame at print size, welded and closed.
+        app.workspace.import_fit = false;
+        app.import_mesh(&app.stl_path.clone());
+        assert_eq!((app.subtools.len(), app.active_tool), (3, 2));
+        assert_eq!(app.subtools[2].name, "model");
+        let b = app.doc.bounds();
+        assert!(((b.max - b.min) - extent * 10.0).abs().max_element() < 1e-3);
+        assert!(print::check(&app.doc.mesh().indices).watertight());
+        assert_eq!(app.doc.mesh().triangle_count(), tris);
+        // Without a window the dialogs fall back to the stored paths.
+        app.ask_file(file_dialog::Ask::ExportStl);
+        assert!(matches!(app.pending_doc, Some(DocOp::ExportStl)));
+        app.ask_file(file_dialog::Ask::ImportMesh);
+        assert!(matches!(app.pending_doc, Some(DocOp::ImportMesh)));
+        app.pending_doc = None;
+        // A broken STL adds nothing.
+        std::fs::write(dir.join("bad.stl"), b"solid nothing\nendsolid\n").unwrap();
+        app.import_mesh(&dir.join("bad.stl").to_string_lossy());
+        assert_eq!(app.subtools.len(), 3);
+        assert!(app.status.starts_with("Import failed"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
