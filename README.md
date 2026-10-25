@@ -30,6 +30,7 @@ cargo run --release -- --divide 2 --selftest-curve                   # Zipper al
 cargo run --release -- --segments 400 --selftest-clip                # three crossing Clip Line cuts (a pie slice), checks no cut pushes an earlier one out, log, exit (--hold keeps it open, turned)
 cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
 cargo run --release -- --segments 400 --selftest-insert              # Insert Mesh: one of each shape, GPU readback, undo/redo, log, exit
+cargo run --release -- --segments 12 --selftest-sculptris            # Sculptris Pro: three strokes, timing, closed surface, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
@@ -174,7 +175,7 @@ bar sliders. Long label/value rows wrap inside narrow trays.
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The 48 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
+The 48 brushes and tools, Sculptris Pro, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X / Y / Z and
 radial symmetry, Auto Masking, LazyMouse and Spacing, Transpose, Curve strokes and live
@@ -273,6 +274,26 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
   drag sets its size and it is about as dense as the model. It becomes a **new polygroup**
   and the rest of the subtool is **masked**, ready for Transpose or the Gizmo. Symmetry
   inserts mirror copies. One undo step; needs a subtool without subdivision levels.
+
+### Sculptris Pro (0.16)
+
+ZBrush's dynamic tessellation: with **Sculptris Pro** on (top shelf, or Brush › Sculptris
+Pro), strokes add triangles where the brush goes and remove them where there are more than
+needed, so you can start from a ball of a few hundred polygons and sculpt any detail
+without dividing or remeshing.
+
+- Triangles follow **Draw Size**, as in ZBrush's adaptive mode: a small brush makes small
+  triangles, a large one large ones. **Detail** (Brush › Sculptris Pro) sets how fine for a
+  given size (50: edges a fifth of the radius; every 25 halves them).
+- **Smooth** (Shift) relaxes and coarsens to its own size; masked surface, hidden
+  polygons, open borders and polygroup borders stay as they are. Symmetry retessellates
+  every copy.
+- Every dab brush works with it except Layer, Morph, the detail brushes (Zipper, Stitch,
+  Rake), drag brushes (Grab, Snake Hook, Elastic, Move Topological) and DragRect /
+  DragDot strokes, which sculpt as usual. It needs a subtool without subdivision levels
+  and without layers (a stroke then sculpts as usual and says why).
+- A stroke is one undo step (it keeps a copy of the subtool from before it). Fluid up to a
+  few hundred thousand triangles; at around two million each pointer move takes ~30 ms.
 
 ### Canvas and Document
 

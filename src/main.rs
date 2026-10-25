@@ -15,6 +15,8 @@ mod curve_tube;
 mod deform;
 mod gizmo;
 mod insert_mesh;
+mod sculptris;
+mod fx;
 mod layers;
 mod obj;
 mod pressure;
@@ -493,6 +495,8 @@ struct App {
     selftest_tube: Option<(u8, u32)>,
     /// `--selftest-insert`: likewise, for Insert Mesh.
     selftest_insert: Option<(u8, u32)>,
+    /// `--selftest-sculptris`: likewise, for Sculptris Pro.
+    selftest_sculptris: Option<(u8, u32)>,
     /// `--hold`: a self-test leaves the window open when it is done.
     selftest_hold: bool,
     /// `--selftest-clip`: frames left before the crossing Clip Line cuts.
@@ -518,6 +522,11 @@ struct App {
     action_line: Option<ActionLine>,
     transpose: Option<TransposeDrag>,
     insert: Option<InsertDrag>,
+    /// Sculptris Pro during a stroke: the subtool as it was before (the stroke's undo step
+    /// once the mesh changed), whether it changed, and where the last pass was.
+    sculptris_before: Option<Box<multires::Packed>>,
+    sculptris_changed: bool,
+    sculptris_at: Vec<Vec3>,
     /// Where Gizmo 3D was put (Alt + click, Alt + drag) or carried by its drags, for the
     /// subtool with this id; otherwise it stands at the subtool's centre, world-aligned.
     gizmo_place: Option<(u64, gizmo::Place)>,
@@ -650,6 +659,7 @@ impl App {
             selftest_curve_state: CurveTest::default(),
             selftest_tube: None,
             selftest_insert: None,
+            selftest_sculptris: None,
             selftest_hold: false,
             selftest_clip: None,
             cursor: Vec2::ZERO,
@@ -665,6 +675,9 @@ impl App {
             action_line: None,
             transpose: None,
             insert: None,
+            sculptris_before: None,
+            sculptris_changed: false,
+            sculptris_at: Vec::new(),
             gizmo_place: None,
             mask_press: None,
             mask_stroke: None,
@@ -3570,6 +3583,72 @@ impl App {
         }
     }
 
+    /// `--selftest-sculptris`: Sculptris Pro strokes through the real input handlers on the
+    /// GPU. Phase 0 strokes across the model at three sizes, timing every pointer move;
+    /// phase 1 checks the surface is closed, the GPU copy, undo and redo.
+    fn selftest_sculptris_phase(&mut self, phase: u8) -> Option<u8> {
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_curve_state.ok &= pass;
+            log::info!("selftest-sculptris: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let max_diff = |a: &[Vec3], b: &[Vec3]| a.par_iter().zip(b).map(|(x, y)| x.distance(*y)).reduce(|| 0.0, f32::max);
+        match phase {
+            0 => {
+                self.selftest_curve_state = CurveTest { ok: true, ..CurveTest::default() };
+                self.workspace.sculptris = true;
+                self.workspace.select_brush(&mut self.brush, BrushKind::ClayBuildup);
+                self.pressure = None;
+                let b = self.doc.bounds();
+                let (centre, size) = ((b.min + b.max) * 0.5, (b.max - b.min).max_element());
+                let original = self.mesh().positions.clone();
+                let tris = self.mesh().triangle_count();
+                let c = self.project(centre);
+                let r = (self.project(centre + Vec3::X * size * 0.5) - c).length();
+                let mut moves = Vec::new();
+                for (k, share) in [0.08f32, 0.04, 0.02].into_iter().enumerate() {
+                    self.brush.radius = size * share;
+                    let y = (k as f32 - 1.0) * r * 0.3;
+                    let (from, to) = (c + Vec2::new(-r * 0.6, y), c + Vec2::new(r * 0.6, y + r * 0.1));
+                    self.cursor_moved(from, false);
+                    self.left_press(false, false);
+                    for i in 1..=60 {
+                        let t = Instant::now();
+                        self.cursor_moved(from + (to - from) * (i as f32 / 60.0), false);
+                        moves.push(t.elapsed().as_secs_f32() * 1000.0);
+                    }
+                    self.left_release();
+                }
+                let after = self.mesh().triangle_count();
+                let mean = moves.iter().sum::<f32>() / moves.len() as f32;
+                let worst = moves.iter().copied().fold(0.0, f32::max);
+                check(self, &format!("three strokes took {} → {} triangles; pointer moves {mean:.1} ms mean, {worst:.1} ms worst", fmt_count(tris), fmt_count(after)), after != tris);
+                let m = self.mesh();
+                let closed = (0..m.vertex_count() as u32).into_par_iter().all(|v| {
+                    m.neighbors(v).iter().all(|&w| m.incident(v).iter().filter(|&&t| m.indices[3 * t as usize..3 * t as usize + 3].contains(&w)).count() == 2)
+                });
+                check(self, "the surface is still closed: every edge has two triangles", closed);
+                self.selftest_curve_state.original = original;
+                self.selftest_curve_state.bent = self.mesh().positions.clone();
+                Some(1)
+            }
+            _ => {
+                let t = std::mem::take(&mut self.selftest_curve_state);
+                self.selftest_curve_state.ok = t.ok;
+                if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                    let d = if gpu.len() >= t.bent.len() { max_diff(&gpu[..t.bent.len()], &t.bent) } else { f32::INFINITY };
+                    check(self, &format!("GPU copy matches the CPU ({d:.1e})"), d < 1e-6);
+                }
+                self.history_jump(-3);
+                check(self, "three undos put the subtool back", self.mesh().positions == t.original);
+                self.history_jump(3);
+                check(self, "redo brings the strokes back", self.mesh().positions == t.bent);
+                let ok = self.selftest_curve_state.ok;
+                log::info!("selftest-sculptris: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -4063,7 +4142,107 @@ impl App {
         if self.drag_stamp.is_some() {
             self.lazy_point = None;
         }
+        self.begin_sculptris();
         self.apply_stroke();
+    }
+
+    /// Sculptris Pro, at the start of a stroke that can use it: keep the subtool for undo.
+    fn begin_sculptris(&mut self) {
+        self.sculptris_before = None;
+        self.sculptris_changed = false;
+        self.sculptris_at.clear();
+        let kind = self.stroke_brush.kind;
+        if !self.workspace.sculptris || !Stroke::retessellates(kind) || self.drag_stamp.is_some() || !self.stroke_brush.sculpt {
+            return;
+        }
+        if self.doc.count() > 1 {
+            self.workspace.notify("Sculptris Pro needs a subtool without subdivision levels · Del Lower first; this stroke sculpts as usual".to_string());
+            return;
+        }
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify("Sculptris Pro: bake or delete the layers first · Mesh › Layers; this stroke sculpts as usual".to_string());
+            return;
+        }
+        self.sculptris_before = Some(Box::new(self.doc.pack_copy()));
+    }
+
+    /// Sculptris Pro before the dabs at `path`: retessellate around where they land (and
+    /// their symmetry images) when the brush has moved on from the last pass.
+    fn sculptris_pass(&mut self, path: &[Vec2], radius: f32) {
+        let hits: Vec<Vec3> = path
+            .iter()
+            .filter_map(|&p| {
+                let (o, d) = self.ray_at(p);
+                self.doc.mesh().raycast(o, d).map(|h| h.point)
+            })
+            .collect();
+        let fresh = hits.iter().any(|h| self.sculptris_at.iter().all(|c| c.distance(*h) > radius * 0.3));
+        if !fresh {
+            return;
+        }
+        let images = self.workspace.sym().images();
+        let centres: Vec<Vec3> = hits.iter().flat_map(|&h| images.of(h)).collect();
+        let target = sculptris::target_edge(radius, self.workspace.sculptris_detail);
+        self.sculptris_at = hits;
+        let t = Instant::now();
+        let Some((mesh, stats)) = sculptris::retessellated(self.doc.mesh(), &centres, radius * 1.15, target) else {
+            return;
+        };
+        if let Some(s) = self.stroke.as_mut() {
+            s.rebase();
+        }
+        // What the GPU copy must take again: vertices from the first chunk that changed,
+        // triangles from the first that differs.
+        let old = self.doc.mesh();
+        let verts = old.chunks.iter().zip(&mesh.chunks).position(|(a, b)| a.vert_end != b.vert_end).map_or(old.vertex_count().min(mesh.vertex_count()), |c| old.chunks[c].vert_start as usize);
+        let verts = (0..verts).into_par_iter().find_first(|&v| old.positions[v] != mesh.positions[v]).unwrap_or(verts);
+        let shared = old.indices.len().min(mesh.indices.len());
+        let tris = (0..shared).into_par_iter().find_first(|&i| old.indices[i] != mesh.indices[i]).unwrap_or(shared) / 3;
+        let generation = self.doc.generation;
+        let budget = self.doc.budget;
+        self.doc = Multires::new(mesh, budget);
+        self.sculptris_changed = true;
+        let written = self.gfx.as_mut().is_some_and(|gfx| gfx.generation == generation && gfx.rewrite_from(self.doc.mesh_mut(), verts, tris, true));
+        if let Some(gfx) = self.gfx.as_mut() {
+            if written {
+                gfx.generation = self.doc.generation;
+            } else {
+                // Afresh, with room to grow so the next passes write in place.
+                gfx.clear_levels();
+                gfx.generation = self.doc.generation;
+                let mesh = self.doc.mesh_mut();
+                let (n, t, c) = (mesh.vertex_count(), mesh.triangle_count(), mesh.chunks.len());
+                let room = render::Room { verts: n + (n / 4).max(1 << 16), tris: t + (t / 4).max(1 << 17), chunks: c + (c / 4).max(64) };
+                if !gfx.upload_level_with_room(mesh, 0, room) {
+                    self.show_active_level();
+                }
+            }
+        }
+        self.update_hover();
+        log::debug!("sculptris: {stats:?} in {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// Sculptris Pro at the end of a stroke that changed the mesh: one undo step that puts
+    /// the whole subtool back. Returns true when it took the stroke.
+    fn end_sculptris(&mut self) -> bool {
+        let Some(before) = self.sculptris_before.take() else {
+            return false;
+        };
+        let changed = std::mem::take(&mut self.sculptris_changed);
+        self.sculptris_at.clear();
+        if !changed {
+            return false;
+        }
+        if let Some(stroke) = self.stroke.take() {
+            let _ = stroke.end(self.doc.mesh_mut());
+        }
+        let tris = (before.triangle_count(), self.doc.mesh().triangle_count());
+        self.history.push(UndoStep::Replace(before));
+        self.history.name_last(self.stroke_brush.kind.name());
+        self.morph_targets.remove(&self.subtools[self.active_tool].id);
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.status = format!("Sculptris Pro: {} → {} triangles", fmt_count(tris.0), fmt_count(tris.1));
+        true
     }
 
     /// The pressure of the pen in use, or `None` once a mouse moves the pointer (kept up to
@@ -4139,7 +4318,11 @@ impl App {
                 ray,
             );
         } else {
-            for p in self.stroke_path() {
+            let path = self.stroke_path();
+            if self.sculptris_before.is_some() {
+                self.sculptris_pass(&path, brush.radius);
+            }
+            for p in path {
                 let ray = self.ray_at(p);
                 let Some(hit) = self.doc.mesh().raycast(ray.0, ray.1) else {
                     continue;
@@ -4177,6 +4360,7 @@ impl App {
             self.stroke_pending = false;
             self.apply_stroke();
         }
+        self.end_sculptris();
         if let Some(stroke) = self.stroke.take() {
             let level = self.doc.active();
             self.commit_stroke(stroke, level);
@@ -5814,6 +5998,16 @@ impl App {
                 self.selftest_tube = Some((phase, left - 1));
             }
         }
+        if let Some((phase, left)) = self.selftest_sculptris {
+            if left == 0 {
+                self.selftest_sculptris = self.selftest_sculptris_phase(phase).map(|next| (next, 10));
+                if self.selftest_sculptris.is_none() && !self.selftest_hold {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_sculptris = Some((phase, left - 1));
+            }
+        }
         if let Some((phase, left)) = self.selftest_insert {
             if left == 0 {
                 self.selftest_insert = self.selftest_insert_phase(phase).map(|next| (next, 10));
@@ -6704,6 +6898,9 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-tube") {
         app.selftest_tube = Some((0, 20));
     }
+    if args.iter().any(|a| a == "--selftest-sculptris") {
+        app.selftest_sculptris = Some((0, 20));
+    }
     if args.iter().any(|a| a == "--selftest-insert") {
         app.selftest_insert = Some((0, 20));
     }
@@ -6877,6 +7074,45 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    #[test]
+    fn sculptris_pro_adds_triangles_under_the_stroke_as_one_undo_step() {
+        let mut app = App::new(8, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app.workspace.sculptris = true;
+        app.workspace.select_brush(&mut app.brush, BrushKind::Draw);
+        app.brush.radius = 0.3;
+        app.brush.strength = 0.5;
+        let before = app.doc.mesh().positions.clone();
+        let tris = app.doc.mesh().triangle_count();
+        let c = app.project(Vec3::new(0.0, 0.0, 1.0));
+        let stroke = |app: &mut App, from: Vec2, to: Vec2| {
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=10 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 10.0), false);
+            }
+            app.left_release();
+        };
+        stroke(&mut app, c - Vec2::new(60.0, 0.0), c + Vec2::new(60.0, 0.0));
+        let after = app.doc.mesh().triangle_count();
+        assert!(after > tris + 200, "{tris} → {after}");
+        // The stroke still raised the surface where it went.
+        let top = app.doc.mesh().positions.iter().map(|p| p.z).fold(f32::MIN, f32::max);
+        assert!(top > 1.0, "{top}");
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Draw"));
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().positions, before);
+        app.history_jump(1);
+        assert_eq!(app.doc.mesh().triangle_count(), after);
+        // With subdivision levels it sculpts as usual.
+        app.history_jump(-1);
+        assert!(app.doc.divide());
+        let n = app.doc.mesh().triangle_count();
+        stroke(&mut app, c - Vec2::new(60.0, 0.0), c + Vec2::new(60.0, 0.0));
+        assert_eq!(app.doc.mesh().triangle_count(), n);
+    }
 
     #[test]
     fn insert_mesh_adds_a_masked_off_polygroup_sized_by_the_drag() {

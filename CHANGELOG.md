@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.0 — 2026-10-25
+
+- Sculptris Pro (top shelf, Brush › Sculptris Pro): strokes retessellate the surface under the brush (split long edges, collapse short ones, flip toward valence six, relax along the surface), with triangle size following Draw Size and a Detail slider. Masks, hidden polygons, open borders and polygroup borders are kept; symmetry copies retessellate too; one undo step per stroke; subtools without subdivision levels and layers.
+- Faster local mesh rebuilds: only the chunks a change touches are put together again, the rest copied and renumbered in parallel (about 4× quicker than a full rebuild at a million vertices), and the GPU copy is rewritten in place from the first change.
+- Fixed a deadlock: built-in alphas (0.14) were painted lazily on rayon threads, and a first use inside a brush's parallel loop could wait on itself. They are now painted on plain threads.
+- New --selftest-sculptris.
+- Verification: 241 release tests (new: refining under a brush and coarsening with masks and polygroup borders kept, the surface closed and outward; patched meshes equal to full rebuilds, tables and chunks consistent, a grown chunk split; a Sculptris Pro stroke through the input path with undo/redo and the refusal with levels); every native self-test passes on the GPU, Sculptris Pro at 1.7k to 1.9M triangles.
+
 ## 0.15.0 — 2026-10-25
 
 - Squash and stretch along one axis: Transpose Scale mode's middle circle (along the action line), Gizmo 3D axis boxes, and Deformation › Size X / Y / Z toggles. Flattening a sphere works; masks hold; live preview; one undo step.

@@ -738,6 +738,10 @@ pub struct Workspace {
     pub brush_pressure: HashMap<BrushKind, TabletPressure>,
     /// The mesh IMM Primitives inserts.
     pub insert_shape: crate::primitive::Primitive,
+    /// Sculptris Pro (ZBrush): strokes retessellate the mesh under the brush; Detail sets
+    /// how small its triangles are for the brush size (see `sculptris::target_edge`).
+    pub sculptris: bool,
+    pub sculptris_detail: f32,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -870,6 +874,8 @@ impl Workspace {
             curve_drag: None,
             brush_pressure: HashMap::new(),
             insert_shape: crate::primitive::Primitive::Sphere,
+            sculptris: false,
+            sculptris_detail: 50.0,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -1388,6 +1394,17 @@ impl Workspace {
                             self.mode = mode;
                         }
                     }
+                    shelf_separator(ui);
+                    // ZBrush keeps Sculptris Pro on the top shelf.
+                    ui.vertical(|ui| {
+                        ui.add_space(12.0);
+                        if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(84.0, 22.0))
+                            .on_hover_text("Strokes add and remove triangles under the brush · Detail in Brush › Sculptris Pro")
+                            .clicked()
+                        {
+                            self.sculptris = !self.sculptris;
+                        }
+                    });
                     shelf_separator(ui);
                     // Sculpt / polypaint modes and live RGB intensity.
                     ui.vertical(|ui| {
@@ -2084,6 +2101,14 @@ impl Workspace {
                         zslider(ui,"Focal Shift",&mut m.brush.focal_shift,-100.0..=100.0,false,false,0);
                     },
                 );
+                self.sec(ui, h, id, "sculptris", "Sculptris Pro", None, true, true, &mut |ws, ui| {
+                    ui.checkbox(&mut ws.sculptris, "Sculptris Pro")
+                        .on_hover_text("Strokes add and remove triangles under the brush as you sculpt (subtools without subdivision levels)");
+                    ui.add_enabled_ui(ws.sculptris, |ui| {
+                        zslider(ui, "Detail", &mut ws.sculptris_detail, 0.0..=100.0, false, false, 0);
+                    });
+                    note(ui, "Triangles follow Draw Size: a smaller brush makes smaller ones · Smooth (Shift) coarsens to its own size · masked surface stays as it is");
+                });
                 if m.brush.kind.is_imm() {
                     self.sec(ui, h, id, "imm", "Insert Mesh", None, true, true, &mut |ws, ui| {
                         let shapes = crate::insert_mesh::SHAPES;

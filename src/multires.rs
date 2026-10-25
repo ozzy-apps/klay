@@ -1011,6 +1011,11 @@ impl Packed {
     /// Rebuild the full level stack: the base mesh as it was, then every level by replaying
     /// its subdivision and adding its offsets. Only for data this build produced; files go
     /// through [`try_unpack`](Self::try_unpack).
+    /// Triangles of the base level.
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+
     pub fn unpack(self) -> Multires {
         self.unpack_checked().expect("packed data from this session is consistent")
     }

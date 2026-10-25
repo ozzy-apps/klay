@@ -4,7 +4,6 @@
 //! repeat seamlessly.
 
 use glam::Vec2;
-use rayon::prelude::*;
 use std::sync::OnceLock;
 
 pub const SIZE: usize = 512;
@@ -198,10 +197,22 @@ fn worley(uv: Vec2, n: i32) -> (f32, f32, u32) {
 pub fn image(b: Baked) -> &'static [f32] {
     static IMAGES: [OnceLock<Vec<f32>>; 9] = [const { OnceLock::new() }; 9];
     IMAGES[b.index()].get_or_init(|| {
-        let raw: Vec<f32> = (0..SIZE * SIZE)
-            .into_par_iter()
-            .map(|i| b.height(Vec2::new(((i % SIZE) as f32 + 0.5) / SIZE as f32, ((i / SIZE) as f32 + 0.5) / SIZE as f32)))
-            .collect();
+        // Painted on plain threads, not rayon's: the first use is often inside a brush's
+        // parallel loop, and a rayon worker waiting here could pick up another dab that
+        // waits for this same image, and never finish (a deadlock).
+        let mut raw = vec![0.0f32; SIZE * SIZE];
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let rows = SIZE.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (k, part) in raw.chunks_mut(rows * SIZE).enumerate() {
+                scope.spawn(move || {
+                    for (j, out) in part.iter_mut().enumerate() {
+                        let i = k * rows * SIZE + j;
+                        *out = b.height(Vec2::new(((i % SIZE) as f32 + 0.5) / SIZE as f32, ((i / SIZE) as f32 + 0.5) / SIZE as f32));
+                    }
+                });
+            }
+        });
         // Stretch to the full 0..1 range.
         let (lo, hi) = raw.iter().fold((f32::MAX, f32::MIN), |(a, z), &v| (a.min(v), z.max(v)));
         let span = (hi - lo).max(1e-6);

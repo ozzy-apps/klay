@@ -1514,14 +1514,25 @@ impl Gfx {
     /// (see [`upload_level_with_room`](Self::upload_level_with_room)). False when they do
     /// not: the caller uploads the level afresh.
     pub fn swap_tail(&mut self, mesh: &mut SculptMesh, keep: crate::mesh::Extent) -> bool {
+        if keep.chunks > mesh.chunks.len() {
+            return false;
+        }
+        self.rewrite_from(mesh, keep.verts, keep.tris, false)
+    }
+
+    /// Show the active level again after its vertices from `verts` on and its triangles
+    /// from `tris` on changed (Sculptris Pro), writing just those into its buffers when they
+    /// have room. With `rescale` the normal accumulators are scaled for the new triangle
+    /// sizes. False when the buffers are too small: the caller uploads the level afresh.
+    pub fn rewrite_from(&mut self, mesh: &mut SculptMesh, verts: usize, tris: usize, rescale: bool) -> bool {
         let Some(b) = self.levels.get_mut(self.active).and_then(Option::as_mut) else {
             return false;
         };
         let (n, t, c) = (mesh.vertex_count(), mesh.triangle_count(), mesh.chunks.len());
-        if n > b.room.verts || t > b.room.tris || c > b.room.chunks || keep.chunks > c {
+        if n > b.room.verts || t > b.room.tris || c > b.room.chunks {
             return false;
         }
-        let (kv, kt) = (keep.verts, keep.tris);
+        let (kv, kt) = (verts.min(n), tris.min(t));
         let q = &self.queue;
         if n > kv {
             q.write_buffer(&b.positions, (kv * 12) as u64, bytemuck::cast_slice(&mesh.positions[kv..]));
@@ -1539,29 +1550,37 @@ impl Gfx {
         if t > kt {
             q.write_buffer(&b.indices, (kt * 12) as u64, bytemuck::cast_slice(&mesh.indices[3 * kt..]));
         }
-        let mut verts: Vec<u32> = mesh.chunks.iter().map(|ch| ch.vert_start).collect();
-        let mut tris: Vec<u32> = mesh.chunks.iter().map(|ch| ch.tri_start).collect();
+        let mut chunk_verts: Vec<u32> = mesh.chunks.iter().map(|ch| ch.vert_start).collect();
+        let mut chunk_tris: Vec<u32> = mesh.chunks.iter().map(|ch| ch.tri_start).collect();
         let border: Vec<u32> = mesh.chunks.iter().map(|ch| ch.tri_border).collect();
-        verts.push(n as u32);
-        tris.push(t as u32);
-        let [chunk_verts, chunk_tris, chunk_border, _] = &b._tables;
-        q.write_buffer(chunk_verts, 0, bytemuck::cast_slice(&verts));
-        q.write_buffer(chunk_tris, 0, bytemuck::cast_slice(&tris));
+        chunk_verts.push(n as u32);
+        chunk_tris.push(t as u32);
+        let [cv, ct, cb, _] = &b._tables;
+        q.write_buffer(cv, 0, bytemuck::cast_slice(&chunk_verts));
+        q.write_buffer(ct, 0, bytemuck::cast_slice(&chunk_tris));
         if !border.is_empty() {
-            q.write_buffer(chunk_border, 0, bytemuck::cast_slice(&border));
+            q.write_buffer(cb, 0, bytemuck::cast_slice(&border));
         }
         b.index_count = (3 * t) as u32;
         b.dirty_flags.resize(c, 0);
+        if rescale {
+            b.normal_scale = normal_scale(mesh);
+        }
         // Rebuilt from the mesh when next needed.
         b.bytes -= b.draw.as_ref().map_or(0, |(d, _)| d.size()) + b.groups.as_ref().map_or(0, |g| g.bytes);
         b.draw = None;
         b.vis_version = None;
         b.groups = None;
-        for ch in &mut mesh.chunks[keep.chunks..] {
-            ch.dirty_pos = false;
-            ch.dirty_mask = false;
-            ch.dirty_color = false;
-            ch.dirty_nrm = true;
+        for ch in &mut mesh.chunks {
+            let written = ch.vert_end as usize > kv;
+            if written || ch.tri_end as usize > kt {
+                if written {
+                    ch.dirty_pos = false;
+                    ch.dirty_mask = false;
+                    ch.dirty_color = false;
+                }
+                ch.dirty_nrm = true;
+            }
         }
         true
     }

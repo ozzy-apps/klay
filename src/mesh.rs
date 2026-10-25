@@ -17,6 +17,9 @@ pub use crate::primitive::cube_sphere;
 /// Target number of vertices per chunk.
 pub const CHUNK_TARGET: usize = 4096;
 
+mod patch;
+pub use patch::{NewVertex, Patch, VRef};
+
 #[derive(Clone, Copy, Debug)]
 pub struct Aabb {
     pub min: Vec3,
@@ -283,17 +286,64 @@ impl SculptMesh {
     }
 
     /// Repartition geometry and vertex paint together, preserving their correspondence.
-    pub fn from_raw_painted(positions: Vec<Vec3>, indices: Vec<u32>, mut tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> Self {
-        let n = positions.len();
-        assert!(colors.is_empty() || colors.len() == n);
-
+    pub fn from_raw_painted(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> Self {
         // 1. Partition vertices into spatial chunks by recursive median split.
         let groups = partition_vertices(&positions);
+        Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new())
+    }
+
+    /// Build a mesh whose vertices already have a chunk each (`vert_chunk`, below
+    /// `chunk_count`): every chunk keeps its vertices, one grown past [`CHUNK_TARGET`] is
+    /// split, empty ones go. Much quicker than [`from_raw`](Self::from_raw) for a mesh that
+    /// changed in a few places. Per-vertex `mask` and `colors` and
+    /// per-triangle `tri_groups` and `hidden` (each may be empty) are carried along.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_assigned(
+        positions: Vec<Vec3>,
+        indices: Vec<u32>,
+        vert_chunk: &[u32],
+        chunk_count: usize,
+        tri_groups: Vec<u16>,
+        colors: Vec<[u8; 4]>,
+        mask: Vec<u8>,
+        hidden: Vec<u8>,
+    ) -> Self {
+        let mut members: Vec<Vec<u32>> = vec![Vec::new(); chunk_count];
+        for (v, &c) in vert_chunk.iter().enumerate() {
+            members[c as usize].push(v as u32);
+        }
+        let mut groups = Vec::with_capacity(chunk_count + 8);
+        for m in members {
+            if m.len() > CHUNK_TARGET {
+                groups.extend(partition_ids(m, &positions));
+            } else if !m.is_empty() {
+                groups.push(m);
+            }
+        }
+        Self::from_partition(groups, positions, indices, tri_groups, colors, mask, hidden)
+    }
+
+    /// The shared tail of the constructors: `groups` lists every vertex once, chunk by
+    /// chunk.
+    fn from_partition(
+        groups: Vec<Vec<u32>>,
+        positions: Vec<Vec3>,
+        indices: Vec<u32>,
+        mut tri_groups: Vec<u16>,
+        colors: Vec<[u8; 4]>,
+        mask: Vec<u8>,
+        mut hidden: Vec<u8>,
+    ) -> Self {
+        let n = positions.len();
+        assert!(colors.is_empty() || colors.len() == n);
+        assert!(mask.is_empty() || mask.len() == n);
 
         // 2. Reorder vertices so each chunk is contiguous.
         let mut remap = vec![0u32; n];
         let mut new_positions = Vec::with_capacity(n);
         let mut new_colors = Vec::with_capacity(colors.len());
+        let mut new_mask = Vec::with_capacity(mask.len());
         let mut vert_chunk = Vec::with_capacity(n);
         let mut chunks = Vec::with_capacity(groups.len());
         for (ci, g) in groups.iter().enumerate() {
@@ -302,6 +352,7 @@ impl SculptMesh {
                 remap[old as usize] = new_positions.len() as u32;
                 new_positions.push(positions[old as usize]);
                 if !colors.is_empty() { new_colors.push(colors[old as usize]); }
+                if !mask.is_empty() { new_mask.push(mask[old as usize]); }
                 vert_chunk.push(ci as u32);
             }
             chunks.push(Chunk::new(start, new_positions.len() as u32, 0, 0, 0));
@@ -310,13 +361,17 @@ impl SculptMesh {
         let indices: Vec<u32> = indices.into_par_iter().map(|i| remap[i as usize]).collect();
 
         // 3. Group the triangles by the chunk owning their first vertex, border ones first.
-        let indices = group_triangles(indices, &mut chunks, &mut tri_groups);
+        let indices = group_triangles(indices, &mut chunks, &mut tri_groups, &mut hidden);
 
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
         let mut mesh = Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris);
         mesh.colors = new_colors;
+        mesh.mask = new_mask;
         if !tri_groups.is_empty() {
             mesh.set_groups(tri_groups);
+        }
+        if !hidden.is_empty() {
+            mesh.set_hidden(hidden);
         }
         mesh
     }
@@ -590,7 +645,36 @@ impl SculptMesh {
         vt_offsets: Vec<u32>,
         vt_tris: Vec<u32>,
     ) -> Self {
-        let mut mesh = Self {
+        let mut mesh = Self::assemble_parts(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris);
+
+        // Chunk neighbours and external vertices (referenced by our triangles, owned elsewhere).
+        let info: Vec<(Vec<u32>, Vec<u32>)> = (0..mesh.chunks.len()).into_par_iter().map(|ci| mesh.chunk_links(ci))
+            .collect();
+        for (ch, (external, nbs)) in mesh.chunks.iter_mut().zip(info) {
+            ch.external = external;
+            ch.neighbors = nbs;
+        }
+
+        // Chunk bounds.
+        let Self { chunks, positions, .. } = &mut mesh;
+        chunks.par_iter_mut().for_each(|ch| ch.aabb = chunk_bounds(ch, positions));
+        mesh
+    }
+
+    /// [`assemble`](Self::assemble) without working out chunk neighbours, borrowed vertices
+    /// and bounds (the caller sets them).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble_parts(
+        positions: Vec<Vec3>,
+        indices: Vec<u32>,
+        chunks: Vec<Chunk>,
+        vert_chunk: Vec<u32>,
+        adj_offsets: Vec<u32>,
+        adj_verts: Vec<u32>,
+        vt_offsets: Vec<u32>,
+        vt_tris: Vec<u32>,
+    ) -> Self {
+        Self {
             positions,
             indices,
             chunks,
@@ -609,47 +693,35 @@ impl SculptMesh {
             group_count: 1,
             hidden_count: 0,
             stamp_id: 0,
-        };
-
-        // Chunk neighbours and external vertices (referenced by our triangles, owned elsewhere).
-        let info: Vec<(Vec<u32>, Vec<u32>)> = mesh
-            .chunks
-            .par_iter()
-            .enumerate()
-            .map(|(ci, ch)| {
-                let mut nbs = Vec::new();
-                for v in ch.vert_start..ch.vert_end {
-                    for &w in mesh.neighbors(v) {
-                        let cw = mesh.vert_chunk[w as usize];
-                        if cw != ci as u32 {
-                            nbs.push(cw);
-                        }
-                    }
-                }
-                nbs.sort_unstable();
-                nbs.dedup();
-                let mut external = Vec::new();
-                for t in ch.border_tris() {
-                    for &v in &mesh.indices[3 * t as usize..3 * t as usize + 3] {
-                        if v < ch.vert_start || v >= ch.vert_end {
-                            external.push(v);
-                        }
-                    }
-                }
-                external.sort_unstable();
-                external.dedup();
-                (external, nbs)
-            })
-            .collect();
-        for (ch, (external, nbs)) in mesh.chunks.iter_mut().zip(info) {
-            ch.external = external;
-            ch.neighbors = nbs;
         }
+    }
 
-        // Chunk bounds.
-        let Self { chunks, positions, .. } = &mut mesh;
-        chunks.par_iter_mut().for_each(|ch| ch.aabb = chunk_bounds(ch, positions));
-        mesh
+    /// Chunk `ci`'s borrowed vertices (referenced by its triangles, owned by other chunks)
+    /// and its neighbouring chunks (sharing an edge), both sorted.
+    pub(crate) fn chunk_links(&self, ci: usize) -> (Vec<u32>, Vec<u32>) {
+        let ch = &self.chunks[ci];
+        let mut nbs = Vec::new();
+        for v in ch.vert_start..ch.vert_end {
+            for &w in self.neighbors(v) {
+                let cw = self.vert_chunk[w as usize];
+                if cw != ci as u32 {
+                    nbs.push(cw);
+                }
+            }
+        }
+        nbs.sort_unstable();
+        nbs.dedup();
+        let mut external = Vec::new();
+        for t in ch.border_tris() {
+            for &v in &self.indices[3 * t as usize..3 * t as usize + 3] {
+                if v < ch.vert_start || v >= ch.vert_end {
+                    external.push(v);
+                }
+            }
+        }
+        external.sort_unstable();
+        external.dedup();
+        (external, nbs)
     }
 
     /// Vertices within `r` of `c`, grouped by chunk. Parallel over chunks.
@@ -1125,7 +1197,7 @@ pub(crate) fn crosses_chunk(tri: &[u32], vert_start: u32, vert_end: u32) -> bool
 /// contiguous range with the ones that cross into another chunk first, keeping the input
 /// order within each part, and record the ranges in `chunks[c]`. `groups` (one per
 /// triangle, or empty) is reordered the same way.
-fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16>) -> Vec<u32> {
+fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16>, hidden: &mut Vec<u8>) -> Vec<u32> {
     // Chunk and border flag per triangle, then counting sort by (chunk, !border).
     let owner: Vec<(u32, bool)> = indices
         .par_chunks_exact(3)
@@ -1145,6 +1217,7 @@ fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16
     let mut fill = start.clone();
     let mut out = vec![0u32; indices.len()];
     let mut out_groups = vec![0u16; groups.len()];
+    let mut out_hidden = vec![0u8; hidden.len()];
     for (t, (tri, &(c, border))) in indices.chunks_exact(3).zip(&owner).enumerate() {
         let slot = &mut fill[2 * c as usize + !border as usize];
         let at = 3 * *slot as usize;
@@ -1152,9 +1225,13 @@ fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16
         if !groups.is_empty() {
             out_groups[*slot as usize] = groups[t];
         }
+        if !hidden.is_empty() {
+            out_hidden[*slot as usize] = hidden[t];
+        }
         *slot += 1;
     }
     *groups = out_groups;
+    *hidden = out_hidden;
     for (c, ch) in chunks.iter_mut().enumerate() {
         ch.tri_start = start[2 * c];
         ch.tri_border = start[2 * c + 1];
@@ -1260,3 +1337,4 @@ pub(crate) fn partition_ids(ids: Vec<u32>, positions: &[Vec3]) -> Vec<Vec<u32>> 
     }
     out
 }
+

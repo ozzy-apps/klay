@@ -1464,6 +1464,28 @@ impl Stroke {
 
     /// Finish the stroke and return the positions it replaced, per chunk, if anything
     /// changed. A GPU grab is applied to the CPU mesh here, once.
+    /// Sculptris Pro changed the mesh under the stroke: forget what it saved by chunk and
+    /// vertex (undo then comes from a copy of the whole subtool), keep the rest (the plane,
+    /// the direction, the last dab).
+    pub fn rebase(&mut self) {
+        self.snapshots.clear();
+        self.snapshotted.clear();
+        self.snapshot_index.clear();
+        self.paint_snapshots.clear();
+        self.paint_snapshotted.clear();
+    }
+
+    /// Whether a stroke with `kind` can run with Sculptris Pro: brushes that move the
+    /// surface by dabs and do not lean on where each vertex was when the stroke began.
+    pub fn retessellates(kind: BrushKind) -> bool {
+        !kind.is_drag()
+            && !kind.is_mask()
+            && !kind.is_detail()
+            && !kind.is_insert()
+            && !kind.is_imm()
+            && !matches!(kind, BrushKind::Paint | BrushKind::Layer | BrushKind::Morph | BrushKind::ClipLine)
+    }
+
     pub fn end(mut self, mesh: &mut SculptMesh) -> Option<ChunkData> {
         if let Some(g) = self.grab.take() {
             if g.gpu && g.delta != Vec3::ZERO {
