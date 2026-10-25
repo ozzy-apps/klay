@@ -657,6 +657,9 @@ struct App {
     demo: bool,
     /// `--demo-brushes`: stroke with the advanced brushes at start.
     demo_brushes: bool,
+    /// `--demo-stamp texture:NAME` or `alpha:NAME`: one Draw stroke at a large Draw Size
+    /// with that built-in pattern (before / after snapshots of the alphas).
+    demo_stamp: Option<String>,
     vsync: bool,
     /// Frames left in `--stress` mode (a large grab moved every frame), plus accumulators.
     stress: Option<(u32, f32, f32)>,
@@ -811,6 +814,7 @@ impl App {
             last_dab_count: 0,
             demo,
             demo_brushes: false,
+            demo_stamp: None,
             vsync: true,
             stress: None,
             upload_ms: 0.0,
@@ -4768,6 +4772,26 @@ impl App {
         ])
     }
 
+    /// `--demo-stamp texture:NAME` / `alpha:NAME`: a short Draw stroke at Draw Size 1.27 and
+    /// Z Intensity 0.5 with that built-in pattern, like stamping detail onto a dense sphere.
+    fn demo_stamp_stroke(&mut self, spec: &str) {
+        let (slot, name) = spec.split_once(':').unwrap_or(("texture", spec));
+        let texture = slot != "alpha";
+        let list = if texture { brush_asset::Pattern::textures() } else { brush_asset::Pattern::alphas() };
+        let Some(p) = list.into_iter().find(|p| p.name().eq_ignore_ascii_case(name)) else {
+            log::error!("--demo-stamp: no built-in {slot} named {name}");
+            return;
+        };
+        if texture {
+            self.workspace.assets.texture = p;
+        } else {
+            self.workspace.assets.alpha = p;
+        }
+        for (name, ms, dabs, count) in self.run_scripts(vec![(BrushKind::Draw, 1.27, 0.5, false, line(Vec2::new(-0.03, 0.0), Vec2::new(0.03, 0.0), 4))]) {
+            log::info!("demo stamp {name} {spec}: {dabs} dabs over {count} verts in {ms:.1} ms");
+        }
+    }
+
     /// Scripted strokes through the real input path: used by `--demo` and `--bench`.
     fn scripted_strokes(&mut self) -> Vec<(String, f32, u32, usize)> {
         let scripts: Vec<(BrushKind, f32, f32, bool, Vec<Vec2>)> = vec![
@@ -7620,6 +7644,9 @@ impl ApplicationHandler for App {
                 log::info!("demo stroke {name}: {dabs} dabs over {count} verts in {ms:.1} ms");
             }
         }
+        if let Some(spec) = self.demo_stamp.take() {
+            self.demo_stamp_stroke(&spec);
+        }
         if let Some(path) = self.open_on_start.take() {
             self.open_project(&path);
         } else if !self.automated && self.workspace.layout.start_from_stored {
@@ -8264,8 +8291,9 @@ fn main() {
     }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
+    app.demo_stamp = flag("--demo-stamp").cloned();
     app.automated = args.iter().any(|a| {
-        a.starts_with("--selftest") || matches!(a.as_str(), "--demo" | "--demo-brushes" | "--stress" | "--frames" | "--snapshot")
+        a.starts_with("--selftest") || matches!(a.as_str(), "--demo" | "--demo-brushes" | "--demo-stamp" | "--stress" | "--frames" | "--snapshot")
     });
     // Look for a newer release only in a normal run (not self-tests, demos, snapshots).
     app.workspace.updates_allowed = !app.automated && !args.iter().any(|a| a == "--no-update-check");

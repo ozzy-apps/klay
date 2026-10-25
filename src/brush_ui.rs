@@ -360,23 +360,18 @@ impl Workspace {
             .or_insert_with(|| {
                 let n = 96;
                 let mut data = Vec::with_capacity(n * n * 4);
-                for y in 0..n {
-                    for x in 0..n {
-                        let uv =
-                            glam::Vec2::new(x as f32 / (n - 1) as f32, y as f32 / (n - 1) as f32);
-                        let c = p.sample(uv, false);
-                        let rgb = if color {
-                            c.truncate()
-                        } else {
-                            glam::Vec3::splat(p.alpha(uv))
-                        };
-                        data.extend([
-                            (rgb.x * 255.0) as u8,
-                            (rgb.y * 255.0) as u8,
-                            (rgb.z * 255.0) as u8,
-                            if color { (c.w * 255.0) as u8 } else { 255 },
-                        ]);
-                    }
+                for c in p.thumbnail(n) {
+                    let rgb = if color {
+                        c.truncate()
+                    } else {
+                        glam::Vec3::splat(c.truncate().dot(glam::Vec3::new(0.2126, 0.7152, 0.0722)) * c.w)
+                    };
+                    data.extend([
+                        (rgb.x * 255.0) as u8,
+                        (rgb.y * 255.0) as u8,
+                        (rgb.z * 255.0) as u8,
+                        if color { (c.w * 255.0) as u8 } else { 255 },
+                    ]);
                 }
                 ctx.load_texture(
                     format!("brush-asset-{}-{color}", p.key()),

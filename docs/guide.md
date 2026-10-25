@@ -43,6 +43,7 @@ cargo run --release -- --selftest-document                             # Back gr
 cargo run --release -- --segments 100 --selftest-symmetry              # Draw, Grab, Snake Hook, Inflate with Y + Radial Z 6 through the canvas, GPU readback, undo/redo
 cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # start with symmetry (x, y, z, r<axis><count>), save the canvas after start-up and quit
 cargo run --release -- --snapshot ui.png --snapshot-ui               # save the whole window, interface included, after start-up and quit
+cargo run --release -- --segments 400 --divide 2 --demo-stamp texture:Scales --camera-distance 0.45 --snapshot s.png   # one Draw stroke at Draw Size 1.27 with a built-in pattern (texture:NAME or alpha:NAME)
 cargo run --release -- --space-menu                                  # start with the Space menu open
 cargo run --release -- --brush-catalog                               # start with the B catalog open
 cargo run --release -- --theme "Graphite Blue"                       # start in an interface theme (Preferences › Theme)
@@ -264,9 +265,14 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 - **Alpha rotation**, above the alphas (Alpha palette and the shelf's Alpha popup): **Fixed** (at **Angle**), **Follow** (the alpha
   rolls with the stroke direction, ZBrush's Roll) or **Random** (a new turn every dab, as
   ZBrush's spray-style texture painting does), for sculpting, painting and the mask pen.
-- Nine new detail alphas, painted by Klay as tileable 512 px images: **Pores, Wrinkles,
+- Nine new detail alphas, painted by Klay as tileable images: **Pores, Wrinkles,
   Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers**. As alphas they fade softly at the
   stamp's edge; as textures (Texture palette) they repeat seamlessly for texture painting.
+- Seven more followed (Unreleased): **Skin, Creases, Cracked Earth, Panels, Wood Grain, Cobbles,
+  Hammered**, and all 16 are painted at 2048 × 2048 in 16 bits and read back with a smooth
+  cubic filter (imported images too), so even a large Draw Size over a dense mesh gives
+  smooth edges, not stair steps. Each image is built the first time it is used (8 MB, about
+  0.15 s); the thumbnails in the grid are drawn on their own.
 
 ### ZBrush tools added in 0.15
 

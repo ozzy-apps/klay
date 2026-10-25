@@ -60,23 +60,35 @@ impl BrushImage {
         }))
     }
 
+    /// Colour at `uv` (0..1, clamped at the edges): a cubic B-spline over the 4 × 4 nearest
+    /// pixels, so 8-bit steps and pixel edges do not show as ridges at a large Draw Size.
     fn sample(&self, uv: Vec2) -> Vec4 {
         let p = uv.clamp(Vec2::ZERO, Vec2::ONE)
             * Vec2::new((self.width - 1) as f32, (self.height - 1) as f32);
-        let (x, y) = (p.x.floor() as usize, p.y.floor() as usize);
-        let at = |x: usize, y: usize| {
-            Vec4::from_array(self.rgba[y * self.width + x].map(|v| v as f32 / 255.0))
-        };
-        at(x, y)
-            .lerp(at((x + 1).min(self.width - 1), y), p.x.fract())
-            .lerp(
-                at(x, (y + 1).min(self.height - 1)).lerp(
-                    at((x + 1).min(self.width - 1), (y + 1).min(self.height - 1)),
-                    p.x.fract(),
-                ),
-                p.y.fract(),
-            )
+        let i = p.floor();
+        let (wx, wy) = (
+            crate::alpha_library::bspline(p.x - i.x),
+            crate::alpha_library::bspline(p.y - i.y),
+        );
+        let (ix, iy) = (i.x as i64 - 1, i.y as i64 - 1);
+        let mut sum = Vec4::ZERO;
+        for (dy, wy) in wy.iter().enumerate() {
+            let y = (iy + dy as i64).clamp(0, self.height as i64 - 1) as usize;
+            for (dx, wx) in wx.iter().enumerate() {
+                let x = (ix + dx as i64).clamp(0, self.width as i64 - 1) as usize;
+                let c = Vec4::from_array(self.rgba[y * self.width + x].map(|v| v as f32));
+                sum += c * (wx * wy);
+            }
+        }
+        sum / 255.0
     }
+}
+
+/// How a library pattern used as an alpha fades out toward the stamp's edge.
+fn alpha_fade(uv: Vec2) -> f32 {
+    let r = (uv * 2.0 - Vec2::ONE).length();
+    let t = ((1.0 - r) / 0.3).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -172,11 +184,7 @@ impl Pattern {
         }
         if let Self::Library(b) = self {
             // As an alpha it fades out toward the stamp's edge; as a texture it repeats.
-            let fade = if repeat { 1.0 } else {
-                let r = (uv * 2.0 - Vec2::ONE).length();
-                let t = ((1.0 - r) / 0.3).clamp(0.0, 1.0);
-                t * t * (3.0 - 2.0 * t)
-            };
+            let fade = if repeat { 1.0 } else { alpha_fade(uv) };
             return Vec3::splat(crate::alpha_library::sample(*b, uv) * fade).extend(1.0);
         }
         let p = uv * 2.0 - Vec2::ONE;
@@ -221,6 +229,17 @@ impl Pattern {
         };
         color.extend(1.0)
     }
+    /// An `n` × `n` picture of the stamp (as `sample(uv, false)`) for the asset grid.
+    /// Library patterns are painted at this size straight from the pattern, so browsing
+    /// does not paint each full-size image.
+    pub fn thumbnail(&self, n: usize) -> Vec<Vec4> {
+        let uv = |i: usize| Vec2::new((i % n) as f32 + 0.5, (i / n) as f32 + 0.5) / n as f32;
+        if let Self::Library(b) = self {
+            let h = crate::alpha_library::preview(*b, n);
+            return (0..n * n).map(|i| Vec3::splat(h[i] * alpha_fade(uv(i))).extend(1.0)).collect();
+        }
+        (0..n * n).map(|i| self.sample(uv(i), false)).collect()
+    }
     pub fn alpha(&self, uv: Vec2) -> f32 {
         let c = self.sample(uv, false);
         c.truncate().dot(Vec3::new(0.2126, 0.7152, 0.0722)) * c.w
@@ -255,6 +274,49 @@ mod tests {
         }
         assert_eq!(Pattern::Soft.alpha(Vec2::splat(0.5)), 1.0);
         assert_eq!(Pattern::Soft.alpha(Vec2::ZERO), 0.0);
+    }
+    #[test]
+    fn library_patterns_fill_both_grids_with_stable_keys() {
+        let (alphas, textures) = (Pattern::alphas(), Pattern::textures());
+        for name in ["Skin", "Creases", "Cracked Earth", "Panels", "Wood Grain", "Cobbles", "Hammered", "Scales", "Pores"] {
+            assert!(alphas.iter().any(|p| p.name() == name), "{name} missing from the alpha grid");
+            assert!(textures.iter().any(|p| p.name() == name), "{name} missing from the texture grid");
+        }
+        // Saved brush assets refer to built-ins by key: the older ones keep theirs.
+        use crate::alpha_library::Baked;
+        assert_eq!(Pattern::Library(Baked::Pores).locator(), "builtin:20");
+        assert_eq!(Pattern::Library(Baked::Scales).locator(), "builtin:22");
+        assert_eq!(Pattern::Library(Baked::Fibers).locator(), "builtin:28");
+        let mut keys: Vec<u64> = alphas.iter().map(Pattern::key).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), alphas.len());
+        // Every thumbnail is a full picture with something on it.
+        for p in alphas.iter().chain(&textures).filter(|p| **p != Pattern::Off) {
+            let t = p.thumbnail(24);
+            assert_eq!(t.len(), 24 * 24);
+            assert!(t.iter().all(|c| c.is_finite() && c.min_element() >= 0.0 && c.max_element() <= 1.0), "{}", p.name());
+            assert!(t.iter().any(|c| c.x > 0.2), "{} thumbnail is blank", p.name());
+        }
+    }
+    #[test]
+    fn imported_images_sample_smoothly() {
+        // A hard black / white edge in an 8-bit image: neighbouring samples across it
+        // change gradually, with no step where pixels meet.
+        let i = BrushImage {
+            id: 0,
+            name: "edge".into(),
+            source: Default::default(),
+            width: 8,
+            height: 1,
+            rgba: (0..8).map(|x| if x < 4 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }).collect(),
+        };
+        let h: Vec<f32> = (0..=400).map(|k| i.sample(Vec2::new(k as f32 / 400.0, 0.5)).x).collect();
+        let d: Vec<f32> = h.windows(2).map(|w| w[1] - w[0]).collect();
+        let jump = d.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let kink = d.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(d.iter().all(|&x| x >= -1e-6), "not monotonic");
+        assert!(kink < jump * 0.1, "slope breaks {kink} vs {jump}");
     }
     #[test]
     fn imports_rgba_and_rejects_corrupt_images() {
