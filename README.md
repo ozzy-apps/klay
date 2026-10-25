@@ -62,4 +62,4 @@ The full manual is in [docs/guide.md](docs/guide.md), and what changed in each v
 
 Found a bug, or have a request? [Open an issue](https://github.com/ozzy-apps/klay/issues) or write to [klay@ozzy.co.nl](mailto:klay@ozzy.co.nl).
 
-Made with love by Ozzy ♥
+Made with love by Ozzy ♥ · [MIT License](LICENSE)

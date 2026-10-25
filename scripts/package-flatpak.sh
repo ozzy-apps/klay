@@ -21,6 +21,7 @@ for size in 64 128 256 512; do
   install -Dm644 "assets/icon/klay-$size.png" "$files/share/icons/hicolor/${size}x${size}/apps/$app.png"
 done
 install -Dm644 "packaging/$app.metainfo.xml" "$files/share/metainfo/$app.metainfo.xml"
+install -Dm644 LICENSE "$files/share/licenses/$app/LICENSE"
 # Wayland or X11, the GPU, projects in the home folder, and the network for update checks.
 flatpak build-finish "$build" --command=klay \
   --socket=wayland --socket=fallback-x11 --share=ipc --device=dri \

@@ -15,6 +15,7 @@ install -m 644 packaging/klay.desktop "$klay_bundle/usr/share/applications/klay.
 ln -sfn klay.svg "$klay_bundle/.DirIcon"
 install -m 644 CHANGELOG.md "$klay_bundle/CHANGELOG.md"
 install -m 644 README.md "$klay_bundle/README.md"
+install -m 644 LICENSE "$klay_bundle/LICENSE"
 # A single file to attach to a GitHub release (Klay's update check offers it on Linux).
 tar -C "$(dirname -- "$klay_bundle")" -czf "$klay_bundle.tar.gz" "$(basename -- "$klay_bundle")"
 printf '%s\n' "$klay_bundle" "$klay_bundle.tar.gz"

@@ -7,6 +7,7 @@
 - Update checks: at start and every six hours Klay asks GitHub for the latest release of its repository (with the system's curl, in the background); a newer one shows a card with Download (this platform's file, or the release page), Later and Skip this version. Preferences › Updates turns it off, checks now and shows the result. Releases must be published on a public GitHub repository for this to find them.
 - Packages for the release: `scripts/package-deb.sh` (.deb), `scripts/package-flatpak.sh` (a Flatpak bundle on the Freedesktop 25.08 runtime, app id nl.co.ozzy.Klay, with AppStream metadata) and `scripts/package-appimage.sh` (AppImage, with appimagetool); package binaries are stripped (24 MB instead of 241 MB). `scripts/package-linux.sh` also writes a .tar.gz of the AppDir.
 - A short README with screenshots; the full manual moved to docs/guide.md.
+- Klay is MIT licensed (LICENSE); the packages carry the licence.
 - New flags: --fake-update X (show the update card), --no-update-check.
 - Verification: 281 release tests (new: moving shelf items between shelves and taking them off on the canvas, brushes and commands dropped on the bottom shelf and run from it, old shelf lines converted, stored config round trip, update card and skip, release JSON parsing, version comparison); every native self-test passes on the GPU.
 

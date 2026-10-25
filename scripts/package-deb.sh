@@ -15,6 +15,20 @@ for size in 32 64 128 256 512; do
   install -Dm644 "assets/icon/klay-$size.png" "$root/usr/share/icons/hicolor/${size}x${size}/apps/klay.png"
 done
 install -Dm644 README.md "$root/usr/share/doc/klay/README.md"
+{
+  echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/"
+  echo "Upstream-Name: Klay"
+  echo "Source: https://github.com/ozzy-apps/klay"
+  echo
+  echo "Files: *"
+  echo "Copyright: 2026 Ozzy"
+  echo "License: MIT"
+  sed 's/^$/./; s/^/ /' LICENSE | tail -n +2
+  echo
+  echo "Files: usr/bin/klay"
+  echo "Comment: includes the Inter typeface, SIL Open Font License 1.1 (see assets/fonts/Inter-OFL.txt in the source)"
+} > "$root/usr/share/doc/klay/copyright"
+chmod 644 "$root/usr/share/doc/klay/copyright"
 install -Dm644 CHANGELOG.md "$root/usr/share/doc/klay/changelog"
 gzip -9n "$root/usr/share/doc/klay/changelog"
 size=$(du -sk "$root/usr" | cut -f1)
