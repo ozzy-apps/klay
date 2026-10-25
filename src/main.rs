@@ -35,6 +35,7 @@ mod render;
 mod sculpt;
 mod subtool;
 mod tablet;
+mod update;
 mod transform;
 mod wedge;
 mod workspace;
@@ -2560,6 +2561,24 @@ impl App {
             .map(|(t, &i)| (!mesh.visible(t as u32) || (i != 0) == hide) as u8)
             .collect();
         self.apply_hidden(hidden, if hide { "Hide rectangle" } else { "Select rectangle" });
+    }
+
+    /// Preferences › Config › Store Config: every subtool to `path`, which Klay opens at
+    /// start; the project's own path stays as it is.
+    fn save_startup_doc(&mut self, path: &Path) {
+        if self.busy() {
+            self.workspace.notify("Startup document: wait for the current task to finish");
+            return;
+        }
+        self.doc.freeze_layers();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let result = self.with_project_tools(|tools, extras| project::save_with(path, tools, extras, self.active_tool));
+        self.workspace.notify(match result {
+            Ok(bytes) => format!("Config stored with the model as the startup document ({:.1} MB)", bytes as f64 / 1e6),
+            Err(e) => format!("Startup document not saved: {e}"),
+        });
     }
 
     /// F11: the window fills the screen (borderless), or goes back to a window.
@@ -6658,6 +6677,12 @@ impl App {
         if actions.fullscreen {
             self.toggle_fullscreen();
         }
+        if let Some(path) = actions.store_startup_doc {
+            self.save_startup_doc(&path);
+        }
+        if let Some(path) = actions.delete_startup_doc {
+            let _ = std::fs::remove_file(path);
+        }
         if let Some(op) = actions.layer {
             self.layer_op(op);
         }
@@ -7254,6 +7279,15 @@ impl ApplicationHandler for App {
         }
         if let Some(path) = self.open_on_start.take() {
             self.open_project(&path);
+        } else if !self.automated && self.workspace.layout.start_from_stored {
+            // Preferences › Config: the stored startup document, opened as a new, unsaved
+            // project (Save asks for a path of its own).
+            let doc = self.workspace.startup_doc_path();
+            if doc.exists() {
+                let keep = self.project_path.clone();
+                self.open_project(&doc.to_string_lossy());
+                self.project_path = keep;
+            }
         }
         for _ in 0..std::mem::take(&mut self.initial_subtools) {
             self.append_primitive();
@@ -7877,6 +7911,8 @@ fn main() {
     app.automated = args.iter().any(|a| {
         a.starts_with("--selftest") || matches!(a.as_str(), "--demo" | "--demo-brushes" | "--stress" | "--frames" | "--snapshot")
     });
+    // Look for a newer release only in a normal run (not self-tests, demos, snapshots).
+    app.workspace.updates_allowed = !app.automated && !args.iter().any(|a| a == "--no-update-check");
     // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).
     if let Some(spec) = flag("--symmetry") {
         for part in spec.split(',').map(str::trim) {
@@ -7909,8 +7945,25 @@ fn main() {
     }
     // `--customize`: start in Customize shelves mode (for snapshots of it).
     app.workspace.customize = args.iter().any(|a| a == "--customize");
+    // `--fake-update X`: show the update prompt for a release X (snapshots, no network).
+    if let Some(v) = flag("--fake-update") {
+        app.workspace.pretend_update(update::Release {
+            version: v.clone(),
+            page: format!("{}/releases/tag/v{v}", branding::REPOSITORY),
+            asset: None,
+            notes: "Every shelf item can be dragged anywhere · default config · update checks".into(),
+        });
+    }
     // `--about`: start with About Klay open (for snapshots of it).
     app.workspace.about_open = args.iter().any(|a| a == "--about");
+    // `--menu NAME`: start with that palette's menu-bar dropdown open (snapshots).
+    if let Some(name) = flag("--menu") {
+        app.workspace.open_menu(&name);
+    }
+    // `--ui-scale X`: start at this interface scale.
+    if let Some(x) = flag("--ui-scale").and_then(|v| v.parse::<f32>().ok()) {
+        app.workspace.layout.ui_scale = x;
+    }
     // `--theme NAME`: start in this interface theme (Preferences › Theme).
     if let Some(name) = flag("--theme") {
         app.workspace.layout.theme = name.clone();

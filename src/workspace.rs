@@ -24,6 +24,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 #[path = "brush_ui.rs"]
 mod brush_ui;
+#[path = "custom_shelf.rs"]
+mod custom_shelf;
+use custom_shelf::ShelfSource;
+#[path = "shelves.rs"]
+mod shelves;
+pub use shelves::ShelfSide;
 
 // ---------------------------------------------------------------- theme tokens
 pub const BACKGROUND: Color32 = Color32::from_rgb(14, 15, 16); // canvas
@@ -217,15 +223,11 @@ const DIVIDER_W: f32 = 7.0;
 const HEADER_H: f32 = 34.0;
 const SECTION_H: f32 = 30.0;
 const SECTION_W: f32 = 250.0; // section width in horizontal trays
-/// The top shelf's groups and the right shelf's items, in their default order.
-pub const TOP_SHELF: [&str; 5] = ["modes", "toggles", "rgb", "zadd", "size"];
-pub const RIGHT_SHELF: [&str; 13] = ["frame", "persp", "floor", "sym", "sep1", "polyf", "local", "transp", "ghost", "solo", "sep2", "detail", "hide"];
-
 /// Preferences › Interface › UI scale steps.
 pub const UI_SCALES: [f32; 8] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
 /// Height of sliders, segmented buttons and plain buttons.
 const CONTROL_H: f32 = 26.0;
-const DROPDOWN_W: f32 = 330.0;
+const DROPDOWN_W: f32 = 360.0;
 const NC: &str = "Not connected";
 
 /// Inter at a weight: the interface font (bundled, OFL).
@@ -475,10 +477,14 @@ pub struct DockLayout {
     /// user's own themes.
     pub theme: String,
     pub custom_themes: Vec<ThemeSpec>,
-    /// Customize shelves: the items of the top and right shelves in order, each shown or
-    /// hidden.
-    pub top_shelf: Vec<(String, bool)>,
-    pub right_shelf: Vec<(String, bool)>,
+    /// The items of the top, left, right and bottom shelves, in order (`shelves.rs`).
+    pub shelves: [Vec<String>; 4],
+    /// Preferences › Config: start from the stored config (and its startup document)
+    /// instead of the last session.
+    pub start_from_stored: bool,
+    /// Preferences › Updates: look for a newer release, and a release the user skipped.
+    pub check_updates: bool,
+    pub skip_version: String,
     /// Document › Back / Border, saved with the workspace (ZBrush: Save As Startup Doc).
     pub document: DocumentLook,
 }
@@ -500,8 +506,10 @@ impl Default for DockLayout {
             ui_scale: 1.0,
             theme: "Klay Dark".to_string(),
             custom_themes: Vec::new(),
-            top_shelf: TOP_SHELF.iter().map(|s| (s.to_string(), true)).collect(),
-            right_shelf: RIGHT_SHELF.iter().map(|s| (s.to_string(), true)).collect(),
+            shelves: ShelfSide::ALL.map(shelves::default_items),
+            start_from_stored: false,
+            check_updates: true,
+            skip_version: String::new(),
             document: DocumentLook::default(),
         }
     }
@@ -593,12 +601,20 @@ impl DockLayout {
         for t in &self.custom_themes {
             text.push_str(&t.encode());
         }
-        for (key, items, default) in [("topshelf", &self.top_shelf, &TOP_SHELF[..]), ("rightshelf", &self.right_shelf, &RIGHT_SHELF[..])] {
-            let plain: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-            if plain != default || items.iter().any(|(_, shown)| !shown) {
-                let list: Vec<String> = items.iter().map(|(s, shown)| if *shown { s.clone() } else { format!("-{s}") }).collect();
-                text.push_str(&format!("{key}|{}\n", list.join(",")));
+        for side in ShelfSide::ALL {
+            let items = &self.shelves[side as usize];
+            if *items != shelves::default_items(side) {
+                text.push_str(&format!("shelf|{}|{}\n", side.name(), items.join(";")));
             }
+        }
+        if self.start_from_stored {
+            text.push_str("startup|stored\n");
+        }
+        if !self.check_updates {
+            text.push_str("updates|off\n");
+        }
+        if !self.skip_version.is_empty() {
+            text.push_str(&format!("skipversion|{}\n", self.skip_version));
         }
         if (self.ui_scale - 1.0).abs() > 1e-3 {
             text.push_str(&format!("scale|{:.2}\n", self.ui_scale));
@@ -616,6 +632,7 @@ impl DockLayout {
             sections: BTreeMap::new(),
             ..defaults.clone()
         };
+        let (mut shelf_lines, mut old_top, mut old_right, mut old_mine) = (false, None, None, None);
         for line in text.lines() {
             let parts: Vec<_> = line.split('|').collect();
             match parts.as_slice() {
@@ -651,26 +668,25 @@ impl DockLayout {
                         result.custom_themes.push(t);
                     }
                 }
-                [key @ ("topshelf" | "rightshelf"), list] => {
-                    let known: &[&str] = if *key == "topshelf" { &TOP_SHELF } else { &RIGHT_SHELF };
-                    let mut items: Vec<(String, bool)> = Vec::new();
-                    for item in list.split(',') {
-                        let (name, shown) = match item.strip_prefix('-') {
-                            Some(n) => (n, false),
-                            None => (item, true),
-                        };
-                        if known.contains(&name) && !items.iter().any(|(n, _)| n == name) {
-                            items.push((name.to_string(), shown));
+                ["shelf", side, list] => {
+                    if let Some(side) = ShelfSide::parse(side) {
+                        let mut items: Vec<String> = Vec::new();
+                        for id in list.split(';').filter(|id| shelves::known(id)) {
+                            if id == "sep" || id == "space" || !items.iter().any(|x| x == id) {
+                                items.push(id.to_string());
+                            }
                         }
+                        result.shelves[side as usize] = items;
+                        shelf_lines = true;
                     }
-                    // Items added in a later version join at the end.
-                    for k in known {
-                        if !items.iter().any(|(n, _)| n == k) {
-                            items.push((k.to_string(), true));
-                        }
-                    }
-                    if *key == "topshelf" { result.top_shelf = items } else { result.right_shelf = items }
                 }
+                // Before 0.25 the top and right shelves were groups and My shelf a list.
+                ["topshelf", list] => old_top = Some(list.to_string()),
+                ["rightshelf", list] => old_right = Some(list.to_string()),
+                ["myshelf", list] => old_mine = Some(list.to_string()),
+                ["startup", "stored"] => result.start_from_stored = true,
+                ["updates", "off"] => result.check_updates = false,
+                ["skipversion", v] => result.skip_version = (*v).to_string(),
                 ["scale", value] => {
                     if let Ok(v) = value.parse::<f32>() {
                         result.ui_scale = v.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1]);
@@ -683,6 +699,9 @@ impl DockLayout {
                 }
                 _ => {}
             }
+        }
+        if !shelf_lines && (old_top.is_some() || old_right.is_some() || old_mine.is_some()) {
+            result.shelves = shelves::migrate(old_top.as_deref(), old_right.as_deref(), old_mine.as_deref());
         }
         // New palettes appear automatically when an older workspace is loaded.
         for palette in defaults.palettes {
@@ -796,6 +815,11 @@ pub struct Actions {
     pub frame: bool,
     /// F11 / Preferences: switch the window to fullscreen and back.
     pub fullscreen: bool,
+    /// Preferences › Config › Store Config: also save the model as the startup document
+    /// (to this path).
+    pub store_startup_doc: Option<PathBuf>,
+    /// Preferences › Config › Delete stored config: the startup document goes too.
+    pub delete_startup_doc: Option<PathBuf>,
     pub zoom: f32,
     pub view: Option<(f32, f32)>,
     /// SubTool list: make this one active.
@@ -1065,6 +1089,21 @@ pub struct Workspace {
     pub applied_scale: f32,
     /// Preferences › Interface › Customize shelves: shelf items can be dragged and hidden.
     pub customize: bool,
+    /// Preferences › Config: Store Config saves the model too; Factory settings waits for a
+    /// second click (the time of the first).
+    store_doc: bool,
+    factory_armed: Option<f64>,
+    /// Update checks: allowed in this run (not in tests and scripted runs), the check in
+    /// flight, what it found, a short status, when to check next, and "Later" for now.
+    pub updates_allowed: bool,
+    update_rx: Option<std::sync::mpsc::Receiver<crate::update::Outcome>>,
+    update_found: Option<crate::update::Release>,
+    update_status: String,
+    update_next: f64,
+    update_later: bool,
+    /// Tests: draw every section open.
+    #[cfg(test)]
+    open_all: bool,
     /// The palette last applied (the theme changes when the layout's theme does).
     applied_palette: Option<Palette>,
     /// The brush a held modifier strokes with, shown in the panels this frame instead of
@@ -1132,9 +1171,16 @@ impl Workspace {
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
             .unwrap_or_else(std::env::temp_dir);
         let persistence_path = root.join("klay/workspace.layout");
-        let layout = std::fs::read_to_string(&persistence_path)
+        let mut layout = std::fs::read_to_string(&persistence_path)
             .map(|s| DockLayout::decode(&s))
             .unwrap_or_default();
+        // Preferences › Config: start from the stored config instead of the last session.
+        if layout.start_from_stored {
+            if let Ok(text) = std::fs::read_to_string(root.join("klay/stored.layout")) {
+                layout = DockLayout::decode(&text);
+                layout.start_from_stored = true;
+            }
+        }
         let saved = layout.encode();
         let brush_ui=brush_ui::BrushUi::new(root.join("klay/brush-assets.v1"));
         let assets=brush_ui.settings();
@@ -1206,6 +1252,16 @@ impl Workspace {
             gesture_tool: BrushKind::SelectRect,
             applied_scale: 1.0,
             customize: false,
+            store_doc: true,
+            factory_armed: None,
+            updates_allowed: false,
+            update_rx: None,
+            update_found: None,
+            update_status: String::new(),
+            update_next: 0.0,
+            update_later: false,
+            #[cfg(test)]
+            open_all: false,
             applied_palette: None,
             held_brush: None,
             draw_settings: HashMap::new(),
@@ -1241,6 +1297,7 @@ impl Workspace {
             apply_style(ui.ctx());
             self.applied_palette = Some(palette);
         }
+        custom_shelf::set_customizing(self.customize);
         let held = self.begin_held_brush(m.brush);
         let a = self.show_panels(ui, m);
         self.end_held_brush(m.brush, held);
@@ -1272,17 +1329,19 @@ impl Workspace {
         self.menubar(ui, &title);
         self.status_bar(ui, m);
         if !self.focus {
-            self.shelf_top(ui, m, &mut a);
+            self.shelves_before_trays(ui, m, &mut a);
             self.tray(ui, Side::Left, m, &mut a);
             self.divider(ui, Side::Left);
             self.tray(ui, Side::Right, m, &mut a);
             self.divider(ui, Side::Right);
             self.tray(ui, Side::Top, m, &mut a);
             self.tray(ui, Side::Bottom, m, &mut a);
-            self.shelf_left(ui, m, &mut a);
-            self.shelf_right(ui, &mut a);
+            self.shelves_after_trays(ui, m, &mut a);
         }
         self.canvas = ui.available_rect_before_wrap();
+        self.shelf_drop_outside(ui.ctx());
+        self.poll_updates(ui.ctx());
+        self.update_card(ui.ctx());
         self.canvas_overlays(ui, m, &mut a);
         self.quick_popup(ui, m);
         self.quick_menu_ui(ui, m);
@@ -1323,6 +1382,253 @@ impl Workspace {
     }
 
     /// Show `text` in the status bar for a moment (from outside a frame).
+    /// Start an update check when one is due, and read the answer when it comes.
+    fn poll_updates(&mut self, ctx: &Context) {
+        let now = ctx.input(|i| i.time);
+        if let Some(rx) = &self.update_rx {
+            if let Ok(outcome) = rx.try_recv() {
+                self.update_rx = None;
+                self.update_status = match outcome {
+                    Ok(Some(r)) => {
+                        let s = format!("Klay {} is available (you have {})", r.version, crate::branding::VERSION);
+                        if self.update_found.as_ref().map(|f| &f.version) != Some(&r.version) {
+                            self.update_later = false;
+                        }
+                        self.update_found = Some(r);
+                        s
+                    }
+                    Ok(None) => {
+                        self.update_found = None;
+                        format!("Klay {} is up to date", crate::branding::VERSION)
+                    }
+                    Err(e) => format!("Could not check: {e}"),
+                };
+                log::info!("update check: {}", self.update_status);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
+        if self.updates_allowed && self.layout.check_updates && now >= self.update_next {
+            self.start_update_check(now);
+        }
+    }
+
+    fn start_update_check(&mut self, now: f64) {
+        self.update_rx = Some(crate::update::check_in_background(crate::branding::REPOSITORY, crate::branding::VERSION));
+        self.update_status = "Checking…".to_string();
+        // Again in six hours while Klay runs.
+        self.update_next = now + 6.0 * 3600.0;
+    }
+
+    /// A newer release: a small card at the canvas's bottom right until it is answered.
+    fn update_card(&mut self, ctx: &Context) {
+        let Some(r) = self.update_found.clone() else { return };
+        if self.update_later || self.layout.skip_version == r.version || self.focus || !self.layout.check_updates {
+            return;
+        }
+        egui::Area::new(Id::unique("update-card"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(self.canvas.right_bottom() - vec2(16.0, 52.0))
+            .pivot(Align2::RIGHT_BOTTOM)
+            .show(ctx, |ui| {
+                popup_frame().inner_margin(14).show(ui, |ui| {
+                    ui.set_max_width(320.0);
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.label(RichText::new(format!("Klay {} is out", r.version)).font(font(15.0, Weight::SemiBold)).color(FG()));
+                    ui.label(RichText::new(format!("You have {}", crate::branding::VERSION)).font(font(12.5, Weight::Regular)).color(FG2()));
+                    if !r.notes.trim().is_empty() {
+                        ui.add(egui::Label::new(RichText::new(r.notes.trim()).font(font(12.0, Weight::Regular)).color(FG3())).wrap());
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let download = r.asset.as_ref().map(|a| a.1.clone()).unwrap_or_else(|| r.page.clone());
+                        if ui
+                            .add(egui::Button::new(RichText::new("Download").color(ACC_FG()).font(font(13.0, Weight::SemiBold))).fill(ACC()).min_size(vec2(96.0, CONTROL_H)))
+                            .on_hover_text(r.asset.as_ref().map_or_else(|| r.page.clone(), |a| a.0.clone()))
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(download));
+                            self.update_later = true;
+                        }
+                        if ui.add(egui::Button::new("Later").min_size(vec2(64.0, CONTROL_H))).on_hover_text("Ask again next time Klay starts").clicked() {
+                            self.update_later = true;
+                        }
+                        if ui.add(egui::Button::new("Skip this version").min_size(vec2(0.0, CONTROL_H))).clicked() {
+                            self.layout.skip_version = r.version.clone();
+                        }
+                    });
+                    if !r.page.is_empty() {
+                        ui.hyperlink_to("Release notes", &r.page);
+                    }
+                });
+            });
+    }
+
+    /// Preferences › Updates.
+    fn updates_section(&mut self, ui: &mut Ui) {
+        ui.checkbox(&mut self.layout.check_updates, "Check for updates")
+            .on_hover_text("When Klay starts and every six hours, ask GitHub for a newer release");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = (ui.available_width() - 4.0) * 0.5;
+            let busy = self.update_rx.is_some();
+            if ui.add_enabled_ui(!busy, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Check now").truncate())).inner.clicked() {
+                let now = ui.input(|i| i.time);
+                self.start_update_check(now);
+            }
+            let found = self.update_found.clone();
+            if ui
+                .add_enabled_ui(found.is_some(), |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Download").truncate()))
+                .inner
+                .clicked()
+            {
+                if let Some(r) = found {
+                    let url = r.asset.map(|a| a.1).unwrap_or(r.page);
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+        });
+        let status = if self.update_status.is_empty() { format!("Klay {} · not checked yet", crate::branding::VERSION) } else { self.update_status.clone() };
+        note(ui, &status);
+        if !self.layout.skip_version.is_empty() {
+            ui.horizontal(|ui| {
+                note(ui, &format!("Skipping {}", self.layout.skip_version));
+                if ui.small_button("Undo").clicked() {
+                    self.layout.skip_version.clear();
+                    self.update_later = false;
+                }
+            });
+        }
+    }
+
+    /// Show the update prompt for a release (`--fake-update`, tests).
+    pub fn pretend_update(&mut self, release: crate::update::Release) {
+        self.update_status = format!("Klay {} is available (you have {})", release.version, crate::branding::VERSION);
+        self.update_found = Some(release);
+        self.update_later = false;
+    }
+
+    /// Preferences › Config: where the stored config and the startup document live.
+    pub fn stored_config_path(&self) -> PathBuf {
+        self.persistence_path.with_file_name("stored.layout")
+    }
+
+    pub fn startup_doc_path(&self) -> PathBuf {
+        self.persistence_path.with_file_name("startup.klay")
+    }
+
+    /// Store Config: the whole interface to the stored config, which Klay now starts from.
+    pub fn store_config(&mut self) -> std::io::Result<()> {
+        self.layout.start_from_stored = true;
+        let stored = self.stored_config_path();
+        if let Some(dir) = stored.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(stored, self.layout.encode())
+    }
+
+    /// Load Config: the stored interface, now. `false` when nothing is stored.
+    pub fn load_config(&mut self) -> bool {
+        let Ok(text) = std::fs::read_to_string(self.stored_config_path()) else { return false };
+        let keep = self.layout.start_from_stored;
+        self.layout = DockLayout::decode(&text);
+        self.layout.start_from_stored = keep;
+        true
+    }
+
+    /// Preferences › Config: the Config section.
+    fn config_section(&mut self, ui: &mut Ui, a: &mut Actions) {
+        let stored = self.stored_config_path();
+        let doc = self.startup_doc_path();
+        let has_config = stored.exists();
+        let has_doc = doc.exists();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = (ui.available_width() - 4.0) * 0.5;
+            if ui
+                .add_sized([w, CONTROL_H], egui::Button::new("Store Config").truncate())
+                .on_hover_text("Keep the whole interface as it is now (palettes, trays, shelves, theme, scale, document look), and the model as the startup document when ticked below")
+                .clicked()
+            {
+                match self.store_config() {
+                    Ok(()) => {
+                        if self.store_doc {
+                            a.store_startup_doc = Some(doc.clone());
+                        }
+                        self.notify("Config stored · Klay starts from it");
+                    }
+                    Err(e) => self.notify(format!("Could not store the config: {e}")),
+                }
+            }
+            if ui
+                .add_enabled_ui(has_config, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Load Config").truncate()))
+                .inner
+                .on_hover_text("Bring the stored interface back now (the model stays)")
+                .clicked()
+            {
+                if self.load_config() {
+                    self.notify("Stored config loaded");
+                }
+            }
+        });
+        ui.checkbox(&mut self.store_doc, "Store the model as the startup document")
+            .on_hover_text("Store Config also saves every subtool; Klay opens them at start");
+        ui.add_enabled_ui(has_config, |ui| {
+            ui.checkbox(&mut self.layout.start_from_stored, "Start with the stored config")
+                .on_hover_text("Off: Klay starts as you left it last time");
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = (ui.available_width() - 4.0) * 0.5;
+            let now = ui.input(|i| i.time);
+            let armed = self.factory_armed.is_some_and(|t| now - t < 4.0);
+            if ui
+                .add_sized([w, CONTROL_H], egui::Button::new(if armed { "Click to reset" } else { "Factory settings" }).selected(armed).truncate())
+                .on_hover_text("Klay's own interface: palettes, trays, shelves, theme and scale (the stored config is kept)")
+                .clicked()
+            {
+                if armed {
+                    let keep = (self.layout.start_from_stored, self.layout.custom_themes.clone());
+                    self.layout = DockLayout::default();
+                    self.layout.start_from_stored = keep.0;
+                    self.layout.custom_themes = keep.1;
+                    self.factory_armed = None;
+                    self.notify("Factory settings");
+                } else {
+                    self.factory_armed = Some(now);
+                }
+            }
+            if ui
+                .add_enabled_ui(has_config || has_doc, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Delete stored").truncate()))
+                .inner
+                .on_hover_text("Remove the stored config and startup document")
+                .clicked()
+            {
+                let _ = std::fs::remove_file(&stored);
+                a.delete_startup_doc = Some(doc.clone());
+                self.layout.start_from_stored = false;
+                self.notify("Stored config deleted");
+            }
+        });
+        note(
+            ui,
+            &match (has_config, has_doc) {
+                (false, _) => "Nothing stored yet: the interface is kept as you leave it.".to_string(),
+                (true, true) => "A config and a startup document are stored.".to_string(),
+                (true, false) => "A config is stored (no startup document).".to_string(),
+            },
+        );
+    }
+
+    /// Open a palette's menu-bar dropdown by name (`--menu`, for snapshots).
+    pub fn open_menu(&mut self, name: &str) -> bool {
+        let Some(id) = PaletteId::parse(name) else { return false };
+        self.dropdown = Some(id);
+        // Under its menu-bar entry once the bar is drawn; near the left until then.
+        self.dropdown_anchor = Rect::from_min_size(pos2(400.0, 0.0), vec2(80.0, MENUBAR_H));
+        true
+    }
+
     pub fn notify(&mut self, text: impl Into<String>) {
         self.pending_notice = Some(text.into());
     }
@@ -1476,6 +1782,24 @@ impl Workspace {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Previous / next theme: small, at the far right.
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let all: Vec<ThemeSpec> = ThemeSpec::presets().into_iter().chain(self.layout.custom_themes.iter().cloned()).collect();
+                        let at = all.iter().position(|t| t.name == self.layout.theme).unwrap_or(0);
+                        let n = all.len();
+                        let (prev, next) = (&all[(at + n - 1) % n], &all[(at + 1) % n]);
+                        if theme_arrow(ui, false).on_hover_text(format!("Next theme: {}", next.name)).clicked() {
+                            self.layout.theme = next.name.clone();
+                        }
+                        let pal = all[at].palette();
+                        let (r, resp) = ui.allocate_exact_size(vec2(14.0, 22.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 5.0, pal.acc);
+                        ui.painter().circle_stroke(r.center(), 5.5, Stroke::new(1.0, LINE2()));
+                        resp.on_hover_text(format!("Theme: {} · Preferences › Theme", all[at].name));
+                        if theme_arrow(ui, true).on_hover_text(format!("Previous theme: {}", prev.name)).clicked() {
+                            self.layout.theme = prev.name.clone();
+                        }
+                        ui.add_space(10.0);
                         ui.add(egui::Label::new(RichText::new(title).font(font(12.5, Weight::Medium)).color(FG2())).truncate());
                     });
                 });
@@ -1644,6 +1968,9 @@ impl Workspace {
                             .id_salt("dropdown-scroll")
                             .scroll_source(egui::scroll_area::ScrollSource::ALL)
                             .max_height(max_height)
+                            // Grow to the palette's full height (down to the status bar)
+                            // before scrolling; egui would otherwise keep the first frame's.
+                            .min_scrolled_height(max_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| self.palette(ui, &state, true, m, a));
                     });
@@ -1709,333 +2036,6 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ shelves
-    fn shelf_top(&mut self, ui: &mut Ui, m: &mut Model<'_>, a: &mut Actions) {
-        egui::Panel::top("shelf")
-            .exact_size(SHELF_H)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::NONE.fill(BG1()).inner_margin(Margin::symmetric(12, 0)))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                ui.painter()
-                    .hline(rect.x_range(), rect.bottom() - 0.5, (1.0, LINE()));
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    // The groups in the order the workspace keeps (Preferences › Interface ›
-                    // Customize shelves); Undo / Redo stay at the right end.
-                    let items = self.layout.top_shelf.clone();
-                    let mut first = true;
-                    let mut moved = None;
-                    for (index, (id, shown)) in items.iter().enumerate() {
-                        if !shown && !self.customize {
-                            continue;
-                        }
-                        if !first {
-                            shelf_separator(ui);
-                        }
-                        first = false;
-                        let r = ui.scope(|ui| self.top_group(ui, id, m)).response.rect;
-                        if self.customize {
-                            match customize_item(ui, r, "top", index, *shown) {
-                                CustomizeEvent::Toggle => self.layout.top_shelf[index].1 = !shown,
-                                CustomizeEvent::Move(from) => moved = Some((from, index)),
-                                CustomizeEvent::None => {}
-                            }
-                        }
-                    }
-                    if let Some((from, to)) = moved {
-                        let item = self.layout.top_shelf.remove(from);
-                        self.layout.top_shelf.insert(to, item);
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        a.redo |= ui
-                            .add_enabled(m.can_redo, egui::Button::new("Redo").min_size(vec2(64.0, 32.0)))
-                            .on_hover_text("Ctrl+Shift+Z")
-                            .clicked();
-                        a.undo |= ui
-                            .add_enabled(m.can_undo, egui::Button::new("Undo").min_size(vec2(64.0, 32.0)))
-                            .on_hover_text("Ctrl+Z")
-                            .clicked();
-                        if self.customize {
-                            if ui.add(egui::Button::new(RichText::new("Done customizing").color(ACC_FG())).fill(ACC()).min_size(vec2(0.0, 32.0))).clicked() {
-                                self.customize = false;
-                            }
-                        }
-                    });
-                });
-            });
-    }
-
-    /// One group of the top shelf.
-    fn top_group(&mut self, ui: &mut Ui, id: &str, m: &mut Model<'_>) {
-        match id {
-            // Mode buttons (Q / W / E / R).
-            "modes" => {
-                // Straight into the shelf's centred row, so they sit in its middle.
-                {
-                    for (glyph, label, mode, hint) in [
-                        ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
-                        ("move", "Move", Mode::Move, "Move · W · drag the model for an action line, its middle circle moves"),
-                        ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle; its middle circle squashes along the line"),
-                        ("rotate", "Rotate", Mode::Rotate, "Rotate · R · drag the action line's end circle"),
-                    ] {
-                        if big_button(ui, glyph, label, vec2(56.0, 56.0), self.mode == mode, !self.customize)
-                            .on_hover_text(hint)
-                            .clicked()
-                        {
-                            self.mode = mode;
-                        }
-                    }
-                }
-            }
-            // ZBrush keeps Sculptris Pro and Live Boolean on the top shelf.
-            "toggles" => {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    ui.add_space(6.0);
-                    if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(120.0, CONTROL_H))
-                        .on_hover_text("Strokes add and remove triangles under the brush · Detail in Brush › Sculptris Pro")
-                        .clicked()
-                    {
-                        self.sculptris = !self.sculptris;
-                    }
-                    if small_toggle(ui, "Live Boolean", self.live_boolean, vec2(120.0, CONTROL_H))
-                        .on_hover_text("Show the subtools' Add / Subtract / Intersect result · Mesh › Boolean")
-                        .clicked()
-                    {
-                        self.live_boolean = !self.live_boolean;
-                    }
-                });
-            }
-            // Sculpt / polypaint modes and live RGB intensity.
-            "rgb" => {
-                ui.vertical(|ui| {
-                    ui.set_width(200.0);
-                    ui.add_space(6.0);
-                    self.paint_modes(ui, m);
-                    zslider(ui, "RGB Intensity", &mut m.brush.rgb_intensity, 0.0..=1.0, false, true, 2);
-                });
-            }
-            // Zadd / Zsub and Z Intensity.
-            "zadd" => {
-                ui.vertical(|ui| {
-                    ui.set_width(200.0);
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.set_width(200.0);
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let w = ui.available_width() - 54.0;
-                        ui.scope(|ui| {
-                            ui.set_width(w);
-                            if let Some(i) = seg(ui, &["Zadd", "Zsub"], self.subtract as usize, false) {
-                                self.subtract = i == 1;
-                            }
-                        });
-                        ui.add_enabled(false, egui::Button::new("Zcut").min_size(vec2(50.0, CONTROL_H)));
-                    });
-                    zslider(ui, "Z Intensity", &mut m.brush.strength, 0.0..=1.0, false, true, 2);
-                });
-            }
-            // Focal Shift and Draw Size.
-            "size" => {
-                ui.vertical(|ui| {
-                    ui.set_width(236.0);
-                    ui.add_space(6.0);
-                    zslider(ui, "Focal Shift", &mut m.brush.focal_shift, -100.0..=100.0, false, true, 0);
-                    ui.horizontal(|ui| {
-                        ui.set_width(236.0);
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let w = ui.available_width() - 44.0;
-                        ui.scope(|ui| {
-                            ui.set_width(w);
-                            draw_size_slider(ui, "Draw Size", &mut m.brush.radius, true);
-                        });
-                        if small_toggle(ui, "Dyn", self.dynamic, vec2(40.0, CONTROL_H))
-                            .on_hover_text("Radius follows zoom")
-                            .clicked()
-                        {
-                            self.dynamic = !self.dynamic;
-                        }
-                    });
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn shelf_left(&mut self, ui: &mut Ui, m: &mut Model<'_>, a: &mut Actions) {
-        let _ = a;
-        egui::Panel::left("shelf-left")
-            .exact_size(LEFT_SHELF_W)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::NONE.fill(SHELF()).inner_margin(Margin::symmetric(7, 10)))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                ui.painter()
-                    .vline(rect.right() - 0.5, rect.y_range(), (1.0, LINE()));
-                ScrollArea::vertical()
-                    .id_salt("shelf-left-scroll")
-                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 8.0;
-                        // brush
-                        let tex = self.texture(ui.ctx(), Some(m.brush.kind), self.subtract);
-                        let resp = thumb(ui, "Brush", Thumb::Texture(tex), m.brush.kind.name(), true, false);
-                        if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
-                        let kind = m.brush.kind;
-                        let mode = self.stroke_mode(kind);
-                        let modes = Self::stroke_modes(kind);
-                        let resp = thumb(ui, "Stroke", Thumb::Glyph("stroke"), mode, false, false);
-                        if modes.len() < 2 {
-                            resp.on_hover_text(format!("{} strokes {} only", kind.name(), mode));
-                        } else if resp.on_hover_text(format!("Click for the next stroke: {}", modes.join(" / "))).clicked() {
-                            let at = modes.iter().position(|m| *m == mode).unwrap_or(0);
-                            self.set_stroke_mode(kind, modes[(at + 1) % modes.len()]);
-                        }
-                        self.asset_shelf(ui,false);
-                        self.asset_shelf(ui,true);
-                        // material
-                        let tex = self.texture(ui.ctx(), None, false);
-                        let resp = thumb(
-                            ui,
-                            "Material",
-                            Thumb::Texture(tex),
-                            MATERIALS[self.material].1.trim_start_matches("MatCap "),
-                            false,
-                            false,
-                        );
-                        egui::Popup::from_toggle_button_response(&resp)
-                            .align(egui::RectAlign::RIGHT_START)
-                            .gap(6.0)
-                            .frame(popup_frame())
-                            .show(|ui| {
-                                ui.label(RichText::new("MATERIAL").size(11.0).color(FG3()));
-                                self.material_swatches(ui);
-                            });
-                        // colour
-                        ui.add_space(3.0);
-                        color_picker(ui, &mut self.color);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let (r, resp) =
-                                ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
-                            let p = ui.painter();
-                            let back =
-                                Rect::from_min_size(r.min + vec2(14.0, 10.0), vec2(22.0, 22.0));
-                            let front = Rect::from_min_size(r.min, vec2(22.0, 22.0));
-                            for (rect, c) in [(back, self.color2), (front, self.color)] {
-                                p.rect_filled(rect, 0, Color32::from(c));
-                                p.rect_stroke(rect, 0, Stroke::new(1.0, LINE()), StrokeKind::Inside);
-                            }
-                            glyph(
-                                p,
-                                r.right_top() + vec2(-6.0, 6.0),
-                                "swap",
-                                if resp.hovered() { FG() } else { FG2() },
-                            );
-                            if resp.on_hover_text("Switch colours").clicked() {
-                                std::mem::swap(&mut self.color, &mut self.color2);
-                            }
-                            let [cr, cg, cb] = self.color.to_srgb();
-                            ui.label(
-                                RichText::new(format!("#{cr:02X}{cg:02X}{cb:02X}"))
-                                    .font(font(12.0, Weight::Medium))
-                                    .color(FG2()),
-                            );
-                        });
-                        ui.add_enabled_ui(false, |ui| {
-                            let _ = ui.add(
-                                egui::Button::new(RichText::new("Alternate").color(ACC_FG()))
-                                    .fill(ACC())
-                                    .min_size(vec2(86.0, CONTROL_H)),
-                            );
-                        });
-                        ui.add_space(6.0);
-                    });
-            });
-    }
-
-    fn shelf_right(&mut self, ui: &mut Ui, a: &mut Actions) {
-        egui::Panel::right("shelf-right")
-            .exact_size(RIGHT_SHELF_W)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::NONE.fill(SHELF()).inner_margin(Margin::symmetric(6, 10)))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                ui.painter()
-                    .vline(rect.left() + 0.5, rect.y_range(), (1.0, LINE()));
-                ui.spacing_mut().item_spacing.y = 6.0;
-                let items = self.layout.right_shelf.clone();
-                let mut moved = None;
-                for (index, (id, shown)) in items.iter().enumerate() {
-                    if !shown && !self.customize {
-                        continue;
-                    }
-                    let r = self.right_item(ui, id, a);
-                    if self.customize {
-                        match customize_item(ui, r, "right", index, *shown) {
-                            CustomizeEvent::Toggle => self.layout.right_shelf[index].1 = !shown,
-                            CustomizeEvent::Move(from) => moved = Some((from, index)),
-                            CustomizeEvent::None => {}
-                        }
-                    }
-                }
-                if let Some((from, to)) = moved {
-                    let item = self.layout.right_shelf.remove(from);
-                    self.layout.right_shelf.insert(to, item);
-                }
-            });
-    }
-
-    /// One right-shelf item; returns its rectangle. In Customize mode the buttons do
-    /// nothing (a click hides or shows them instead).
-    fn right_item(&mut self, ui: &mut Ui, id: &str, a: &mut Actions) -> Rect {
-        let size = vec2(52.0, 50.0);
-        let live = !self.customize;
-        let button = |ui: &mut Ui, icon: &str, label: &str, on: bool, enabled: bool, hint: &str| {
-            let r = big_button(ui, icon, label, size, on, enabled && live).on_hover_text(hint);
-            (r.rect, r.clicked())
-        };
-        let (rect, clicked) = match id {
-            "frame" => button(ui, "frame", "Frame", false, true, "Frame mesh · F"),
-            "persp" => button(ui, "persp", "Persp", self.perspective, true, "Perspective · P"),
-            "floor" => button(ui, "floor", "Floor", self.grid, true, "Floor grid · Shift + P"),
-            "sym" => button(ui, "sym", if self.symmetry { "Sym X" } else { "Sym" }, self.symmetry, true, "Symmetry across X · X"),
-            "polyf" => button(ui, "polyf", "PolyF", self.polyframe, true, "Polygroup colours · Shift + F"),
-            "local" => button(ui, "local", "Local", false, false, NC),
-            "transp" => button(ui, "transp", "Transp", false, false, NC),
-            "ghost" => button(ui, "ghost", "Ghost", false, false, NC),
-            "solo" => button(ui, "solo", "Solo", self.solo, true, "Show only the active subtool"),
-            "detail" => button(ui, "detail", "Detail", self.wireframe, true, "Surface detail shading"),
-            "hide" => button(ui, "hide", "Hide", false, true, "Hide interface · Tab"),
-            _ => {
-                // A separator (taller in Customize mode, so it can be picked up).
-                let h = if self.customize { 12.0 } else { 3.0 };
-                let (r, _) = ui.allocate_exact_size(vec2(40.0, h), Sense::hover());
-                ui.painter().hline(r.x_range(), r.center().y, (1.0, LINE()));
-                (r, false)
-            }
-        };
-        if clicked {
-            match id {
-                "frame" => a.frame = true,
-                "persp" => self.perspective = !self.perspective,
-                "floor" => self.grid = !self.grid,
-                "sym" => self.symmetry = !self.symmetry,
-                "polyf" => self.polyframe = !self.polyframe,
-                "solo" => self.solo = !self.solo,
-                "detail" => self.wireframe = !self.wireframe,
-                "hide" => self.set_focus(true),
-                _ => {}
-            }
-        }
-        rect
-    }
-
     // ------------------------------------------------------------ trays
     fn divider(&mut self, ui: &mut Ui, side: Side) {
         let panel = match side {
@@ -2369,6 +2369,8 @@ impl Workspace {
     ) -> bool {
         let key = format!("{}/{}", pal.name(), sid);
         let open = *self.layout.sections.get(&key).unwrap_or(&default_open);
+        #[cfg(test)]
+        let open = open || self.open_all;
         let (r, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), SECTION_H), Sense::click());
         // Section titles: small capitals on the tray, a divider above, the chevron and any
@@ -2803,9 +2805,11 @@ impl Workspace {
                         let w = (ui.available_width() - 3.0) * 0.5;
                         a.undo |= ui
                             .add_enabled_ui(m.can_undo, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Undo").truncate())).inner
+                            .shelf(ui, "cmd:undo")
                             .clicked();
                         a.redo |= ui
                             .add_enabled_ui(m.can_redo, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Redo").truncate())).inner
+                            .shelf(ui, "cmd:redo")
                             .clicked();
                     });
                     kv(
@@ -2890,29 +2894,20 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         use crate::mask::MaskOp;
-                        ui.horizontal(|ui| {
-                            for (label, op, hint) in [
-                                ("Invert", MaskOp::Invert, "Ctrl + I · Ctrl + click the background"),
-                                ("Clear", MaskOp::Clear, "Ctrl + Shift + A · Ctrl + drag the background"),
-                                ("Mask all", MaskOp::All, "Ctrl + A"),
-                            ] {
-                                if ui.button(label).on_hover_text(hint).clicked() {
-                                    a.mask = Some(op);
-                                }
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            for (label, op, hint) in [
-                                ("Blur", MaskOp::Blur, "Ctrl + click the model"),
-                                ("Sharpen", MaskOp::Sharpen, "Ctrl + Alt + click the model"),
-                                ("Grow", MaskOp::Grow, "Spread the mask one ring of polygons"),
-                                ("Shrink", MaskOp::Shrink, "Pull the mask back one ring of polygons"),
-                            ] {
-                                if ui.button(label).on_hover_text(hint).clicked() {
-                                    a.mask = Some(op);
-                                }
-                            }
-                        });
+                        let ops = [
+                            ("Invert", MaskOp::Invert, "Ctrl + I · Ctrl + click the background"),
+                            ("Clear", MaskOp::Clear, "Ctrl + Shift + A · Ctrl + drag the background"),
+                            ("Mask all", MaskOp::All, "Ctrl + A"),
+                            ("Blur", MaskOp::Blur, "Ctrl + click the model"),
+                            ("Sharpen", MaskOp::Sharpen, "Ctrl + Alt + click the model"),
+                            ("Grow", MaskOp::Grow, "Spread the mask one ring of polygons"),
+                            ("Shrink", MaskOp::Shrink, "Pull the mask back one ring of polygons"),
+                        ];
+                        let items: Vec<(&str, &str)> = ops.iter().map(|(l, _, h)| (*l, *h)).collect();
+                        let ids = ["cmd:mask-invert", "cmd:mask-clear", "cmd:mask-all", "cmd:mask-blur", "cmd:mask-sharpen", "cmd:mask-grow", "cmd:mask-shrink"];
+                        if let Some(i) = button_cells(ui, &items, 3, Some(&ids)) {
+                            a.mask = Some(ops[i].1);
+                        }
                         let full = |ui: &mut Ui, label: &str, hint: &str| {
                             ui.add_sized([ui.available_width(), 20.0], egui::Button::new(label)).on_hover_text(hint).clicked()
                         };
@@ -3027,7 +3022,7 @@ impl Workspace {
                                             .selected(selected),
                                     )
                                     .on_hover_text(hint)
-                                    .clicked();
+                                    .shelf(&child, ["cmd:append", "cmd:duplicate", "cmd:delete-subtool", "cmd:subtool-up", "cmd:subtool-down", "toggle:solo"][k]).clicked();
                             }
                         }
                         a.append |= clicked[0];
@@ -3060,7 +3055,7 @@ impl Workspace {
                             if !on {
                                 child.disable();
                             }
-                            clicked[col] = child.put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(hint).clicked();
+                            clicked[col] = child.put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(hint).shelf(&child, ["cmd:merge-down", "cmd:split-hidden", "cmd:groups-split"][col]).clicked();
                         }
                         a.merge_down |= clicked[0];
                         a.split_hidden |= clicked[1];
@@ -3154,13 +3149,16 @@ impl Workspace {
                             let released = if kind == Deform::Size {
                                 // ZBrush's x y z toggles: Size scales along the lit axes only.
                                 ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    let w = ui.available_width() - 3.0 * 20.0;
-                                    let v = ui.allocate_ui(vec2(w, 22.0), |ui| spring_slider(ui, kind, &mut ws.deform_drag)).inner;
+                                    // Fixed cells: the row never asks for more than the tray has.
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    ui.spacing_mut().button_padding = vec2(2.0, 2.0);
+                                    let cell = 24.0;
+                                    let w = (ui.available_width() - 3.0 * (cell + 3.0)).max(40.0);
+                                    let v = ui.allocate_ui(vec2(w, CONTROL_H), |ui| spring_slider(ui, kind, &mut ws.deform_drag)).inner;
                                     for (i, name) in ["X", "Y", "Z"].into_iter().enumerate() {
                                         let on = ws.size_axes[i];
                                         if ui
-                                            .add(egui::Button::new(RichText::new(name).size(11.0)).selected(on).min_size(vec2(18.0, 22.0)))
+                                            .add_sized([cell, CONTROL_H], egui::Button::new(RichText::new(name).size(12.0)).selected(on).truncate())
                                             .on_hover_text(format!("Size scales along {name}"))
                                             .clicked()
                                         {
@@ -3178,9 +3176,9 @@ impl Workspace {
                             }
                         }
                         if ui
-                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Mirror And Weld"))
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror And Weld"))
                             .on_hover_text("Make the subtool symmetric: the +X half mirrored onto −X and welded (no subdivision levels)")
-                            .clicked()
+                            .shelf(ui, "cmd:mirror-weld").clicked()
                         {
                             a.mirror_weld = true;
                         }
@@ -3326,7 +3324,7 @@ impl Workspace {
                                 "Next level ({} vertices) is over the budget",
                                 crate::fmt_count(m.next_level_vertices)
                             ))
-                            .clicked()
+                            .shelf(ui, "cmd:divide").clicked()
                         {
                             a.divide = true;
                         }
@@ -3359,7 +3357,7 @@ impl Workspace {
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Del Lower").truncate())
                                     .on_hover_text("Make this level the base, deleting the ones below · clears undo")
-                                    .clicked()
+                                    .shelf(ui, "cmd:del-lower").clicked()
                                 {
                                     a.del_lower = true;
                                 }
@@ -3368,7 +3366,7 @@ impl Workspace {
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Del Higher").truncate())
                                     .on_hover_text("Delete the levels above this one · clears undo")
-                                    .clicked()
+                                    .shelf(ui, "cmd:del-higher").clicked()
                                 {
                                     a.del_higher = true;
                                 }
@@ -3382,14 +3380,14 @@ impl Workspace {
                                 if ui
                                     .add_enabled_ui(m.hidden > 0, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Del Hidden").truncate())).inner
                                     .on_hover_text("Delete the hidden polygons")
-                                    .clicked()
+                                    .shelf(ui, "cmd:del-hidden").clicked()
                                 {
                                     a.del_hidden = true;
                                 }
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Close Holes").truncate())
                                     .on_hover_text("Cap every open border, each cap a new polygroup")
-                                    .clicked()
+                                    .shelf(ui, "cmd:close-holes").clicked()
                                 {
                                     a.close_holes = true;
                                 }
@@ -3428,7 +3426,7 @@ impl Workspace {
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Update").truncate())
                                     .on_hover_text("Remesh again now · Ctrl + drag on the background")
-                                    .clicked()
+                                    .shelf(ui, "cmd:remesh").clicked()
                                 {
                                     a.wedge_now = true;
                                 }
@@ -3464,7 +3462,7 @@ impl Workspace {
                             Some(why) => r.on_disabled_hover_text(why),
                             None => r,
                         };
-                        if r.clicked() {
+                        if r.shelf(ui, "cmd:zremesh").clicked() {
                             a.zremesh = true;
                         }
                     });
@@ -3506,14 +3504,14 @@ impl Workspace {
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Show all").truncate())
                                     .on_hover_text("Ctrl + Shift + click on the background")
-                                    .clicked()
+                                    .shelf(ui, "cmd:show-all").clicked()
                                 {
                                     a.show_all = true;
                                 }
                                 if ui
                                     .add_sized([w, CONTROL_H], egui::Button::new("Invert").truncate())
                                     .on_hover_text("Swap hidden and visible · Ctrl + Shift + drag on the background")
-                                    .clicked()
+                                    .shelf(ui, "cmd:invert-visibility").clicked()
                                 {
                                     a.invert_visibility = true;
                                 }
@@ -3559,7 +3557,7 @@ impl Workspace {
                                     egui::Button::new("Group Visible").truncate(),
                                 )
                                 .on_hover_text("One new polygroup of the visible polygons · Ctrl + W")
-                                .clicked()
+                                .shelf(ui, "cmd:group-visible").clicked()
                             {
                                 a.group_visible = true;
                             }
@@ -3762,22 +3760,30 @@ impl Workspace {
                             let w = (ui.available_width() - 4.0) * 0.5;
                             if ui
                                 .add_sized([w, CONTROL_H], egui::Button::new(if ws.customize { "Done" } else { "Customize" }).selected(ws.customize).truncate())
-                                .on_hover_text("Drag the top and right shelves' items to move them, click one to hide or show it")
+                                .on_hover_text("Drag any shelf item to another place or shelf, or onto the canvas to take it off")
                                 .clicked()
                             {
                                 ws.customize = !ws.customize;
                             }
                             if ui.add_sized([w, CONTROL_H], egui::Button::new("Reset shelves").truncate()).clicked() {
-                                ws.layout.top_shelf = TOP_SHELF.iter().map(|s| (s.to_string(), true)).collect();
-                                ws.layout.right_shelf = RIGHT_SHELF.iter().map(|s| (s.to_string(), true)).collect();
+                                ws.layout.shelves = ShelfSide::ALL.map(shelves::default_items);
                             }
                         });
+                        if ws.customize {
+                            ws.shelf_catalog(ui);
+                        }
                         note(ui, "Palettes dock anywhere: drag the ring left of a palette's name to a tray, or click it for the tray menu");
                     },
                 );
                 let current_name = self.layout.theme.clone();
                 self.sec(ui, h, id, "theme", "Theme", Some(&current_name), true, true, &mut |ws, ui| {
                     ws.theme_section(ui);
+                });
+                self.sec(ui, h, id, "config", "Config", None, true, true, &mut |ws, ui| {
+                    ws.config_section(ui, a);
+                });
+                self.sec(ui, h, id, "updates", "Updates", None, true, true, &mut |ws, ui| {
+                    ws.updates_section(ui);
                 });
                 self.sec(
                     ui,
@@ -4472,6 +4478,32 @@ impl Workspace {
                         });
                 });
             });
+        if self.customize && !self.focus {
+            // Customize mode says so where you look, with the way out.
+            egui::Area::new(Id::unique("customize-banner"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(canvas.center().x, canvas.top() + 8.0))
+                .pivot(Align2::CENTER_TOP)
+                .show(&ctx, |ui| {
+                    popup_frame().inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.label(RichText::new("Customizing").font(font(13.0, Weight::SemiBold)).color(ACC_TEXT()));
+                            ui.label(
+                                RichText::new("Drag shelf items between shelves, onto the canvas to take them off · drag outlined buttons and brushes onto a shelf")
+                                    .font(font(12.5, Weight::Regular))
+                                    .color(FG2()),
+                            );
+                            if ui
+                                .add(egui::Button::new(RichText::new("Done").color(ACC_FG()).font(font(13.0, Weight::SemiBold))).fill(ACC()).min_size(vec2(64.0, CONTROL_H)))
+                                .clicked()
+                            {
+                                self.customize = false;
+                            }
+                        });
+                    });
+                });
+        }
         if !self.focus {
             egui::Area::new(Id::unique("view-gizmo"))
                 .fixed_pos(pos2(canvas.right() - 76.0, canvas.top() + 10.0))
@@ -4809,8 +4841,11 @@ pub fn zslider_scaled(
     let value_text = format!("{:.*}", decimals, *value);
     let value_galley = ui.painter().layout_no_wrap(value_text, font(13.0, Weight::SemiBold), FG());
     let value_w = (value_galley.size().x + 16.0).max(48.0).min(r.width() * 0.4);
-    let field = Rect::from_min_max(pos2(r.right() - value_w, r.top()), r.max);
-    let bar = Rect::from_min_max(r.min, pos2(field.left() - 4.0, r.bottom()));
+    // Too narrow for a name and a value field (a side shelf): the value on the bar, the name
+    // on hover.
+    let narrow = r.width() < 90.0;
+    let field = if narrow { Rect::from_min_max(r.right_top(), r.max) } else { Rect::from_min_max(pos2(r.right() - value_w, r.top()), r.max) };
+    let bar = if narrow { r } else { Rect::from_min_max(r.min, pos2(field.left() - 4.0, r.bottom())) };
     let mut changed = false;
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
@@ -4839,6 +4874,15 @@ pub fn zslider_scaled(
         );
     }
     p.rect_stroke(bar, 4, Stroke::new(1.0, LINE()), StrokeKind::Inside);
+    if narrow {
+        p.galley(
+            pos2(bar.center().x - value_galley.size().x * 0.5, bar.center().y - value_galley.size().y * 0.5),
+            value_galley,
+            FG(),
+        );
+        resp.on_hover_text(label);
+        return changed;
+    }
     p.with_clip_rect(bar.shrink(1.0).intersect(p.clip_rect())).text(
         pos2(bar.left() + 9.0, bar.center().y),
         Align2::LEFT_CENTER,
@@ -4856,43 +4900,42 @@ pub fn zslider_scaled(
     changed
 }
 
-/// What happened to a shelf item in Customize mode.
-#[derive(Debug, PartialEq)]
-enum CustomizeEvent {
-    None,
-    /// Clicked: hide it, or show it again.
-    Toggle,
-    /// The item at this index of the same shelf was dropped on it.
-    Move(usize),
+/// A small chevron button in the menu bar (previous / next theme).
+fn theme_arrow(ui: &mut Ui, left: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(r, 4, BG3());
+    }
+    let c = r.center();
+    let color = if resp.hovered() { FG() } else { FG3() };
+    let (a, b) = if left { (3.0, -2.0) } else { (-2.0, 3.0) };
+    p.line_segment([c + vec2(a, -4.5), c + vec2(b, 0.0)], Stroke::new(1.6, color));
+    p.line_segment([c + vec2(b, 0.0), c + vec2(a, 4.5)], Stroke::new(1.6, color));
+    resp
 }
 
-/// A shelf item being dragged in Customize mode: its shelf and place.
-#[derive(Clone, Copy, Debug)]
-struct ShelfDrag(&'static str, usize);
-
-/// Customize mode over a shelf item at `rect`: it can be dragged onto another item of its
-/// shelf (it takes that place) and clicked to hide or show it. Hidden items stay visible,
-/// dimmed and struck through, while customizing.
-fn customize_item(ui: &mut Ui, rect: Rect, shelf: &'static str, index: usize, shown: bool) -> CustomizeEvent {
-    let resp = ui.interact(rect, Id::unique(("customize", shelf, index)), Sense::click_and_drag());
-    resp.dnd_set_drag_payload(ShelfDrag(shelf, index));
-    let p = ui.painter();
-    if !shown {
-        p.rect_filled(rect, 4, BG1().gamma_multiply(0.75));
-        p.line_segment([rect.left_bottom() + vec2(4.0, -4.0), rect.right_top() + vec2(-4.0, 4.0)], Stroke::new(1.5, FG3()));
+/// Buttons in a grid of `cols` equal cells across the available width; a label wider
+/// than its cell is cut short, so the grid never widens a tray. Returns the one clicked.
+fn button_cells(ui: &mut Ui, items: &[(&str, &str)], cols: usize, shelf_ids: Option<&[&str]>) -> Option<usize> {
+    let gap = 4.0;
+    let w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32).floor();
+    let mut clicked = None;
+    for (row, chunk) in items.chunks(cols).enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (k, (label, hint)) in chunk.iter().enumerate() {
+                let mut resp = ui.add_sized([w, CONTROL_H], egui::Button::new(*label).truncate()).on_hover_text(*hint);
+                if let Some(ids) = shelf_ids {
+                    resp = resp.shelf(ui, ids[row * cols + k]);
+                }
+                if resp.clicked() {
+                    clicked = Some(row * cols + k);
+                }
+            }
+        });
     }
-    let hovered_drop = resp.dnd_hover_payload::<ShelfDrag>().is_some_and(|d| d.0 == shelf && d.1 != index);
-    let color = if hovered_drop || resp.dragged() { ACC() } else if resp.hovered() { ACC_TEXT() } else { ACC().gamma_multiply(0.55) };
-    p.rect_stroke(rect.expand(2.0), 5, Stroke::new(if hovered_drop { 2.0 } else { 1.0 }, color), StrokeKind::Outside);
-    if let Some(d) = resp.dnd_release_payload::<ShelfDrag>() {
-        if d.0 == shelf && d.1 != index {
-            return CustomizeEvent::Move(d.1);
-        }
-    }
-    if resp.on_hover_text(if shown { "Drag to move · click to hide" } else { "Hidden · click to show" }).clicked() {
-        return CustomizeEvent::Toggle;
-    }
-    CustomizeEvent::None
+    clicked
 }
 
 /// A theme in the Theme section: its panel colour with its accent and text on it, and
@@ -5040,13 +5083,23 @@ enum Thumb {
 
 /// Left-shelf thumbnail: a caption (what it is), the image, and its current name.
 fn thumb(ui: &mut Ui, caption: &str, content: Thumb, label: &str, on: bool, dim: bool) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(vec2(86.0, 106.0), Sense::click());
+    // Full size on a side shelf; a compact square (no caption) on a top or bottom shelf or
+    // a narrow side shelf.
+    let w = ui.available_width().clamp(44.0, 86.0);
+    let compact = ui.available_height() < 100.0 || w < 70.0;
+    let h = if compact { ui.available_height().clamp(44.0, 62.0).min(w + 18.0) } else { 106.0 };
+    let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let p = ui.painter();
     p.rect_filled(r, 4, if resp.hovered() { BG3() } else { TILE() });
     p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC() } else { LINE() }), StrokeKind::Inside);
-    let cap = p.layout_job(caps(caption, 10.5, FG3()));
-    p.galley(pos2(r.center().x - cap.size().x * 0.5, r.top() + 6.0), cap, FG3());
-    let im = Rect::from_center_size(pos2(r.center().x, r.top() + 52.0), vec2(60.0, 60.0));
+    let side = if compact { h - 22.0 } else { 60.0 };
+    let im = if compact {
+        Rect::from_center_size(pos2(r.center().x, r.top() + 3.0 + side * 0.5), vec2(side, side))
+    } else {
+        let cap = p.layout_job(caps(caption, 10.5, FG3()));
+        p.galley(pos2(r.center().x - cap.size().x * 0.5, r.top() + 6.0), cap, FG3());
+        Rect::from_center_size(pos2(r.center().x, r.top() + 52.0), vec2(side, side))
+    };
     match content {
         Thumb::Texture(tex) => {
             p.image(tex, im, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -5054,16 +5107,15 @@ fn thumb(ui: &mut Ui, caption: &str, content: Thumb, label: &str, on: bool, dim:
         Thumb::Glyph(name) => glyph_large(p, im.center(), name, if dim { FG3() } else { FG2() }),
     }
     let color = if dim { FG3() } else { FG() };
-    let mut job = egui::text::LayoutJob::simple(label.to_owned(), font(12.0, Weight::Medium), color, 80.0);
+    let mut job = egui::text::LayoutJob::simple(label.to_owned(), font(if compact { 11.0 } else { 12.0 }, Weight::Medium), color, w - 6.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let galley = p.layout_job(job);
-    p.galley(pos2(r.center().x - galley.size().x * 0.5, r.bottom() - 10.0 - galley.size().y * 0.5), galley, color);
-    resp.on_hover_text(label)
+    let y = if compact { r.bottom() - 9.0 } else { r.bottom() - 10.0 };
+    p.galley(pos2(r.center().x - galley.size().x * 0.5, y - galley.size().y * 0.5), galley, color);
+    resp.on_hover_text(format!("{caption}: {label}"))
 }
 
-/// A catalog tile. `code` is the ZBrush brush code drawn in the corner, lit when its
-/// first letter has been typed.
 fn brush_tile(
     ui: &mut Ui, tex: TextureId, name: &str, key: usize, code: (&str, Option<char>), on: bool, width: f32,
 ) -> egui::Response {
@@ -5106,9 +5158,9 @@ fn spaced(code: &str) -> String {
     code.chars().map(String::from).collect::<Vec<_>>().join(" ")
 }
 
-/// HSV picker: saturation/value square plus a hue strip on its right (left shelf).
-fn color_picker(ui: &mut Ui, color: &mut Hsva) {
-    let (r, _) = ui.allocate_exact_size(vec2(86.0, 72.0), Sense::hover());
+/// The shelf picker at any size: the square with the hue strip on its right.
+fn color_picker_sized(ui: &mut Ui, color: &mut Hsva, size: Vec2) {
+    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
     let sv = Rect::from_min_max(r.min, pos2(r.right() - 15.0, r.bottom()));
     let hue = Rect::from_min_max(pos2(r.right() - 12.0, r.top()), r.max);
     hsv_picker(ui, color, sv, hue, false);
@@ -5224,13 +5276,6 @@ fn popup_frame() -> Frame {
             spread: 0,
             color: Color32::from_black_alpha(150),
         })
-}
-
-fn shelf_separator(ui: &mut Ui) {
-    ui.add_space(6.0);
-    let (r, _) = ui.allocate_exact_size(vec2(1.0, SHELF_H - 18.0), Sense::hover());
-    ui.painter().vline(r.center().x, r.y_range(), (1.0, LINE()));
-    ui.add_space(6.0);
 }
 
 fn tag(p: &egui::Painter, right_center: Pos2, text: &str) {
@@ -6233,12 +6278,21 @@ mod tests {
         layout.ui_scale = 1.25;
         layout.theme = "Mine".into();
         layout.custom_themes.push(ThemeSpec::new("Mine", [10, 20, 30], [200, 210, 220], [90, 160, 240]));
-        layout.right_shelf.swap(0, 2);
-        layout.right_shelf[5].1 = false;
-        layout.top_shelf.swap(1, 3);
+        layout.shelves[ShelfSide::Right as usize].swap(0, 2);
+        layout.shelves[ShelfSide::Right as usize].remove(5);
+        layout.shelves[ShelfSide::Bottom as usize] = vec!["brush:Clay".into(), "sep".into(), "cmd:divide".into(), "slider:z".into()];
         let back = DockLayout::decode(&layout.encode());
         assert_eq!(back, layout);
         assert_eq!(back.current_theme().accent, [90, 160, 240]);
+        // Workspaces from 0.23–0.24 kept groups, hidden items and My shelf: they open as
+        // item lists, hidden ones left off.
+        let old = DockLayout::decode("topshelf|toggles,-modes,rgb,zadd,size,custom\nrightshelf|persp,frame,-local,floor\nmyshelf|brush:Clay;cmd:frame\n");
+        let top = &old.shelves[ShelfSide::Top as usize];
+        assert_eq!(&top[..3], &["toggle:sculptris", "toggle:live-boolean", "sep"]);
+        assert!(!top.iter().any(|s| s.starts_with("mode:")));
+        assert!(top.contains(&"brush:Clay".to_string()) && top.ends_with(&["space".to_string(), "cmd:undo".to_string(), "cmd:redo".to_string()]));
+        assert_eq!(old.shelves[ShelfSide::Right as usize], vec!["toggle:persp", "cmd:frame", "toggle:floor"]);
+        assert_eq!(old.shelves[ShelfSide::Left as usize], shelves::default_items(ShelfSide::Left));
     }
 
     #[test]
@@ -6262,7 +6316,7 @@ mod tests {
     }
 
     #[test]
-    fn customize_mode_drags_a_shelf_button_to_a_new_place_and_click_hides_it() {
+    fn customize_mode_moves_shelf_items_and_the_canvas_takes_them_off() {
         let (mut workspace, ctx) = test_workspace("customize");
         let size = vec2(1600.0, 1000.0);
         workspace.customize = true;
@@ -6270,21 +6324,16 @@ mod tests {
         let output = frame(&mut workspace, &ctx, size, vec![]);
         let from = text_position(&output, "Frame") + vec2(10.0, -12.0);
         let to = text_position(&output, "Floor") + vec2(10.0, -12.0);
-        frame(&mut workspace, &ctx, size, vec![egui::Event::PointerMoved(from)]);
-        frame(&mut workspace, &ctx, size, vec![pointer(from, true)]);
-        for k in 1..=10 {
-            frame(&mut workspace, &ctx, size, vec![egui::Event::PointerMoved(from.lerp(to, k as f32 / 10.0))]);
-        }
-        frame(&mut workspace, &ctx, size, vec![pointer(to, false)]);
-        frame(&mut workspace, &ctx, size, vec![]);
-        let order: Vec<&str> = workspace.layout.right_shelf.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(&order[..3], &["persp", "floor", "frame"], "{order:?}");
-        // A click hides it; outside Customize mode it is gone, and it costs no click there.
-        let output = frame(&mut workspace, &ctx, size, vec![]);
         let perspective = workspace.perspective;
-        click(&mut workspace, &ctx, size, text_position(&output, "Persp") + vec2(10.0, -12.0));
-        assert!(!workspace.layout.right_shelf[0].1);
-        assert_eq!(workspace.perspective, perspective, "customizing does not press the button");
+        drag(&mut workspace, &ctx, size, from, to);
+        let right = &workspace.layout.shelves[ShelfSide::Right as usize];
+        assert_eq!(&right[..3], &["toggle:persp", "cmd:frame", "toggle:floor"], "{right:?}");
+        // Persp dropped on the canvas comes off the shelf; customizing pressed nothing.
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        drag(&mut workspace, &ctx, size, text_position(&output, "Persp") + vec2(10.0, -12.0), pos2(800.0, 500.0));
+        assert!(!workspace.layout.shelves[ShelfSide::Right as usize].contains(&"toggle:persp".to_string()));
+        assert_eq!(workspace.perspective, perspective);
+        // It waits in Preferences' catalog of shelf items until it is dragged back.
         workspace.customize = false;
         let output = frame(&mut workspace, &ctx, size, vec![]);
         assert_eq!(text_count(&output, "Persp"), 0);
@@ -6340,6 +6389,164 @@ mod tests {
         let (wide, narrow) = (place(&three, 262.0), place(&three, 200.0));
         assert!((narrow.0 - wide.0 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
         assert!((narrow.1 - wide.1 - 62.0).abs() < 0.5, "{wide:?} {narrow:?}");
+    }
+
+    /// Press at `from`, move to `to` in steps, release.
+    fn drag(workspace: &mut Workspace, ctx: &Context, size: Vec2, from: Pos2, to: Pos2) {
+        frame(workspace, ctx, size, vec![egui::Event::PointerMoved(from)]);
+        frame(workspace, ctx, size, vec![pointer(from, true)]);
+        for k in 1..=12 {
+            frame(workspace, ctx, size, vec![egui::Event::PointerMoved(from.lerp(to, k as f32 / 12.0))]);
+        }
+        frame(workspace, ctx, size, vec![pointer(to, false)]);
+        frame(workspace, ctx, size, vec![]);
+    }
+
+    #[test]
+    fn buttons_and_brushes_dragged_onto_a_shelf_run_from_there() {
+        let (mut workspace, ctx) = test_workspace("my-shelf");
+        let size = vec2(1600.0, 1000.0);
+        frame(&mut workspace, &ctx, size, vec![]);
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&out, "Bottom shelf · drag buttons here"), 0, "an empty bottom shelf is not shown");
+        workspace.customize = true;
+        frame(&mut workspace, &ctx, size, vec![]);
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        let bottom = text_position(&out, "Bottom shelf · drag buttons here");
+        // The right shelf's Frame button, then a brush from the Brush palette.
+        drag(&mut workspace, &ctx, size, text_position(&out, "Frame") + vec2(10.0, -12.0), bottom);
+        assert_eq!(workspace.layout.shelves[ShelfSide::Bottom as usize], vec!["cmd:frame".to_string()]);
+        assert!(!workspace.layout.shelves[ShelfSide::Right as usize].contains(&"cmd:frame".to_string()));
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        let clay = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Clay" && t.pos.x < 280.0 => Some(t.pos),
+                _ => None,
+            })
+            .unwrap();
+        let low = |out: &egui::FullOutput, text: &str| {
+            out.shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == text && t.pos.y > size.y - STATUS_H - SHELF_H - 2.0 => Some(t.pos),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{text} on the bottom shelf"))
+        };
+        // Dropped on the bottom shelf's Frame button, the brush goes before it.
+        drag(&mut workspace, &ctx, size, clay + vec2(6.0, -20.0), low(&out, "Frame") + vec2(4.0, 4.0));
+        assert_eq!(workspace.layout.shelves[ShelfSide::Bottom as usize], vec!["brush:Clay".to_string(), "cmd:frame".to_string()]);
+        // Saved with the workspace.
+        let back = DockLayout::decode(&workspace.layout.encode());
+        assert_eq!(back.shelves, workspace.layout.shelves);
+        // Out of Customize mode the bottom shelf's Frame button frames the model.
+        workspace.customize = false;
+        frame(&mut workspace, &ctx, size, vec![]);
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        let at = low(&out, "Frame") + vec2(4.0, 4.0);
+        let mut primitive = crate::primitive::Settings::default();
+        frame(&mut workspace, &ctx, size, vec![egui::Event::PointerMoved(at)]);
+        frame_full(&mut workspace, &ctx, size, vec![pointer(at, true)], &[row("Sphere 1", true)], &mut primitive);
+        let (_, actions) = frame_full(&mut workspace, &ctx, size, vec![pointer(at, false)], &[row("Sphere 1", true)], &mut primitive);
+        assert!(actions.frame);
+        let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn a_newer_release_shows_a_card_that_can_skip_it() {
+        let (mut workspace, ctx) = test_workspace("update-card");
+        let size = vec2(1600.0, 1000.0);
+        workspace.pretend_update(crate::update::Release {
+            version: "9.9.9".into(),
+            page: "https://github.com/ozzy-apps/klay/releases/tag/v9.9.9".into(),
+            asset: None,
+            notes: "Faster everything".into(),
+        });
+        frame(&mut workspace, &ctx, size, vec![]);
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&out, "Klay 9.9.9 is out"), 1);
+        assert_eq!(text_count(&out, "Faster everything"), 1);
+        click(&mut workspace, &ctx, size, text_position(&out, "Skip this version") + vec2(4.0, 4.0));
+        assert_eq!(workspace.layout.skip_version, "9.9.9");
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&out, "Klay 9.9.9 is out"), 0, "a skipped release asks no more");
+        assert!(DockLayout::decode(&workspace.layout.encode()).skip_version == "9.9.9");
+        let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn stored_config_comes_back_and_klay_starts_from_it() {
+        let (mut workspace, _ctx) = test_workspace("stored-config");
+        let _ = std::fs::remove_file(workspace.stored_config_path());
+        assert!(!workspace.load_config(), "nothing stored yet");
+        workspace.layout.theme = "Moss".into();
+        workspace.layout.ui_scale = 1.25;
+        workspace.layout.shelves[ShelfSide::Bottom as usize] = vec!["cmd:divide".into()];
+        workspace.store_config().unwrap();
+        assert!(workspace.layout.start_from_stored);
+        // The session moves on…
+        workspace.layout.theme = "Plum".into();
+        workspace.layout.shelves[ShelfSide::Bottom as usize].clear();
+        // …Load Config brings the stored interface back.
+        assert!(workspace.load_config());
+        assert_eq!(workspace.layout.theme, "Moss");
+        assert_eq!(workspace.layout.ui_scale, 1.25);
+        assert_eq!(workspace.layout.shelves[ShelfSide::Bottom as usize], vec!["cmd:divide".to_string()]);
+        // A later session saved as something else still starts from the stored config.
+        let stored = std::fs::read_to_string(workspace.stored_config_path()).unwrap();
+        let mut last = DockLayout::decode(&stored);
+        last.theme = "Plum".into();
+        let decoded = DockLayout::decode(&last.encode());
+        assert!(decoded.start_from_stored);
+        let _ = std::fs::remove_file(workspace.stored_config_path());
+        let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn theme_arrows_step_through_the_themes_and_menus_reach_down_the_screen() {
+        let (mut workspace, ctx) = test_workspace("theme-arrows");
+        let size = vec2(1600.0, 1000.0);
+        frame(&mut workspace, &ctx, size, vec![]);
+        // The two chevrons sit at the menu bar's right end: next, then previous.
+        click(&mut workspace, &ctx, size, pos2(size.x - 6.0 - 11.0, MENUBAR_H * 0.5));
+        assert_eq!(workspace.layout.theme, ThemeSpec::presets()[1].name);
+        click(&mut workspace, &ctx, size, pos2(size.x - 6.0 - 22.0 - 2.0 - 14.0 - 2.0 - 11.0, MENUBAR_H * 0.5));
+        assert_eq!(workspace.layout.theme, ThemeSpec::presets()[0].name);
+        // Preferences opens as a dropdown tall enough to show every theme and the editor.
+        assert!(workspace.open_menu("Preferences"));
+        frame(&mut workspace, &ctx, size, vec![]);
+        let out = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&out, "High Contrast"), 1);
+        assert_eq!(text_count(&out, "New theme"), 1);
+        let _ = std::fs::remove_file(&workspace.persistence_path);
+    }
+
+    #[test]
+    fn no_palette_section_widens_a_narrow_tray() {
+        // Every palette in the right tray with every section open: nothing may ask for more
+        // width than the tray has, or the tray's content slides sideways and is cut off
+        // (it did with Deformation's Size row). The right shelf must sit exactly where it
+        // does with every palette closed.
+        let size = vec2(1600.0, 1400.0);
+        let persp = |width: f32, open: bool| {
+            let (mut workspace, ctx) = test_workspace(&format!("narrow-{width}-{open}"));
+            workspace.layout.tray_width = width;
+            for p in &mut workspace.layout.palettes {
+                p.place = Place::Tray(Side::Right);
+                p.open = open;
+            }
+            workspace.open_all = open;
+            frame(&mut workspace, &ctx, size, vec![]);
+            let out = frame(&mut workspace, &ctx, size, vec![]);
+            let _ = std::fs::remove_file(&workspace.persistence_path);
+            text_position(&out, "Persp").x
+        };
+        for width in [200.0, 284.0] {
+            let (closed, open) = (persp(width, false), persp(width, true));
+            assert!((closed - open).abs() < 0.5, "tray {width}: shelf at {closed} closed, {open} with everything open");
+        }
     }
 
     #[test]

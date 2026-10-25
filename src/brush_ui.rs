@@ -262,11 +262,7 @@ impl Workspace {
 
     pub(super) fn paint_modes(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
         if m.brush.kind.is_mask() || m.brush.kind.is_gesture() {
-            ui.label(if m.brush.kind.is_mask() {
-                "Mask"
-            } else {
-                "Clip Line"
-            });
+            ui.label(if m.brush.kind.is_mask() { "Mask" } else { m.brush.kind.name() });
             return;
         }
         let selected = if m.brush.paint {
@@ -591,7 +587,7 @@ impl Workspace {
                 ui.spacing_mut().item_spacing.x = gap;
                 for &k in row {
                     let tex = self.texture(ui.ctx(), Some(k), self.subtract && !k.is_mask());
-                    if compact_brush_tile(ui, tex, k, on(k), width).clicked() {
+                    if compact_brush_tile(ui, tex, k, on(k), width).shelf(ui, &super::custom_shelf::brush_id(k)).clicked() {
                         self.choose_brush(m, k);
                     }
                 }
@@ -760,6 +756,7 @@ impl Workspace {
                                                     m.brush.kind == k,
                                                     70.0,
                                                 );
+                                                let r = r.shelf(ui, &super::custom_shelf::brush_id(k));
                                                 if r.hovered() {
                                                     self.brush_ui.preview = Some(k);
                                                 }
@@ -841,6 +838,7 @@ impl Workspace {
                                                     m.brush.kind == k,
                                                     tile,
                                                 );
+                                                let r = r.shelf(ui, &super::custom_shelf::brush_id(k));
                                                 if r.hovered() {
                                                     self.brush_ui.preview = Some(k);
                                                 }

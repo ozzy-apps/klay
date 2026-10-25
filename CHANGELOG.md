@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.25.0 — 2026-10-25
+
+- Every shelf item can go anywhere, as in ZBrush: the top, left, right and a new bottom shelf are lists of single items (the four mode buttons, Sculptris Pro, Live Boolean, Z+RGB / RGB / Z, RGB Intensity, Zadd / Zsub, Z Intensity, Focal Shift, Draw Size, Undo, Redo, the Brush / Stroke / Alpha / Texture / Material thumbnails, the colour picker, Alternate, the view buttons, separators and springs) plus any brush or palette command dragged on. In Customize mode drag an item to another place or shelf, or onto the canvas to take it off; taken-off built-in items wait under Preferences › Interface to be dragged back. Items draw to fit (half-height pairs on the top and bottom shelves, full width on the side shelves; sliders on a narrow shelf show their value, the name on hover). My shelf's buttons move onto the top shelf; workspaces from 0.23–0.24 open with their shelves converted.
+- Preferences › Config (ZBrush's Store Config): Store Config keeps the whole interface (palettes, trays, shelves, theme, custom themes, scale, document look) and, when ticked, the model as the startup document; Klay then starts from them instead of the last session (Start with the stored config). Load Config brings the stored interface back, Factory settings (click twice) returns to Klay's own, Delete stored removes both files.
+- Update checks: at start and every six hours Klay asks GitHub for the latest release of its repository (with the system's curl, in the background); a newer one shows a card with Download (this platform's file, or the release page), Later and Skip this version. Preferences › Updates turns it off, checks now and shows the result. Releases must be published on a public GitHub repository for this to find them.
+- Packages for the release: `scripts/package-deb.sh` (.deb), `scripts/package-flatpak.sh` (a Flatpak bundle on the Freedesktop 25.08 runtime, app id nl.co.ozzy.Klay, with AppStream metadata) and `scripts/package-appimage.sh` (AppImage, with appimagetool); package binaries are stripped (24 MB instead of 241 MB). `scripts/package-linux.sh` also writes a .tar.gz of the AppDir.
+- A short README with screenshots; the full manual moved to docs/guide.md.
+- New flags: --fake-update X (show the update card), --no-update-check.
+- Verification: 281 release tests (new: moving shelf items between shelves and taking them off on the canvas, brushes and commands dropped on the bottom shelf and run from it, old shelf lines converted, stored config round trip, update card and skip, release JSON parsing, version comparison); every native self-test passes on the GPU.
+
+## 0.24.0 — 2026-10-25
+
+- My shelf (ZBrush's custom shelf): in Customize mode (Preferences › Interface › Customize) drag brushes (Brush palette and B catalog), right-shelf buttons and the outlined palette buttons onto it: mask operations, Divide, Del Lower / Higher, Remesh, ZRemesher, Del Hidden, Close Holes, Mirror And Weld, the SubTool buttons, Show all / Invert / Group Visible, Undo / Redo. Its buttons do what the originals do (toggles light up, brushes show their preview). Drag them to reorder, click to remove while customizing. It sits in the top shelf as a group of its own (movable and hideable like the others), two rows, narrowing its buttons to leave room for Undo / Redo; hidden while empty. Saved with the workspace.
+- Customize mode shows a banner at the top of the canvas with Done.
+- Previous / next theme: small arrows at the right end of the menu bar, with the current theme's accent between them.
+- Menu-bar dropdowns grow down to the status bar before they scroll (Preferences showed only its first theme row) and are 360 px wide.
+- A tray no longer widens and slides its content sideways: Deformation's Size row and Masking's buttons fit narrow trays (buttons in fixed cells that clip their labels).
+- Fix: a drop on one kind of target no longer throws away a drag of another kind.
+- New flags: --menu NAME, --ui-scale X.
+- Verification: 276 release tests (new: every palette and section open in a 200 and 284 px tray leaves the shelf in place; dragging the right shelf's Frame and a brush onto My shelf, reordering it, saving it, and its Frame button framing; the theme arrows; the Preferences dropdown showing every theme); every native self-test passes on the GPU.
+
 ## 0.23.1 — 2026-10-25
 
 - The border round the document frame (always empty canvas that navigates, even over the model) is 40 points wide instead of 16, and **Document › Back › Border width** sets it from 8 to 120; saved with the workspace (older workspaces get the new default).
