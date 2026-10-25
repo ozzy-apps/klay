@@ -593,3 +593,140 @@ impl App {
         false
     }
 }
+
+/// State of `--selftest-cull`.
+#[derive(Default)]
+pub(super) struct CullTest {
+    frame: u32,
+    /// The canvas drawn with culling, waiting for the one drawn without.
+    culled: Option<(u32, u32, Vec<u8>)>,
+    /// Some step drew fewer chunks than the level has (culling did something).
+    dropped_some: bool,
+    ok: bool,
+}
+
+/// What `--selftest-cull` does before each comparison.
+const CULL_STEPS: [&str; 8] = [
+    "home view",
+    "close up and turned",
+    "far away",
+    "during a GPU Grab stroke",
+    "after the Grab",
+    "after Deformation › Offset X",
+    "with half the polygons hidden",
+    "with PolyF",
+];
+
+impl App {
+    /// `--selftest-cull`: after each step (camera moves, a GPU Grab under way and done, a
+    /// whole-subtool move, hidden polygons, PolyF) the canvas drawn with GPU culling must
+    /// match the canvas drawn whole, pixel for pixel: culling may only drop what cannot be
+    /// seen, however the mesh moved.
+    pub(super) fn selftest_cull_frame(&mut self, t: &mut CullTest) -> bool {
+        let frame = t.frame;
+        t.frame += 1;
+        if frame < 20 {
+            return false;
+        }
+        // Each step: its action at 0 (a Grab drags on until 3), then frames to settle, the
+        // culled canvas at 20, the whole one at 22, compared at 24.
+        let (step, local) = (((frame - 20) / 26) as usize, (frame - 20) % 26);
+        let Some(&name) = CULL_STEPS.get(step) else {
+            log::info!("selftest-cull: culling dropped chunks somewhere ({})", if t.dropped_some { "ok" } else { "FAIL" });
+            assert!(t.ok && t.dropped_some, "cull self-test failed");
+            log::info!("selftest-cull: all passed");
+            return true;
+        };
+        let check = |t: &mut CullTest, what: String, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-cull: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let start = Vec3::new(0.45, 0.35, 0.82).normalize();
+        match (step, local) {
+            (0, 0) => {
+                t.ok = true;
+                self.workspace.grid = false;
+                self.cursor_moved(self.canvas_origin() + Vec2::splat(4.0), false);
+                self.hover = None;
+            }
+            (1, 0) => {
+                self.camera.distance *= 0.4;
+                self.camera.yaw += 0.7;
+                self.camera.pitch += 0.3;
+            }
+            (2, 0) => self.camera.distance *= 10.0,
+            (3, 0) => {
+                self.home_camera();
+                self.workspace.select_brush(&mut self.brush, BrushKind::Grab);
+                self.brush.radius = 0.35;
+                self.brush.strength = 1.0;
+                let p = self.project(start);
+                self.cursor_moved(p, false);
+                self.left_press(false, false);
+            }
+            (3, 1..=3) => {
+                // Pull the patch well outside the sphere's old outline.
+                let p = self.project(start) + Vec2::new(local as f32 * 70.0, -(local as f32) * 30.0);
+                self.cursor_moved(p, false);
+            }
+            (4, 0) => self.left_release(),
+            (5, 0) => self.deform(Deform::OffsetX, -50.0),
+            (6, 0) => {
+                let mesh = self.doc.mesh();
+                let mid = (mesh.bounds().min.x + mesh.bounds().max.x) * 0.5;
+                let hidden: Vec<u8> = (0..mesh.triangle_count())
+                    .map(|t| (mesh.positions[mesh.indices[3 * t] as usize].x > mid) as u8)
+                    .collect();
+                self.apply_hidden(hidden, "Hide half");
+                self.camera.yaw += 0.5;
+            }
+            (7, 0) => self.workspace.polyframe = true,
+            (_, 20) => {
+                if step == 3 {
+                    check(t, "the Grab runs on the GPU".into(), self.gfx.as_ref().is_some_and(Gfx::gpu_grab_active));
+                }
+                if let Some(g) = self.gfx.as_mut() {
+                    g.culling = true;
+                }
+                self.request_snapshot();
+            }
+            (_, 22) => {
+                let counts = self.gfx.as_ref().and_then(Gfx::read_cull_counts);
+                let Some(image) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
+                    log::warn!("selftest-cull: this surface cannot be read back; skipped");
+                    return true;
+                };
+                match counts {
+                    Some(c) => {
+                        log::info!("selftest-cull: {name}: drew {} of {} chunks", c.chunks, c.chunk_total);
+                        t.dropped_some |= c.chunks < c.chunk_total;
+                    }
+                    None => check(t, format!("{name}: the frame went through the cull pass"), false),
+                }
+                t.culled = Some(image);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.culling = false;
+                }
+                self.request_snapshot();
+            }
+            (_, 24) => {
+                let whole = self.gfx.as_mut().and_then(|g| g.snapshot_image.take());
+                let (Some((w, h, a)), Some((w2, h2, b))) = (t.culled.take(), whole) else {
+                    check(t, format!("{name}: both frames read back"), false);
+                    return false;
+                };
+                let differ = if (w, h) == (w2, h2) {
+                    a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).any(|k| p[k].abs_diff(q[k]) > 8)).count()
+                } else {
+                    usize::MAX
+                };
+                check(t, format!("{name}: culled and whole frames match ({differ} of {} pixels differ)", w * h), differ == 0);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.culling = true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}

@@ -3,7 +3,8 @@
 ## Unreleased
 
 - File dialogs: Document › Open (Ctrl + O), Save As, SubTool › Save / Load / Export OBJ and Document › Import / Export OBJ open the desktop's own file dialog (the XDG portal, so GNOME's or KDE's; zenity where there is no portal) instead of reading a typed path. Save (Ctrl + S) saves straight to the project's file once it has one and asks the first time. Dialogs start in the folder of the file they are about, else where the last file was picked; SubTool › Save offers the subtool's name; Load and Import take several files at once; a saved name without `.klay` / `.obj` gets it. The canvas keeps drawing while a dialog is open. The Document palette shows the project's folder instead of a path field.
-- Verification: 284 release tests (new: file names from subtool names, extensions on saved files, where dialogs start).
+- GPU culling: the active subtool is drawn chunk by chunk, and chunks that cannot be seen (outside the view or the document frame, or facing wholly away) are skipped on the GPU before any of their triangles are processed. At 61M vertices a framed model draws in 8.0 ms instead of 15.2 ms, a close-up in 1.4 ms, a far view in 10.4 ms; at 15.4M 2.2 ms instead of 3.9. Chunk bounds are refitted on the GPU as you sculpt, grab, move and hide, and the picture is pixel-identical to drawing everything. `--render triangles` draws without culling; `--camera-distance K` and `--frames` (which now logs what culling drew) are for timing.
+- Verification: 284 release tests (new: file names from subtool names, extensions on saved files, where dialogs start); every native self-test passes on the GPU, plus the new `--selftest-cull` (culled and whole frames compared pixel for pixel after camera moves, a GPU Grab during and after the stroke, Offset X, hidden polygons and PolyF, at 15.4M and 61M).
 
 ## 0.25.0 — 2026-10-25
 

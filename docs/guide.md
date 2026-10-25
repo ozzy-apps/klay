@@ -16,7 +16,9 @@ cargo run --release -- --bench 1500       # headless CPU benchmark at 13.5M vert
 cargo run --release -- --segments 1500 --stress --novsync   # per-frame cost of a huge grab
 cargo run --release -- --segments 400 --divide 2            # start two subdivision levels up (15.4M vertices)
 cargo run --release -- --bench 400 --divide 2               # divide timings, base-level stroke, step-up cost
-cargo run --release -- --segments 400 --divide 2 --novsync --frames   # average frame time at the top level, then exit
+cargo run --release -- --segments 400 --divide 2 --novsync --frames   # average frame time at the top level and what culling drew, then exit
+cargo run --release -- --segments 400 --divide 3 --novsync --frames --camera-distance 0.35 --render triangles   # closer camera; draw without GPU culling
+cargo run --release -- --segments 200 --divide 2 --novsync --selftest-cull   # culled vs whole frames, pixel for pixel, after camera moves and edits, log, exit
 cargo run --release -- --subtools 4                         # start with four subtools in a row
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
@@ -857,6 +859,18 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   and adds, atomically, to the vertices they touch in other flagged chunks; a third turns the
   sums into packed unit normals. Dirty position ranges are re-uploaded as merged contiguous
   runs. egui is drawn in a second pass.
+- GPU culling (`bounds.wgsl`, `cull.wgsl`): the active subtool is drawn as one indexed draw
+  per chunk through a single `multi_draw_indexed_indirect`, and a compute pass empties the
+  draws of chunks that cannot be seen: outside the view or the document frame, or with every
+  triangle facing away (a normal cone per chunk, as in meshoptimizer's cluster cones). Each
+  chunk's box and cone are refitted on the GPU after the normal pass, for the chunks that
+  moved or were re-shaded and their edge neighbours, so GPU Grab, Transpose releases and
+  every brush keep them right without CPU work. Draws stay in chunk order, so a culled frame
+  is pixel-identical to one whole draw (`--selftest-cull` checks this after camera moves, a
+  GPU Grab, a subtool move, hidden polygons and PolyF). Culling pauses while a Transpose
+  preview moves vertices in the vertex shader, skips the back-face test under Live Boolean
+  (which draws back faces), and gives PolyF each draw's first triangle through its first
+  instance (`vs_active`). `--render triangles` draws the subtool whole for comparisons.
 
 ## Numbers (RTX 5060, 16 cores, release build)
 
@@ -882,6 +896,25 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | GPU memory at level 2 / 3 while shown | 0.8 / 3.2 GB (52 bytes per vertex) |
 | Memory for the three levels | 2.2 GB |
 | Grab of a third of a 13.5M-vertex mesh (`--segments 1500 --stress --novsync`), with the normal passes each frame | 8.9 ms/frame (9.3 ms before the accumulate passes) |
+
+### GPU culling (400-segment sphere, `--novsync --frames --camera-distance K`)
+
+Frame times with culling, against 0.25 drawing the whole level. Without culling the frame
+costs the same at any distance (triangle setup bound, measured from 12.6 to 16.5 ms at
+61M), so 0.25's column is one number per level.
+
+| Level, camera | 0.25 (whole level) | Culled | Drawn |
+| --- | --- | --- | --- |
+| 15.4M vertices, close up (0.35×) | 3.9 ms | 1.1 ms | – |
+| 15.4M vertices, framed (1×) | 3.9 ms | 2.2 ms | – |
+| 15.4M vertices, far (4×) | 3.9 ms | 2.8 ms | – |
+| 61.4M vertices, close up (0.35×) | 15.3 ms | 1.4 ms | 25 of 16 384 chunks |
+| 61.4M vertices, framed (1×) | 15.2 ms | 8.0 ms | 36% of the triangles |
+| 61.4M vertices, far (4×) | 15.2 ms | 10.4 ms | 47% of the triangles |
+
+From far away more chunks are drawn (small chunks on screen turn less, so fewer are wholly
+back-facing) and every drawn triangle is far under a pixel: the point splats planned next
+are for that case.
 
 ### SubTools (400-segment sphere, `--bench 400 --divide N` and `--selftest-subtools`)
 

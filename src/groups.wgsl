@@ -73,12 +73,12 @@ fn fs_groups_bool(in: VsOut, @builtin(primitive_index) prim: u32, @builtin(front
     }
     var v = in;
     v.normal = in.normal * side;
-    return group_surface(v, prim);
+    return group_surface(v, prim + in.prim_base);
 }
 
 @fragment
 fn fs_groups(in: VsOut, @builtin(primitive_index) prim: u32) -> @location(0) vec4<f32> {
-    return group_surface(in, prim);
+    return group_surface(in, prim + in.prim_base);
 }
 
 // Polygroup colour and the polyframe, shaded.

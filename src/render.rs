@@ -80,6 +80,54 @@ struct AffineParams {
     _pad: [u32; 3],
 }
 
+/// Uniform of the chunk bounds pass (see `bounds.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BoundsParams {
+    listed: u32,
+    all: u32,
+    _pad: [u32; 2],
+}
+
+/// Per-chunk bounds as `bounds.wgsl` writes them: box min (w: cone cutoff), box max, cone
+/// axis.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChunkBounds {
+    min: [f32; 4],
+    max: [f32; 4],
+    axis: [f32; 4],
+}
+
+impl ChunkBounds {
+    /// A box no test culls, until the bounds pass has run.
+    const ANYWHERE: Self = Self { min: [-3.0e38, -3.0e38, -3.0e38, 1.0], max: [3.0e38, 3.0e38, 3.0e38, 0.0], axis: [0.0, 0.0, 1.0, 0.0] };
+}
+
+/// Uniform of the cull pass (see `cull.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CullParams {
+    planes: [[f32; 4]; 6],
+    eye: [f32; 4],
+    forward: [f32; 4],
+    chunk_count: u32,
+    cone: u32,
+    frustum: u32,
+    first_instance: u32,
+    _pad: [u32; 4],
+}
+
+/// What the cull pass counted in the last frame it ran: chunks and triangles drawn of the
+/// shown level's chunks and triangles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CullCounts {
+    pub chunks: u32,
+    pub chunk_total: u32,
+    pub triangles: u32,
+    pub triangle_total: u32,
+}
+
 /// A grab stroke running on the GPU.
 struct GpuGrab {
     bind_group: wgpu::BindGroup,
@@ -126,6 +174,24 @@ struct MeshBuffers {
     groups: Option<GroupBuffers>,
     /// What the buffers have room for (see [`Gfx::swap_tail`]).
     room: Room,
+    /// GPU culling: each chunk's bounds (`ChunkBounds`), its first triangle and triangle
+    /// count in the drawn index buffer, the indexed draws the cull pass writes and their
+    /// counts (`cull.wgsl`).
+    #[allow(dead_code)] // bound in the bounds and cull bind groups
+    bounds: wgpu::Buffer,
+    ranges: wgpu::Buffer,
+    draws: wgpu::Buffer,
+    draw_counts: wgpu::Buffer,
+    /// The chunks whose bounds the next bounds pass refits (`bounds_listed` of
+    /// `bounds_work`), or all of them.
+    bounds_work: wgpu::Buffer,
+    bounds_params: wgpu::Buffer,
+    bounds_bind_group: wgpu::BindGroup,
+    cull_bind_group: wgpu::BindGroup,
+    bounds_listed: u32,
+    bounds_all: bool,
+    /// Triangles of the drawn index buffer (all, or the visible ones).
+    drawn_triangles: u32,
     // Kept alive for the bind group.
     _tables: [wgpu::Buffer; 4],
 }
@@ -264,7 +330,28 @@ pub struct Gfx {
     pub snapshot_image: Option<(u32, u32, Vec<u8>)>,
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    /// Parked subtools' stand-ins (`vs_main`), plain and for Live Boolean.
     pipeline: wgpu::RenderPipeline,
+    /// The active subtool (`vs_active`, drawn per chunk when culling), plain and for Live
+    /// Boolean.
+    active_pipeline: wgpu::RenderPipeline,
+    active_bool_pipeline: wgpu::RenderPipeline,
+    /// GPU chunk culling (`bounds.wgsl`, `cull.wgsl`). `culling` turns it on and off
+    /// (`--render triangles`); `cull_first_instance` when an indirect draw may start at
+    /// another instance (PolyF needs it under culling). Every chunk keeps its draw slot
+    /// (culled ones draw nothing), so chunks are drawn in index order, exactly as one
+    /// draw of the whole level: no depth ties resolve differently from frame to frame.
+    /// Packing the visible draws with a count was measured no faster.
+    pub culling: bool,
+    cull_supported: bool,
+    cull_first_instance: bool,
+    bounds_pipeline: wgpu::ComputePipeline,
+    bounds_bgl: wgpu::BindGroupLayout,
+    cull_pipeline: wgpu::ComputePipeline,
+    cull_bgl: wgpu::BindGroupLayout,
+    cull_params: wgpu::Buffer,
+    /// Whether the last frame drew the active subtool through the cull pass.
+    pub culled_last_frame: bool,
     /// Polygroup colours (PolyF), plain and for Live Boolean; `None` when the GPU has no
     /// primitive index.
     group_pipeline: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
@@ -343,11 +430,13 @@ impl Gfx {
         let primitive_index = adapter.features().contains(wgpu::Features::PRIMITIVE_INDEX);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("klay"),
-            required_features: if primitive_index {
+            // PRIMITIVE_INDEX: the polygroup pass; INDIRECT_FIRST_INSTANCE lets it work under
+            // GPU culling.
+            required_features: (if primitive_index {
                 wgpu::Features::PRIMITIVE_INDEX
             } else {
                 wgpu::Features::empty()
-            },
+            }) | (adapter.features() & wgpu::Features::INDIRECT_FIRST_INSTANCE),
             required_limits: adapter.limits(),
             ..Default::default()
         }))
@@ -571,13 +660,13 @@ impl Gfx {
 
         // The mesh pipelines: plain, or for Live Boolean with both faces drawn and a
         // fragment entry that keeps only the result's surface.
-        let mesh_pipeline = |module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, label: &str, fs: &str, cull: Option<wgpu::Face>| {
+        let mesh_pipeline = |module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, label: &str, vs: &str, fs: &str, cull: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(vs),
                     compilation_options: Default::default(),
                     buffers: &[
                         Some(wgpu::VertexBufferLayout {
@@ -628,8 +717,10 @@ impl Gfx {
                 cache: None,
             })
         };
-        let pipeline = mesh_pipeline(&shader, &mesh_layout, "mesh pipeline", "fs_main", Some(wgpu::Face::Back));
-        let bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "live boolean pipeline", "fs_bool", None);
+        let pipeline = mesh_pipeline(&shader, &mesh_layout, "mesh pipeline", "vs_main", "fs_main", Some(wgpu::Face::Back));
+        let bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "live boolean pipeline", "vs_main", "fs_bool", None);
+        let active_pipeline = mesh_pipeline(&shader, &mesh_layout, "active mesh pipeline", "vs_active", "fs_main", Some(wgpu::Face::Back));
+        let active_bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "active live boolean pipeline", "vs_active", "fs_bool", None);
 
         // PolyF: the polygroup of each drawn triangle, the drawn index buffer and the
         // positions, so the fragment shader can find its triangle's edges.
@@ -666,8 +757,8 @@ impl Gfx {
                 immediate_size: 0,
             });
             (
-                mesh_pipeline(&module, &layout, "polygroup pipeline", "fs_groups", Some(wgpu::Face::Back)),
-                mesh_pipeline(&module, &layout, "polygroup live boolean pipeline", "fs_groups_bool", None),
+                mesh_pipeline(&module, &layout, "polygroup pipeline", "vs_active", "fs_groups", Some(wgpu::Face::Back)),
+                mesh_pipeline(&module, &layout, "polygroup live boolean pipeline", "vs_active", "fs_groups_bool", None),
             )
         });
 
@@ -806,6 +897,56 @@ impl Gfx {
         let normal_own = normal_pass("normals own", "cs_own");
         let normal_border = normal_pass("normals border", "cs_border");
         let normal_normalize = normal_pass("normals normalize", "cs_normalize");
+        // --- GPU chunk culling ------------------------------------------------------------
+        let compute_uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let compute_pipeline = |label: &str, source: &str, entry: &str, bgl: &wgpu::BindGroupLayout| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let bounds_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bounds bgl"),
+            entries: &[storage(0, true), storage(1, true), storage(2, true), storage(3, true), storage(4, false), compute_uniform(5)],
+        });
+        let bounds_pipeline = compute_pipeline("chunk bounds", include_str!("bounds.wgsl"), "cs_bounds", &bounds_bgl);
+        let cull_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cull bgl"),
+            entries: &[storage(0, true), storage(1, true), storage(2, false), storage(3, false), compute_uniform(4)],
+        });
+        let cull_pipeline = compute_pipeline("chunk cull", include_str!("cull.wgsl"), "cs_cull", &cull_bgl);
+        let cull_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cull params"),
+            size: std::mem::size_of::<CullParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let features = device.features();
+        let cull_supported = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        let cull_first_instance = features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+        log::info!("gpu culling: {cull_supported} (first instance {cull_first_instance})");
         // --- Grab compute pipeline ------------------------------------------------------
         let grab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grab"),
@@ -913,6 +1054,17 @@ impl Gfx {
             config,
             depth_view,
             pipeline,
+            active_pipeline,
+            active_bool_pipeline,
+            culling: true,
+            cull_supported,
+            cull_first_instance,
+            bounds_pipeline,
+            bounds_bgl,
+            cull_pipeline,
+            cull_bgl,
+            cull_params,
+            culled_last_frame: false,
             group_pipeline,
             group_bgl,
             bool_pipeline,
@@ -1295,6 +1447,22 @@ impl Gfx {
         self.read_buffer(&b.mask)
     }
 
+    /// What the last culled frame drew of the shown level (self-tests, `--frames`). `None`
+    /// when culling did not run.
+    pub fn read_cull_counts(&self) -> Option<CullCounts> {
+        if !self.culled_last_frame {
+            return None;
+        }
+        let b = self.active_buffers()?;
+        let counts: Vec<u32> = self.read_buffer(&b.draw_counts)?;
+        Some(CullCounts {
+            chunks: counts[0],
+            chunk_total: b.dirty_flags.len() as u32,
+            triangles: counts[1],
+            triangle_total: b.drawn_triangles,
+        })
+    }
+
     /// Read premultiplied vertex paint for native pipeline verification.
     pub fn read_colors(&self) -> Option<Vec<[u8; 4]>> {
         self.read_buffer(&self.active_buffers()?.colors)
@@ -1517,6 +1685,17 @@ impl Gfx {
             std::mem::size_of::<NormalParams>(),
             U::UNIFORM | U::COPY_DST,
         );
+        let bounds = self.upload_in(
+            "chunk bounds",
+            bytemuck::cast_slice(&vec![ChunkBounds::ANYWHERE; chunk_count]),
+            room.chunks * std::mem::size_of::<ChunkBounds>(),
+            U::STORAGE,
+        );
+        let ranges = self.upload_in("chunk draw ranges", bytemuck::cast_slice(&full_ranges(mesh)), room.chunks * 8, U::STORAGE);
+        let draws = plain("chunk draws", room.chunks * 20, U::STORAGE | U::INDIRECT);
+        let draw_counts = plain("chunk draw counts", 16, U::STORAGE | U::COPY_DST | U::COPY_SRC);
+        let bounds_work = plain("bounds work list", room.chunks * 4, U::STORAGE | U::COPY_DST);
+        let bounds_params = plain("bounds params", std::mem::size_of::<BoundsParams>(), U::UNIFORM | U::COPY_DST);
         // Padded to whole words; zero (nothing masked) unless the mesh has a mask.
         let mask = if mesh.mask.is_empty() {
             plain("mask", room.verts.div_ceil(4) * 4, U::STORAGE | U::COPY_DST | U::COPY_SRC)
@@ -1538,6 +1717,10 @@ impl Gfx {
             &acc,
             &chunk_flag,
             &work,
+            &bounds,
+            &ranges,
+            &draws,
+            &bounds_work,
         ]
         .iter()
         .map(|b| b.size())
@@ -1557,6 +1740,7 @@ impl Gfx {
                 chunk_flag,
                 work,
                 normal_params,
+                (bounds, ranges, draws, draw_counts, bounds_work, bounds_params),
             ));
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             return None;
@@ -1615,6 +1799,16 @@ impl Gfx {
                 resource: mask.as_entire_binding(),
             }],
         });
+        let bounds_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bounds bg"),
+            layout: &self.bounds_bgl,
+            entries: &entries(&[&positions, &indices, &chunk_tris, &bounds_work, &bounds, &bounds_params]),
+        });
+        let cull_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cull bg"),
+            layout: &self.cull_bgl,
+            entries: &entries(&[&bounds, &ranges, &draws, &draw_counts, &self.cull_params]),
+        });
         Some(MeshBuffers {
             mask,
             mask_bind_group,
@@ -1636,6 +1830,17 @@ impl Gfx {
             vis_version: None,
             groups: None,
             room,
+            bounds,
+            ranges,
+            draws,
+            draw_counts,
+            bounds_work,
+            bounds_params,
+            bounds_bind_group,
+            cull_bind_group,
+            bounds_listed: 0,
+            bounds_all: true,
+            drawn_triangles: mesh.triangle_count() as u32,
             _tables: [chunk_verts, chunk_tris, chunk_border, acc],
         })
     }
@@ -1694,6 +1899,11 @@ impl Gfx {
         }
         b.index_count = (3 * t) as u32;
         b.dirty_flags.resize(c, 0);
+        // Every chunk's draw range again (the visible ones are rebuilt with the draw
+        // buffer), and a refit of every box: chunks changed their triangles.
+        q.write_buffer(&b.ranges, 0, bytemuck::cast_slice(&full_ranges(mesh)));
+        b.drawn_triangles = t as u32;
+        b.bounds_all = true;
         if rescale {
             b.normal_scale = normal_scale(mesh);
         }
@@ -1742,6 +1952,10 @@ impl Gfx {
             let m = self.levels[self.active].as_mut().unwrap();
             m.bytes -= m.draw.as_ref().map_or(0, |(b, _)| b.size());
             m.bytes += draw.as_ref().map_or(0, |(b, _)| b.size());
+            // Each chunk's place in the index buffer drawn from now on.
+            let ranges = if draw.is_some() { visible_ranges(mesh) } else { full_ranges(mesh) };
+            self.queue.write_buffer(&m.ranges, 0, bytemuck::cast_slice(&ranges));
+            m.drawn_triangles = draw.as_ref().map_or(mesh.triangle_count() as u32, |(_, n)| n / 3);
             m.draw = draw;
             m.vis_version = Some(mesh.vis_version);
         }
@@ -1909,6 +2123,8 @@ impl Gfx {
         let mut count = 0;
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut normal_chunks = 0;
+        // Chunks whose boxes need a refit: moved or re-shaded ones.
+        let mut moved: Vec<u32> = Vec::new();
         for (i, ch) in mesh.chunks.iter_mut().enumerate() {
             if std::mem::take(&mut ch.dirty_color) {
                 let (a,b)=ch.range();
@@ -1925,6 +2141,7 @@ impl Gfx {
                 continue;
             }
             ch.dirty_pos = false;
+            moved.push(i as u32);
             count += 1;
             let (s, e) = ch.range();
             match runs.last_mut() {
@@ -2045,6 +2262,31 @@ impl Gfx {
                 }),
             );
         }
+        // Bounds: the moved chunks and those whose normals change, plus their edge
+        // neighbours, whose triangles reach their vertices.
+        if !buffers.bounds_all && (normal_chunks > 0 || !moved.is_empty()) {
+            let mut listed = buffers.dirty_flags.clone();
+            for &c in &moved {
+                listed[c as usize] = 1;
+            }
+            let mut work: Vec<u32> = (0..listed.len() as u32).filter(|&c| listed[c as usize] != 0).collect();
+            let direct = work.len();
+            for k in 0..direct {
+                for &nb in &mesh.chunks[work[k] as usize].neighbors {
+                    if listed[nb as usize] == 0 {
+                        listed[nb as usize] = 1;
+                        work.push(nb);
+                    }
+                }
+            }
+            // A list still waiting for its pass (two uploads before a frame): refit all.
+            if work.len() * 2 > listed.len() || buffers.bounds_listed > 0 {
+                buffers.bounds_all = true;
+            } else if !work.is_empty() {
+                self.queue.write_buffer(&buffers.bounds_work, 0, bytemuck::cast_slice(&work));
+                buffers.bounds_listed = work.len() as u32;
+            }
+        }
         self.needs_normals = normal_chunks > 0;
         self.last_normal_chunks = normal_chunks;
         self.last_upload_bytes = bytes;
@@ -2119,6 +2361,10 @@ impl Gfx {
                 let groups = count.div_ceil(256);
                 pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
             }
+            // Every box moved with the vertices.
+            if let Some(b) = self.levels.get_mut(level).and_then(Option::as_mut) {
+                b.bounds_all = true;
+            }
         }
 
         // GPU grab: move the selected vertices.
@@ -2157,6 +2403,51 @@ impl Gfx {
                 pass.dispatch_workgroups(chunks.min(65535), chunks.div_ceil(65535), 1);
             }
         }
+
+        // GPU culling: refit the boxes of chunks that moved, then write one draw per chunk
+        // that can be seen. Off while a Transpose preview moves vertices in the vertex
+        // shader, and for PolyF when draws cannot carry their first triangle.
+        let previewing = uniforms.xf_center[3] > 0.5;
+        let groups_on = polyframe && self.group_pipeline.is_some() && self.active_buffers().is_some_and(|m| m.groups.is_some());
+        let cull_on = self.culling
+            && self.cull_supported
+            && !previewing
+            && !(groups_on && !self.cull_first_instance)
+            && self.active_buffers().is_some();
+        if let Some(m) = self.levels.get_mut(self.active).and_then(Option::as_mut) {
+            let chunks = m.dirty_flags.len() as u32;
+            let jobs = if m.bounds_all { chunks } else { m.bounds_listed };
+            if jobs > 0 {
+                self.queue.write_buffer(
+                    &m.bounds_params,
+                    0,
+                    bytemuck::bytes_of(&BoundsParams { listed: m.bounds_listed, all: m.bounds_all as u32, _pad: [0; 2] }),
+                );
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("chunk bounds"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.bounds_pipeline);
+                pass.set_bind_group(0, &m.bounds_bind_group, &[]);
+                pass.dispatch_workgroups(jobs.min(65535), jobs.div_ceil(65535), 1);
+                m.bounds_all = false;
+                m.bounds_listed = 0;
+            }
+            if cull_on {
+                let params = cull_params(uniforms, chunks, self.bool_count == 0, self.cull_first_instance);
+                self.queue.write_buffer(&self.cull_params, 0, bytemuck::bytes_of(&params));
+                encoder.clear_buffer(&m.draw_counts, 0, None);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("chunk cull"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cull_pipeline);
+                pass.set_bind_group(0, &m.cull_bind_group, &[]);
+                let groups = chunks.div_ceil(64);
+                pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+            }
+        }
+        self.culled_last_frame = cull_on;
 
         // Mesh pass.
         {
@@ -2210,7 +2501,7 @@ impl Gfx {
                         pass.set_pipeline(if boolean { bool_pipeline } else { pipeline });
                         pass.set_bind_group(2, &g.bind_group, &[]);
                     }
-                    _ => pass.set_pipeline(plain),
+                    _ => pass.set_pipeline(if boolean { &self.active_bool_pipeline } else { &self.active_pipeline }),
                 }
                 let (indices, count) = m.drawn();
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -2219,7 +2510,12 @@ impl Gfx {
                 pass.set_vertex_buffer(1, m.normals.slice(..));
                 pass.set_vertex_buffer(2, m.colors.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..count, 0, 0..1);
+                let chunks = m.dirty_flags.len() as u32;
+                if cull_on {
+                    pass.multi_draw_indexed_indirect(&m.draws, 0, chunks);
+                } else {
+                    pass.draw_indexed(0..count, 0, 0..1);
+                }
             }
             pass.set_pipeline(plain);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -2306,6 +2602,65 @@ impl MeshBuffers {
             Some((b, n)) => (b, *n),
             None => (&self.indices, self.index_count),
         }
+    }
+}
+
+/// Bind group entries binding `buffers` whole, at bindings 0, 1, 2, ...
+fn entries<'a>(buffers: &[&'a wgpu::Buffer]) -> Vec<wgpu::BindGroupEntry<'a>> {
+    buffers
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
+        .collect()
+}
+
+/// Each chunk's first triangle and triangle count in the full index buffer.
+fn full_ranges(mesh: &SculptMesh) -> Vec<[u32; 2]> {
+    mesh.chunks.iter().map(|ch| [ch.tri_start, ch.tri_end - ch.tri_start]).collect()
+}
+
+/// Each chunk's first triangle and triangle count in the visible-triangle index buffer
+/// (`SculptMesh::visible_indices`, which keeps the full buffer's order).
+fn visible_ranges(mesh: &SculptMesh) -> Vec<[u32; 2]> {
+    let counts: Vec<u32> = mesh
+        .chunks
+        .par_iter()
+        .map(|ch| ch.tris().filter(|&t| mesh.visible(t)).count() as u32)
+        .collect();
+    let mut order: Vec<usize> = (0..mesh.chunks.len()).collect();
+    order.sort_by_key(|&c| mesh.chunks[c].tri_start);
+    let mut ranges = vec![[0u32; 2]; mesh.chunks.len()];
+    let mut first = 0;
+    for c in order {
+        ranges[c] = [first, counts[c]];
+        first += counts[c];
+    }
+    ranges
+}
+
+/// The cull pass's uniform for this frame: the frustum narrowed to the document frame,
+/// the camera for the back-face test (`cone`: off for Live Boolean, which draws back
+/// faces), and whether draws carry their first triangle as their first instance.
+fn cull_params(u: &Uniforms, chunks: u32, cone: bool, first_instance: bool) -> CullParams {
+    let m = glam::Mat4::from_cols_array_2d(&u.view_proj);
+    let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
+    // The document frame inside the viewport, as a fraction of the clip range.
+    let [_, _, w, h] = u.viewport;
+    let inset = u.back_shape[2].max(0.0);
+    let lx = (1.0 - 2.0 * inset / w.max(1.0)).max(0.0);
+    let ly = (1.0 - 2.0 * inset / h.max(1.0)).max(0.0);
+    let planes = [r3 * lx + r0, r3 * lx - r0, r3 * ly + r1, r3 * ly - r1, r2, r3 - r2];
+    // An orthographic projection leaves clip w constant.
+    let ortho = r3.truncate().length() < 1e-6;
+    CullParams {
+        planes: planes.map(|p| p.to_array()),
+        eye: [u.cam_pos[0], u.cam_pos[1], u.cam_pos[2], ortho as u32 as f32],
+        forward: r2.truncate().normalize_or_zero().extend(0.0).to_array(),
+        chunk_count: chunks,
+        cone: cone as u32,
+        frustum: 1,
+        first_instance: first_instance as u32,
+        _pad: [0; 4],
     }
 }
 

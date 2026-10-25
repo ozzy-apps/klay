@@ -122,21 +122,19 @@ struct VsOut {
     @location(2) @interpolate(flat) parked: u32,
     @location(3) mask: f32,
     @location(4) color: vec4<f32>,
+    // The drawn index buffer's first triangle of this draw (vs_active, culled draws), so
+    // the polygroup pass can find its triangle from the primitive index.
+    @location(5) @interpolate(flat) prim_base: u32,
 };
 
-@vertex
-fn vs_main(
-    @location(0) pos: vec3<f32>,
-    @location(1) nrm: vec4<f32>,
-    @location(2) color: vec4<f32>,
-    @builtin(instance_index) instance: u32,
-    @builtin(vertex_index) vertex: u32,
-) -> VsOut {
+// A vertex as drawn: the active subtool's moved by the live Transpose preview as far as its
+// mask lets it.
+fn vertex_out(pos: vec3<f32>, nrm: vec4<f32>, color: vec4<f32>, vertex: u32, is_active: bool) -> VsOut {
     var out: VsOut;
     var p = pos;
     var n = nrm.xyz;
     out.mask = 0.0;
-    if (instance == 0u) {
+    if (is_active) {
         // xf_center.w: a Transpose preview is on; display.w: the subtool has a mask.
         let previewing = u.xf_center.w > 0.5;
         var m = 0.0;
@@ -154,8 +152,39 @@ fn vs_main(
     out.clip = u.view_proj * vec4<f32>(p, 1.0);
     out.world_pos = p;
     out.normal = n;
-    out.parked = instance;
     out.color = color;
+    out.parked = 0u;
+    out.prim_base = 0u;
+    return out;
+}
+
+// Parked subtools' stand-ins: the instance from 1 on marks them (with Live Boolean,
+// 1 + the operand slot).
+@vertex
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) nrm: vec4<f32>,
+    @location(2) color: vec4<f32>,
+    @builtin(instance_index) instance: u32,
+    @builtin(vertex_index) vertex: u32,
+) -> VsOut {
+    var out = vertex_out(pos, nrm, color, vertex, instance == 0u);
+    out.parked = instance;
+    return out;
+}
+
+// The active subtool, drawn in one draw per visible chunk: the instance is the draw's
+// first triangle (0 when drawn whole).
+@vertex
+fn vs_active(
+    @location(0) pos: vec3<f32>,
+    @location(1) nrm: vec4<f32>,
+    @location(2) color: vec4<f32>,
+    @builtin(instance_index) instance: u32,
+    @builtin(vertex_index) vertex: u32,
+) -> VsOut {
+    var out = vertex_out(pos, nrm, color, vertex, true);
+    out.prim_base = instance;
     return out;
 }
 

@@ -484,6 +484,8 @@ struct App {
     selftest_boolean: Option<native_tests::BooleanTest>,
     /// `--selftest-document`: Back / Border on the GPU, the empty border, Snapshot.
     selftest_document: Option<native_tests::DocumentTest>,
+    /// `--selftest-cull`: culled and whole frames compared after camera moves and edits.
+    selftest_cull: Option<native_tests::CullTest>,
     /// `--snapshot FILE`: frames left, then the canvas is saved to FILE and the app quits.
     snapshot_to: Option<(String, u32)>,
     /// `--snapshot-ui`: the snapshot is the whole window, interface included.
@@ -615,6 +617,11 @@ struct App {
     selftest_wedge: Option<(u8, u32)>,
     /// SubTool list operation from the interface, run outside the egui pass.
     pending_subtool: Option<SubToolOp>,
+    /// `--render triangles`: draw the active subtool whole, without GPU culling (A/B checks).
+    render_triangles: bool,
+    /// `--camera-distance K`: the camera distance times K once the model is framed
+    /// (`--frames`, `--snapshot`).
+    camera_distance: Option<f32>,
     /// Frames left in `--frames` mode (plain frame timing at the active level) and the
     /// accumulated frame time.
     measure: Option<(u32, f32)>,
@@ -691,6 +698,7 @@ impl App {
             selftest_materials: None,
             selftest_boolean: None,
             selftest_document: None,
+            selftest_cull: None,
             selftest_symmetry: None,
             snapshot_to: None,
             snapshot_ui: false,
@@ -772,6 +780,8 @@ impl App {
             selftest_wedge: None,
             pending_subtool: None,
             measure: None,
+            render_triangles: false,
+            camera_distance: None,
             quit: false,
             build_ms,
             last_frame: Instant::now(),
@@ -2043,6 +2053,10 @@ impl App {
 
     /// Write a drawn snapshot as `<project> snapshot N.png` next to the project file.
     fn save_snapshot(&mut self) {
+        // `--selftest-cull` reads its snapshots itself.
+        if self.selftest_cull.is_some() {
+            return;
+        }
         let Some((w, h, rgba)) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
             return;
         };
@@ -7167,6 +7181,10 @@ impl App {
             if self.selftest_document_frame(&mut t) { self.quit = true; }
             else { self.selftest_document = Some(t); }
         }
+        if let Some(mut t) = self.selftest_cull.take() {
+            if self.selftest_cull_frame(&mut t) { self.quit = true; }
+            else { self.selftest_cull = Some(t); }
+        }
         if let Some(mut t) = self.selftest_boolean.take() {
             if self.selftest_boolean_frame(&mut t) { self.quit = !self.selftest_hold; }
             else { self.selftest_boolean = Some(t); }
@@ -7215,8 +7233,18 @@ impl App {
             // Skip the first frames: they include the upload and the first normal pass.
             let acc = if left <= TOTAL { acc + dt * 1000.0 } else { acc };
             if left == 0 {
+                let culled = match self.gfx.as_ref().and_then(Gfx::read_cull_counts) {
+                    Some(c) => format!(
+                        ", culling drew {} of {} chunks ({} of {} triangles)",
+                        c.chunks,
+                        c.chunk_total,
+                        fmt_count(c.triangles as usize),
+                        fmt_count(c.triangle_total as usize)
+                    ),
+                    None => ", no culling".to_string(),
+                };
                 log::info!(
-                    "frames: avg {:.2} ms over {TOTAL} frames at level {} ({} vertices), last upload {:.2} ms, submit {:.2} ms",
+                    "frames: avg {:.2} ms over {TOTAL} frames at level {} ({} vertices), last upload {:.2} ms, submit {:.2} ms{culled}",
                     acc / TOTAL as f32,
                     self.doc.active(),
                     fmt_count(self.mesh().vertex_count()),
@@ -7360,6 +7388,7 @@ impl ApplicationHandler for App {
         self.egui_state = Some(state);
         let mut gfx = gfx;
         gfx.snapshot_ui = self.snapshot_ui;
+        gfx.culling = !self.render_triangles;
         self.gfx = Some(gfx);
         match tablet::Tablet::for_window(&window) {
             Ok(t) => {
@@ -7407,6 +7436,9 @@ impl ApplicationHandler for App {
         }
         if self.subtools.len() > 1 {
             self.frame_camera();
+        }
+        if let Some(k) = self.camera_distance {
+            self.camera.distance *= k;
         }
     }
 
@@ -7988,6 +8020,9 @@ fn main() {
         // Snapshots go next to the project: keep them out of the working directory.
         app.project_path = std::env::temp_dir().join(format!("klay-document-{}.klay", std::process::id())).to_string_lossy().into_owned();
     }
+    if args.iter().any(|a| a == "--selftest-cull") {
+        app.selftest_cull = Some(native_tests::CullTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-boolean") {
         app.selftest_boolean = Some(native_tests::BooleanTest::default());
     }
@@ -8055,6 +8090,8 @@ fn main() {
         // `--snapshot-ui`: the whole window with the interface (for UI reviews).
         app.snapshot_ui = args.iter().any(|a| a == "--snapshot-ui");
     }
+    app.render_triangles = flag("--render").is_some_and(|r| r == "triangles");
+    app.camera_distance = flag("--camera-distance").and_then(|s| s.parse().ok());
     // `--customize`: start in Customize shelves mode (for snapshots of it).
     app.workspace.customize = args.iter().any(|a| a == "--customize");
     // `--fake-update X`: show the update prompt for a release X (snapshots, no network).
