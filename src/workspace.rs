@@ -3908,15 +3908,7 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         zslider(ui, "Spacing", &mut ws.spacing, 0.03..=1.0, false, false, 2);
-                        // How each dab's alpha and texture are turned (ZBrush: Roll, spray strokes).
-                        ui.label(RichText::new("Alpha rotation").size(12.0).color(FG2()));
-                        let turns = crate::sculpt::AlphaTurn::ALL;
-                        let names: Vec<&str> = turns.iter().map(|t| t.name()).collect();
-                        let at = turns.iter().position(|t| *t == ws.assets.turn).unwrap_or(0);
-                        if let Some(i) = seg(ui, &names, at, false) {
-                            ws.assets.turn = turns[i];
-                        }
-                        zslider(ui, "Angle", &mut ws.assets.angle, -180.0..=180.0, false, false, 0);
+                        // Alpha rotation sits above the alphas (Alpha palette and shelf popup).
                         ui.checkbox(&mut ws.lazy_mouse, "LazyMouse")
                             .on_hover_text("The brush trails the cursor on a string, for steady lines · L");
                         ui.add_enabled_ui(ws.lazy_mouse, |ui| {

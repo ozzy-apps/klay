@@ -387,22 +387,23 @@ impl Workspace {
             .id()
     }
 
-    /// The controls above the alpha or texture grid: how the stamp turns (alpha), or
-    /// Relief, Tiling and the texture's own turn (texture).
+    /// The controls above the alpha or texture grid: Alpha rotation (how each dab's stamp
+    /// turns), or Relief, Tiling and the texture's own turn.
     pub(super) fn asset_controls(&mut self, ui: &mut Ui, texture: bool) {
         if texture {
             zslider(ui, "Relief", &mut self.assets.texture_strength, 0.0..=1.0, false, false, 2);
             zslider(ui, "Tiling", &mut self.assets.texture_scale, 0.25..=16.0, true, false, 2);
             zslider(ui, "Rotate", &mut self.assets.texture_angle, -180.0..=180.0, false, false, 0);
         } else {
-            // The same setting as Stroke › Modifiers › Alpha rotation.
+            // How each dab's alpha and texture are turned (ZBrush: Roll, spray strokes).
+            ui.label(RichText::new("Alpha rotation").size(12.0).color(FG2()));
             let turns = crate::sculpt::AlphaTurn::ALL;
             let names: Vec<&str> = turns.iter().map(|t| t.name()).collect();
             let at = turns.iter().position(|t| *t == self.assets.turn).unwrap_or(0);
             if let Some(i) = seg(ui, &names, at, false) {
                 self.assets.turn = turns[i];
             }
-            zslider(ui, "Rotate", &mut self.assets.angle, -180.0..=180.0, false, false, 0);
+            zslider(ui, "Angle", &mut self.assets.angle, -180.0..=180.0, false, false, 0);
         }
         ui.add_space(2.0);
     }

@@ -258,7 +258,7 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 
 ### Alphas in 0.14
 
-- **Stroke › Modifiers › Alpha rotation**: **Fixed** (at **Angle**), **Follow** (the alpha
+- **Alpha rotation**, above the alphas (Alpha palette and the shelf's Alpha popup): **Fixed** (at **Angle**), **Follow** (the alpha
   rolls with the stroke direction, ZBrush's Roll) or **Random** (a new turn every dab, as
   ZBrush's spray-style texture painting does), for sculpting, painting and the mask pen.
 - Nine new detail alphas, painted by Klay as tileable 512 px images: **Pores, Wrinkles,
