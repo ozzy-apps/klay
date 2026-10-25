@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.0 — 2026-10-25
+
+- Booleans between subtools: Add / Subtract / Intersect per subtool (Mesh › Boolean, marked in the SubTool list), combining the visible subtools top to bottom.
+- Live Boolean (top shelf, Mesh › Boolean): the viewport draws only the result's surface, carved walls turned inside out, from a 96³ distance volume per subtool; a Transpose or Gizmo drag of the active subtool moves its cut live.
+- Make Boolean Mesh: the result as a new closed subtool, built by Remesh's exact winding-number scan with the boolean rule per grid line and a full dual-contouring fit where subtools meet (sharp edges); polygroups and polypaint kept; the inputs are hidden.
+- Projects: format version 6 saves each subtool's boolean operation (1–5 still open).
+- New --selftest-boolean and --snapshot-frames N.
+- Verification: 245 release tests (new: the fold of operations; made meshes' volumes add up for subtract, intersect and union and stay closed; distance volumes; Make Boolean Mesh through the app; version 6 round trip); every native self-test passes on the GPU, the live view within 27/255 of the made mesh at every probe.
+
 ## 0.16.0 — 2026-10-25
 
 - Sculptris Pro (top shelf, Brush › Sculptris Pro): strokes retessellate the surface under the brush (split long edges, collapse short ones, flip toward valence six, relax along the surface), with triangle size following Draw Size and a Detail slider. Masks, hidden polygons, open borders and polygroup borders are kept; symmetry copies retessellate too; one undo step per stroke; subtools without subdivision levels and layers.

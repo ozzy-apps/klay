@@ -218,7 +218,7 @@ struct Hit {
 
 /// Rasterise every triangle onto the lines of all three axes in one pass over the
 /// triangles, then keep each line's winding changes.
-fn scan(mesh: &SculptMesh, grid: &Grid) -> [Lines; 3] {
+fn scan(mesh: &SculptMesh, grid: &Grid, csg: Option<&Csg>) -> [Lines; 3] {
     let parts: Vec<[Vec<Hit>; 3]> = mesh
         .indices
         .par_chunks(3 * 4096)
@@ -264,15 +264,16 @@ fn scan(mesh: &SculptMesh, grid: &Grid) -> [Lines; 3] {
     })
     .into_iter()
     .enumerate()
-    .map(|(axis, hits)| lines_of(hits, grid.n[(axis + 1) % 3] * grid.n[(axis + 2) % 3]))
+    .map(|(axis, hits)| lines_of(hits, grid.n[(axis + 1) % 3] * grid.n[(axis + 2) % 3], csg))
     .collect::<Vec<_>>()
     .try_into()
     .unwrap_or_else(|_| unreachable!())
 }
 
 /// Per line: the running winding number of its sorted hits, keeping the steps between
-/// zero and non-zero.
-fn lines_of(hits: Vec<Hit>, lines: usize) -> Lines {
+/// zero and non-zero. With `csg` every operand keeps its own winding number and the steps
+/// kept are those of the boolean result.
+fn lines_of(hits: Vec<Hit>, lines: usize, csg: Option<&Csg>) -> Lines {
     // Where each line's hits start, found in parallel by binary search.
     let bounds: Vec<usize> = (0..=lines)
         .into_par_iter()
@@ -283,8 +284,25 @@ fn lines_of(hits: Vec<Hit>, lines: usize) -> Lines {
         .with_min_len(1024)
         .map(|l| {
             let mut out = Vec::new();
+            let line = &hits[bounds[l]..bounds[l + 1]];
+            if let Some(csg) = csg {
+                if line.is_empty() {
+                    return out;
+                }
+                let mut w = vec![0i32; csg.ops.len()];
+                let mut was = false;
+                for h in line {
+                    w[csg.owner[h.tri as usize] as usize] += h.sign;
+                    let now = crate::boolean::fold(csg.ops, |o| w[o] != 0);
+                    if was != now {
+                        out.push((f32::from_bits(h.key as u32), h.tri));
+                        was = now;
+                    }
+                }
+                return out;
+            }
             let mut w = 0i32;
-            for h in &hits[bounds[l]..bounds[l + 1]] {
+            for h in line {
                 let was = w != 0;
                 w += h.sign;
                 if was != (w != 0) {
@@ -593,15 +611,80 @@ impl Field<'_> {
     }
 }
 
+/// A distance volume of a closed mesh, for Live Boolean: `n`³ grid points over its
+/// bounds (cubic voxels of `h`, from `origin`), each the distance to the surface in voxels
+/// along the nearest of the three grid lines through it (exact where a line crosses close
+/// by), negative inside, packed into a byte: 127.5 is the surface, 0 and 255 are
+/// [`VOLUME_RANGE`] voxels in and out. Point `(i, j, k)` is byte `i + n (j + n k)`.
+pub struct Volume {
+    pub origin: Vec3,
+    pub h: f32,
+    pub n: usize,
+    pub data: Vec<u8>,
+}
+
+/// Voxels each side of the surface the bytes of a [`Volume`] cover.
+pub const VOLUME_RANGE: f32 = 3.0;
+
+pub fn distance_volume(mesh: &SculptMesh, n: usize) -> Volume {
+    let b = mesh.bounds();
+    let ext = (b.max - b.min).max_element().max(1e-6);
+    // Three voxels of room each side (and the usual offset off axis-aligned faces).
+    let h = ext / (n as f32 - 7.0);
+    let centre = (b.min + b.max) * 0.5;
+    let origin = centre - Vec3::splat(h * (n as f32 - 1.0) * 0.5) + Vec3::splat(0.371_337 * h * 0.25);
+    let hd = h as f64;
+    let grid = Grid { origin: origin.to_array().map(|v| v as f64), h: hd, inv_h: 1.0 / hd, n: [n; 3] };
+    let [x, y, z] = scan(mesh, &grid, None);
+    let near = |line: &[f32], at: f32| -> f32 {
+        let i = line.partition_point(|&d| d < at);
+        let mut best = f32::INFINITY;
+        if i < line.len() {
+            best = line[i] - at;
+        }
+        if i > 0 {
+            best = best.min(at - line[i - 1]);
+        }
+        best
+    };
+    let mut data = vec![255u8; n * n * n];
+    data.par_chunks_mut(n * n).enumerate().for_each(|(k, slab)| {
+        for j in 0..n {
+            for i in 0..n {
+                let zl = z.line(i + j * n);
+                let inside = zl.partition_point(|&d| d < k as f32) % 2 == 1;
+                let d = near(zl, k as f32).min(near(x.line(j + k * n), i as f32)).min(near(y.line(k + i * n), j as f32)).min(VOLUME_RANGE);
+                let s = if inside { -d } else { d };
+                slab[i + j * n] = (127.5 + s / VOLUME_RANGE * 127.5).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    Volume { origin, h, n, data }
+}
+
+/// Which operand each triangle belongs to and how the operands combine (see
+/// [`crate::boolean`]).
+pub struct Csg<'a> {
+    pub owner: &'a [u8],
+    pub ops: &'a [crate::boolean::BoolOp],
+}
+
 /// Remesh `mesh` (closed) at `s.resolution`, carrying its polygroups over.
 pub fn remesh(mesh: &SculptMesh, s: &Settings) -> Result<Output, String> {
+    remesh_with(mesh, s, None)
+}
+
+/// [`remesh`] with the surface of a boolean of operands instead of their union. Where the
+/// surfaces of different operands meet, vertices are placed by a full dual-contouring fit
+/// so the edge stays sharp.
+pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result<Output, String> {
     let mut stats = Stats::default();
     let grid = Grid::around(mesh, s.voxel())?;
     stats.grid = grid.n.map(|n| n as u32);
 
     // 1. Scans along the three axes.
     let t = Instant::now();
-    let [x, y, z] = scan(mesh, &grid);
+    let [x, y, z] = scan(mesh, &grid, csg);
     stats.crossings = x.depth.len() + y.depth.len() + z.depth.len();
     stats.scan_ms = t.elapsed().as_secs_f32() * 1000.0;
     if z.depth.is_empty() {
@@ -724,6 +807,21 @@ pub fn remesh(mesh: &SculptMesh, s: &Settings) -> Result<Output, String> {
                     let n = nsum[v].normalize_or_zero();
                     if n == Vec3::ZERO {
                         continue;
+                    }
+                    // A crease (booleans): fit every tangent plane in 3D, kept in the cell.
+                    if csg.is_some() {
+                        let planes: Vec<(Vec3, Vec3)> = (0..12)
+                            .filter(|&e| table.patch[cfg as usize][e] as usize == v && hits[e].1 != u32::MAX)
+                            .map(|e| (normals[e], hits[e].0))
+                            .collect();
+                        let spread = planes.iter().map(|(a, _)| a.dot(n)).fold(1.0f32, f32::min);
+                        if spread < 0.9 {
+                            let lo = grid.world([i as f64, j as f64, k as f64]);
+                            if let Some(x) = qef(&planes, pos[v], lo, lo + Vec3::splat(h)) {
+                                pos[v] = x;
+                                continue;
+                            }
+                        }
                     }
                     let (mut num, mut den) = (0.0f32, 0.0f32);
                     for e in 0..12 {
@@ -853,6 +951,26 @@ pub fn remesh(mesh: &SculptMesh, s: &Settings) -> Result<Output, String> {
         groups,
         stats,
     })
+}
+
+/// The point that best fits the planes (normal, point) in the least-squares sense, pulled
+/// a little toward `mean` so a flat or straight set stays put along its free directions,
+/// and kept inside the box `lo..hi`.
+fn qef(planes: &[(Vec3, Vec3)], mean: Vec3, lo: Vec3, hi: Vec3) -> Option<Vec3> {
+    let mut ata = glam::Mat3::ZERO;
+    let mut atb = Vec3::ZERO;
+    for &(n, p) in planes {
+        let d = n.dot(p - mean);
+        ata += glam::Mat3::from_cols(n * n.x, n * n.y, n * n.z);
+        atb += n * d;
+    }
+    let lambda = 0.05 * planes.len() as f32;
+    let m = ata + glam::Mat3::IDENTITY * lambda;
+    if m.determinant().abs() < 1e-9 {
+        return None;
+    }
+    let x = mean + m.inverse() * atb;
+    x.is_finite().then(|| x.clamp(lo, hi))
 }
 
 /// A ring of four vertices listed counter-clockwise seen from the axis's positive side,

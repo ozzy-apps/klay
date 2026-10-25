@@ -130,6 +130,75 @@ struct MeshBuffers {
     _tables: [wgpu::Buffer; 4],
 }
 
+/// Points per axis of a Live Boolean volume, and how many operands it shows.
+pub const BOOL_VOLUME: usize = 96;
+pub const BOOL_MAX: usize = 20;
+
+/// Live Boolean parameters (`shader.wgsl`, `BoolParams`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BoolParams {
+    /// Operand count (0: off), the active subtool's slot (-1: none), points per volume,
+    /// points along the atlas's depth.
+    pub info: [f32; 4],
+    /// World → the active subtool's own space (undoes its live Transpose preview).
+    pub active_inv: [[f32; 4]; 4],
+    /// Per operand: volume origin and operation (0 Add, 1 Subtract, 2 Intersect); one over
+    /// its size.
+    pub boxes: [[f32; 4]; 2 * BOOL_MAX],
+}
+
+/// The operands' volumes, one slab of `BOOL_VOLUME`³ after another along z.
+struct BoolAtlas {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    slabs: usize,
+}
+
+impl BoolAtlas {
+    fn new(device: &wgpu::Device, slabs: usize) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("live boolean volumes"),
+            size: wgpu::Extent3d { width: BOOL_VOLUME as u32, height: BOOL_VOLUME as u32, depth_or_array_layers: (BOOL_VOLUME * slabs) as u32 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view, slabs }
+    }
+}
+
+/// What the uniform bind group holds besides the uniforms and the volumes, kept to build it
+/// again when the volume atlas grows.
+struct SharedBinds {
+    bgl: wgpu::BindGroupLayout,
+    matcap_view: wgpu::TextureView,
+    matcap_sampler: wgpu::Sampler,
+    bool_sampler: wgpu::Sampler,
+    bool_buf: wgpu::Buffer,
+}
+
+impl SharedBinds {
+    fn bind_group(&self, device: &wgpu::Device, uniforms: &wgpu::Buffer, atlas: &wgpu::TextureView) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("uniform bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.matcap_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.matcap_sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(atlas) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.bool_sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: self.bool_buf.as_entire_binding() },
+            ],
+        })
+    }
+}
+
 /// Vertices, triangles and chunks a level's buffers have room for.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Room {
@@ -190,8 +259,16 @@ pub struct Gfx {
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
-    /// Polygroup colours (PolyF); `None` when the GPU has no primitive index.
-    group_pipeline: Option<wgpu::RenderPipeline>,
+    /// Polygroup colours (PolyF), plain and for Live Boolean; `None` when the GPU has no
+    /// primitive index.
+    group_pipeline: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    /// Live Boolean: the mesh pipeline drawing both faces and keeping only the result's
+    /// surface; the volumes; how many operands are live (0: off); each slab's volume key.
+    bool_pipeline: wgpu::RenderPipeline,
+    shared: SharedBinds,
+    bool_atlas: BoolAtlas,
+    bool_count: usize,
+    bool_keys: Vec<u64>,
     group_bgl: wgpu::BindGroupLayout,
     background_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
@@ -379,26 +456,51 @@ impl Gfx {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Live Boolean: the operands' distance volumes, their sampler and params.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniform bg"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&matcap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&matcap_sampler),
-                },
-            ],
+        let bool_atlas = BoolAtlas::new(&device, 1);
+        let bool_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("boolean sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
+        let bool_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boolean params"),
+            size: std::mem::size_of::<BoolParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shared = SharedBinds { bgl, matcap_view, matcap_sampler, bool_sampler, bool_buf };
+        let bind_group = shared.bind_group(&device, &uniform_buf, &bool_atlas.view);
+        let bgl = shared.bgl.clone();
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("uniform layout"),
             bind_group_layouts: &[Some(&bgl)],
@@ -455,61 +557,67 @@ impl Gfx {
             shader_location: 2,
         }];
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 12,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &pos_attr,
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 4,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &nrm_attr,
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 4,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &color_attr,
-                    }),
-                ],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        // The mesh pipelines: plain, or for Live Boolean with both faces drawn and a
+        // fragment entry that keeps only the result's surface.
+        let mesh_pipeline = |module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, label: &str, fs: &str, cull: Option<wgpu::Face>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 12,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &pos_attr,
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 4,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &nrm_attr,
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 4,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &color_attr,
+                        }),
+                    ],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: cull,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = mesh_pipeline(&shader, &mesh_layout, "mesh pipeline", "fs_main", Some(wgpu::Face::Back));
+        let bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "live boolean pipeline", "fs_bool", None);
 
         // PolyF: the polygroup of each drawn triangle, the drawn index buffer and the
         // positions, so the fragment shader can find its triangle's edges.
@@ -545,58 +653,10 @@ impl Gfx {
                 bind_group_layouts: &[Some(&bgl), Some(&mask_bgl), Some(&group_bgl)],
                 immediate_size: 0,
             });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("polygroup pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[
-                        Some(wgpu::VertexBufferLayout {
-                            array_stride: 12,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &pos_attr,
-                        }),
-                        Some(wgpu::VertexBufferLayout {
-                            array_stride: 4,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &nrm_attr,
-                        }),
-                        Some(wgpu::VertexBufferLayout {
-                            array_stride: 4,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &color_attr,
-                        }),
-                    ],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_groups"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+            (
+                mesh_pipeline(&module, &layout, "polygroup pipeline", "fs_groups", Some(wgpu::Face::Back)),
+                mesh_pipeline(&module, &layout, "polygroup live boolean pipeline", "fs_groups_bool", None),
+            )
         });
 
         let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -842,6 +902,11 @@ impl Gfx {
             pipeline,
             group_pipeline,
             group_bgl,
+            bool_pipeline,
+            shared,
+            bool_atlas,
+            bool_count: 0,
+            bool_keys: Vec::new(),
             uniform_buf,
             background_pipeline,
             pick_pipeline,
@@ -932,6 +997,54 @@ impl Gfx {
                 m.groups.as_ref().map_or(0, |g| g.bytes),
             )
         })
+    }
+
+    /// Live Boolean: show the boolean of `operands` (a key that changes with the volume, the
+    /// volume, the operation), top to bottom; `active_slot` is the active subtool's place
+    /// among them and `active_inv` undoes its live Transpose preview.
+    pub fn set_boolean(&mut self, operands: &[(u64, &crate::wedge::Volume, crate::boolean::BoolOp)], active_slot: Option<usize>, active_inv: glam::Mat4) {
+        let n = operands.len().min(BOOL_MAX);
+        if n > self.bool_atlas.slabs {
+            self.bool_atlas = BoolAtlas::new(&self.device, n.max(self.bool_atlas.slabs * 2).min(BOOL_MAX));
+            self.bind_group = self.shared.bind_group(&self.device, &self.uniform_buf, &self.bool_atlas.view);
+            self.bool_keys.clear();
+        }
+        let mut params = <BoolParams as bytemuck::Zeroable>::zeroed();
+        for (k, (key, vol, op)) in operands.iter().take(n).enumerate() {
+            if vol.n != BOOL_VOLUME {
+                continue;
+            }
+            if self.bool_keys.get(k) != Some(key) {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.bool_atlas.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: (k * BOOL_VOLUME) as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &vol.data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(BOOL_VOLUME as u32),
+                        rows_per_image: Some(BOOL_VOLUME as u32),
+                    },
+                    wgpu::Extent3d { width: BOOL_VOLUME as u32, height: BOOL_VOLUME as u32, depth_or_array_layers: BOOL_VOLUME as u32 },
+                );
+            }
+            let (origin, inv) = crate::boolean::volume_box(vol);
+            params.boxes[2 * k] = origin.extend(op.code() as f32).to_array();
+            params.boxes[2 * k + 1] = inv.extend(0.0).to_array();
+        }
+        self.bool_keys = operands.iter().take(n).map(|o| o.0).collect();
+        params.info = [n as f32, active_slot.map_or(-1.0, |s| s as f32), BOOL_VOLUME as f32, (BOOL_VOLUME * self.bool_atlas.slabs) as f32];
+        params.active_inv = active_inv.to_cols_array_2d();
+        self.queue.write_buffer(&self.shared.bool_buf, 0, bytemuck::bytes_of(&params));
+        self.bool_count = n;
+    }
+
+    /// Live Boolean off: everything is drawn as it is.
+    pub fn clear_boolean(&mut self) {
+        self.bool_count = 0;
     }
 
     /// Whether polygroup colours can be shown (the GPU has primitive index support).
@@ -1925,7 +2038,7 @@ impl Gfx {
     pub fn render(
         &mut self,
         uniforms: &Uniforms,
-        parked: &[u64],
+        parked: &[(u64, u32)],
         polyframe: bool,
         paint_jobs: &[egui::ClippedPrimitive],
         mut textures_delta: egui::TexturesDelta,
@@ -2071,13 +2184,15 @@ impl Gfx {
             let (fx, fy) = ((x + inset).round(), (y + inset).round());
             let (fw, fh) = ((width - 2.0 * inset).round().max(1.0), (height - 2.0 * inset).round().max(1.0));
             pass.set_scissor_rect(fx as u32, fy as u32, fw as u32, fh as u32);
+            let boolean = self.bool_count > 0;
+            let plain = if boolean { &self.bool_pipeline } else { &self.pipeline };
             if let Some(m) = self.active_buffers() {
                 match (&self.group_pipeline, &m.groups, polyframe) {
-                    (Some(pipeline), Some(g), true) => {
-                        pass.set_pipeline(pipeline);
+                    (Some((pipeline, bool_pipeline)), Some(g), true) => {
+                        pass.set_pipeline(if boolean { bool_pipeline } else { pipeline });
                         pass.set_bind_group(2, &g.bind_group, &[]);
                     }
-                    _ => pass.set_pipeline(&self.pipeline),
+                    _ => pass.set_pipeline(plain),
                 }
                 let (indices, count) = m.drawn();
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -2088,17 +2203,18 @@ impl Gfx {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..count, 0, 0..1);
             }
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(plain);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &self.no_mask, &[]);
-            for key in parked {
-                if let Some(s) = self.stand_ins.get(key) {
+            for &(key, instance) in parked {
+                if let Some(s) = self.stand_ins.get(&key) {
                     pass.set_vertex_buffer(0, s.positions.slice(..));
                     pass.set_vertex_buffer(1, s.normals.slice(..));
                     pass.set_vertex_buffer(2, s.colors.slice(..));
                     pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    // Instance 1 marks a parked subtool for the shader.
-                    pass.draw_indexed(0..s.index_count, 0, 1..2);
+                    // An instance from 1 on marks a parked subtool for the shader (with Live
+                    // Boolean, 1 + its operand slot).
+                    pass.draw_indexed(0..s.index_count, 0, instance..instance + 1);
                 }
             }
         }

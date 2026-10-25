@@ -12,6 +12,7 @@
 //!              · (version 5 on) sculpt layers (count; name · intensity · visible ·
 //!                offsets of the highest level each) and the Morph Target (0, or 1 · level
 //!                · positions)
+//!              · (version 6 on) boolean operation u8 (0 Add, 1 Subtract, 2 Intersect)
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -33,7 +34,7 @@ pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
 /// 5: layers and Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2:
 /// mask. Versions 1–4 still open.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -44,6 +45,8 @@ pub struct SavedTool {
     /// version 5.
     pub layers: crate::layers::Layers,
     pub morph: Option<(usize, Vec<glam::Vec3>)>,
+    /// How it joins the subtools above it (version 6; Add before).
+    pub boolean: crate::boolean::BoolOp,
 }
 
 /// What a subtool has besides its stack (version 5): layers and a Morph Target.
@@ -51,6 +54,7 @@ pub struct SavedTool {
 pub struct Extras<'a> {
     pub layers: Option<&'a crate::layers::Layers>,
     pub morph: Option<(usize, &'a [glam::Vec3])>,
+    pub boolean: crate::boolean::BoolOp,
 }
 
 pub struct Project {
@@ -224,6 +228,9 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
                 None => out.u8(0)?,
             }
         }
+        if version >= 6 {
+            out.u8(extras.get(k).map_or(0, |e| e.boolean.code()))?;
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -291,12 +298,14 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
                 morph = Some((level, input.vec()?));
             }
         }
+        let boolean = if version >= 6 { crate::boolean::BoolOp::from_code(input.u8()?) } else { Default::default() };
         tools.push(SavedTool {
             name,
             visible,
             packed,
             layers,
             morph,
+            boolean,
         });
     }
     input.exact(END, "end of project marker")?;

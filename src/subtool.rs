@@ -32,6 +32,8 @@ pub struct SubTool {
     pub parked: Option<Box<Parked>>,
     /// Wedge is on (ZBrush: the DynaMesh button): Ctrl + drag on the background re-wedges.
     pub wedge: bool,
+    /// How it joins the visible subtools above it (ZBrush: SubTool › Boolean).
+    pub boolean: crate::boolean::BoolOp,
 }
 
 pub struct Parked {

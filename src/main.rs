@@ -17,6 +17,7 @@ mod gizmo;
 mod insert_mesh;
 mod sculptris;
 mod fx;
+mod boolean;
 mod layers;
 mod obj;
 mod pressure;
@@ -448,6 +449,7 @@ struct App {
     selftest_surface: Option<native_tests::SurfaceTest>,
     /// `--selftest-materials`: every material drawn and read back, then polypaint under a MatCap.
     selftest_materials: Option<native_tests::MaterialTest>,
+    selftest_boolean: Option<native_tests::BooleanTest>,
     /// `--selftest-document`: Back / Border on the GPU, the empty border, Snapshot.
     selftest_document: Option<native_tests::DocumentTest>,
     /// `--snapshot FILE`: frames left, then the canvas is saved to FILE and the app quits.
@@ -527,6 +529,10 @@ struct App {
     sculptris_before: Option<Box<multires::Packed>>,
     sculptris_changed: bool,
     sculptris_at: Vec<Vec3>,
+    /// Live Boolean: each subtool's distance volume and the version it was made from.
+    bool_volumes: std::collections::HashMap<u64, (u64, wedge::Volume)>,
+    /// Live Boolean was refused for too many subtools (told once).
+    bool_refused: bool,
     /// Where Gizmo 3D was put (Alt + click, Alt + drag) or carried by its drags, for the
     /// subtool with this id; otherwise it stands at the subtool's centre, world-aligned.
     gizmo_place: Option<(u64, gizmo::Place)>,
@@ -610,6 +616,7 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             subtools: vec![SubTool {
+            boolean: Default::default(),
                 id: 1,
                 name: format!("{} 1", settings.kind.short()),
                 visible: true,
@@ -630,6 +637,7 @@ impl App {
             selftest_brushes: None,
             selftest_surface: None,
             selftest_materials: None,
+            selftest_boolean: None,
             selftest_document: None,
             selftest_symmetry: None,
             snapshot_to: None,
@@ -678,6 +686,8 @@ impl App {
             sculptris_before: None,
             sculptris_changed: false,
             sculptris_at: Vec::new(),
+            bool_volumes: std::collections::HashMap::new(),
+            bool_refused: false,
             gizmo_place: None,
             mask_press: None,
             mask_stroke: None,
@@ -847,6 +857,7 @@ impl App {
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
         self.subtools.push(SubTool {
+            boolean: Default::default(),
             id,
             name: name.clone(),
             visible: true,
@@ -885,6 +896,7 @@ impl App {
         self.subtools.insert(
             self.active_tool + 1,
             SubTool {
+            boolean: Default::default(),
                 id,
                 name: name.clone(),
                 visible: true,
@@ -988,6 +1000,73 @@ impl App {
             let tool = self.parked_subtool(name, true, Multires::new(mesh, budget));
             self.subtools.insert(self.active_tool + 1 + k, tool);
         }
+    }
+
+    /// SubTool › Boolean › Make Boolean Mesh: the boolean of every visible subtool (shown
+    /// levels, top to bottom) as a new subtool at the end, selected; the subtools it came
+    /// from are hidden and Live Boolean goes off. Not undoable (delete the new subtool).
+    fn make_boolean_mesh(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let mut unpacked: Vec<(usize, Multires)> = Vec::new();
+        for (i, tool) in self.subtools.iter().enumerate() {
+            if i == self.active_tool || !tool.visible {
+                continue;
+            }
+            if let Some(p) = &tool.parked {
+                match p.packed.clone().try_unpack() {
+                    Ok(doc) => unpacked.push((i, doc)),
+                    Err(e) => {
+                        self.workspace.notify(format!("Make Boolean Mesh: {}: {e}", tool.name));
+                        return;
+                    }
+                }
+            }
+        }
+        let mut parts: Vec<(&SculptMesh, boolean::BoolOp)> = Vec::new();
+        let mut used = Vec::new();
+        for (i, tool) in self.subtools.iter().enumerate() {
+            let mesh = if i == self.active_tool {
+                Some(self.doc.mesh())
+            } else {
+                unpacked.iter().find(|(j, _)| *j == i).map(|(_, d)| d.mesh())
+            };
+            if let Some(mesh) = mesh {
+                parts.push((mesh, tool.boolean));
+                used.push(tool.id);
+            }
+        }
+        let resolution = self.workspace.boolean_resolution.round() as u32;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| boolean::make_mesh(&parts, resolution)));
+        drop(parts);
+        let (mesh, _) = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.workspace.notify(format!("Make Boolean Mesh: {e}"));
+                return;
+            }
+            Err(_) => {
+                self.workspace.notify("Make Boolean Mesh failed".to_string());
+                return;
+            }
+        };
+        let tris = mesh.triangle_count();
+        let n = self.subtools.iter().filter(|t| t.name.starts_with("Boolean")).count() + 1;
+        let name = format!("Boolean {n}");
+        let budget = self.doc.budget;
+        let tool = self.parked_subtool(name.clone(), true, Multires::new(mesh, budget));
+        self.subtools.push(tool);
+        self.select_subtool(self.subtools.len() - 1);
+        for tool in &mut self.subtools {
+            if used.contains(&tool.id) {
+                tool.visible = false;
+            }
+        }
+        self.workspace.live_boolean = false;
+        self.status = format!("{name}: {} triangles from {} subtools in {:.0} ms", fmt_count(tris), used.len(), t.elapsed().as_secs_f32() * 1000.0);
+        self.workspace.notify(format!("{} · the subtools it came from are hidden", self.status));
     }
 
     /// SubTool › Split Hidden: the hidden polygons become a subtool of their own. Not undoable.
@@ -1545,6 +1624,63 @@ impl App {
             .collect()
     }
 
+    /// Live Boolean: bring each operand's volume up to date and hand them to the renderer.
+    /// Returns (subtool, operand slot) for every drawn subtool; empty when the viewport
+    /// draws everything as it is (Live Boolean off, Solo, or nothing but Add).
+    fn update_live_boolean(&mut self) -> Vec<(usize, usize)> {
+        let operands: Vec<usize> = (0..self.subtools.len()).filter(|&i| i == self.active_tool || self.subtools[i].visible).collect();
+        let wanted = self.workspace.live_boolean && !self.workspace.solo && operands.iter().any(|&i| self.subtools[i].boolean != boolean::BoolOp::Add);
+        if !wanted || operands.len() > render::BOOL_MAX {
+            if wanted && !self.bool_refused {
+                self.bool_refused = true;
+                self.workspace.notify(format!("Live Boolean shows at most {} visible subtools · hide some", render::BOOL_MAX));
+            }
+            if let Some(gfx) = self.gfx.as_mut() {
+                gfx.clear_boolean();
+            }
+            return Vec::new();
+        }
+        self.bool_refused = false;
+        // The active subtool's version: its stack and every edit to it.
+        let active_id = self.subtools[self.active_tool].id;
+        let version = self.doc.generation.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.history.edits() ^ (self.doc.active() as u64) << 56;
+        let stale = self.bool_volumes.get(&active_id).is_none_or(|(v, _)| *v != version);
+        // Not while a stroke or drag is under way: the old volume stands in until it ends.
+        if stale && (!self.busy() || !self.bool_volumes.contains_key(&active_id)) {
+            let vol = wedge::distance_volume(self.doc.mesh(), render::BOOL_VOLUME);
+            self.bool_volumes.insert(active_id, (version, vol));
+        }
+        for &i in &operands {
+            let tool = &self.subtools[i];
+            if i == self.active_tool || self.bool_volumes.contains_key(&tool.id) {
+                continue;
+            }
+            // A parked subtool never seen: its shown level, once.
+            if let Some(Ok(doc)) = tool.parked.as_ref().map(|p| p.packed.clone().try_unpack()) {
+                let vol = wedge::distance_volume(doc.mesh(), render::BOOL_VOLUME);
+                self.bool_volumes.insert(tool.id, (0, vol));
+            }
+        }
+        let inv = self.preview_map().inverse().matrix();
+        let mut list = Vec::new();
+        let mut slots = Vec::new();
+        let mut active_slot = None;
+        for &i in &operands {
+            let tool = &self.subtools[i];
+            if let Some((v, vol)) = self.bool_volumes.get(&tool.id) {
+                if i == self.active_tool {
+                    active_slot = Some(list.len());
+                }
+                slots.push((i, list.len()));
+                list.push((tool.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ *v, vol, tool.boolean));
+            }
+        }
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.set_boolean(&list, active_slot, inv);
+        }
+        slots
+    }
+
     /// Bounds of what is drawn: the active subtool and the visible parked ones.
     fn model_bounds(&self) -> Aabb {
         self.drawn_parked()
@@ -1565,6 +1701,7 @@ impl App {
                     None => &self.doc.layers,
                 }),
                 morph: self.morph_targets.get(&t.id).map(|(level, pts)| (*level, pts.as_slice())),
+                boolean: t.boolean,
             })
             .collect();
         let tools: Vec<(&str, bool, &multires::Packed)> = self
@@ -1732,6 +1869,7 @@ impl App {
         let extras = [project::Extras {
             layers: Some(&self.doc.layers),
             morph: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, p)| (*l, p.as_slice())),
+            boolean: self.subtools[self.active_tool].boolean,
         }];
         self.status = match project::save_with(Path::new(&path), &[(name.as_str(), true, &packed)], &extras, 0) {
             Ok(bytes) => format!(
@@ -1798,6 +1936,7 @@ impl App {
             }
         }
         SubTool {
+            boolean: Default::default(),
             id,
             name,
             visible,
@@ -1956,7 +2095,7 @@ impl App {
         self.doc = Multires::new(mesh, budget);
         let id = self.new_tool_id();
         let name = Path::new(path).file_stem().map_or_else(|| format!("Import {id}"), |s| s.to_string_lossy().to_string());
-        self.subtools.push(SubTool { id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -2044,6 +2183,7 @@ impl App {
             if i == active {
                 let id = self.new_tool_id();
                 staged.push(SubTool {
+                    boolean: saved.boolean,
                     id,
                     name: saved.name,
                     visible: true,
@@ -2053,7 +2193,8 @@ impl App {
                 });
                 active_doc = Some(doc);
             } else {
-                let tool = self.parked_subtool(saved.name, saved.visible, doc);
+                let mut tool = self.parked_subtool(saved.name, saved.visible, doc);
+                tool.boolean = saved.boolean;
                 staged.push(tool);
             }
             if let Some(m) = morph {
@@ -2101,6 +2242,7 @@ impl App {
         self.history = History::new(32);
         let id = self.new_tool_id();
         self.subtools = vec![SubTool {
+            boolean: Default::default(),
             id,
             name: format!("{} {id}", self.primitive.kind.short()),
             visible: true,
@@ -5619,6 +5761,7 @@ impl App {
                     top: self.doc.top(),
                     bytes: levels_bytes,
                     drawn: true,
+                    boolean: t.boolean,
                 },
                 Some(p) => SubToolRow {
                     name: t.name.clone(),
@@ -5629,6 +5772,7 @@ impl App {
                     top: p.packed.counts().len() - 1,
                     bytes: p.packed.bytes() + p.history.bytes(),
                     drawn: p.stand_in_vertices > 0 || self.gfx.is_none(),
+                    boolean: t.boolean,
                 },
             })
             .collect();
@@ -5778,6 +5922,12 @@ impl App {
         }
         if actions.group_visible {
             self.pending_vis = Some(VisOp::GroupVisible);
+        }
+        if let Some(op) = actions.boolean_op {
+            self.subtools[self.active_tool].boolean = op;
+        }
+        if actions.make_boolean {
+            self.make_boolean_mesh();
         }
         if actions.gizmo_center || actions.gizmo_reset {
             self.gizmo_pivot(actions.gizmo_center);
@@ -6084,6 +6234,10 @@ impl App {
             if self.selftest_document_frame(&mut t) { self.quit = true; }
             else { self.selftest_document = Some(t); }
         }
+        if let Some(mut t) = self.selftest_boolean.take() {
+            if self.selftest_boolean_frame(&mut t) { self.quit = !self.selftest_hold; }
+            else { self.selftest_boolean = Some(t); }
+        }
         if let Some(mut t) = self.selftest_materials.take() {
             if self.selftest_materials_frame(&mut t) { self.quit = true; }
             else { self.selftest_materials = Some(t); }
@@ -6214,7 +6368,12 @@ impl App {
                 [bits as f32, axis, count, 0.0]
             },
         };
-        let parked: Vec<u64> = self.drawn_parked().into_iter().map(|(key, _)| key).collect();
+        let slots = self.update_live_boolean();
+        let parked: Vec<(u64, u32)> = self
+            .drawn_parked()
+            .into_iter()
+            .map(|(key, i)| (key, slots.iter().find(|s| s.0 == i).map_or(1, |s| 1 + s.1 as u32)))
+            .collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
@@ -6880,6 +7039,9 @@ fn main() {
         // Snapshots go next to the project: keep them out of the working directory.
         app.project_path = std::env::temp_dir().join(format!("klay-document-{}.klay", std::process::id())).to_string_lossy().into_owned();
     }
+    if args.iter().any(|a| a == "--selftest-boolean") {
+        app.selftest_boolean = Some(native_tests::BooleanTest::default());
+    }
     if args.iter().any(|a| a == "--selftest-materials") {
         app.selftest_materials = Some(native_tests::MaterialTest::default());
     }
@@ -6933,7 +7095,9 @@ fn main() {
     }
     // `--snapshot FILE`: after start-up (and `--demo-brushes`), save the canvas and quit.
     if let Some(path) = flag("--snapshot") {
-        app.snapshot_to = Some((path.clone(), 30));
+        // `--snapshot-frames N`: after N frames instead of 30.
+        let frames = flag("--snapshot-frames").and_then(|n| n.parse().ok()).unwrap_or(30);
+        app.snapshot_to = Some((path.clone(), frames));
     }
     // `--gizmo`: start in Move mode with Gizmo 3D (Y).
     if args.iter().any(|a| a == "--gizmo") {
@@ -7074,6 +7238,27 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    #[test]
+    fn make_boolean_mesh_carves_the_subtract_subtool_out() {
+        let mut app = App::new(24, false, usize::MAX);
+        let (p, i) = cube_sphere(24, 0.6);
+        let bite = SculptMesh::from_raw(p.into_iter().map(|q| q + Vec3::new(0.0, 0.0, 0.9)).collect(), i);
+        app.insert_after_active(vec![("Bite".into(), bite)]);
+        app.subtools[1].boolean = boolean::BoolOp::Subtract;
+        app.workspace.boolean_resolution = 160.0;
+        app.workspace.live_boolean = true;
+        app.make_boolean_mesh();
+        assert_eq!(app.subtools.len(), 3);
+        assert_eq!(app.active_tool, 2);
+        assert_eq!(app.subtools[2].name, "Boolean 1");
+        assert!(!app.subtools[0].visible && !app.subtools[1].visible, "the operands are hidden");
+        assert!(!app.workspace.live_boolean);
+        let m = app.doc.mesh();
+        assert!(m.triangle_count() > 1000);
+        assert!(m.positions.iter().all(|p| p.distance(Vec3::new(0.0, 0.0, 0.9)) > 0.55), "the bite is gone");
+        assert!(m.positions.iter().any(|p| p.z < -0.95), "the far side stays");
+    }
 
     #[test]
     fn sculptris_pro_adds_triangles_under_the_stroke_as_one_undo_step() {
@@ -8934,6 +9119,16 @@ mod stroke_modifier_tests {
         // The loaded layer still works: hiding it takes its part out.
         other.layer_op(LayerOp::Eye(0));
         assert_ne!(other.doc.mesh().positions, shaped);
+        // Version 6: boolean operations, the active subtool's and a parked one's.
+        let (p, i) = cube_sphere(6, 0.3);
+        app.insert_after_active(vec![("Cutter".into(), SculptMesh::from_raw(p, i))]);
+        app.subtools[0].boolean = boolean::BoolOp::Intersect;
+        app.subtools[1].boolean = boolean::BoolOp::Subtract;
+        std::fs::write(&path, app.project_bytes()).unwrap();
+        let mut third = App::new(10, false, usize::MAX);
+        third.open_project(path.to_str().unwrap());
+        let ops: Vec<boolean::BoolOp> = third.subtools.iter().map(|t| t.boolean).collect();
+        assert_eq!(ops, [boolean::BoolOp::Intersect, boolean::BoolOp::Subtract]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

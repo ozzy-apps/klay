@@ -500,3 +500,95 @@ impl App {
         false
     }
 }
+
+/// State of `--selftest-boolean`.
+#[derive(Default)]
+pub(super) struct BooleanTest {
+    frame: u32,
+    probes: Vec<Vec2>,
+    /// Pixels: the bite drawn as it is, with Live Boolean, and the made boolean mesh.
+    plain: Vec<[u8; 4]>,
+    live: Vec<[u8; 4]>,
+    ok: bool,
+}
+
+impl App {
+    /// `--selftest-boolean`: a ball subtracted from the front of the model. The frame is
+    /// read back at probes across the bite with Live Boolean off and on, then after Make
+    /// Boolean Mesh: the live view must match the made mesh and differ from the plain one.
+    pub(super) fn selftest_boolean_frame(&mut self, t: &mut BooleanTest) -> bool {
+        let frame = t.frame;
+        t.frame += 1;
+        let check = |t: &mut BooleanTest, what: String, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-boolean: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let capture = |app: &mut App, probes: &[Vec2]| {
+            if let Some(g) = app.gfx.as_mut() {
+                g.capture = probes.iter().map(|p| [p.x.round() as u32, p.y.round() as u32]).collect();
+            }
+        };
+        let take = |app: &mut App| app.gfx.as_mut().map(|g| std::mem::take(&mut g.captured)).unwrap_or_default();
+        let diff = |a: &[u8; 4], b: &[u8; 4]| (0..3).map(|k| (a[k] as i32 - b[k] as i32).abs()).max().unwrap();
+        match frame {
+            18 => {
+                t.ok = true;
+                self.workspace.wireframe = false;
+                let b = self.doc.bounds();
+                let (c, r) = ((b.min + b.max) * 0.5, (b.max - b.min).x * 0.5);
+                let f = self.camera.forward();
+                let (right, up) = (self.camera.right(), self.camera.up());
+                let front = c - f * r;
+                let (p, i) = cube_sphere(24, r * 0.4);
+                let bite = SculptMesh::from_raw(p.into_iter().map(|q| q + front).collect(), i);
+                self.insert_after_active(vec![("Bite".into(), bite)]);
+                self.subtools[self.active_tool + 1].boolean = boolean::BoolOp::Subtract;
+                // Probes in the bite (away from its rim) and on the model around it.
+                t.probes = [(0.0, 0.0), (0.1, 0.06), (-0.08, -0.1), (0.15, -0.05), (0.75, 0.0), (-0.7, 0.3), (0.1, -0.78)]
+                    .iter()
+                    .map(|&(x, y)| {
+                        let q = right * x + up * y;
+                        let z = (1.0f32 - x * x - y * y).max(0.0).sqrt();
+                        self.project(c + (q - f * z) * r)
+                    })
+                    .collect();
+                self.cursor_moved(self.canvas_origin() + Vec2::splat(4.0), false);
+                self.hover = None;
+            }
+            22 => capture(self, &t.probes.clone()),
+            23 => {
+                t.plain = take(self);
+                if t.plain.len() != t.probes.len() {
+                    log::warn!("selftest-boolean: this surface cannot be read back; skipped");
+                    return true;
+                }
+                self.workspace.live_boolean = true;
+            }
+            28 => capture(self, &t.probes.clone()),
+            29 => {
+                t.live = take(self);
+                let changed = (0..4).map(|k| diff(&t.live[k], &t.plain[k])).max().unwrap();
+                check(t, format!("Live Boolean carves the bite: it changed by up to {changed}/255"), changed > 20);
+                let outside = (4..7).map(|k| diff(&t.live[k], &t.plain[k])).max().unwrap();
+                check(t, format!("the model around it is untouched ({outside}/255)"), outside <= 3);
+                let start = Instant::now();
+                self.make_boolean_mesh();
+                log::info!("selftest-boolean: {}", self.status);
+                check(t, format!("Make Boolean Mesh in {:.0} ms", start.elapsed().as_secs_f32() * 1000.0), self.subtools.last().is_some_and(|s| s.name.starts_with("Boolean")));
+                self.hover = None;
+            }
+            36 => capture(self, &t.probes.clone()),
+            37 => {
+                let made = take(self);
+                let errors: Vec<i32> = (0..t.probes.len()).map(|k| diff(&made[k], &t.live[k])).collect();
+                let worst = *errors.iter().max().unwrap();
+                let mean = errors.iter().sum::<i32>() as f32 / errors.len() as f32;
+                check(t, format!("the live view matches the made mesh: worst {worst}/255, mean {mean:.1}"), worst <= 40 && mean <= 15.0);
+                log::info!("selftest-boolean: {}", if t.ok { "all passed" } else { "FAILED" });
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+}

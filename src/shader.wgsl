@@ -32,6 +32,20 @@ struct Uniforms {
 // Two layers per MatCap: diffuse (times the surface colour), then specular (added).
 @group(0) @binding(1) var matcaps: texture_2d_array<f32>;
 @group(0) @binding(2) var matcap_sampler: sampler;
+
+// Live Boolean (boolean.rs): every operand's distance volume, one slab after another along
+// z in one 3D texture (0.5 is the surface, less is inside).
+struct BoolParams {
+    // Operand count; the active subtool's slot (-1 none); points per volume; atlas depth.
+    info: vec4<f32>,
+    // World to the active subtool's own space (undoes its live Transpose preview).
+    active_inv: mat4x4<f32>,
+    // Per operand: volume origin and operation (0 Add, 1 Subtract, 2 Intersect); 1 / size.
+    boxes: array<vec4<f32>, 40>,
+};
+@group(0) @binding(3) var bool_volumes: texture_3d<f32>;
+@group(0) @binding(4) var bool_sampler: sampler;
+@group(0) @binding(5) var<uniform> boolean: BoolParams;
 // Mask of the active subtool, one byte per vertex packed in words.
 @group(1) @binding(0) var<storage, read> mask: array<u32>;
 
@@ -164,8 +178,87 @@ fn fs_pick(in: PickOut) -> @location(0) u32 {
     return in.id;
 }
 
+// Whether `p` is inside operand `k`.
+fn bool_inside(k: u32, p_world: vec3<f32>) -> bool {
+    var p = p_world;
+    if (i32(k) == i32(boolean.info.y)) {
+        p = (boolean.active_inv * vec4<f32>(p_world, 1.0)).xyz;
+    }
+    let o = boolean.boxes[2u * k];
+    let s = boolean.boxes[2u * k + 1u];
+    let uvw = (p - o.xyz) * s.xyz;
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) {
+        return false;
+    }
+    let slab = boolean.info.z;
+    let half = 0.5 / slab;
+    let xy = clamp(uvw.xy, vec2<f32>(half), vec2<f32>(1.0 - half));
+    let z = (f32(k) * slab + clamp(uvw.z * slab, 0.5, slab - 0.5)) / boolean.info.w;
+    return textureSampleLevel(bool_volumes, bool_sampler, vec3<f32>(xy, z), 0.0).r < 0.5;
+}
+
+// Whether `p` is inside the result, with operand `own` taken as `own_in` (top to bottom:
+// Add joins, Subtract carves, Intersect keeps the overlap).
+fn bool_result(own: u32, own_in: bool, p: vec3<f32>) -> bool {
+    var r = false;
+    let n = u32(boolean.info.x);
+    for (var k = 0u; k < n; k = k + 1u) {
+        var a = own_in;
+        if (k != own) {
+            a = bool_inside(k, p);
+        }
+        let op = u32(boolean.boxes[2u * k].w + 0.5);
+        if (op == 0u) {
+            r = r || a;
+        } else if (op == 1u) {
+            r = r && !a;
+        } else {
+            r = r && a;
+        }
+    }
+    return r;
+}
+
+// Live Boolean for one fragment of a subtool's surface: 1 where it is the result's surface
+// as drawn (front faces), -1 where it is the result's surface seen from its other side (a
+// carved wall: back faces, normal turned round), 0 where it is not part of the result.
+fn bool_side(in: VsOut, front: bool) -> f32 {
+    var slot = i32(in.parked) - 1;
+    if (in.parked == 0u) {
+        slot = i32(boolean.info.y);
+    }
+    if (slot < 0 || slot >= i32(boolean.info.x)) {
+        return select(0.0, 1.0, front);
+    }
+    let with_it = bool_result(u32(slot), true, in.world_pos);
+    let without = bool_result(u32(slot), false, in.world_pos);
+    if (with_it == without) {
+        return 0.0;
+    }
+    if (with_it) {
+        return select(0.0, 1.0, front);
+    }
+    return select(-1.0, 0.0, front);
+}
+
+@fragment
+fn fs_bool(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let side = bool_side(in, front);
+    if (side == 0.0) {
+        discard;
+    }
+    var v = in;
+    v.normal = in.normal * side;
+    return surface(v);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return surface(in);
+}
+
+// The material (or polypaint) shaded.
+fn surface(in: VsOut) -> vec4<f32> {
     var base = vec3<f32>(0.78, 0.62, 0.50);
     if (u.params.w > 0.5 && u.params.w < 1.5) { base = vec3<f32>(0.52, 0.58, 0.66); }
     if (u.params.w > 1.5 && u.params.w < 2.5) { base = vec3<f32>(0.62, 0.29, 0.20); }

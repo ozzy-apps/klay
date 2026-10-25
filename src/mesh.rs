@@ -292,6 +292,21 @@ impl SculptMesh {
         Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new())
     }
 
+    /// [`from_raw_painted`](Self::from_raw_painted) with a tag per triangle (which
+    /// operand of a boolean it came from), returned in the mesh's triangle order.
+    pub fn from_raw_tagged(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>, tags: Vec<u8>) -> (Self, Vec<u8>) {
+        let t = indices.len() / 3;
+        let groups = partition_vertices(&positions);
+        // The tags ride along as the hidden flags, then are taken back out.
+        let mut mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), tags);
+        let mut tags = std::mem::take(&mut mesh.hidden);
+        mesh.set_hidden(Vec::new());
+        if tags.is_empty() {
+            tags = vec![0; t];
+        }
+        (mesh, tags)
+    }
+
     /// Build a mesh whose vertices already have a chunk each (`vert_chunk`, below
     /// `chunk_count`): every chunk keeps its vertices, one grown past [`CHUNK_TARGET`] is
     /// split, empty ones go. Much quicker than [`from_raw`](Self::from_raw) for a mesh that

@@ -66,7 +66,23 @@ fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 @fragment
+fn fs_groups_bool(in: VsOut, @builtin(primitive_index) prim: u32, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let side = bool_side(in, front);
+    if (side == 0.0) {
+        discard;
+    }
+    var v = in;
+    v.normal = in.normal * side;
+    return group_surface(v, prim);
+}
+
+@fragment
 fn fs_groups(in: VsOut, @builtin(primitive_index) prim: u32) -> @location(0) vec4<f32> {
+    return group_surface(in, prim);
+}
+
+// Polygroup colour and the polyframe, shaded.
+fn group_surface(in: VsOut, prim: u32) -> vec4<f32> {
     let word = drawn_groups[prim >> 1u];
     let g = (word >> ((prim & 1u) * 16u)) & 0xffffu;
     var color = shade(in, group_color(g));

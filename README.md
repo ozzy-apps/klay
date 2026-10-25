@@ -31,6 +31,7 @@ cargo run --release -- --segments 400 --selftest-clip                # three cro
 cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
 cargo run --release -- --segments 400 --selftest-insert              # Insert Mesh: one of each shape, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 12 --selftest-sculptris            # Sculptris Pro: three strokes, timing, closed surface, GPU readback, undo/redo, log, exit
+cargo run --release -- --segments 100 --selftest-boolean             # Live Boolean: a subtracted ball, frame readback vs Make Boolean Mesh, log, exit
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
@@ -294,6 +295,24 @@ without dividing or remeshing.
   and without layers (a stroke then sculpts as usual and says why).
 - A stroke is one undo step (it keeps a copy of the subtool from before it). Fluid up to a
   few hundred thousand triangles; at around two million each pointer move takes ~30 ms.
+
+### Live Boolean (0.17)
+
+ZBrush's booleans between subtools. Every subtool has an operation (Mesh › Boolean, marked
+beside its name in the SubTool list): **Add**, **Subtract** or **Intersect**. Visible
+subtools combine top to bottom: each one joins, carves itself out of, or keeps only its
+overlap with the result of the ones above it.
+
+- **Live Boolean** (top shelf, or Mesh › Boolean) shows the result in the viewport as you
+  work: move, scale or turn a Subtract subtool with Transpose or the Gizmo and the hole
+  follows it while you drag; sculpt either one and the result updates when the stroke ends.
+  Each subtool's inside is kept as a 96³ distance volume, so the cut line is accurate to
+  about 1/90 of the subtool's size. Up to 20 visible subtools.
+- **Make Boolean Mesh** builds the result as one new closed subtool (named Boolean 1, 2, …)
+  at the Boolean **Resolution** (Remesh voxels across two units, default 400), with sharp
+  edges where the subtools meet, polygroups and polypaint kept. The subtools it came from
+  are hidden and Live Boolean goes off. Not undoable: delete the new subtool to go back.
+- Projects (format version 6) save each subtool's operation; versions 1–5 still open.
 
 ### Canvas and Document
 

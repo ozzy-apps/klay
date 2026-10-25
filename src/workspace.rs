@@ -495,6 +495,8 @@ pub struct SubToolRow {
     pub bytes: usize,
     /// False for a parked subtool whose stand-in did not fit on the GPU.
     pub drawn: bool,
+    /// How it joins the subtools above it.
+    pub boolean: crate::boolean::BoolOp,
 }
 
 #[derive(Default)]
@@ -573,6 +575,9 @@ pub struct Actions {
     /// Gizmo 3D: to the unmasked centre, or back to the subtool centre and world axes.
     pub gizmo_center: bool,
     pub gizmo_reset: bool,
+    /// SubTool › Boolean: the active subtool's operation; Make Boolean Mesh.
+    pub boolean_op: Option<crate::boolean::BoolOp>,
+    pub make_boolean: bool,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -742,6 +747,10 @@ pub struct Workspace {
     /// how small its triangles are for the brush size (see `sculptris::target_edge`).
     pub sculptris: bool,
     pub sculptris_detail: f32,
+    /// Live Boolean (ZBrush): the viewport shows the subtools' boolean result; Make
+    /// Boolean Mesh builds it at this resolution (Remesh voxels across two units).
+    pub live_boolean: bool,
+    pub boolean_resolution: f32,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -876,6 +885,8 @@ impl Workspace {
             insert_shape: crate::primitive::Primitive::Sphere,
             sculptris: false,
             sculptris_detail: 50.0,
+            live_boolean: false,
+            boolean_resolution: 400.0,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -1395,14 +1406,21 @@ impl Workspace {
                         }
                     }
                     shelf_separator(ui);
-                    // ZBrush keeps Sculptris Pro on the top shelf.
+                    // ZBrush keeps Sculptris Pro and Live Boolean on the top shelf.
                     ui.vertical(|ui| {
-                        ui.add_space(12.0);
-                        if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(84.0, 22.0))
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.add_space(1.0);
+                        if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(84.0, 21.0))
                             .on_hover_text("Strokes add and remove triangles under the brush · Detail in Brush › Sculptris Pro")
                             .clicked()
                         {
                             self.sculptris = !self.sculptris;
+                        }
+                        if small_toggle(ui, "Live Boolean", self.live_boolean, vec2(84.0, 21.0))
+                            .on_hover_text("Show the subtools' Add / Subtract / Intersect result · Mesh › Boolean")
+                            .clicked()
+                        {
+                            self.live_boolean = !self.live_boolean;
                         }
                     });
                     shelf_separator(ui);
@@ -2698,6 +2716,26 @@ impl Workspace {
                         note(ui, "Alt + click a subtool to select it");
                     },
                 );
+                self.sec(ui, h, id, "boolean", "Boolean", None, false, true, &mut |ws, ui| {
+                    ui.checkbox(&mut ws.live_boolean, "Live Boolean")
+                        .on_hover_text("The viewport shows the result of every visible subtool, top to bottom");
+                    let active = m.subtools.iter().find(|r| r.active).map_or(Default::default(), |r| r.boolean);
+                    let ops = crate::boolean::BoolOp::ALL;
+                    let names: Vec<&str> = ops.iter().map(|o| o.name()).collect();
+                    let at = ops.iter().position(|o| *o == active).unwrap_or(0);
+                    if let Some(i) = seg(ui, &names, at, false) {
+                        a.boolean_op = Some(ops[i]);
+                    }
+                    zslider(ui, "Resolution", &mut ws.boolean_resolution, 64.0..=1024.0, false, false, 0);
+                    if ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Make Boolean Mesh"))
+                        .on_hover_text("Build the result as a new closed subtool; the visible ones are hidden")
+                        .clicked()
+                    {
+                        a.make_boolean = true;
+                    }
+                    note(ui, "Add joins, Subtract carves, Intersect keeps the overlap · each subtool acts on the visible ones above it · Resolution: Remesh voxels across two units");
+                });
                 self.sec(
                     ui,
                     h,
@@ -4676,6 +4714,15 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
         FontId::proportional(13.0),
         text,
     );
+    if row.boolean != crate::boolean::BoolOp::Add {
+        p.text(
+            pos2(eye_rect.left() - 6.0, r.top() + 10.0),
+            Align2::RIGHT_CENTER,
+            row.boolean.glyph(),
+            FontId::proportional(14.0),
+            ACC,
+        );
+    }
     let detail = if !row.drawn {
         "stand-in did not fit on the GPU".to_string()
     } else if row.top > 0 {
@@ -5094,6 +5141,7 @@ mod tests {
 
     fn row(name: &str, active: bool) -> SubToolRow {
         SubToolRow {
+            boolean: Default::default(),
             name: name.to_string(),
             visible: true,
             active,
