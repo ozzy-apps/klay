@@ -323,7 +323,7 @@ impl App {
             t.ok &= pass;
             log::info!("selftest-document: {what} ({})", if pass { "ok" } else { "FAIL" });
         };
-        let inset = crate::workspace::FRAME_INSET * self.scale;
+        let inset = self.workspace.layout.document.inset * self.scale;
         let read = |app: &mut App, at: &[Vec2]| {
             if let Some(g) = app.gfx.as_mut() {
                 g.capture = at.iter().map(|p| [p.x.round() as u32, p.y.round() as u32]).collect();
@@ -340,6 +340,7 @@ impl App {
                     center: 0.5,
                     rate: 1.0,
                     border: [10, 120, 200],
+                    ..Default::default()
                 };
             }
             22 => {

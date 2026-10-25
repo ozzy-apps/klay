@@ -33,7 +33,9 @@ const CANVAS_TEXT: Color32 = Color32::from_rgb(230, 232, 234);
 const CANVAS_TEXT2: Color32 = Color32::from_rgb(180, 186, 193);
 /// Inset of the document frame drawn inside the canvas, in points. Like ZBrush, the margin
 /// between the frame and the canvas edge always navigates, even over the model.
-pub const FRAME_INSET: f32 = 16.0;
+pub const FRAME_INSET: f32 = 40.0;
+/// Document › Back › Border width range (points).
+pub const FRAME_INSETS: std::ops::RangeInclusive<f32> = 8.0..=120.0;
 /// The interface colours of the current theme (Preferences › Theme). Each token below is
 /// a function so the whole interface follows a theme change on the next frame.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -400,11 +402,14 @@ pub struct DocumentLook {
     /// Softness of the gradient: 0 is a hard edge, 1 a ramp over the whole height.
     pub rate: f32,
     pub border: [u8; 3],
+    /// Width of the border between the document frame and the canvas edge (points): the
+    /// margin that always navigates, even over the model.
+    pub inset: f32,
 }
 
 impl Default for DocumentLook {
     fn default() -> Self {
-        Self { back: [24, 25, 28], range: 0.2, center: 0.5, rate: 1.0, border: [12, 13, 14] }
+        Self { back: [24, 25, 28], range: 0.2, center: 0.5, rate: 1.0, border: [12, 13, 14], inset: FRAME_INSET }
     }
 }
 
@@ -420,7 +425,7 @@ impl DocumentLook {
 
     fn encode(&self) -> String {
         let rgb = |c: [u8; 3]| format!("{},{},{}", c[0], c[1], c[2]);
-        format!("document|{}|{:.3}|{:.3}|{:.3}|{}\n", rgb(self.back), self.range, self.center, self.rate, rgb(self.border))
+        format!("document|{}|{:.3}|{:.3}|{:.3}|{}|{:.0}\n", rgb(self.back), self.range, self.center, self.rate, rgb(self.border), self.inset)
     }
 
     fn decode(parts: &[&str]) -> Option<Self> {
@@ -430,12 +435,17 @@ impl DocumentLook {
         };
         let unit = |s: &str| s.parse::<f32>().ok().map(|x| x.clamp(0.0, 1.0));
         match parts {
-            [back, range, center, rate, border] => Some(Self {
+            // Workspaces from before the border width had five fields.
+            [back, range, center, rate, border, rest @ ..] if rest.len() <= 1 => Some(Self {
                 back: rgb(back)?,
                 range: unit(range)?,
                 center: unit(center)?,
                 rate: unit(rate)?,
                 border: rgb(border)?,
+                inset: rest
+                    .first()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .map_or(FRAME_INSET, |v| v.clamp(*FRAME_INSETS.start(), *FRAME_INSETS.end())),
             }),
             _ => None,
         }
@@ -2710,6 +2720,7 @@ impl Workspace {
                                 .on_hover_text("Colour of the border around the document frame");
                             ui.label("Border");
                         });
+                        zslider(ui, "Border width", &mut d.inset, FRAME_INSETS, false, false, 0);
                         zslider(ui, "Range", &mut d.range, 0.0..=1.0, false, false, 2);
                         zslider(ui, "Center", &mut d.center, 0.0..=1.0, false, false, 2);
                         zslider(ui, "Rate", &mut d.rate, 0.0..=1.0, false, false, 2);
@@ -4419,7 +4430,7 @@ impl Workspace {
         let painter = ui.painter().with_clip_rect(canvas);
         // document frame
         painter.rect_stroke(
-            canvas.shrink(FRAME_INSET),
+            canvas.shrink(self.layout.document.inset),
             0,
             Stroke::new(1.0, Color32::from_white_alpha(28)),
             StrokeKind::Inside,
@@ -6211,6 +6222,13 @@ mod tests {
         layout.right_tray = false;
         layout.tray_width = 300.0;
         assert_eq!(DockLayout::decode(&layout.encode()), layout);
+        // The canvas border width comes back; a workspace from before it had none gets
+        // the default.
+        layout.document.inset = 64.0;
+        assert_eq!(DockLayout::decode(&layout.encode()).document.inset, 64.0);
+        let old = DockLayout::decode("document|24,25,28|0.200|0.500|1.000|12,13,14\n");
+        assert_eq!(old.document.inset, FRAME_INSET);
+        assert_eq!(old.document.border, [12, 13, 14]);
         // Interface scale, theme, custom themes and shelf order come back too.
         layout.ui_scale = 1.25;
         layout.theme = "Mine".into();
@@ -6357,7 +6375,7 @@ mod tests {
         let mut layout = DockLayout::default();
         // Klay's default look adds nothing to the file.
         assert!(!layout.encode().contains("document|"));
-        layout.document = DocumentLook { back: [90, 60, 40], range: 0.8, center: 0.3, rate: 0.5, border: [1, 2, 3] };
+        layout.document = DocumentLook { back: [90, 60, 40], range: 0.8, center: 0.3, rate: 0.5, border: [1, 2, 3], inset: 52.0 };
         let back = DockLayout::decode(&layout.encode());
         assert_eq!(back.document, layout.document);
         // A broken line keeps the default.

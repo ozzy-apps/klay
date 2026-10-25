@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.23.1 — 2026-10-25
+
+- The border round the document frame (always empty canvas that navigates, even over the model) is 40 points wide instead of 16, and **Document › Back › Border width** sets it from 8 to 120; saved with the workspace (older workspaces get the new default).
+- Verification: 273 release tests (the layout round trip keeps the border width and reads workspaces from before it); the document, transpose, mask and clip self-tests pass on the GPU.
+
 ## 0.23.0 — 2026-10-25
 
 - 17 new brushes (66 in all):

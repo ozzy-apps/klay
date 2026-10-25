@@ -1351,7 +1351,7 @@ impl App {
         if !self.canvas_rect.is_positive() {
             return false;
         }
-        let inner = self.canvas_rect.shrink(workspace::FRAME_INSET * self.scale);
+        let inner = self.canvas_rect.shrink(self.workspace.layout.document.inset * self.scale);
         !inner.contains(egui::pos2(self.cursor.x, self.cursor.y))
     }
 
@@ -1914,7 +1914,7 @@ impl App {
     /// Document › Snapshot: ask the renderer for the canvas inside the document frame of
     /// the next frame; `save_snapshot` writes it once drawn.
     fn request_snapshot(&mut self) {
-        let inset = workspace::FRAME_INSET * self.scale;
+        let inset = self.workspace.layout.document.inset * self.scale;
         let mut r = self.canvas_rect.shrink(inset);
         if self.gfx.as_ref().is_some_and(|g| g.snapshot_ui) {
             let (w, h) = self.gfx.as_ref().map(|g| (g.config.width, g.config.height)).unwrap_or((1, 1));
@@ -7153,7 +7153,7 @@ impl App {
             },
             back_shape: {
                 let d = &self.workspace.layout.document;
-                [d.center, d.rate, workspace::FRAME_INSET * self.scale, 0.0]
+                [d.center, d.rate, self.workspace.layout.document.inset * self.scale, 0.0]
             },
             border: {
                 let c = self.workspace.layout.document.border.map(|c| c as f32 / 255.0);

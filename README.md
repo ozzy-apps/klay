@@ -395,7 +395,8 @@ ZBrush's long list.
 
 The document frame is drawn inside the canvas, and the margin around it (the border) is
 always empty canvas: models are drawn only inside the frame, as in ZBrush, so however far you
-zoom in there is always somewhere to click and drag to rotate, move and zoom.
+zoom in there is always somewhere to click and drag to rotate, move and zoom. The border is
+40 points wide; **Document › Back › Border width** sets it from 8 to 120.
 
 **Document** palette: **New / Open / Save** use the path field; **Save As** saves to a new
 path and keeps working there; **Revert** opens the project again as it was last saved (it
