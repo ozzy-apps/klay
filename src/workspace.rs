@@ -485,6 +485,8 @@ pub struct DockLayout {
     pub skip_version: String,
     /// Document › Back / Border, saved with the workspace (ZBrush: Save As Startup Doc).
     pub document: DocumentLook,
+    /// Performance › Drawing: dense parts of the model drawn as points.
+    pub dense_points: bool,
 }
 
 impl Default for DockLayout {
@@ -509,6 +511,7 @@ impl Default for DockLayout {
             check_updates: true,
             skip_version: String::new(),
             document: DocumentLook::default(),
+            dense_points: true,
         }
     }
 }
@@ -611,6 +614,9 @@ impl DockLayout {
         if !self.check_updates {
             text.push_str("updates|off\n");
         }
+        if !self.dense_points {
+            text.push_str("points|off\n");
+        }
         if !self.skip_version.is_empty() {
             text.push_str(&format!("skipversion|{}\n", self.skip_version));
         }
@@ -684,6 +690,7 @@ impl DockLayout {
                 ["myshelf", list] => old_mine = Some(list.to_string()),
                 ["startup", "stored"] => result.start_from_stored = true,
                 ["updates", "off"] => result.check_updates = false,
+                ["points", "off"] => result.dense_points = false,
                 ["skipversion", v] => result.skip_version = (*v).to_string(),
                 ["scale", value] => {
                     if let Ok(v) = value.parse::<f32>() {
@@ -741,6 +748,10 @@ pub struct Model<'a> {
     pub upload_ms: f32,
     pub render_ms: f32,
     pub adapter: &'a str,
+    /// What GPU culling drew in a recent frame (`None`: not culled), and whether this GPU
+    /// can draw points (64-bit atomics).
+    pub drawn: Option<crate::render::CullCounts>,
+    pub points_supported: bool,
     /// World X, Y, Z axes in view space as (right, up, towards-camera) components, for
     /// the axis gizmo.
     pub axes: [[f32; 3]; 3],
@@ -3677,6 +3688,21 @@ impl Workspace {
                         );
                     },
                 );
+                self.sec(ui, h, id, "drawing", "Drawing", None, true, true, &mut |ws, ui| {
+                    ui.add_enabled_ui(m.points_supported, |ui| {
+                        ui.checkbox(&mut ws.layout.dense_points, "Points for dense meshes")
+                            .on_hover_text("Where the model has more vertices than pixels, draw them as points instead of triangles: much faster, looks the same");
+                    });
+                    match m.drawn {
+                        Some(c) => {
+                            kv(ui, "Chunks", &format!("{} of {}", crate::fmt_count((c.chunks + c.point_chunks) as usize), crate::fmt_count(c.chunk_total as usize)));
+                            kv(ui, "Triangles", &format!("{} of {}", crate::fmt_count(c.triangles as usize), crate::fmt_count(c.triangle_total as usize)));
+                            kv(ui, "Points", &crate::fmt_count(c.points as usize));
+                        }
+                        None => kv(ui, "Chunks", "all drawn (not culled)"),
+                    }
+                    note(ui, "Off screen and back-facing chunks are skipped on the GPU");
+                });
                 self.sec(ui, h, id, "gpu", "GPU", None, true, true, &mut |_, ui| {
                     kv(ui, "Device", m.adapter);
                     kv(ui, "Chunks", &crate::fmt_count(m.chunks));
@@ -5855,6 +5881,8 @@ mod tests {
                         upload_ms: 0.0,
                         render_ms: 0.0,
                         adapter: "Test adapter",
+                        drawn: None,
+                        points_supported: true,
                         axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                         subtools,
                         parked_bytes: 0,

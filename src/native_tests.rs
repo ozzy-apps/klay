@@ -645,6 +645,10 @@ impl App {
         match (step, local) {
             (0, 0) => {
                 t.ok = true;
+                // Triangles only: points would not match the whole draw pixel for pixel.
+                if let Some(g) = self.gfx.as_mut() {
+                    g.splatting = false;
+                }
                 self.workspace.grid = false;
                 self.cursor_moved(self.canvas_origin() + Vec2::splat(4.0), false);
                 self.hover = None;
@@ -723,6 +727,156 @@ impl App {
                 check(t, format!("{name}: culled and whole frames match ({differ} of {} pixels differ)", w * h), differ == 0);
                 if let Some(g) = self.gfx.as_mut() {
                     g.culling = true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+/// State of `--selftest-splat`.
+#[derive(Default)]
+pub(super) struct SplatTest {
+    frame: u32,
+    /// The canvas drawn with points, waiting for the one drawn with triangles only.
+    points: Option<(u32, u32, Vec<u8>)>,
+    ok: bool,
+}
+
+/// What `--selftest-splat` does before each comparison.
+const SPLAT_STEPS: [&str; 6] = [
+    "framed",
+    "far away",
+    "turned, the lower half painted",
+    "everything masked",
+    "during a GPU Grab stroke",
+    "after the Grab",
+];
+
+impl App {
+    /// `--selftest-splat`: dense chunks drawn as points must look like the same chunks
+    /// drawn as triangles: next to no pixel of the model left empty (holes), and a small
+    /// mean colour difference, with paint, a mask and a GPU Grab moving the points.
+    pub(super) fn selftest_splat_frame(&mut self, t: &mut SplatTest) -> bool {
+        let frame = t.frame;
+        t.frame += 1;
+        if frame < 20 {
+            return false;
+        }
+        let (step, local) = (((frame - 20) / 26) as usize, (frame - 20) % 26);
+        let Some(&name) = SPLAT_STEPS.get(step) else {
+            assert!(t.ok, "splat self-test failed");
+            log::info!("selftest-splat: all passed");
+            return true;
+        };
+        let check = |t: &mut SplatTest, what: String, pass: bool| {
+            t.ok &= pass;
+            log::info!("selftest-splat: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let start = Vec3::new(0.45, 0.35, 0.82).normalize();
+        match (step, local) {
+            (0, 0) => {
+                t.ok = true;
+                self.workspace.grid = false;
+                self.cursor_moved(self.canvas_origin() + Vec2::splat(4.0), false);
+                self.hover = None;
+            }
+            (1, 0) => self.camera.distance *= 4.0,
+            (2, 0) => {
+                self.camera.distance /= 4.0;
+                self.camera.yaw += 0.6;
+                let mesh = self.doc.mesh_mut();
+                let colors: Vec<[u8; 4]> =
+                    mesh.positions.iter().map(|p| if p.y < 0.0 { [180, 40, 30, 255] } else { [0, 0, 0, 0] }).collect();
+                mesh.colors = colors;
+                for ch in &mut mesh.chunks {
+                    ch.dirty_color = true;
+                }
+            }
+            (3, 0) => {
+                self.workspace.show_mask = true;
+                self.mask_op(MaskOp::All);
+            }
+            (4, 0) => {
+                self.mask_op(MaskOp::Clear);
+                self.home_camera();
+                self.workspace.select_brush(&mut self.brush, BrushKind::Grab);
+                self.brush.radius = 0.35;
+                self.brush.strength = 1.0;
+                let p = self.project(start);
+                self.cursor_moved(p, false);
+                self.left_press(false, false);
+            }
+            (4, 1..=3) => {
+                let p = self.project(start) + Vec2::new(local as f32 * 70.0, -(local as f32) * 30.0);
+                self.cursor_moved(p, false);
+            }
+            (5, 0) => self.left_release(),
+            (_, 20) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.splatting = true;
+                }
+                self.request_snapshot();
+            }
+            (_, 22) => {
+                let counts = self.gfx.as_ref().and_then(Gfx::read_cull_counts);
+                let Some(image) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
+                    log::warn!("selftest-splat: this surface cannot be read back; skipped");
+                    return true;
+                };
+                let used = counts.map_or(0, |c| c.point_chunks);
+                check(t, format!("{name}: {used} chunks drawn as points"), used > 0);
+                t.points = Some(image);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.splatting = false;
+                }
+                self.request_snapshot();
+            }
+            (_, 24) => {
+                let triangles = self.gfx.as_mut().and_then(|g| g.snapshot_image.take());
+                let (Some((w, h, a)), Some((w2, h2, b))) = (t.points.take(), triangles) else {
+                    check(t, format!("{name}: both frames read back"), false);
+                    return false;
+                };
+                if (w, h) != (w2, h2) {
+                    check(t, format!("{name}: frames of the same size"), false);
+                    return false;
+                }
+                // The model's pixels: those the triangles drew away from the background,
+                // which is one colour per row (no floor grid); the left column is background.
+                let (w, h) = (w as usize, h as usize);
+                let px = |img: &[u8], x: usize, y: usize| [img[4 * (y * w + x)], img[4 * (y * w + x) + 1], img[4 * (y * w + x) + 2]];
+                let far = |p: [u8; 3], q: [u8; 3]| (0..3).map(|k| p[k].abs_diff(q[k])).max().unwrap();
+                let (mut model, mut holes, mut total) = (0usize, 0usize, 0usize);
+                for y in 0..h {
+                    let back = px(&b, 0, y);
+                    for x in 0..w {
+                        let tri = px(&b, x, y);
+                        if far(tri, back) <= 6 {
+                            continue;
+                        }
+                        model += 1;
+                        let point = px(&a, x, y);
+                        holes += (far(point, back) <= 6) as usize;
+                        total += far(point, tri) as usize;
+                    }
+                }
+                let mean = total as f32 / model.max(1) as f32;
+                // KLAY_SPLAT_DUMP=<folder>: keep both frames of every step to look at.
+                if let Some(dir) = std::env::var_os("KLAY_SPLAT_DUMP") {
+                    let dir = std::path::PathBuf::from(dir);
+                    for (kind, img) in [("points", &a), ("triangles", &b)] {
+                        let _ = image::save_buffer(dir.join(format!("splat-{step}-{kind}.png")), img, w as u32, h as u32, image::ColorType::Rgba8);
+                    }
+                }
+                check(
+                    t,
+                    format!("{name}: {holes} of {model} model pixels empty, mean difference {mean:.1}/255"),
+                    model > 1000 && holes * 2000 <= model && mean <= 4.0,
+                );
+                if let Some(g) = self.gfx.as_mut() {
+                    g.splatting = true;
                 }
             }
             _ => {}

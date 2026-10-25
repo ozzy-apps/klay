@@ -406,3 +406,75 @@ fn symmetric_distance(p: vec3<f32>, c: vec3<f32>) -> f32 {
     }
     return d;
 }
+
+// --- Point splats (splat.wgsl) resolved into the frame -----------------------------------
+// Drawn as a full-screen triangle right after the background: every pixel a point landed
+// in is shaded like a triangle's fragment, from the nearest vertex's own position, normal,
+// paint and mask, and writes that vertex's depth, so triangles drawn after it sort against
+// it. An empty pixel with three or four filled neighbours takes the nearest of them, so
+// single-pixel gaps between points do not show the background.
+struct SplatView {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+// Per framebuffer pixel: the winning vertex and its inverted depth (both 0: empty).
+@group(3) @binding(0) var<storage, read> splat_keys: array<vec2<u32>>;
+@group(3) @binding(1) var<storage, read> splat_positions: array<f32>;
+@group(3) @binding(2) var<storage, read> splat_normals: array<u32>;
+@group(3) @binding(3) var<storage, read> splat_colors: array<u32>;
+@group(3) @binding(4) var<uniform> splat_view: SplatView;
+
+struct SplatOut {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+fn splat_key(x: i32, y: i32) -> vec2<u32> {
+    if (x < 0 || y < 0 || x >= i32(splat_view.width) || y >= i32(splat_view.height)) {
+        return vec2<u32>(0u);
+    }
+    return splat_keys[u32(y) * splat_view.width + u32(x)];
+}
+
+@fragment
+fn fs_splat(@builtin(position) at: vec4<f32>) -> SplatOut {
+    let x = i32(at.x);
+    let y = i32(at.y);
+    var key = splat_key(x, y);
+    if (key.y == 0u) {
+        var filled = 0u;
+        var best = vec2<u32>(0u);
+        for (var k = 0; k < 4; k++) {
+            let d = select(select(vec2<i32>(0, 1), vec2<i32>(0, -1), k == 2), select(vec2<i32>(1, 0), vec2<i32>(-1, 0), k == 1), k < 2);
+            let n = splat_key(x + d.x, y + d.y);
+            if (n.y != 0u) {
+                filled += 1u;
+                if (n.y > best.y) {
+                    best = n;
+                }
+            }
+        }
+        if (filled < 3u) {
+            discard;
+        }
+        key = best;
+    }
+    let v = key.x;
+    var in: VsOut;
+    in.clip = at;
+    in.world_pos = vec3<f32>(splat_positions[3u * v], splat_positions[3u * v + 1u], splat_positions[3u * v + 2u]);
+    in.normal = unpack4x8snorm(splat_normals[v]).xyz;
+    in.parked = 0u;
+    in.prim_base = 0u;
+    in.mask = 0.0;
+    if (u.display.w > 0.5) {
+        in.mask = mask_at(v);
+    }
+    in.color = unpack4x8unorm(splat_colors[v]);
+    var out: SplatOut;
+    out.color = surface(in);
+    out.depth = bitcast<f32>(0xffffffffu - key.y);
+    return out;
+}

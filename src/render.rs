@@ -108,6 +108,9 @@ impl ChunkBounds {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CullParams {
+    view_proj: [[f32; 4]; 4],
+    viewport: [f32; 4],
+    splat: [f32; 4],
     planes: [[f32; 4]; 6],
     eye: [f32; 4],
     forward: [f32; 4],
@@ -126,6 +129,24 @@ pub struct CullCounts {
     pub chunk_total: u32,
     pub triangles: u32,
     pub triangle_total: u32,
+    /// Chunks drawn as points, and their vertices.
+    pub point_chunks: u32,
+    pub points: u32,
+}
+
+/// Uniform of the splat pass (see `splat.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SplatParams {
+    view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    forward: [f32; 4],
+    viewport: [f32; 4],
+    frame: [f32; 4],
+    width: u32,
+    height: u32,
+    chunk_count: u32,
+    _pad: u32,
 }
 
 /// A grab stroke running on the GPU.
@@ -182,6 +203,8 @@ struct MeshBuffers {
     ranges: wgpu::Buffer,
     draws: wgpu::Buffer,
     draw_counts: wgpu::Buffer,
+    /// Per chunk, what the cull pass chose: 0 not drawn, 1 triangles, 2 points.
+    modes: wgpu::Buffer,
     /// The chunks whose bounds the next bounds pass refits (`bounds_listed` of
     /// `bounds_work`), or all of them.
     bounds_work: wgpu::Buffer,
@@ -352,6 +375,28 @@ pub struct Gfx {
     cull_params: wgpu::Buffer,
     /// Whether the last frame drew the active subtool through the cull pass.
     pub culled_last_frame: bool,
+    /// Point splats for dense chunks (`splat.wgsl`, `fs_splat`): on when `splatting` and the
+    /// GPU has 64-bit atomics (`splat_pipeline`); a chunk is drawn as points from
+    /// `splat_density` vertices per pixel. `splat_keys` holds one 64-bit key per
+    /// framebuffer pixel, sized with the surface.
+    pub splatting: bool,
+    pub splat_density: f32,
+    splat_pipeline: Option<wgpu::ComputePipeline>,
+    splat_bgl: wgpu::BindGroupLayout,
+    resolve_pipeline: wgpu::RenderPipeline,
+    resolve_bgl: wgpu::BindGroupLayout,
+    splat_params: wgpu::Buffer,
+    splat_view: wgpu::Buffer,
+    splat_keys: Option<(wgpu::Buffer, u32, u32)>,
+    /// What the cull pass drew, read back every `COUNTS_EVERY` frames without waiting
+    /// (Performance palette): the copy's state (0 free, 1 mapping, 2 mapped), the shown
+    /// level's chunk and triangle totals at the copy, and the last result (`None` when the
+    /// last frame was not culled).
+    counts_readback: wgpu::Buffer,
+    counts_state: Arc<std::sync::atomic::AtomicU8>,
+    counts_totals: (u32, u32),
+    counts_frame: u32,
+    pub drawn: Option<CullCounts>,
     /// Polygroup colours (PolyF), plain and for Live Boolean; `None` when the GPU has no
     /// primitive index.
     group_pipeline: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
@@ -431,12 +476,16 @@ impl Gfx {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("klay"),
             // PRIMITIVE_INDEX: the polygroup pass; INDIRECT_FIRST_INSTANCE lets it work under
-            // GPU culling.
+            // GPU culling; 64-bit atomics: point splats (ALL_OPS lets them skip a lost write).
             required_features: (if primitive_index {
                 wgpu::Features::PRIMITIVE_INDEX
             } else {
                 wgpu::Features::empty()
-            }) | (adapter.features() & wgpu::Features::INDIRECT_FIRST_INSTANCE),
+            }) | (adapter.features()
+                & (wgpu::Features::INDIRECT_FIRST_INSTANCE
+                    | wgpu::Features::SHADER_INT64
+                    | wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX
+                    | wgpu::Features::SHADER_INT64_ATOMIC_ALL_OPS)),
             required_limits: adapter.limits(),
             ..Default::default()
         }))
@@ -934,7 +983,16 @@ impl Gfx {
         let bounds_pipeline = compute_pipeline("chunk bounds", include_str!("bounds.wgsl"), "cs_bounds", &bounds_bgl);
         let cull_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cull bgl"),
-            entries: &[storage(0, true), storage(1, true), storage(2, false), storage(3, false), compute_uniform(4)],
+            entries: &[
+                storage(0, true),
+                storage(1, true),
+                storage(2, false),
+                storage(3, false),
+                compute_uniform(4),
+                storage(5, true),
+                storage(6, true),
+                storage(7, false),
+            ],
         });
         let cull_pipeline = compute_pipeline("chunk cull", include_str!("cull.wgsl"), "cs_cull", &cull_bgl);
         let cull_params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -943,10 +1001,92 @@ impl Gfx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Point splats.
+        let splat_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("splat bgl"),
+            entries: &[storage(0, true), storage(1, true), storage(2, true), storage(3, true), storage(4, false), compute_uniform(5)],
+        });
+        let int64 = wgpu::Features::SHADER_INT64 | wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX;
+        let splat_pipeline = device.features().contains(int64).then(|| {
+            let early = device.features().contains(wgpu::Features::SHADER_INT64_ATOMIC_ALL_OPS);
+            let source = include_str!("splat.wgsl").replace("//EARLY ", if early { "" } else { "// " });
+            compute_pipeline("point splats", &source, "cs_splat", &splat_bgl)
+        });
+        let splat_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("splat params"),
+            size: std::mem::size_of::<SplatParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let splat_view = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("splat view"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fragment_buffer = |binding: u32, uniform: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: if uniform { wgpu::BufferBindingType::Uniform } else { wgpu::BufferBindingType::Storage { read_only: true } },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("splat resolve bgl"),
+            entries: &[
+                fragment_buffer(0, false),
+                fragment_buffer(1, false),
+                fragment_buffer(2, false),
+                fragment_buffer(3, false),
+                fragment_buffer(4, true),
+            ],
+        });
+        let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("splat resolve layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&mask_bgl), None, Some(&resolve_bgl)],
+            immediate_size: 0,
+        });
+        let resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("splat resolve"),
+            layout: Some(&resolve_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_background"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_splat"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let features = device.features();
         let cull_supported = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
         let cull_first_instance = features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
-        log::info!("gpu culling: {cull_supported} (first instance {cull_first_instance})");
+        log::info!(
+            "gpu culling: {cull_supported} (first instance {cull_first_instance}), point splats: {}",
+            splat_pipeline.is_some()
+        );
         // --- Grab compute pipeline ------------------------------------------------------
         let grab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grab"),
@@ -1032,6 +1172,12 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
+        let counts_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cull counts readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
@@ -1065,6 +1211,20 @@ impl Gfx {
             cull_bgl,
             cull_params,
             culled_last_frame: false,
+            splatting: true,
+            splat_density: SPLAT_DENSITY,
+            splat_pipeline,
+            splat_bgl,
+            resolve_pipeline,
+            resolve_bgl,
+            splat_params,
+            splat_view,
+            splat_keys: None,
+            counts_readback,
+            counts_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            counts_totals: (0, 0),
+            counts_frame: 0,
+            drawn: None,
             group_pipeline,
             group_bgl,
             bool_pipeline,
@@ -1447,6 +1607,31 @@ impl Gfx {
         self.read_buffer(&b.mask)
     }
 
+    /// Whether this GPU can draw dense chunks as points (64-bit atomics).
+    pub fn points_supported(&self) -> bool {
+        self.splat_pipeline.is_some()
+    }
+
+    /// Pick up the cull counts copied a few frames ago once they are readable, without
+    /// waiting for the GPU.
+    fn take_counts(&mut self) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.counts_state.load(Acquire) != 2 {
+            return;
+        }
+        let counts: Vec<u32> = match self.counts_readback.get_mapped_range(..) {
+            Ok(view) => bytemuck::pod_collect_to_vec(&view[..]),
+            Err(_) => Vec::new(),
+        };
+        self.counts_readback.unmap();
+        self.counts_state.store(0, Release);
+        if let [chunks, triangles, point_chunks, points] = counts[..] {
+            let (chunk_total, triangle_total) = self.counts_totals;
+            self.drawn = Some(CullCounts { chunks, chunk_total, triangles, triangle_total, point_chunks, points });
+        }
+    }
+
     /// What the last culled frame drew of the shown level (self-tests, `--frames`). `None`
     /// when culling did not run.
     pub fn read_cull_counts(&self) -> Option<CullCounts> {
@@ -1460,6 +1645,8 @@ impl Gfx {
             chunk_total: b.dirty_flags.len() as u32,
             triangles: counts[1],
             triangle_total: b.drawn_triangles,
+            point_chunks: counts[2],
+            points: counts[3],
         })
     }
 
@@ -1675,8 +1862,8 @@ impl Gfx {
         };
         let normals = plain("normals", room.verts * 4, U::VERTEX | U::STORAGE);
         let colors=if mesh.colors.is_empty() {
-            plain("paint",room.verts*4,U::VERTEX|U::COPY_DST|U::COPY_SRC)
-        } else {self.upload_in("paint",bytemuck::cast_slice(&mesh.colors),room.verts*4,U::VERTEX|U::COPY_SRC)};
+            plain("paint",room.verts*4,U::VERTEX|U::STORAGE|U::COPY_DST|U::COPY_SRC)
+        } else {self.upload_in("paint",bytemuck::cast_slice(&mesh.colors),room.verts*4,U::VERTEX|U::STORAGE|U::COPY_SRC)};
         let acc = plain("normal accumulators", room.verts * 12, U::STORAGE);
         let chunk_flag = plain("chunk_flag", room.chunks * 4, U::STORAGE | U::COPY_DST);
         let work = plain("normal work list", room.chunks * 4, U::STORAGE | U::COPY_DST);
@@ -1694,6 +1881,7 @@ impl Gfx {
         let ranges = self.upload_in("chunk draw ranges", bytemuck::cast_slice(&full_ranges(mesh)), room.chunks * 8, U::STORAGE);
         let draws = plain("chunk draws", room.chunks * 20, U::STORAGE | U::INDIRECT);
         let draw_counts = plain("chunk draw counts", 16, U::STORAGE | U::COPY_DST | U::COPY_SRC);
+        let modes = plain("chunk draw modes", room.chunks * 4, U::STORAGE);
         let bounds_work = plain("bounds work list", room.chunks * 4, U::STORAGE | U::COPY_DST);
         let bounds_params = plain("bounds params", std::mem::size_of::<BoundsParams>(), U::UNIFORM | U::COPY_DST);
         // Padded to whole words; zero (nothing masked) unless the mesh has a mask.
@@ -1721,6 +1909,7 @@ impl Gfx {
             &ranges,
             &draws,
             &bounds_work,
+            &modes,
         ]
         .iter()
         .map(|b| b.size())
@@ -1740,7 +1929,7 @@ impl Gfx {
                 chunk_flag,
                 work,
                 normal_params,
-                (bounds, ranges, draws, draw_counts, bounds_work, bounds_params),
+                (bounds, ranges, draws, draw_counts, bounds_work, bounds_params, modes),
             ));
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             return None;
@@ -1807,7 +1996,7 @@ impl Gfx {
         let cull_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cull bg"),
             layout: &self.cull_bgl,
-            entries: &entries(&[&bounds, &ranges, &draws, &draw_counts, &self.cull_params]),
+            entries: &entries(&[&bounds, &ranges, &draws, &draw_counts, &self.cull_params, &chunk_verts, &chunk_tris, &modes]),
         });
         Some(MeshBuffers {
             mask,
@@ -1834,6 +2023,7 @@ impl Gfx {
             ranges,
             draws,
             draw_counts,
+            modes,
             bounds_work,
             bounds_params,
             bounds_bind_group,
@@ -2318,6 +2508,7 @@ impl Gfx {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
+        self.take_counts();
 
         let mut encoder = self
             .device
@@ -2414,6 +2605,23 @@ impl Gfx {
             && !previewing
             && !(groups_on && !self.cull_first_instance)
             && self.active_buffers().is_some();
+        // Points stand in for triangles only where shading needs nothing per triangle:
+        // not with polygroups shown or Live Boolean, which cuts per fragment.
+        let splat_on = cull_on && self.splatting && self.splat_pipeline.is_some() && !groups_on && self.bool_count == 0;
+        let (fw, fh) = (self.config.width, self.config.height);
+        if splat_on && self.splat_keys.as_ref().is_none_or(|k| (k.1, k.2) != (fw, fh)) {
+            let keys = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("splat keys"),
+                size: fw as u64 * fh as u64 * 8,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.splat_keys = Some((keys, fw, fh));
+            self.queue.write_buffer(&self.splat_view, 0, bytemuck::cast_slice(&[fw, fh, 0, 0]));
+        }
+        let frame_rect = document_frame(uniforms, fw, fh);
+        let mut resolve = None;
+        let mut read_counts = false;
         if let Some(m) = self.levels.get_mut(self.active).and_then(Option::as_mut) {
             let chunks = m.dirty_flags.len() as u32;
             let jobs = if m.bounds_all { chunks } else { m.bounds_listed };
@@ -2434,7 +2642,8 @@ impl Gfx {
                 m.bounds_listed = 0;
             }
             if cull_on {
-                let params = cull_params(uniforms, chunks, self.bool_count == 0, self.cull_first_instance);
+                let mut params = cull_params(uniforms, chunks, self.bool_count == 0, self.cull_first_instance);
+                params.splat = [splat_on as u32 as f32, self.splat_density, 0.0, 0.0];
                 self.queue.write_buffer(&self.cull_params, 0, bytemuck::bytes_of(&params));
                 encoder.clear_buffer(&m.draw_counts, 0, None);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2445,9 +2654,52 @@ impl Gfx {
                 pass.set_bind_group(0, &m.cull_bind_group, &[]);
                 let groups = chunks.div_ceil(64);
                 pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+                drop(pass);
+                self.counts_frame = self.counts_frame.wrapping_add(1);
+                use std::sync::atomic::Ordering::Acquire;
+                if self.counts_frame % COUNTS_EVERY == 0 && self.counts_state.load(Acquire) == 0 {
+                    encoder.copy_buffer_to_buffer(&m.draw_counts, 0, &self.counts_readback, 0, 16);
+                    self.counts_totals = (chunks, m.drawn_triangles);
+                    read_counts = true;
+                }
+            }
+            if let (true, Some(pipeline), Some((keys, _, _))) = (splat_on, &self.splat_pipeline, &self.splat_keys) {
+                let params = SplatParams {
+                    view_proj: uniforms.view_proj,
+                    eye: cull_eye(uniforms),
+                    forward: cull_forward(uniforms),
+                    viewport: uniforms.viewport,
+                    frame: frame_rect,
+                    width: fw,
+                    height: fh,
+                    chunk_count: chunks,
+                    _pad: 0,
+                };
+                self.queue.write_buffer(&self.splat_params, 0, bytemuck::bytes_of(&params));
+                encoder.clear_buffer(keys, 0, None);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("splat bg"),
+                    layout: &self.splat_bgl,
+                    entries: &entries(&[&m.positions, &m.normals, &m._tables[0], &m.modes, keys, &self.splat_params]),
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("point splats"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(chunks.min(65535), chunks.div_ceil(65535), 1);
+                resolve = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("splat resolve bg"),
+                    layout: &self.resolve_bgl,
+                    entries: &entries(&[keys, &m.positions, &m.normals, &m.colors, &self.splat_view]),
+                }));
             }
         }
         self.culled_last_frame = cull_on;
+        if !cull_on {
+            self.drawn = None;
+        }
 
         // Mesh pass.
         {
@@ -2495,6 +2747,14 @@ impl Gfx {
             pass.set_scissor_rect(fx as u32, fy as u32, fw as u32, fh as u32);
             let boolean = self.bool_count > 0;
             let plain = if boolean { &self.bool_pipeline } else { &self.pipeline };
+            // The points first: they write depth, and the triangles sort against them.
+            if let (Some(bg), Some(m)) = (&resolve, self.active_buffers()) {
+                pass.set_pipeline(&self.resolve_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, &m.mask_bind_group, &[]);
+                pass.set_bind_group(3, bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
             if let Some(m) = self.active_buffers() {
                 match (&self.group_pipeline, &m.groups, polyframe) {
                     (Some((pipeline, bool_pipeline)), Some(g), true) => {
@@ -2582,6 +2842,13 @@ impl Gfx {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
+        if read_counts {
+            let state = self.counts_state.clone();
+            state.store(1, std::sync::atomic::Ordering::Release);
+            self.counts_readback.map_async(wgpu::MapMode::Read, .., move |r| {
+                state.store(if r.is_ok() { 2 } else { 0 }, std::sync::atomic::Ordering::Release);
+            });
+        }
         if let Some(buffer) = capture {
             self.read_capture(&buffer);
         }
@@ -2638,6 +2905,38 @@ fn visible_ranges(mesh: &SculptMesh) -> Vec<[u32; 2]> {
     ranges
 }
 
+/// Frames between reads of the cull counts for the Performance palette.
+const COUNTS_EVERY: u32 = 20;
+
+/// Vertices per pixel from which a chunk is drawn as points (see `cull.wgsl`).
+pub const SPLAT_DENSITY: f32 = 2.0;
+
+/// The document frame inside the viewport in framebuffer pixels (x0, y0, x1, y1), as the
+/// mesh pass's scissor rectangle.
+fn document_frame(u: &Uniforms, width: u32, height: u32) -> [f32; 4] {
+    let [x, y, w, h] = u.viewport;
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let w = w.clamp(1.0, width as f32 - x);
+    let h = h.clamp(1.0, height as f32 - y);
+    let inset = u.back_shape[2].max(0.0).min(w.min(h) * 0.5 - 1.0).max(0.0);
+    let (fx, fy) = ((x + inset).round(), (y + inset).round());
+    let (fw, fh) = ((w - 2.0 * inset).round().max(1.0), (h - 2.0 * inset).round().max(1.0));
+    [fx, fy, fx + fw, fy + fh]
+}
+
+/// The camera for back-face tests: position, w 1 when orthographic (clip w constant).
+fn cull_eye(u: &Uniforms) -> [f32; 4] {
+    let r3 = glam::Mat4::from_cols_array_2d(&u.view_proj).row(3);
+    let ortho = r3.truncate().length() < 1e-6;
+    [u.cam_pos[0], u.cam_pos[1], u.cam_pos[2], ortho as u32 as f32]
+}
+
+/// The viewing direction (used by orthographic cameras).
+fn cull_forward(u: &Uniforms) -> [f32; 4] {
+    glam::Mat4::from_cols_array_2d(&u.view_proj).row(2).truncate().normalize_or_zero().extend(0.0).to_array()
+}
+
 /// The cull pass's uniform for this frame: the frustum narrowed to the document frame,
 /// the camera for the back-face test (`cone`: off for Live Boolean, which draws back
 /// faces), and whether draws carry their first triangle as their first instance.
@@ -2650,12 +2949,13 @@ fn cull_params(u: &Uniforms, chunks: u32, cone: bool, first_instance: bool) -> C
     let lx = (1.0 - 2.0 * inset / w.max(1.0)).max(0.0);
     let ly = (1.0 - 2.0 * inset / h.max(1.0)).max(0.0);
     let planes = [r3 * lx + r0, r3 * lx - r0, r3 * ly + r1, r3 * ly - r1, r2, r3 - r2];
-    // An orthographic projection leaves clip w constant.
-    let ortho = r3.truncate().length() < 1e-6;
     CullParams {
+        view_proj: u.view_proj,
+        viewport: u.viewport,
+        splat: [0.0; 4],
         planes: planes.map(|p| p.to_array()),
-        eye: [u.cam_pos[0], u.cam_pos[1], u.cam_pos[2], ortho as u32 as f32],
-        forward: r2.truncate().normalize_or_zero().extend(0.0).to_array(),
+        eye: cull_eye(u),
+        forward: cull_forward(u),
         chunk_count: chunks,
         cone: cone as u32,
         frustum: 1,

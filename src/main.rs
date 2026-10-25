@@ -486,6 +486,8 @@ struct App {
     selftest_document: Option<native_tests::DocumentTest>,
     /// `--selftest-cull`: culled and whole frames compared after camera moves and edits.
     selftest_cull: Option<native_tests::CullTest>,
+    /// `--selftest-splat`: points against triangles after paint, a mask and a Grab.
+    selftest_splat: Option<native_tests::SplatTest>,
     /// `--snapshot FILE`: frames left, then the canvas is saved to FILE and the app quits.
     snapshot_to: Option<(String, u32)>,
     /// `--snapshot-ui`: the snapshot is the whole window, interface included.
@@ -699,6 +701,7 @@ impl App {
             selftest_boolean: None,
             selftest_document: None,
             selftest_cull: None,
+            selftest_splat: None,
             selftest_symmetry: None,
             snapshot_to: None,
             snapshot_ui: false,
@@ -2053,8 +2056,8 @@ impl App {
 
     /// Write a drawn snapshot as `<project> snapshot N.png` next to the project file.
     fn save_snapshot(&mut self) {
-        // `--selftest-cull` reads its snapshots itself.
-        if self.selftest_cull.is_some() {
+        // `--selftest-cull` and `--selftest-splat` read their snapshots themselves.
+        if self.selftest_cull.is_some() || self.selftest_splat.is_some() {
             return;
         }
         let Some((w, h, rgba)) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
@@ -6736,6 +6739,8 @@ impl App {
                     .as_ref()
                     .map(|g| g.adapter_name.as_str())
                     .unwrap_or(""),
+                drawn: self.gfx.as_ref().and_then(|g| g.drawn),
+                points_supported: self.gfx.as_ref().is_some_and(Gfx::points_supported),
                 axes: {
                     let (r, u, f) = (self.camera.right(), self.camera.up(), self.camera.forward());
                     [Vec3::X, Vec3::Y, Vec3::Z].map(|v| [v.dot(r), v.dot(u), -v.dot(f)])
@@ -7185,6 +7190,10 @@ impl App {
             if self.selftest_cull_frame(&mut t) { self.quit = true; }
             else { self.selftest_cull = Some(t); }
         }
+        if let Some(mut t) = self.selftest_splat.take() {
+            if self.selftest_splat_frame(&mut t) { self.quit = true; }
+            else { self.selftest_splat = Some(t); }
+        }
         if let Some(mut t) = self.selftest_boolean.take() {
             if self.selftest_boolean_frame(&mut t) { self.quit = !self.selftest_hold; }
             else { self.selftest_boolean = Some(t); }
@@ -7235,11 +7244,13 @@ impl App {
             if left == 0 {
                 let culled = match self.gfx.as_ref().and_then(Gfx::read_cull_counts) {
                     Some(c) => format!(
-                        ", culling drew {} of {} chunks ({} of {} triangles)",
+                        ", culling drew {} of {} chunks as triangles ({} of {} triangles) and {} as points ({} vertices)",
                         c.chunks,
                         c.chunk_total,
                         fmt_count(c.triangles as usize),
-                        fmt_count(c.triangle_total as usize)
+                        fmt_count(c.triangle_total as usize),
+                        c.point_chunks,
+                        fmt_count(c.points as usize)
                     ),
                     None => ", no culling".to_string(),
                 };
@@ -7340,6 +7351,10 @@ impl App {
             .map(|(key, i)| (key, slots.iter().find(|s| s.0 == i).map_or(1, |s| 1 + s.1 as u32)))
             .collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        // Performance › Drawing (self-tests switch points themselves).
+        if self.selftest_cull.is_none() && self.selftest_splat.is_none() {
+            gfx.splatting = self.workspace.layout.dense_points && !self.render_triangles;
+        }
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -8022,6 +8037,9 @@ fn main() {
     }
     if args.iter().any(|a| a == "--selftest-cull") {
         app.selftest_cull = Some(native_tests::CullTest::default());
+    }
+    if args.iter().any(|a| a == "--selftest-splat") {
+        app.selftest_splat = Some(native_tests::SplatTest::default());
     }
     if args.iter().any(|a| a == "--selftest-boolean") {
         app.selftest_boolean = Some(native_tests::BooleanTest::default());

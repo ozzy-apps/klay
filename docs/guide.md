@@ -19,6 +19,7 @@ cargo run --release -- --bench 400 --divide 2               # divide timings, ba
 cargo run --release -- --segments 400 --divide 2 --novsync --frames   # average frame time at the top level and what culling drew, then exit
 cargo run --release -- --segments 400 --divide 3 --novsync --frames --camera-distance 0.35 --render triangles   # closer camera; draw without GPU culling
 cargo run --release -- --segments 200 --divide 2 --novsync --selftest-cull   # culled vs whole frames, pixel for pixel, after camera moves and edits, log, exit
+cargo run --release -- --segments 400 --divide 2 --novsync --selftest-splat  # points vs triangles (empty pixels, colour) with paint, a mask and a GPU Grab, log, exit
 cargo run --release -- --subtools 4                         # start with four subtools in a row
 cargo run --release -- --segments 400 --divide 2 --subtools 3 --selftest-subtools   # pick and switch subtools via the GPU path, log, exit
 cargo run --release -- --open model.klay                    # open a saved project
@@ -871,6 +872,19 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   preview moves vertices in the vertex shader, skips the back-face test under Live Boolean
   (which draws back faces), and gives PolyF each draw's first triangle through its first
   instance (`vs_active`). `--render triangles` draws the subtool whole for comparisons.
+- Point splats (`splat.wgsl`, `fs_splat` in `shader.wgsl`): the cull pass also estimates
+  each visible chunk's vertices per pixel (its vertex count over its box's screen
+  rectangle, which errs towards triangles) and from 2 per pixel draws the chunk as points
+  instead. A compute pass projects every front-facing vertex of those chunks into the
+  pixel it lands in and keeps the nearest with a 64-bit `atomicMax` of
+  `(inverted depth << 32) | vertex`; a full-screen pass right after the background shades
+  each pixel's winner with the same `surface()` as triangles (MatCap, paint, mask, brush
+  ring) and writes its depth, so the triangles of nearer, coarser chunks sort against it.
+  An empty pixel with three or four filled neighbours takes the nearest of them. Points
+  are off with PolyF or Live Boolean on, for chunks with hidden polygons, on GPUs without
+  64-bit atomics, and with Performance › Drawing › Points for dense meshes unticked
+  (saved with the workspace; the palette also shows what the last frames drew).
+  `--selftest-splat` compares points with triangles for empty pixels and colour.
 
 ## Numbers (RTX 5060, 16 cores, release build)
 
@@ -913,8 +927,21 @@ costs the same at any distance (triangle setup bound, measured from 12.6 to 16.5
 | 61.4M vertices, far (4×) | 15.2 ms | 10.4 ms | 47% of the triangles |
 
 From far away more chunks are drawn (small chunks on screen turn less, so fewer are wholly
-back-facing) and every drawn triangle is far under a pixel: the point splats planned next
-are for that case.
+back-facing) and every drawn triangle is far under a pixel: point splats are for that
+case.
+
+### Point splats (400-segment sphere, `--novsync --frames --camera-distance K`)
+
+| Level, camera | 0.25 (whole level) | Culled triangles | Culled, dense chunks as points |
+| --- | --- | --- | --- |
+| 15.4M vertices, close up (0.35×) | 3.9 ms | 1.1 ms | 1.1 ms (12 chunks, all triangles) |
+| 15.4M vertices, framed (1×) | 3.9 ms | 2.2 ms | 1.1 ms (1 529 chunks, 5.7M points) |
+| 15.4M vertices, far (4×) | 3.9 ms | 2.8 ms | 1.2 ms (1 978 chunks, 7.4M points) |
+| 61.4M vertices, framed (1×) | 15.2 ms | 8.0 ms | 1.6 ms (5 862 chunks, 22M points) |
+
+About 1 ms of every frame is the rest of the frame (interface, present). Against triangles,
+`--selftest-splat` finds no empty model pixels on the framed sphere (5 of 252 438 at the
+edge of a long Grab pull) and a mean colour difference under 1/255.
 
 ### SubTools (400-segment sphere, `--bench 400 --divide N` and `--selftest-subtools`)
 
