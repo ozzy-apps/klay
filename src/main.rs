@@ -7774,6 +7774,10 @@ fn main() {
     if args.iter().any(|a| a == "--space-menu") {
         app.workspace.open_quick_menu(egui::pos2(900.0, 360.0), false);
     }
+    // `--brush-catalog`: start with the B catalog open (for snapshots of it).
+    if args.iter().any(|a| a == "--brush-catalog") {
+        app.workspace.open_brush_catalog(egui::pos2(320.0, 140.0));
+    }
     // `--gizmo`: start in Move mode with Gizmo 3D (Y).
     if args.iter().any(|a| a == "--gizmo") {
         app.workspace.gizmo = true;

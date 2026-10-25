@@ -4540,8 +4540,10 @@ fn thumb(ui: &mut Ui, caption: &str, content: Thumb, label: &str, on: bool, dim:
     resp.on_hover_text(label)
 }
 
+/// A catalog tile. `code` is the ZBrush brush code drawn in the corner, lit when its
+/// first letter has been typed.
 fn brush_tile(
-    ui: &mut Ui, tex: TextureId, name: &str, key: usize, on: bool, width: f32,
+    ui: &mut Ui, tex: TextureId, name: &str, key: usize, code: (&str, Option<char>), on: bool, width: f32,
 ) -> egui::Response {
     let color = if on { Color32::WHITE } else { FG2 };
     let label = ui.painter().layout(
@@ -4560,8 +4562,26 @@ fn brush_tile(
     if (1..=9).contains(&key) {
         p.text(im.right_top() + vec2(-3.0, 2.0), Align2::RIGHT_TOP, key.to_string(), font(11.0, Weight::SemiBold), FG);
     }
+    if !code.0.is_empty() {
+        let lit = code.1.is_some_and(|c| code.0.starts_with(c));
+        let galley = p.layout_no_wrap(code.0.to_owned(), font(11.5, Weight::SemiBold), if lit { ACC_FG } else { FG });
+        let chip = Rect::from_min_size(r.min + vec2(4.0, 4.0), galley.size() + vec2(8.0, 2.0));
+        p.rect_filled(chip, 3, if lit { ACC } else { Color32::from_rgba_unmultiplied(14, 16, 18, 210) });
+        p.galley(chip.min + vec2(4.0, 1.0), galley, FG);
+    }
     p.galley(pos2(r.center().x - label.size().x * 0.5, r.top() + width - 2.0), label, color);
-    resp.on_hover_text(if (1..=9).contains(&key) { format!("{name} · {key}") } else { name.to_owned() })
+    let keys = match (code.0.is_empty(), (1..=9).contains(&key)) {
+        (false, true) => format!("{name} · B {} · {key}", spaced(code.0)),
+        (false, false) => format!("{name} · B {}", spaced(code.0)),
+        (true, true) => format!("{name} · {key}"),
+        (true, false) => name.to_owned(),
+    };
+    resp.on_hover_text(keys)
+}
+
+/// "DS" → "D S" for shortcut hints.
+fn spaced(code: &str) -> String {
+    code.chars().map(String::from).collect::<Vec<_>>().join(" ")
 }
 
 /// HSV picker: saturation/value square plus a hue strip on its right (left shelf).

@@ -179,6 +179,69 @@ impl BrushKind {
         !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_imm() && !self.is_zmodeler() && !self.is_mask() && self != Self::ClipLine
     }
 
+    /// ZBrush's two-letter brush code: B, then these two letters picks the brush (B S T
+    /// Standard, B D S Dam Standard, B C B Clay Buildup, B M V Move…). Brushes ZBrush has
+    /// use its code; Klay's own get one from their name.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Draw => "ST",
+            Self::Smooth => "SM",
+            Self::Grab => "MV",
+            Self::Flatten => "FL",
+            Self::Inflate => "IN",
+            Self::DamStandard => "DS",
+            Self::Pinch => "PI",
+            Self::Clay => "CL",
+            Self::ClayBuildup => "CB",
+            Self::Crease => "CR",
+            Self::TrimDynamic => "TD",
+            Self::Polish => "PO",
+            Self::Paint => "PA",
+            Self::Blob => "BL",
+            Self::Layer => "LA",
+            Self::Fill => "FI",
+            Self::Scrape => "SC",
+            Self::Nudge => "NU",
+            Self::Sharpen => "SR",
+            Self::Elastic => "ME",
+            Self::SnakeHook => "SH",
+            Self::MaskPen => "MP",
+            Self::MaskSoft => "MS",
+            Self::MaskRect => "MR",
+            Self::MaskLasso => "ML",
+            Self::MaskCircle => "MC",
+            Self::MaskLine => "MI",
+            Self::ClipLine => "CC",
+            Self::FormSoft => "FS",
+            Self::FormHard => "FH",
+            Self::Zipper => "ZI",
+            Self::Stitch => "SI",
+            Self::Rake => "RA",
+            Self::CurveTube => "CU",
+            Self::ClayTubes => "CT",
+            Self::HPolish => "HP",
+            Self::TrimAdaptive => "TA",
+            Self::Planar => "PL",
+            Self::TrimSmoothBorder => "TS",
+            Self::MoveTopological => "MT",
+            Self::InflateBalloon => "IB",
+            Self::Magnify => "MG",
+            Self::OrbCracks => "OC",
+            Self::MalletFast => "MF",
+            Self::SmoothValleys => "SV",
+            Self::SmoothPeaks => "SP",
+            Self::Morph => "MO",
+            Self::InsertMesh => "IP",
+            Self::ZModeler => "ZM",
+        }
+    }
+
+    /// The brush whose code is these two letters (any case).
+    pub fn from_code(a: char, b: char) -> Option<Self> {
+        let code = [a.to_ascii_uppercase(), b.to_ascii_uppercase()];
+        Self::ALL.into_iter().find(|k| k.code().chars().eq(code))
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Self::Draw=>"Build a rounded stroke. Alt carves.",Self::Smooth=>"Relax surface detail.",

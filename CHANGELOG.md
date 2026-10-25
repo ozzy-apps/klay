@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.22.0 — 2026-10-25
+
+- ZBrush brush keys: B, then a brush's two letters picks it (B D S Dam Standard, B C B Clay Buildup, B M V Move, B S T Standard, B H P hPolish, B T D Trim Dynamic…). All 49 brushes have a code, ZBrush's own where ZBrush has the brush; the catalog shows each code on its tile, the first letter keeps only the brushes it starts, Backspace takes it back.
+- New --brush-catalog (start with the B catalog open).
+- Verification: 256 release tests (new: every code unique and found again; B D S and B M P through the key path, with Backspace and a letter no code starts with).
+
 ## 0.21.0 — 2026-10-25
 
 - Readable interface, same ZBrush layout (from the "Klay Readable UI" mockup): the interface font is Inter (bundled, OFL) in three weights instead of Ubuntu Light; 13 px controls, 12 px notes, brighter secondary text.

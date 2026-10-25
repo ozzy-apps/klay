@@ -41,6 +41,7 @@ cargo run --release -- --segments 100 --selftest-symmetry              # Draw, G
 cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # start with symmetry (x, y, z, r<axis><count>), save the canvas after start-up and quit
 cargo run --release -- --snapshot ui.png --snapshot-ui               # save the whole window, interface included, after start-up and quit
 cargo run --release -- --space-menu                                  # start with the Space menu open
+cargo run --release -- --brush-catalog                               # start with the B catalog open
 cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
@@ -403,16 +404,21 @@ colours are kept with the workspace layout (Workspace › Reset leaves them alon
 
 ### Brushes, alphas and textures
 
-Press **B**, click the current brush thumbnail or choose **All Brushes** for the catalog:
-Quick Pick, search, All/Sculpt/Mask/Detail/Clip filters, alphabet filter, brush grid and a
-large hover preview. The docked Brush palette
-uses a compact working set: one larger current-brush preview, two recent picks and twelve
-small paired brush cells. **Sculpt / Mask** tabs switch the working set and restore the last
-brush from that set. Layer, FormSoft, Zipper and Clip Line are directly available in Sculpt.
-**All Brushes (47)** opens the full library; selecting any brush
-puts it in the active preview and recent picks. This keeps the panel compact as the library
-grows. Previews are original 160 px sculpted clay studies in the
-current material, including the brush's subtract variant where applicable.
+Press **B**, click the current brush thumbnail or choose **All (49)** for the catalog:
+Quick Pick, search, All/Sculpt/Mask/Detail/Clip/Insert filters, alphabet filter, brush grid and a
+large hover preview. The docked Brush palette has **Sculpt / Mask / All** tabs and a
+three-column grid of working brushes; the last row holds the active and recent brushes.
+Previews are original 160 px sculpted clay studies in the current material, including the
+brush's subtract variant where applicable.
+
+**ZBrush brush keys**: press **B**, then the brush's two letters, as in ZBrush. Every tile in the
+catalog shows its code; the first letter keeps only the brushes whose code starts with it
+(Backspace takes it back), the second picks the brush and closes the catalog. ZBrush's codes
+are kept: **B S T** Standard (Draw), **B M V** Move (Grab), **B D S** Dam Standard,
+**B C B** Clay Buildup, **B C L** Clay, **B C T** ClayTubes, **B H P** hPolish, **B T D** Trim
+Dynamic, **B I N** Inflate, **B P I** Pinch, **B F L** Flatten, **B M T** Move Topological,
+**B S H** Snake Hook, **B M P** Mask Pen, **B Z M** ZModeler. Brushes of Klay's own get a code
+from their name (Zipper **Z I**, Clip Line **C C**). Clicking in the search box types there instead.
 
 - Draw, Smooth, Grab, Flatten and Inflate retain shortcuts **1–5**.
 - **6–9** select Dam Standard, Pinch, Clay and Clay Buildup. The catalog also provides

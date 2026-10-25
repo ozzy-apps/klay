@@ -575,3 +575,10 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Space menu (`draw_quick_menu`): `color_picker_stacked` (172 px square, horizontal hue bar under it; `hsv_picker` shared with the shelf's `color_picker`), then the colour line, Swap colors and RGB / Sculpt toggle buttons; the menu opens 208 px left of the pointer so the sliders stay under it. `--space-menu` opens it at start.
 - `--snapshot-ui`: with `--snapshot FILE`, `Gfx::snapshot_ui` copies the whole frame after the egui pass (UI reviews without xwd). Screenshot `ui-readable.png`.
 - Not done: long help notes still sit in the palettes (the mockup moves them to tooltips); popups, the brush catalog and dropdowns only picked up the theme, not a redesign; digits are proportional (egui has no tabular-figures feature).
+
+## Step 63: 0.22.0 — ZBrush brush keys (2026-10-25, Claude Code)
+- User: keyboard combos for brushes like ZBrush (B, D, S → Dam Standard), for every brush.
+- `BrushKind::code` (two capitals, ZBrush's code where ZBrush has the brush: ST Draw/Standard, MV Grab/Move, DS, CB, CL, CT, HP, TD, IN, PI, FL, MT, SH, SM, CR, LA, BL, PO, PL, MG, MF, IB, MP, ML, MR, MC, ZM; Klay's own from their names) and `BrushKind::from_code`.
+- Catalog (`brush_catalog_ui`): `BrushUi::{code, code_fresh}`; letter key events (no modifiers, not while a text field has focus) set the first letter if some code starts with it, the second picks `from_code` → `choose_brush` and closes; Backspace clears; the opening frame's B is skipped (`code_fresh`). With a letter typed the grid shows only matching codes across all groups and hides Quick Pick; the header hint says what to type. `brush_tile(.., code: (&str, Option<char>), ..)` draws the code chip (accent when its first letter is typed) and the hover text names "B D S".
+- `--brush-catalog` opens the catalog at start (snapshots).
+- Codes I was unsure of in ZBrush (SnakeHook SH, Layer LA, Magnify MG, CurveTube CU, IMM IP) can be changed in one table.

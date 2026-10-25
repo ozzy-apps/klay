@@ -38,6 +38,10 @@ pub(super) struct BrushUi {
     library: crate::asset_library::Library,
     recent: Vec<BrushKind>,
     catalog: Option<Pos2>,
+    /// ZBrush brush keys: the first letter typed in the catalog, waiting for the second.
+    code: Option<char>,
+    /// The catalog was opened this frame: the B that opened it is not a code letter.
+    code_fresh: bool,
     filter: Option<char>,
     group: BrushGroup,
     search: String,
@@ -63,6 +67,8 @@ impl BrushUi {
                 BrushKind::Pinch,
             ],
             catalog: None,
+            code: None,
+            code_fresh: false,
             filter: None,
             group: BrushGroup::All,
             search: String::new(),
@@ -164,6 +170,8 @@ impl Workspace {
             return;
         }
         self.brush_ui.catalog = Some(pos);
+        self.brush_ui.code = None;
+        self.brush_ui.code_fresh = true;
         self.brush_ui.filter = None;
         self.brush_ui.search.clear();
         self.brush_ui.group = if self.brush_ui.palette_masks {
@@ -610,6 +618,46 @@ impl Workspace {
             self.brush_ui.catalog = None;
             return;
         }
+        // ZBrush: B, then the brush's two letters (B D S: Dam Standard). The first letter
+        // keeps only the brushes whose code starts with it; Backspace takes it back.
+        let fresh = std::mem::take(&mut self.brush_ui.code_fresh);
+        if !fresh && !ctx.egui_wants_keyboard_input() {
+            let keys: Vec<char> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. }
+                            if modifiers.is_none() =>
+                        {
+                            let name = key.name();
+                            let c = name.chars().next()?;
+                            (name.len() == 1 && c.is_ascii_alphabetic()).then_some(c)
+                                .or((*key == egui::Key::Backspace).then_some('\u{8}'))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for c in keys {
+                match (c, self.brush_ui.code) {
+                    ('\u{8}', _) => self.brush_ui.code = None,
+                    (c, None) => {
+                        if BrushKind::ALL.iter().any(|k| k.code().starts_with(c)) {
+                            self.brush_ui.code = Some(c);
+                        }
+                    }
+                    (c, Some(first)) => {
+                        if let Some(k) = BrushKind::from_code(first, c) {
+                            self.brush_ui.catalog = None;
+                            self.brush_ui.code = None;
+                            self.choose_brush(m, k);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let typed = self.brush_ui.code;
         let bounds = ctx.content_rect().shrink(10.0);
         let width = (bounds.width() - 12.0).min(850.0);
         let height = bounds.height().min(620.0);
@@ -632,8 +680,17 @@ impl Workspace {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(format!("Brushes ({})", BrushKind::ALL.len()))
-                                .size(14.0)
-                                .strong(),
+                                .font(font(14.0, Weight::SemiBold)),
+                        );
+                        ui.add_space(12.0);
+                        let hint = match typed {
+                            Some(c) => format!("{c} …  second letter picks · Backspace goes back"),
+                            None => "Type a brush's two letters: D S Dam Standard, C B Clay Buildup".to_string(),
+                        };
+                        ui.label(
+                            RichText::new(hint)
+                                .font(font(12.5, Weight::Regular))
+                                .color(if typed.is_some() { ACC_TEXT } else { FG3 }),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             close |= ui.button("Close").clicked();
@@ -684,7 +741,7 @@ impl Workspace {
                                         .copied()
                                         .filter(|k| group.accepts(*k))
                                         .collect();
-                                    if !recent.is_empty() && self.brush_ui.search.is_empty() {
+                                    if !recent.is_empty() && self.brush_ui.search.is_empty() && typed.is_none() {
                                         ui.label(RichText::new("Quick Pick").size(12.0).color(FG2));
                                         ui.horizontal(|ui| {
                                             for k in recent {
@@ -695,6 +752,7 @@ impl Workspace {
                                                     tex,
                                                     k.name(),
                                                     0,
+                                                    (k.code(), None),
                                                     m.brush.kind == k,
                                                     70.0,
                                                 );
@@ -739,13 +797,17 @@ impl Workspace {
                                     let search = self.brush_ui.search.trim().to_lowercase();
                                     let mut list: Vec<_> = BrushKind::ALL
                                         .into_iter()
-                                        .filter(|k| {
-                                            group.accepts(*k)
-                                                && k.name().to_lowercase().contains(&search)
-                                                && self
-                                                    .brush_ui
-                                                    .filter
-                                                    .is_none_or(|c| k.name().starts_with(c))
+                                        .filter(|k| match typed {
+                                            // A typed code letter looks through every brush.
+                                            Some(c) => k.code().starts_with(c),
+                                            None => {
+                                                group.accepts(*k)
+                                                    && k.name().to_lowercase().contains(&search)
+                                                    && self
+                                                        .brush_ui
+                                                        .filter
+                                                        .is_none_or(|c| k.name().starts_with(c))
+                                            }
                                         })
                                         .collect();
                                     list.sort_by_key(|k| k.name());
@@ -771,6 +833,7 @@ impl Workspace {
                                                     tex,
                                                     k.name(),
                                                     key,
+                                                    (k.code(), typed),
                                                     m.brush.kind == k,
                                                     tile,
                                                 );
@@ -931,7 +994,7 @@ impl Workspace {
                             ui.horizontal(|ui| {
                                 for k in list {
                                     let tex = self.texture(ui.ctx(), Some(k), self.subtract);
-                                    if brush_tile(ui, tex, k.name(), 0, m.brush.kind == k, 60.0)
+                                    if brush_tile(ui, tex, k.name(), 0, ("", None), m.brush.kind == k, 60.0)
                                         .clicked()
                                     {
                                         self.choose_brush(m, k);
@@ -1207,6 +1270,49 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         )
+    }
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+    #[test]
+    fn brush_codes_are_unique_two_letters_and_find_their_brush() {
+        let mut seen = std::collections::HashSet::new();
+        for k in BrushKind::ALL {
+            let c: Vec<char> = k.code().chars().collect();
+            assert!(c.len() == 2 && c.iter().all(|c| c.is_ascii_uppercase()), "{}", k.name());
+            assert!(seen.insert(k.code()), "{} repeats {}", k.name(), k.code());
+            assert_eq!(BrushKind::from_code(c[0].to_ascii_lowercase(), c[1]), Some(k));
+        }
+        // ZBrush's own codes.
+        for (code, k) in [("DS", BrushKind::DamStandard), ("CB", BrushKind::ClayBuildup), ("ST", BrushKind::Draw), ("MV", BrushKind::Grab), ("HP", BrushKind::HPolish), ("TD", BrushKind::TrimDynamic), ("MT", BrushKind::MoveTopological), ("ZM", BrushKind::ZModeler)] {
+            assert_eq!(k.code(), code);
+        }
+    }
+    #[test]
+    fn b_then_two_letters_picks_the_brush_like_zbrush() {
+        use winit::keyboard::KeyCode;
+        let mut a = app("brush-codes");
+        frame(&mut a, vec![]);
+        // B D S: Dam Standard. The B that opens the catalog is not taken as a letter.
+        a.on_key(KeyCode::KeyB);
+        frame(&mut a, vec![key(egui::Key::B)]);
+        assert!(a.workspace.brush_catalog_open());
+        let out = frame(&mut a, vec![key(egui::Key::D)]);
+        assert!(a.workspace.brush_catalog_open());
+        assert_eq!(a.workspace.brush_ui.code, Some('D'));
+        // Only brushes whose code starts with D are left, so Draw (ST) is not shown.
+        assert!(out.shapes.iter().all(|s| !matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "ST")));
+        frame(&mut a, vec![key(egui::Key::S)]);
+        assert!(!a.workspace.brush_catalog_open());
+        assert_eq!(a.brush.kind, BrushKind::DamStandard);
+        // Backspace takes the first letter back; a letter no code starts with is ignored.
+        a.on_key(KeyCode::KeyB);
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![key(egui::Key::C), key(egui::Key::Backspace), key(egui::Key::X)]);
+        assert_eq!(a.workspace.brush_ui.code, None);
+        frame(&mut a, vec![key(egui::Key::M), key(egui::Key::P)]);
+        assert_eq!(a.brush.kind, BrushKind::MaskPen);
+        assert!(!a.workspace.brush_catalog_open());
     }
     #[test]
     fn space_menu_has_requested_order_live_controls_and_left_color_picker() {
