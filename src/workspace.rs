@@ -1170,6 +1170,9 @@ impl Workspace {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
             .unwrap_or_else(std::env::temp_dir);
+        // Tests never read or write the user's own workspace, stored config or assets.
+        #[cfg(test)]
+        let root = std::env::temp_dir().join(format!("klay-test-config-{}", std::process::id()));
         let persistence_path = root.join("klay/workspace.layout");
         let mut layout = std::fs::read_to_string(&persistence_path)
             .map(|s| DockLayout::decode(&s))
@@ -1297,7 +1300,7 @@ impl Workspace {
             apply_style(ui.ctx());
             self.applied_palette = Some(palette);
         }
-        custom_shelf::set_customizing(self.customize);
+        custom_shelf::set_customizing(ui.ctx(), self.customize);
         let held = self.begin_held_brush(m.brush);
         let a = self.show_panels(ui, m);
         self.end_held_brush(m.brush, held);

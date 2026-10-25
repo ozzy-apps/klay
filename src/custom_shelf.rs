@@ -2,7 +2,6 @@
 //! and palette command that can be put on a shelf, and the drag source that palette
 //! buttons and brush tiles become in Customize mode (see `shelves.rs`).
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Actions other than brushes: id, label, hover text.
 const ACTIONS: &[(&str, &str, &str)] = &[
@@ -76,14 +75,17 @@ pub fn brush_id(kind: BrushKind) -> String {
     format!("brush:{}", kind.name())
 }
 
-static CUSTOMIZING: AtomicBool = AtomicBool::new(false);
-
-pub fn set_customizing(on: bool) {
-    CUSTOMIZING.store(on, Ordering::Relaxed);
+/// Customize mode, kept with the egui context (each window, and each test, its own).
+fn customizing_id() -> Id {
+    Id::unique("klay-customizing")
 }
 
-fn customizing() -> bool {
-    CUSTOMIZING.load(Ordering::Relaxed)
+pub fn set_customizing(ctx: &Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(customizing_id(), on));
+}
+
+fn customizing(ctx: &Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(customizing_id())).unwrap_or(false)
 }
 
 /// A palette button or brush being dragged onto a shelf.
@@ -98,7 +100,7 @@ pub trait ShelfSource {
 
 impl ShelfSource for egui::Response {
     fn shelf(self, ui: &Ui, id: &str) -> Self {
-        if !customizing() {
+        if !customizing(ui.ctx()) {
             return self;
         }
         let drag = ui.interact(self.rect, self.id.with("shelf-source"), Sense::drag());
