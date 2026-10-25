@@ -483,6 +483,8 @@ struct App {
     selftest_document: Option<native_tests::DocumentTest>,
     /// `--snapshot FILE`: frames left, then the canvas is saved to FILE and the app quits.
     snapshot_to: Option<(String, u32)>,
+    /// `--snapshot-ui`: the snapshot is the whole window, interface included.
+    snapshot_ui: bool,
     /// `--selftest-symmetry`: brushes with Y and radial symmetry on the GPU.
     selftest_symmetry: Option<native_tests::SymmetryTest>,
     /// Project file shown in the Document palette, used by Save and Open.
@@ -563,6 +565,11 @@ struct App {
     /// Sculptris Pro during a stroke: the subtool as it was before (the stroke's undo step
     /// once the mesh changed), whether it changed, and where the last pass was.
     sculptris_before: Option<Box<sculptris::Before>>,
+    /// Through the stroke: for each chunk the chunk it was at the start (`None`: rebuilt),
+    /// and for each vertex its number at the start (`u32::MAX`: new).
+    sculptris_track: (Vec<Option<u32>>, Vec<u32>),
+    /// The vertex cap was reached this stroke (told once).
+    sculptris_capped: bool,
     sculptris_changed: bool,
     sculptris_at: Vec<Vec3>,
     /// Live Boolean: each subtool's distance volume and the version it was made from.
@@ -677,6 +684,7 @@ impl App {
             selftest_document: None,
             selftest_symmetry: None,
             snapshot_to: None,
+            snapshot_ui: false,
             project_path: "untitled.klay".to_string(),
             subtool_path: "subtool.klay".to_string(),
             import_path: "model.obj".to_string(),
@@ -725,6 +733,8 @@ impl App {
             zm_drag: None,
             zm_bridge: None,
             sculptris_before: None,
+            sculptris_track: (Vec::new(), Vec::new()),
+            sculptris_capped: false,
             sculptris_changed: false,
             sculptris_at: Vec::new(),
             bool_volumes: std::collections::HashMap::new(),
@@ -1904,7 +1914,11 @@ impl App {
     /// the next frame; `save_snapshot` writes it once drawn.
     fn request_snapshot(&mut self) {
         let inset = workspace::FRAME_INSET * self.scale;
-        let r = self.canvas_rect.shrink(inset);
+        let mut r = self.canvas_rect.shrink(inset);
+        if self.gfx.as_ref().is_some_and(|g| g.snapshot_ui) {
+            let (w, h) = self.gfx.as_ref().map(|g| (g.config.width, g.config.height)).unwrap_or((1, 1));
+            r = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32));
+        }
         log::debug!("snapshot requested: {r:?}");
         if let Some(gfx) = self.gfx.as_mut() {
             if !gfx.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
@@ -4554,12 +4568,25 @@ impl App {
             self.workspace.notify("Sculptris Pro: bake or delete the layers first · Mesh › Layers; this stroke sculpts as usual".to_string());
             return;
         }
+        self.sculptris_capped = false;
         self.sculptris_before = Some(Box::new(sculptris::Before::of(self.doc.mesh())));
+        let mesh = self.doc.mesh();
+        self.sculptris_track = ((0..mesh.chunks.len() as u32).map(Some).collect(), (0..mesh.vertex_count() as u32).collect());
     }
 
     /// Sculptris Pro before the dabs at `path`: retessellate around where they land (and
     /// their symmetry images) when the brush has moved on from the last pass.
     fn sculptris_pass(&mut self, path: &[Vec2], radius: f32) {
+        // Past this many vertices Sculptris Pro stops adding (sculpting goes on), so a long
+        // session at the highest Detail cannot outgrow memory.
+        const MAX_VERTICES: usize = 8_000_000;
+        if self.doc.mesh().vertex_count() > MAX_VERTICES {
+            if !self.sculptris_capped {
+                self.sculptris_capped = true;
+                self.workspace.notify(format!("Sculptris Pro stops adding past {} vertices · lower Detail or ZRemesher first", fmt_count(MAX_VERTICES)));
+            }
+            return;
+        }
         let hits: Vec<Vec3> = path
             .iter()
             .filter_map(|&p| {
@@ -4576,9 +4603,11 @@ impl App {
         let target = sculptris::target_edge(radius, self.workspace.sculptris_detail);
         self.sculptris_at = hits;
         let t = Instant::now();
-        let Some((mesh, stats)) = sculptris::retessellated(self.doc.mesh(), &centres, radius * 1.15, target) else {
+        let Some((mesh, stats, origin, carried)) = sculptris::retessellated_tracked(self.doc.mesh(), &centres, radius * 1.15, target, &self.sculptris_track.1) else {
             return;
         };
+        let chunks: Vec<Option<u32>> = origin.iter().map(|o| o.and_then(|c| self.sculptris_track.0[c as usize])).collect();
+        self.sculptris_track = (chunks, carried);
         if let Some(s) = self.stroke.as_mut() {
             s.rebase();
         }
@@ -4629,17 +4658,40 @@ impl App {
         }
         let tris = (before.idx.len() / 3, self.doc.mesh().triangle_count());
         // Only the region the stroke changed is kept for undo.
+        // Only the chunks the stroke rebuilt (and the vertices it moved elsewhere) are kept
+        // for undo, and undo puts the layout back exactly.
         let t = Instant::now();
-        let diff = sculptris::diff(&before, self.doc.mesh());
-        log::info!(
-            "sculptris: undo keeps {} + {} triangles, {:.1} MB (a full copy: {:.1} MB), {:.0} ms",
-            diff.removed.len(),
-            diff.added.len(),
-            diff.bytes() as f32 / 1e6,
-            (before.pos.len() * 12 + before.idx.len() * 4) as f32 / 1e6,
-            t.elapsed().as_secs_f32() * 1000.0
-        );
-        self.history.push(UndoStep::Region(Box::new(diff)));
+        let (origin, orig) = std::mem::take(&mut self.sculptris_track);
+        let step = match sculptris::stroke_undo(&before, self.doc.mesh(), &origin, &orig) {
+            Some(undo) => {
+                log::info!(
+                    "sculptris: undo keeps {:.1} MB (a full copy: {:.1} MB), {:.0} ms",
+                    undo.bytes() as f32 / 1e6,
+                    (before.pos.len() * 12 + before.idx.len() * 4) as f32 / 1e6,
+                    t.elapsed().as_secs_f32() * 1000.0
+                );
+                UndoStep::Region(Box::new(undo))
+            }
+            // Should not happen; a whole copy is always right.
+            None => {
+                log::warn!("sculptris: the stroke's undo is kept as a whole copy");
+                let mesh = SculptMesh::from_chunked(before.pos.clone(), before.idx.clone(), &before.ranges);
+                let mut doc = Multires::new(mesh, self.doc.budget);
+                {
+                    let m = doc.mesh_mut();
+                    m.mask = before.mask.clone();
+                    m.colors = before.colors.clone();
+                    if !before.groups.is_empty() {
+                        m.set_groups(before.groups.clone());
+                    }
+                    if !before.hidden.is_empty() {
+                        m.set_hidden(before.hidden.clone());
+                    }
+                }
+                UndoStep::Replace(Box::new(doc.pack()))
+            }
+        };
+        self.history.push(step);
         self.history.name_last(self.stroke_brush.kind.name());
         self.morph_targets.remove(&self.subtools[self.active_tool].id);
         self.subtools[self.active_tool].bounds = self.doc.bounds();
@@ -6977,6 +7029,9 @@ impl App {
                 [bits as f32, axis, count, 0.0]
             },
         };
+        if Gfx::take_gpu_error() {
+            self.workspace.notify("The GPU reported an error (likely out of memory) · the view may be incomplete; save, and lower the polygon count".to_string());
+        }
         let slots = self.update_live_boolean();
         let parked: Vec<(u64, u32)> = self
             .drawn_parked()
@@ -7030,6 +7085,8 @@ impl ApplicationHandler for App {
             Some(max_tex),
         );
         self.egui_state = Some(state);
+        let mut gfx = gfx;
+        gfx.snapshot_ui = self.snapshot_ui;
         self.gfx = Some(gfx);
         match tablet::Tablet::for_window(&window) {
             Ok(t) => {
@@ -7710,6 +7767,12 @@ fn main() {
         // `--snapshot-frames N`: after N frames instead of 30.
         let frames = flag("--snapshot-frames").and_then(|n| n.parse().ok()).unwrap_or(30);
         app.snapshot_to = Some((path.clone(), frames));
+        // `--snapshot-ui`: the whole window with the interface (for UI reviews).
+        app.snapshot_ui = args.iter().any(|a| a == "--snapshot-ui");
+    }
+    // `--space-menu`: start with the Space menu open (for snapshots of it).
+    if args.iter().any(|a| a == "--space-menu") {
+        app.workspace.open_quick_menu(egui::pos2(900.0, 360.0), false);
     }
     // `--gizmo`: start in Move mode with Gizmo 3D (Y).
     if args.iter().any(|a| a == "--gizmo") {
@@ -7855,6 +7918,93 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    /// Low poly, highest Detail, many strokes and undos (a crash report): every undo must
+    /// fit, and undoing everything gives the start back.
+    #[test]
+    fn sculptris_pro_survives_strokes_and_undo_on_a_low_poly_model() {
+        let mut app = App::new(4, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app.workspace.sculptris_detail = 100.0;
+        // No mask and a mask of zeros are the same.
+        let state = |app: &App| {
+            let m = app.doc.mesh();
+            let mask = if m.mask.is_empty() { vec![0; m.vertex_count()] } else { m.mask.clone() };
+            (m.positions.clone(), m.indices.clone(), mask)
+        };
+        let mut seed = 12345u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10000) as f32 / 10000.0
+        };
+        let c = app.project(Vec3::ZERO);
+        let r = (app.project(Vec3::X) - c).length();
+        let mut states = vec![state(&app)];
+        for round in 0..60 {
+            // Sculptris strokes, plain strokes (Sculptris off) and mask strokes, mixed: the
+            // plain and mask steps name vertices by chunk, so Sculptris undo must put the
+            // layout back exactly (the crash: it did not).
+            let pick = rnd();
+            app.workspace.sculptris = pick < 0.6;
+            let mask = (0.6..0.75).contains(&pick);
+            let kind = [BrushKind::Draw, BrushKind::ClayBuildup, BrushKind::Smooth, BrushKind::Inflate][round % 4];
+            app.workspace.select_brush(&mut app.brush, kind);
+            app.brush.radius = 0.04 + rnd() * 0.3;
+            app.workspace.symmetry = rnd() < 0.3;
+            let from = c + Vec2::new(rnd() - 0.5, rnd() - 0.5) * r * 1.2;
+            let to = c + Vec2::new(rnd() - 0.5, rnd() - 0.5) * r * 1.2;
+            let m = if mask { ModifiersState::CONTROL } else { ModifiersState::empty() };
+            app.modifiers = m;
+            let edits = app.history.edits();
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=8 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 8.0), false);
+            }
+            app.left_release();
+            app.modifiers = ModifiersState::empty();
+            // A stroke that missed records nothing.
+            if app.history.edits() != edits {
+                states.push(state(&app));
+            }
+            // Undo goes back 32 steps at most: keep the states it can reach.
+            if states.len() > 33 {
+                states.remove(0);
+            }
+            if rnd() < 0.35 {
+                let back = (1 + (rnd() * 4.0) as usize).min(states.len() - 1);
+                let names: Vec<String> = app.history.names().0.iter().rev().take(back).cloned().collect();
+                app.history_jump(-(back as i64));
+                let (now, want) = (state(&app), &states[states.len() - 1 - back]);
+                if now != *want {
+                    let diff_pos = now.0.iter().zip(&want.0).filter(|(a, b)| a != b).count();
+                    let diff_idx = now.1.iter().zip(&want.1).filter(|(a, b)| a != b).count();
+                    let diff_mask = now.2.iter().zip(&want.2).filter(|(a, b)| a != b).count();
+                    panic!(
+                        "round {round}: undo {back} ({names:?}) gave another mesh: vertices {} vs {}, tris {} vs {}, positions differ {diff_pos}, indices {diff_idx}, mask {diff_mask}",
+                        now.0.len(),
+                        want.0.len(),
+                        now.1.len() / 3,
+                        want.1.len() / 3
+                    );
+                }
+                let fwd = (rnd() * (back + 1) as f32) as usize;
+                app.history_jump(fwd as i64);
+                let keep = states.len() - back + fwd;
+                states.truncate(keep);
+                assert!(state(&app) == states[keep - 1], "round {round}: redo {fwd} gave another mesh");
+            }
+        }
+        let steps = (states.len() - 1).min(app.history.names().0.len());
+        let states = states[states.len() - 1 - steps..].to_vec();
+        app.history_jump(-(steps as i64));
+        assert!(state(&app) == states[0], "undoing everything gives the start back, vertex for vertex");
+        app.history_jump(steps as i64);
+        assert!(state(&app) == *states.last().unwrap(), "and redoing everything the end");
+    }
 
     #[test]
     fn zmodeler_extrudes_a_polygon_and_inserts_an_edge_loop_through_the_input_path() {

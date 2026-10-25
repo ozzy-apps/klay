@@ -364,7 +364,14 @@ impl Local {
 
 /// `mesh` retessellated within `reach` of each of `centres` toward edges `target` long, or
 /// `None` when nothing there needed it.
+#[cfg(test)]
 pub fn retessellated(mesh: &SculptMesh, centres: &[Vec3], reach: f32, target: f32) -> Option<(SculptMesh, Stats)> {
+    retessellated_tracked(mesh, centres, reach, target, &[]).map(|(m, s, _, _)| (m, s))
+}
+
+/// [`retessellated`], also giving each new chunk's old chunk (`None`: rebuilt) and `carry`
+/// (a value per old vertex) carried to the new vertices (see [`SculptMesh::patched_tracked`]).
+pub fn retessellated_tracked(mesh: &SculptMesh, centres: &[Vec3], reach: f32, target: f32, carry: &[u32]) -> Option<(SculptMesh, Stats, Vec<Option<u32>>, Vec<u32>)> {
     let (hi, lo) = (target * 4.0 / 3.0, target * 0.8);
     // The region: visible triangles touching a vertex within reach (or the nearest few
     // when the brush is smaller than the triangles under it), and one ring more, so the
@@ -517,12 +524,13 @@ pub fn retessellated(mesh: &SculptMesh, centres: &[Vec3], reach: f32, target: f3
     if !stats.changed() {
         return None;
     }
-    Some((rebuilt(mesh, &l, &region), stats))
+    let (out, origin, carried) = rebuilt(mesh, &l, &region, carry);
+    Some((out, stats, origin, carried))
 }
 
 /// The mesh with the region replaced by `l`'s triangles: new vertices join their parent's
 /// chunk, collapsed ones go, and only the chunks this touches are rebuilt.
-fn rebuilt(mesh: &SculptMesh, l: &Local, region: &[u32]) -> SculptMesh {
+fn rebuilt(mesh: &SculptMesh, l: &Local, region: &[u32], carry: &[u32]) -> (SculptMesh, Vec<Option<u32>>, Vec<u32>) {
     use crate::mesh::{NewVertex, Patch, VRef};
     let mut patch = Patch { removed_tris: region.to_vec(), ..Patch::default() };
     let mut refs = vec![VRef::New(u32::MAX); l.pos.len()];
@@ -545,39 +553,19 @@ fn rebuilt(mesh: &SculptMesh, l: &Local, region: &[u32]) -> SculptMesh {
             patch.new_tris.push((tri.map(|v| refs[v as usize]), l.group[t]));
         }
     }
-    mesh.patched(&patch)
+    mesh.patched_tracked(&patch, carry)
 }
 
-/// A Sculptris Pro stroke's undo: the triangles it took out and those it put in, each
-/// as its corners' positions and attributes, so it holds only the region the stroke
-/// touched (vertex numbers change with every pass, positions do not).
-#[derive(Clone, Debug, Default)]
-pub struct RegionDiff {
-    pub removed: Vec<TriRec>,
-    pub added: Vec<TriRec>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TriRec {
-    pub pos: [Vec3; 3],
-    pub group: u16,
-    pub mask: [u8; 3],
-    pub color: [[u8; 4]; 3],
-}
-
-impl RegionDiff {
-    pub fn bytes(&self) -> usize {
-        (self.removed.len() + self.added.len()) * std::mem::size_of::<TriRec>()
-    }
-}
-
-/// The arrays of a mesh a diff is taken against (kept from the start of a stroke).
+/// The mesh at the start of a Sculptris Pro stroke (its arrays and chunk layout), kept
+/// until the stroke ends and its undo is made.
 pub struct Before {
     pub pos: Vec<Vec3>,
     pub idx: Vec<u32>,
     pub groups: Vec<u16>,
+    pub hidden: Vec<u8>,
     pub mask: Vec<u8>,
     pub colors: Vec<[u8; 4]>,
+    pub ranges: Vec<[u32; 5]>,
 }
 
 impl Before {
@@ -585,130 +573,279 @@ impl Before {
         Self {
             pos: mesh.positions.clone(),
             idx: mesh.indices.clone(),
-            groups: (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect(),
+            groups: if mesh.groups.is_empty() { Vec::new() } else { (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect() },
+            hidden: mesh.hidden.clone(),
             mask: mesh.mask.clone(),
             colors: mesh.colors.clone(),
+            ranges: mesh.chunk_ranges(),
         }
+    }
+
+    fn of_ref(mesh: &SculptMesh) -> Arrays<'_> {
+        Arrays {
+            pos: &mesh.positions,
+            idx: &mesh.indices,
+            groups: &mesh.groups,
+            hidden: &mesh.hidden,
+            mask: &mesh.mask,
+            colors: &mesh.colors,
+            ranges: mesh.chunk_ranges(),
+        }
+    }
+
+    fn arrays(&self) -> Arrays<'_> {
+        Arrays { pos: &self.pos, idx: &self.idx, groups: &self.groups, hidden: &self.hidden, mask: &self.mask, colors: &self.colors, ranges: self.ranges.clone() }
     }
 }
 
-/// A triangle's key: its corners' position bits, turned so the least comes first (the
-/// orientation stays).
-fn tri_key(p: [Vec3; 3]) -> [[u32; 3]; 3] {
-    let b = p.map(|v| v.to_array().map(f32::to_bits));
-    let k = (0..3).min_by_key(|&k| b[k]).unwrap();
-    [b[k], b[(k + 1) % 3], b[(k + 2) % 3]]
+/// A mesh's arrays (either side of a stroke).
+struct Arrays<'a> {
+    pos: &'a [Vec3],
+    idx: &'a [u32],
+    groups: &'a [u16],
+    hidden: &'a [u8],
+    mask: &'a [u8],
+    colors: &'a [[u8; 4]],
+    ranges: Vec<[u32; 5]>,
 }
 
-fn rec(pos: &[Vec3], idx: &[u32], groups: &[u16], mask: &[u8], colors: &[[u8; 4]], t: usize) -> TriRec {
-    let v = [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]];
-    TriRec {
-        pos: v.map(|i| pos[i as usize]),
-        group: groups.get(t).copied().unwrap_or(0),
-        mask: v.map(|i| mask.get(i as usize).copied().unwrap_or(0)),
-        color: v.map(|i| colors.get(i as usize).copied().unwrap_or([0; 4])),
+impl Arrays<'_> {
+    fn chunk_of(&self, v: u32) -> usize {
+        self.ranges.partition_point(|r| r[0] <= v) - 1
     }
 }
 
-/// What changed from `before` to `after`: the triangles only one of them has.
-pub fn diff(before: &Before, after: &SculptMesh) -> RegionDiff {
-    use rayon::prelude::*;
-    let keys = |pos: &[Vec3], idx: &[u32]| -> Vec<([[u32; 3]; 3], u32)> {
-        let mut k: Vec<([[u32; 3]; 3], u32)> = (0..idx.len() / 3)
-            .into_par_iter()
-            .map(|t| (tri_key([pos[idx[3 * t] as usize], pos[idx[3 * t + 1] as usize], pos[idx[3 * t + 2] as usize]]), t as u32))
-            .collect();
-        k.par_sort_unstable();
-        k
-    };
-    let (a, b) = (keys(&before.pos, &before.idx), keys(&after.positions, &after.indices));
-    let after_groups: Vec<u16> = (0..after.triangle_count() as u32).map(|t| after.group(t)).collect();
-    let (mut i, mut j) = (0, 0);
-    let mut d = RegionDiff::default();
-    while i < a.len() || j < b.len() {
-        match (a.get(i), b.get(j)) {
-            (Some(x), Some(y)) if x.0 == y.0 => {
-                i += 1;
-                j += 1;
-            }
-            (Some(x), Some(y)) if x.0 < y.0 => {
-                d.removed.push(rec(&before.pos, &before.idx, &before.groups, &before.mask, &before.colors, x.1 as usize));
-                i += 1;
-            }
-            (Some(x), None) => {
-                d.removed.push(rec(&before.pos, &before.idx, &before.groups, &before.mask, &before.colors, x.1 as usize));
-                i += 1;
-            }
-            (_, Some(y)) => {
-                d.added.push(rec(&after.positions, &after.indices, &after_groups, &after.mask, &after.colors, y.1 as usize));
-                j += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    d
+/// A chunk of the mesh one side of a stroke rebuilds: one the other side has as it is
+/// (its number there), or one kept here whole.
+#[derive(Clone, Debug)]
+enum SideChunk {
+    Carried(u32),
+    Stored { pos: Vec<Vec3>, mask: Vec<u8>, colors: Vec<[u8; 4]>, tris: Vec<u32>, groups: Vec<u16>, hidden: Vec<u8> },
 }
 
-/// `mesh` with the triangles `take_out` replaced by `put_in` (an undo or redo of a
-/// [`RegionDiff`]); `None` when `take_out` is not all there.
-pub fn swapped(mesh: &SculptMesh, take_out: &[TriRec], put_in: &[TriRec]) -> Option<SculptMesh> {
-    use crate::mesh::{NewVertex, Patch, VRef};
-    let bits = |p: Vec3| p.to_array().map(f32::to_bits);
-    let mut at: HashMap<[u32; 3], u32> = HashMap::default();
-    for (v, p) in mesh.positions.iter().enumerate() {
-        at.insert(bits(*p), v as u32);
+/// One side of a Sculptris Pro stroke's undo: how to make that mesh exactly, vertex for
+/// vertex and chunk for chunk, from the mesh on the other side. Chunks the stroke never
+/// rebuilt are taken from the other side; only the rebuilt ones are kept here, with the
+/// vertices of carried chunks the brush moved, so the step holds about what the stroke
+/// touched. The layout comes back exactly, so older undo steps (which name vertices by
+/// chunk) still fit.
+#[derive(Clone, Debug)]
+pub struct Side {
+    ranges: Vec<[u32; 5]>,
+    chunks: Vec<SideChunk>,
+    moved: Vec<(u32, Vec3)>,
+    /// Vertices of the other side outside its carried chunks that carried triangles use:
+    /// (number there, number here).
+    boundary: Vec<(u32, u32)>,
+    masked: bool,
+    painted: bool,
+    grouped: bool,
+    hidden_any: bool,
+    /// What the other side must be: vertices, triangles, chunks.
+    source: (usize, usize, usize),
+}
+
+/// A Sculptris Pro stroke's undo: the mesh before it, and after it, each from the other.
+#[derive(Clone, Debug)]
+pub struct StrokeUndo {
+    /// Makes the mesh before the stroke out of the one after it.
+    pub back: Side,
+    /// Makes the mesh after the stroke out of the one before it.
+    pub forth: Side,
+}
+
+impl StrokeUndo {
+    pub fn bytes(&self) -> usize {
+        self.back.bytes() + self.forth.bytes()
     }
-    let mut patch = Patch::default();
-    let mut removed: HashSet<u32> = HashSet::default();
-    for r in take_out {
-        let v = r.pos.map(|p| at.get(&bits(p)).copied());
-        let [Some(a), Some(b), Some(c)] = v else { return None };
-        let t = mesh.incident(a).iter().copied().find(|&t| {
-            let tri = &mesh.indices[3 * t as usize..3 * t as usize + 3];
-            tri.contains(&b) && tri.contains(&c)
-        })?;
-        if removed.insert(t) {
-            patch.removed_tris.push(t);
+}
+
+impl Side {
+    fn bytes(&self) -> usize {
+        let stored: usize = self
+            .chunks
+            .iter()
+            .map(|c| match c {
+                SideChunk::Carried(_) => 4,
+                SideChunk::Stored { pos, mask, colors, tris, groups, hidden } => pos.len() * 12 + mask.len() + colors.len() * 4 + tris.len() * 4 + groups.len() * 2 + hidden.len(),
+            })
+            .sum();
+        stored + self.moved.len() * 16 + self.boundary.len() * 8 + self.ranges.len() * 20
+    }
+
+    /// The side making `target` from `other`: `carried[c]` is the chunk of `other` that
+    /// target chunk `c` is a copy of; `to_target` gives a vertex of `other`'s number in
+    /// `target`.
+    fn make(target: &Arrays, other: &Arrays, carried: &[Option<u32>], to_target: impl Fn(u32) -> Option<u32>) -> Option<Side> {
+        let mut chunks = Vec::with_capacity(target.ranges.len());
+        let mut moved = Vec::new();
+        let mut other_carried = vec![false; other.ranges.len()];
+        for (c, r) in target.ranges.iter().enumerate() {
+            let (vs, ve, ts, te) = (r[0] as usize, r[1] as usize, r[2] as usize, r[4] as usize);
+            match carried.get(c).copied().flatten() {
+                Some(oc) => {
+                    other_carried[oc as usize] = true;
+                    let o = other.ranges[oc as usize];
+                    if o[1] - o[0] != r[1] - r[0] || o[4] - o[2] != r[4] - r[2] {
+                        return None;
+                    }
+                    for i in 0..ve - vs {
+                        let (a, b) = (target.pos[vs + i], other.pos[o[0] as usize + i]);
+                        if a != b {
+                            moved.push(((vs + i) as u32, a));
+                        }
+                    }
+                    chunks.push(SideChunk::Carried(oc));
+                }
+                None => chunks.push(SideChunk::Stored {
+                    pos: target.pos[vs..ve].to_vec(),
+                    mask: if target.mask.is_empty() { Vec::new() } else { target.mask[vs..ve].to_vec() },
+                    colors: if target.colors.is_empty() { Vec::new() } else { target.colors[vs..ve].to_vec() },
+                    tris: target.idx[3 * ts..3 * te].to_vec(),
+                    groups: if target.groups.is_empty() { Vec::new() } else { target.groups[ts..te].to_vec() },
+                    hidden: if target.hidden.is_empty() { Vec::new() } else { target.hidden[ts..te].to_vec() },
+                }),
+            }
         }
-    }
-    // Vertices of the removed triangles that nothing else uses.
-    let mut candidates: HashSet<u32> = HashSet::default();
-    for &t in &patch.removed_tris {
-        for &v in &mesh.indices[3 * t as usize..3 * t as usize + 3] {
-            candidates.insert(v);
+        // Vertices of the other side's uncarried chunks that its carried triangles use.
+        let mut boundary: HashMap<u32, u32> = HashMap::default();
+        for (oc, &on) in other_carried.iter().enumerate() {
+            if !on {
+                continue;
+            }
+            let o = other.ranges[oc];
+            for &v in &other.idx[3 * o[2] as usize..3 * o[4] as usize] {
+                if !other_carried[other.chunk_of(v)] && !boundary.contains_key(&v) {
+                    boundary.insert(v, to_target(v)?);
+                }
+            }
         }
+        let n = |a: &Arrays| (a.pos.len(), a.idx.len() / 3, a.ranges.len());
+        Some(Side {
+            ranges: target.ranges.clone(),
+            chunks,
+            moved,
+            boundary: boundary.into_iter().collect(),
+            masked: !target.mask.is_empty(),
+            painted: !target.colors.is_empty(),
+            grouped: !target.groups.is_empty(),
+            hidden_any: !target.hidden.is_empty(),
+            source: n(other),
+        })
     }
-    let mut new_at: HashMap<[u32; 3], u32> = HashMap::default();
-    let mut used_old: HashSet<u32> = HashSet::default();
-    let fallback_chunk = patch.removed_tris.first().map_or(0, |&t| mesh.vert_chunk[mesh.indices[3 * t as usize] as usize]);
-    for r in put_in {
-        let mut tri = [VRef::Old(0); 3];
-        let old: Vec<u32> = r.pos.iter().filter_map(|&p| at.get(&bits(p)).copied()).collect();
-        let chunk = old.first().map_or(fallback_chunk, |&v| mesh.vert_chunk[v as usize]);
-        for k in 0..3 {
-            let key = bits(r.pos[k]);
-            tri[k] = if let Some(&v) = at.get(&key) {
-                used_old.insert(v);
-                VRef::Old(v)
+
+    /// The mesh this side makes from `src`; `None` when `src` is not the mesh it was made
+    /// against.
+    pub fn rebuild(&self, src: &SculptMesh) -> Option<SculptMesh> {
+        if (src.vertex_count(), src.triangle_count(), src.chunks.len()) != self.source {
+            return None;
+        }
+        let mut src_to_tgt = vec![u32::MAX; src.chunks.len()];
+        for (c, ch) in self.chunks.iter().enumerate() {
+            if let SideChunk::Carried(oc) = ch {
+                src_to_tgt[*oc as usize] = c as u32;
+            }
+        }
+        let boundary: HashMap<u32, u32> = self.boundary.iter().copied().collect();
+        let map = |v: u32| -> Option<u32> {
+            let sc = src.vert_chunk[v as usize] as usize;
+            let tc = src_to_tgt[sc];
+            if tc != u32::MAX {
+                Some(v - src.chunks[sc].vert_start + self.ranges[tc as usize][0])
             } else {
-                let n = *new_at.entry(key).or_insert_with(|| {
-                    patch.new_verts.push(NewVertex { pos: r.pos[k], chunk, mask: r.mask[k], color: r.color[k] });
-                    (patch.new_verts.len() - 1) as u32
-                });
-                VRef::New(n)
-            };
+                boundary.get(&v).copied()
+            }
+        };
+        let nv = self.ranges.last().map_or(0, |r| r[1] as usize);
+        let nt = self.ranges.last().map_or(0, |r| r[4] as usize);
+        let mut pos = Vec::with_capacity(nv);
+        let mut mask = Vec::with_capacity(if self.masked { nv } else { 0 });
+        let mut colors = Vec::with_capacity(if self.painted { nv } else { 0 });
+        let mut idx = Vec::with_capacity(3 * nt);
+        let mut groups = Vec::with_capacity(if self.grouped { nt } else { 0 });
+        let mut hidden = Vec::with_capacity(if self.hidden_any { nt } else { 0 });
+        for ch in &self.chunks {
+            match ch {
+                SideChunk::Carried(oc) => {
+                    let sch = &src.chunks[*oc as usize];
+                    let (vs, ve) = sch.range();
+                    pos.extend_from_slice(&src.positions[vs..ve]);
+                    if self.masked {
+                        if src.mask.is_empty() { mask.extend(std::iter::repeat_n(0, ve - vs)) } else { mask.extend_from_slice(&src.mask[vs..ve]) }
+                    }
+                    if self.painted {
+                        if src.colors.is_empty() { colors.extend(std::iter::repeat_n([0; 4], ve - vs)) } else { colors.extend_from_slice(&src.colors[vs..ve]) }
+                    }
+                    for t in sch.tris() {
+                        for &v in &src.indices[3 * t as usize..3 * t as usize + 3] {
+                            idx.push(map(v)?);
+                        }
+                        if self.grouped {
+                            groups.push(src.group(t));
+                        }
+                        if self.hidden_any {
+                            hidden.push(src.hidden.get(t as usize).copied().unwrap_or(0));
+                        }
+                    }
+                }
+                SideChunk::Stored { pos: p, mask: m, colors: c, tris, groups: g, hidden: h } => {
+                    pos.extend_from_slice(p);
+                    if self.masked {
+                        if m.is_empty() { mask.extend(std::iter::repeat_n(0, p.len())) } else { mask.extend_from_slice(m) }
+                    }
+                    if self.painted {
+                        if c.is_empty() { colors.extend(std::iter::repeat_n([0; 4], p.len())) } else { colors.extend_from_slice(c) }
+                    }
+                    idx.extend_from_slice(tris);
+                    if self.grouped {
+                        if g.is_empty() { groups.extend(std::iter::repeat_n(0, tris.len() / 3)) } else { groups.extend_from_slice(g) }
+                    }
+                    if self.hidden_any {
+                        if h.is_empty() { hidden.extend(std::iter::repeat_n(0, tris.len() / 3)) } else { hidden.extend_from_slice(h) }
+                    }
+                }
+            }
         }
-        patch.new_tris.push((tri, r.group));
+        if pos.len() != nv || idx.len() != 3 * nt || idx.iter().any(|&v| v as usize >= nv) {
+            return None;
+        }
+        for &(v, p) in &self.moved {
+            pos[v as usize] = p;
+        }
+        let mut mesh = SculptMesh::from_chunked(pos, idx, &self.ranges);
+        mesh.mask = mask;
+        mesh.colors = colors;
+        if self.grouped {
+            mesh.set_groups(groups);
+        }
+        if self.hidden_any {
+            mesh.set_hidden(hidden);
+        }
+        Some(mesh)
     }
-    for v in candidates {
-        if used_old.contains(&v) {
-            continue;
-        }
-        if mesh.incident(v).iter().all(|t| removed.contains(t)) {
-            patch.dead.push(v);
+}
+
+/// The undo of a stroke from `before` to `after`: `origin[c]` is the chunk of `before`
+/// that chunk `c` of `after` is a copy of (`None`: rebuilt), and `orig[v]` the vertex of
+/// `before` that vertex `v` of `after` is (`u32::MAX`: new).
+pub fn stroke_undo(before: &Before, after: &SculptMesh, origin: &[Option<u32>], orig: &[u32]) -> Option<StrokeUndo> {
+    let (b, a) = (before.arrays(), Before::of_ref(after));
+    // Before's chunks the stroke carried, and where they are after it.
+    let mut b_carried: Vec<Option<u32>> = vec![None; b.ranges.len()];
+    for (c, o) in origin.iter().enumerate() {
+        if let Some(bc) = o {
+            b_carried[*bc as usize] = Some(c as u32);
         }
     }
-    Some(mesh.patched(&patch))
+    let mut to_after = vec![u32::MAX; b.pos.len()];
+    for (v, &o) in orig.iter().enumerate() {
+        if o != u32::MAX {
+            to_after[o as usize] = v as u32;
+        }
+    }
+    let back = Side::make(&b, &a, &b_carried, |v| Some(orig[v as usize]).filter(|&x| x != u32::MAX))?;
+    let forth = Side::make(&a, &b, origin, |v| Some(to_after[v as usize]).filter(|&x| x != u32::MAX))?;
+    Some(StrokeUndo { back, forth })
 }
 
 #[cfg(test)]

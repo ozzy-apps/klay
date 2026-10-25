@@ -310,9 +310,9 @@ pub enum UndoStep {
     Groups(Vec<crate::polygroup::GroupRuns>),
     /// The whole stack before it was replaced (Wedge), packed.
     Replace(Box<crate::multires::Packed>),
-    /// A Sculptris Pro stroke: the triangles to take out and put back (see
-    /// [`crate::sculptris::RegionDiff`]: `added` comes out, `removed` goes back in).
-    Region(Box<crate::sculptris::RegionDiff>),
+    /// A Sculptris Pro stroke: what makes the mesh before it out of the one after it (and
+    /// back), keeping only the chunks it rebuilt (see [`crate::sculptris::StrokeUndo`]).
+    Region(Box<crate::sculptris::StrokeUndo>),
     /// What followed `keep` in the base mesh before a part was added or changed there
     /// (CurveTube): `None` for nothing. Only the part is kept, not the whole model.
     Part { keep: crate::mesh::Extent, part: Option<Box<SculptMesh>> },
@@ -496,6 +496,12 @@ fn step_bytes(s: &UndoStep) -> usize {
 /// Apply a step and return its inverse.
 fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
     match step {
+        // A step that no longer fits the mesh (its chunks changed size) is left alone
+        // rather than written over the wrong vertices.
+        UndoStep::Stroke { level, chunks } if !doc.stroke_fits(level, &chunks) => {
+            log::warn!("an undo step does not fit the mesh; left as it is");
+            UndoStep::Stroke { level, chunks }
+        }
         UndoStep::Stroke { level, chunks } => UndoStep::Stroke {
             level,
             chunks: doc.restore(level, chunks),
@@ -517,22 +523,31 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
                 mask,
             }
         }
+        UndoStep::Mask { level, data } if !doc.mask_fits(level, &data) => {
+            log::warn!("a mask undo step does not fit the mesh; left as it is");
+            UndoStep::Mask { level, data }
+        }
         UndoStep::Mask { level, data } => UndoStep::Mask {
             level,
             data: doc.restore_mask(level, data),
         },
+        UndoStep::Paint(data) if !doc.paint_fits(&data) => {
+            log::warn!("a paint undo step does not fit the mesh; left as it is");
+            UndoStep::Paint(data)
+        }
         UndoStep::Paint(data) => UndoStep::Paint(doc.restore_paint(data)),
         UndoStep::Visibility(runs) => UndoStep::Visibility(doc.restore_visibility(runs)),
         UndoStep::Groups(runs) => UndoStep::Groups(doc.restore_groups(runs)),
         UndoStep::Region(d) => {
             let budget = doc.budget;
-            match crate::sculptris::swapped(doc.mesh(), &d.added, &d.removed) {
+            match (doc.count() == 1).then(|| d.back.rebuild(doc.mesh())).flatten() {
                 Some(mesh) => {
                     *doc = Multires::new(mesh, budget);
-                    UndoStep::Region(Box::new(crate::sculptris::RegionDiff { removed: d.added, added: d.removed }))
+                    let d = *d;
+                    UndoStep::Region(Box::new(crate::sculptris::StrokeUndo { back: d.forth, forth: d.back }))
                 }
                 None => {
-                    log::warn!("a Sculptris Pro step no longer fits the mesh; left as it is");
+                    log::warn!("a Sculptris Pro step does not fit the mesh; left as it is");
                     UndoStep::Region(d)
                 }
             }

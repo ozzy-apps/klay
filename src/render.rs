@@ -130,6 +130,10 @@ struct MeshBuffers {
     _tables: [wgpu::Buffer; 4],
 }
 
+/// Set when the GPU reported an error since the app last looked (see
+/// [`Gfx::take_gpu_error`]).
+static GPU_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Points per axis of a Live Boolean volume, and how many operands it shows.
 pub const BOOL_VOLUME: usize = 96;
 pub const BOOL_MAX: usize = 20;
@@ -255,6 +259,8 @@ pub struct Gfx {
     /// Document › Snapshot: a rectangle (x, y, width, height, physical pixels) of the next
     /// frame to copy before the interface is drawn over it, and its RGBA once drawn.
     pub snapshot: Option<[u32; 4]>,
+    /// `--snapshot-ui`: copy the snapshot after the interface is drawn instead of before.
+    pub snapshot_ui: bool,
     pub snapshot_image: Option<(u32, u32, Vec<u8>)>,
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
@@ -346,6 +352,12 @@ impl Gfx {
             ..Default::default()
         }))
         .expect("request device");
+        // A GPU error (most often memory running out under a huge mesh) is logged and
+        // reported, not fatal: wgpu's default handler panics.
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            log::error!("gpu: {e}");
+            GPU_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
+        }));
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -896,6 +908,7 @@ impl Gfx {
             capture: Vec::new(),
             captured: Vec::new(),
             snapshot: None,
+            snapshot_ui: false,
             snapshot_image: None,
             config,
             depth_view,
@@ -1040,6 +1053,11 @@ impl Gfx {
         params.active_inv = active_inv.to_cols_array_2d();
         self.queue.write_buffer(&self.shared.bool_buf, 0, bytemuck::bytes_of(&params));
         self.bool_count = n;
+    }
+
+    /// Whether the GPU reported an error since the last call.
+    pub fn take_gpu_error() -> bool {
+        GPU_ERROR.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Live Boolean off: everything is drawn as it is.
@@ -2220,7 +2238,7 @@ impl Gfx {
         }
 
         // Document › Snapshot: the canvas as drawn, before the interface goes over it.
-        let snapshot = self.copy_snapshot(&mut encoder, &frame.texture);
+        let mut snapshot = if self.snapshot_ui { None } else { self.copy_snapshot(&mut encoder, &frame.texture) };
 
         // egui pass.
         let screen = egui_wgpu::ScreenDescriptor {
@@ -2260,6 +2278,9 @@ impl Gfx {
             self.egui_renderer.render(&mut pass, paint_jobs, &screen);
         }
         let capture = self.copy_capture(&mut encoder, &frame.texture);
+        if self.snapshot_ui {
+            snapshot = self.copy_snapshot(&mut encoder, &frame.texture);
+        }
         self.queue.submit(
             egui_cmds
                 .into_iter()

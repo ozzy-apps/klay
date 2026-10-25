@@ -39,6 +39,8 @@ cargo run --release -- --selftest-materials                            # every m
 cargo run --release -- --selftest-document                             # Back gradient and Border on the GPU, the empty border zoomed in, Snapshot (--hold keeps it open)
 cargo run --release -- --segments 100 --selftest-symmetry              # Draw, Grab, Snake Hook, Inflate with Y + Radial Z 6 through the canvas, GPU readback, undo/redo
 cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # start with symmetry (x, y, z, r<axis><count>), save the canvas after start-up and quit
+cargo run --release -- --snapshot ui.png --snapshot-ui               # save the whole window, interface included, after start-up and quit
+cargo run --release -- --space-menu                                  # start with the Space menu open
 cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
@@ -152,10 +154,11 @@ there as a dropdown; any palette can also be docked into the left, right, top or
 Fixed shelves hold the live sculpt controls. The look is dark and flat with one clay accent;
 `ui-mockup.html` is the interactive HTML reference it was ported from.
 
-The native UI has a restrained readability pass: brighter labels, 13 px body text,
-12 px numeric fields, slightly taller rows and a neutral value area in the existing
-bar sliders. Long label/value rows wrap inside narrow trays.
-`ui-readability.png` shows the updated native interface.
+The interface is set in Inter (bundled under the SIL Open Font License, `assets/fonts`)
+with three levels: palette titles, small-capital section titles, then 26 px controls.
+Sliders keep their name on the bar and show the value in a field of their own; one clay
+accent marks what is on. Buttons that share a row clip their labels inside narrow trays.
+`ui-readable.png` shows the interface.
 
 - **Klay logo and name**: one button opens About Klay, showing the Coral Fold logo, package
   version, build language and GitHub repository link. Close it with **Close**, **Escape** or a

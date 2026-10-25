@@ -105,7 +105,16 @@ fn offsets(counts: &[Vec<u32>]) -> Vec<u32> {
 
 impl SculptMesh {
     /// This mesh with `p` applied.
+    #[cfg(test)]
     pub fn patched(&self, p: &Patch) -> SculptMesh {
+        self.patched_tracked(p, &[]).0
+    }
+
+    /// [`patched`](Self::patched), also saying where things came from: for each new chunk
+    /// the old chunk it is a copy of (`None` for rebuilt ones), and `carry` (a value per old
+    /// vertex, empty for none) carried to the new vertices (`u32::MAX` for new ones).
+    pub fn patched_tracked(&self, p: &Patch, carry: &[u32]) -> (SculptMesh, Vec<Option<u32>>, Vec<u32>) {
+        let carrying = !carry.is_empty();
         let nc = self.chunks.len();
         let removed: HashSet<u32> = p.removed_tris.iter().copied().collect();
         let dead: HashSet<u32> = p.dead.iter().copied().collect();
@@ -209,6 +218,34 @@ impl SculptMesh {
         // Per-vertex arrays.
         let masked = !self.mask.is_empty();
         let painted = !self.colors.is_empty();
+        let carried: Vec<Vec<u32>> = if carrying {
+            pieces
+                .par_iter()
+                .map(|piece| match piece {
+                    Piece::Copy(c) => {
+                        let (s, e) = self.chunks[*c as usize].range();
+                        carry[s..e].to_vec()
+                    }
+                    Piece::Built(list) => list
+                        .iter()
+                        .map(|&r| match r {
+                            VRef::Old(v) => carry[v as usize],
+                            VRef::New(_) => u32::MAX,
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let carried = concat(&carried);
+        let origins: Vec<Option<u32>> = pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Copy(c) => Some(*c),
+                Piece::Built(_) => None,
+            })
+            .collect();
         let per_piece: Vec<(Vec<Vec3>, Vec<u8>, Vec<[u8; 4]>)> = pieces
             .par_iter()
             .map(|piece| match piece {
@@ -505,7 +542,7 @@ impl SculptMesh {
         if hidden_any {
             mesh.set_hidden(hidden);
         }
-        mesh
+        (mesh, origins, carried)
     }
 }
 

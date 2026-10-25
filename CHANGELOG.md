@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.21.0 — 2026-10-25
+
+- Readable interface, same ZBrush layout (from the "Klay Readable UI" mockup): the interface font is Inter (bundled, OFL) in three weights instead of Ubuntu Light; 13 px controls, 12 px notes, brighter secondary text.
+- Three clear levels: palette titles (14 px semibold, accent tick, chevron on the right), section titles (small capitals with a divider), then the controls.
+- Sliders keep their name on the bar (ZBrush style) and show the value in a field of its own; the clay fill has an accent rule along its bottom edge instead of a marker through the name.
+- One accent for "on": segmented buttons, mode buttons and toggles fill with it; tiles, rows and view toggles that are selected get a dark clay fill and an accent border.
+- Controls are 26 px tall on an even spacing; the top shelf has 56 px mode buttons, the right shelf 52 × 50 px buttons, the left shelf thumbnails say what they are (Brush, Stroke, Alpha, Texture, Material) above the image.
+- Brush palette: Sculpt / Mask / All (49) tabs and a fixed three-column grid of brush tiles (the active and recent brushes fill the last row); the full catalog opens from All.
+- Space menu: a larger colour picker (172 px square) with the hue bar underneath it, then the colour, Swap colors and RGB / Sculpt buttons below.
+- Canvas: the projection and subtool name sit in chips, axis labels are red / green / blue, and the brush readout (brush, size, Z intensity, Zadd / Zsub) sits in a chip at the bottom left.
+- Trays are 284 px by default (layouts saved at the old 262 px default open at the new width); buttons that share a row clip their label instead of widening a narrow tray.
+- Sculptris Pro crash fix: undoing a Sculptris Pro stroke could leave the mesh in a different internal order, so undoing further into an earlier sculpt, mask or paint stroke crashed. Its undo now restores the exact layout (chunks carried over by number, the rest stored), every undo step checks that it still fits the mesh and is skipped with a warning when it does not, Sculptris Pro stops adding detail at 8 million vertices, and running out of GPU memory warns instead of closing Klay.
+- New --snapshot-ui (with --snapshot FILE: the whole window, interface included) and --space-menu (start with the Space menu open).
+- Verification: 254 release tests (new: Sculptris Pro on a low-poly model at the highest Detail with mixed sculpt, mask and Sculptris strokes and random undo / redo, the exact state checked at every step); every native self-test passes on the GPU.
+
 ## 0.20.0 — 2026-10-25
 
 - ZModeler: Bevel (an edge loop chamfered into a flat strip, drag for width), Spin (an edge turned round its two polygons), Bridge (two clicks join two polygons by a tube of quads); every action follows symmetry (mirror and radial), mirrored.

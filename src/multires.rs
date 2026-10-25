@@ -1412,6 +1412,31 @@ impl Multires {
         snapshot
     }
 
+    /// Whether chunk data saved for `level` still fits it (each chunk there, as big).
+    pub fn stroke_fits(&self, level: usize, saved: &ChunkData) -> bool {
+        let Some(l) = self.levels.get(level) else { return false };
+        saved.iter().all(|(c, data)| {
+            l.mesh.chunks.get(*c as usize).is_some_and(|ch| {
+                let (s, e) = ch.range();
+                data.len() == e - s || (level > 0 && l.offsets.get(*c as usize).is_some())
+            })
+        })
+    }
+
+    pub fn mask_fits(&self, level: usize, data: &crate::mask::MaskData) -> bool {
+        let Some(l) = self.levels.get(level) else { return false };
+        match data {
+            crate::mask::MaskData::Whole(m) => m.is_empty() || m.len() == l.mesh.vertex_count(),
+            crate::mask::MaskData::Chunks(chunks) => chunks.iter().all(|(c, d)| l.mesh.chunks.get(*c as usize).is_some_and(|ch| d.len() == ch.range().1 - ch.range().0)),
+        }
+    }
+
+    pub fn paint_fits(&self, data: &crate::paint::Snapshot) -> bool {
+        data.levels.iter().all(|(lv, chunks)| {
+            self.levels.get(*lv).is_some_and(|l| chunks.iter().all(|(c, d)| l.mesh.chunks.get(*c as usize).is_some_and(|ch| d.len() == ch.range().1 - ch.range().0)))
+        })
+    }
+
     pub fn restore_paint(&mut self,data:crate::paint::Snapshot)->crate::paint::Snapshot {
         self.set_active(data.active);
         let levels=data.levels.into_iter().map(|(l,c)|(l,crate::paint::restore(&mut self.levels[l].mesh,c))).collect();

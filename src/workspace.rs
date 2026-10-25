@@ -30,33 +30,74 @@ pub const BACKGROUND: Color32 = Color32::from_rgb(14, 15, 16); // canvas
 /// Inset of the document frame drawn inside the canvas, in points. Like ZBrush, the margin
 /// between the frame and the canvas edge always navigates, even over the model.
 pub const FRAME_INSET: f32 = 16.0;
-const BG0: Color32 = Color32::from_rgb(18, 19, 20);
-const BG1: Color32 = Color32::from_rgb(28, 30, 32); // trays, palette bodies
-const BG2: Color32 = Color32::from_rgb(36, 39, 41); // menubar, headers, fields
-const BG3: Color32 = Color32::from_rgb(45, 49, 52); // buttons
-const BG4: Color32 = Color32::from_rgb(56, 61, 65); // hover
+const BG0: Color32 = Color32::from_rgb(20, 23, 26); // value fields, text fields
+const BG1: Color32 = Color32::from_rgb(26, 29, 32); // trays, palette bodies
+const BG2: Color32 = Color32::from_rgb(29, 32, 35); // menubar, status bar, shelves
+const BG3: Color32 = Color32::from_rgb(42, 47, 52); // buttons, slider bars
+const BG4: Color32 = Color32::from_rgb(54, 60, 66); // hover
+const HEAD: Color32 = Color32::from_rgb(38, 42, 46); // palette title bars
+const TILE: Color32 = Color32::from_rgb(34, 38, 42); // thumbnails, brush tiles, subtool rows
+const SHELF: Color32 = Color32::from_rgb(22, 25, 27); // left and right shelves
 const LINE: Color32 = Color32::from_rgb(11, 12, 13);
-const LINE2: Color32 = Color32::from_rgb(57, 62, 67);
-const HI: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 15);
-const FG: Color32 = Color32::from_rgb(232, 234, 237);
-const FG2: Color32 = Color32::from_rgb(184, 189, 196);
-const FG3: Color32 = Color32::from_rgb(139, 145, 153);
-const ACC: Color32 = Color32::from_rgb(227, 131, 79);
-const ACC_FG: Color32 = Color32::from_rgb(27, 18, 12);
-const ACC_DIM: Color32 = Color32::from_rgba_premultiplied(54, 31, 19, 61);
-const ACC_LINE: Color32 = Color32::from_rgba_premultiplied(159, 92, 55, 179);
+const LINE2: Color32 = Color32::from_rgb(47, 53, 58); // dividers inside trays
+const FG: Color32 = Color32::from_rgb(230, 232, 234);
+const FG2: Color32 = Color32::from_rgb(180, 186, 193);
+const FG3: Color32 = Color32::from_rgb(138, 145, 153);
+const ACC: Color32 = Color32::from_rgb(232, 134, 90);
+const ACC_FG: Color32 = Color32::from_rgb(26, 16, 10);
+/// Accent as text on dark surfaces (docked menus, tags that are on).
+const ACC_TEXT: Color32 = Color32::from_rgb(240, 162, 125);
+/// Selected tiles, rows and toggles: a dark clay fill under an accent border.
+const ACC_DIM: Color32 = Color32::from_rgb(58, 42, 34);
+/// Slider fill under the label.
+const ACC_FILL: Color32 = Color32::from_rgb(74, 58, 49);
+const ACC_LINE: Color32 = ACC;
 
-const MENUBAR_H: f32 = 28.0;
-const SHELF_H: f32 = 62.0;
-const STATUS_H: f32 = 22.0;
+const MENUBAR_H: f32 = 30.0;
+const SHELF_H: f32 = 70.0;
+const STATUS_H: f32 = 26.0;
 const LEFT_SHELF_W: f32 = 100.0;
-const RIGHT_SHELF_W: f32 = 54.0;
+const RIGHT_SHELF_W: f32 = 64.0;
 const DIVIDER_W: f32 = 7.0;
-const HEADER_H: f32 = 28.0;
-const SECTION_H: f32 = 24.0;
-const SECTION_W: f32 = 230.0; // section width in horizontal trays
+const HEADER_H: f32 = 34.0;
+const SECTION_H: f32 = 30.0;
+const SECTION_W: f32 = 250.0; // section width in horizontal trays
+/// Height of sliders, segmented buttons and plain buttons.
+const CONTROL_H: f32 = 26.0;
 const DROPDOWN_W: f32 = 330.0;
 const NC: &str = "Not connected";
+
+/// Inter at a weight: the interface font (bundled, OFL).
+fn font(size: f32, weight: Weight) -> FontId {
+    match weight {
+        Weight::Regular => FontId::proportional(size),
+        Weight::Medium => FontId::new(size, egui::FontFamily::Name("medium".into())),
+        Weight::SemiBold => FontId::new(size, egui::FontFamily::Name("semibold".into())),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Weight {
+    Regular,
+    Medium,
+    SemiBold,
+}
+
+/// Small capitals for section titles and captions: upper case with a little tracking.
+fn caps(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text.to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: font(size, Weight::SemiBold),
+            color,
+            extra_letter_spacing: size * 0.06,
+            ..Default::default()
+        },
+    );
+    job
+}
 
 // ---------------------------------------------------------------- layout model
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -276,7 +317,7 @@ impl Default for DockLayout {
             sections: BTreeMap::new(),
             left_tray: true,
             right_tray: true,
-            tray_width: 262.0,
+            tray_width: 284.0,
             document: DocumentLook::default(),
         }
     }
@@ -374,7 +415,8 @@ impl DockLayout {
                         result.right_tray = r;
                     }
                     if let Ok(w) = width.parse::<f32>() {
-                        result.tray_width = w.clamp(200.0, 420.0);
+                        // 262 was the default before the readability pass widened trays.
+                        result.tray_width = if (w - 262.0).abs() < 0.01 { 284.0 } else { w.clamp(200.0, 420.0) };
                     }
                 }
                 ["palette", id, place, open] => {
@@ -1111,7 +1153,7 @@ impl Workspace {
                             ui.add(
                                 egui::Button::new((
                                     egui::Image::new((logo, vec2(22.0, 22.0))),
-                                    RichText::new("Klay").size(13.5).strong(),
+                                    RichText::new("Klay").font(font(14.0, Weight::SemiBold)),
                                 ))
                                 .frame_when_inactive(false)
                                 .corner_radius(5),
@@ -1131,23 +1173,22 @@ impl Workspace {
                         let on = self.dropdown == Some(id);
                         let galley = ui.painter().layout_no_wrap(
                             id.name().to_string(),
-                            FontId::proportional(12.5),
+                            font(13.0, if on { Weight::SemiBold } else { Weight::Regular }),
                             FG,
                         );
-                        let padding=if ui.max_rect().width()<1100.0 {8.0}else{12.0};
+                        let padding=if ui.max_rect().width()<1200.0 {8.0}else{16.0};
                         let width = galley.size().x + padding + if docked { 9.0 } else { 0.0 };
-                        let (r, resp) = ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
+                        let (r, resp) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click());
                         if on {
-                            ui.painter().rect_filled(r, 2, ACC);
+                            ui.painter().rect_filled(r, 3, ACC);
                         } else if resp.hovered() {
-                            ui.painter().rect_filled(r, 2, BG3);
+                            ui.painter().rect_filled(r, 3, BG3);
                         }
+                        // Docked palettes keep a dot: they are in a tray.
                         let color = if on {
                             ACC_FG
-                        } else if docked {
-                            FG2
                         } else {
-                            FG
+                            Color32::from_rgb(218, 222, 226)
                         };
                         ui.painter().galley_with_override_text_color(
                             r.left_center() + vec2(padding*0.5, -galley.size().y * 0.5),
@@ -1171,7 +1212,7 @@ impl Workspace {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(title).size(13.0).color(FG2)).truncate());
+                        ui.add(egui::Label::new(RichText::new(title).font(font(12.5, Weight::Medium)).color(FG2)).truncate());
                     });
                 });
             })
@@ -1357,31 +1398,28 @@ impl Workspace {
                 ui.painter()
                     .hline(ui.max_rect().x_range(), ui.max_rect().top() + 0.5, (1.0, LINE));
                 ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 14.0;
-                    let (r, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
                     ui.painter()
-                        .circle_filled(r.center(), 3.5, Color32::from_rgb(127, 191, 95));
-                    ui.label(RichText::new(message).size(12.0).color(FG2));
-                    ui.label(
-                        RichText::new(format!(
-                            "{} vertices · {} triangles · {} chunks",
-                            crate::fmt_count(m.vertices),
-                            crate::fmt_count(m.triangles),
-                            m.chunks
-                        ))
-                        .font(FontId::monospace(11.5))
-                        .color(FG2),
-                    );
+                        .circle_filled(r.center(), 4.0, Color32::from_rgb(127, 211, 106));
+                    ui.label(RichText::new(message).font(font(12.5, Weight::Medium)).color(FG));
+                    for text in [
+                        format!("{} vertices", crate::fmt_count(m.vertices)),
+                        format!("{} triangles", crate::fmt_count(m.triangles)),
+                        format!("{} chunks", m.chunks),
+                    ] {
+                        ui.label(RichText::new(text).font(font(12.5, Weight::Regular)).color(FG2));
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{:.1} ms · {:.0} fps", m.frame_ms, m.fps))
-                                .font(FontId::monospace(11.5))
+                                .font(font(12.5, Weight::Regular))
                                 .color(FG2),
                         );
                         ui.add(
                             egui::Label::new(
                                 RichText::new("Drag tray space to scroll · Tab hides the interface")
-                                    .size(11.5)
+                                    .font(font(12.5, Weight::Regular))
                                     .color(FG3),
                             )
                             .truncate(),
@@ -1397,15 +1435,13 @@ impl Workspace {
             .exact_size(SHELF_H)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(BG1).inner_margin(Margin::symmetric(8, 0)))
+            .frame(Frame::NONE.fill(BG1).inner_margin(Margin::symmetric(12, 0)))
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 ui.painter()
-                    .hline(rect.x_range(), rect.top() + 0.5, (1.0, HI));
-                ui.painter()
                     .hline(rect.x_range(), rect.bottom() - 0.5, (1.0, LINE));
                 ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                     // mode buttons (Q / W / E / R)
                     for (glyph, label, mode, hint) in [
                         ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
@@ -1413,7 +1449,7 @@ impl Workspace {
                         ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle; its middle circle squashes along the line"),
                         ("rotate", "Rotate", Mode::Rotate, "Rotate · R · drag the action line's end circle"),
                     ] {
-                        if big_button(ui, glyph, label, vec2(46.0, 46.0), self.mode == mode, true)
+                        if big_button(ui, glyph, label, vec2(56.0, 56.0), self.mode == mode, true)
                             .on_hover_text(hint)
                             .clicked()
                         {
@@ -1423,15 +1459,15 @@ impl Workspace {
                     shelf_separator(ui);
                     // ZBrush keeps Sculptris Pro and Live Boolean on the top shelf.
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.add_space(1.0);
-                        if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(84.0, 21.0))
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        ui.add_space(6.0);
+                        if small_toggle(ui, "Sculptris Pro", self.sculptris, vec2(120.0, CONTROL_H))
                             .on_hover_text("Strokes add and remove triangles under the brush · Detail in Brush › Sculptris Pro")
                             .clicked()
                         {
                             self.sculptris = !self.sculptris;
                         }
-                        if small_toggle(ui, "Live Boolean", self.live_boolean, vec2(84.0, 21.0))
+                        if small_toggle(ui, "Live Boolean", self.live_boolean, vec2(120.0, CONTROL_H))
                             .on_hover_text("Show the subtools' Add / Subtract / Intersect result · Mesh › Boolean")
                             .clicked()
                         {
@@ -1441,7 +1477,7 @@ impl Workspace {
                     shelf_separator(ui);
                     // Sculpt / polypaint modes and live RGB intensity.
                     ui.vertical(|ui| {
-                        ui.set_width(170.0);
+                        ui.set_width(200.0);
                         ui.add_space(6.0);
                         self.paint_modes(ui,m);
                         zslider(ui,"RGB Intensity",&mut m.brush.rgb_intensity,0.0..=1.0,false,true,2);
@@ -1449,11 +1485,12 @@ impl Workspace {
                     shelf_separator(ui);
                     // Zadd / Zsub + intensity
                     ui.vertical(|ui| {
-                        ui.set_width(170.0);
+                        ui.set_width(200.0);
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            ui.set_width(170.0);
-                            let w = ui.available_width() - 48.0;
+                            ui.set_width(200.0);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let w = ui.available_width() - 54.0;
                             ui.scope(|ui| {
                                 ui.set_width(w);
                                 if let Some(i) =
@@ -1464,7 +1501,7 @@ impl Workspace {
                             });
                             ui.add_enabled(
                                 false,
-                                egui::Button::new("Zcut").min_size(vec2(44.0, 22.0)),
+                                egui::Button::new("Zcut").min_size(vec2(50.0, CONTROL_H)),
                             );
                         });
                         zslider(
@@ -1480,17 +1517,18 @@ impl Workspace {
                     shelf_separator(ui);
                     // focal shift (not connected) + draw size
                     ui.vertical(|ui| {
-                        ui.set_width(190.0);
+                        ui.set_width(236.0);
                         ui.add_space(6.0);
                         zslider(ui,"Focal Shift",&mut m.brush.focal_shift,-100.0..=100.0,false,true,0);
                         ui.horizontal(|ui| {
-                            ui.set_width(190.0);
-                            let w = ui.available_width() - 40.0;
+                            ui.set_width(236.0);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let w = ui.available_width() - 44.0;
                             ui.scope(|ui| {
                                 ui.set_width(w);
                                 draw_size_slider(ui, "Draw Size", &mut m.brush.radius, true);
                             });
-                            if small_toggle(ui, "Dyn", self.dynamic, vec2(36.0, 22.0))
+                            if small_toggle(ui, "Dyn", self.dynamic, vec2(40.0, CONTROL_H))
                                 .on_hover_text("Radius follows zoom")
                                 .clicked()
                             {
@@ -1500,11 +1538,11 @@ impl Workspace {
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         a.redo |= ui
-                            .add_enabled(m.can_redo, egui::Button::new("Redo"))
+                            .add_enabled(m.can_redo, egui::Button::new("Redo").min_size(vec2(64.0, 32.0)))
                             .on_hover_text("Ctrl+Shift+Z")
                             .clicked();
                         a.undo |= ui
-                            .add_enabled(m.can_undo, egui::Button::new("Undo"))
+                            .add_enabled(m.can_undo, egui::Button::new("Undo").min_size(vec2(64.0, 32.0)))
                             .on_hover_text("Ctrl+Z")
                             .clicked();
                     });
@@ -1518,7 +1556,7 @@ impl Workspace {
             .exact_size(LEFT_SHELF_W)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(BG1).inner_margin(Margin::symmetric(6, 6)))
+            .frame(Frame::NONE.fill(SHELF).inner_margin(Margin::symmetric(7, 10)))
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 ui.painter()
@@ -1529,15 +1567,15 @@ impl Workspace {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.spacing_mut().item_spacing.y = 8.0;
                         // brush
                         let tex = self.texture(ui.ctx(), Some(m.brush.kind), self.subtract);
-                        let resp = thumb(ui, Thumb::Texture(tex), m.brush.kind.name(), true, false);
+                        let resp = thumb(ui, "Brush", Thumb::Texture(tex), m.brush.kind.name(), true, false);
                         if resp.clicked() {self.open_brush_catalog(resp.rect.right_top()+vec2(6.0,0.0));}
                         let kind = m.brush.kind;
                         let mode = self.stroke_mode(kind);
                         let modes = Self::stroke_modes(kind);
-                        let resp = thumb(ui, Thumb::Glyph("stroke"), mode, false, false);
+                        let resp = thumb(ui, "Stroke", Thumb::Glyph("stroke"), mode, false, false);
                         if modes.len() < 2 {
                             resp.on_hover_text(format!("{} strokes {} only", kind.name(), mode));
                         } else if resp.on_hover_text(format!("Click for the next stroke: {}", modes.join(" / "))).clicked() {
@@ -1550,8 +1588,9 @@ impl Workspace {
                         let tex = self.texture(ui.ctx(), None, false);
                         let resp = thumb(
                             ui,
+                            "Material",
                             Thumb::Texture(tex),
-                            MATERIALS[self.material].1,
+                            MATERIALS[self.material].1.trim_start_matches("MatCap "),
                             false,
                             false,
                         );
@@ -1589,8 +1628,8 @@ impl Workspace {
                             }
                             let [cr, cg, cb] = self.color.to_srgb();
                             ui.label(
-                                RichText::new(format!("#{cr:02x}{cg:02x}{cb:02x}"))
-                                    .font(FontId::monospace(11.0))
+                                RichText::new(format!("#{cr:02X}{cg:02X}{cb:02X}"))
+                                    .font(font(12.0, Weight::Medium))
                                     .color(FG2),
                             );
                         });
@@ -1598,7 +1637,7 @@ impl Workspace {
                             let _ = ui.add(
                                 egui::Button::new(RichText::new("Alternate").color(ACC_FG))
                                     .fill(ACC)
-                                    .min_size(vec2(86.0, 20.0)),
+                                    .min_size(vec2(86.0, CONTROL_H)),
                             );
                         });
                         ui.add_space(6.0);
@@ -1611,13 +1650,13 @@ impl Workspace {
             .exact_size(RIGHT_SHELF_W)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(BG1).inner_margin(Margin::symmetric(4, 6)))
+            .frame(Frame::NONE.fill(SHELF).inner_margin(Margin::symmetric(6, 10)))
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 ui.painter()
                     .vline(rect.left() + 0.5, rect.y_range(), (1.0, LINE));
-                ui.spacing_mut().item_spacing.y = 4.0;
-                let size = vec2(46.0, 42.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let size = vec2(52.0, 50.0);
                 if big_button(ui, "frame", "Frame", size, false, true)
                     .on_hover_text("Frame mesh · F")
                     .clicked()
@@ -1636,7 +1675,7 @@ impl Workspace {
                 {
                     self.grid = !self.grid;
                 }
-                if big_button(ui, "sym", "Sym", size, self.symmetry, true)
+                if big_button(ui, "sym", if self.symmetry { "Sym X" } else { "Sym" }, size, self.symmetry, true)
                     .on_hover_text("Symmetry across X · X")
                     .clicked()
                 {
@@ -1751,7 +1790,7 @@ impl Workspace {
             let width = self
                 .layout
                 .tray_width
-                .min(((screen.width() - 420.0) * 0.5).max(160.0));
+                .min(((screen.width() - 440.0) * 0.5).max(160.0));
             panel.exact_size(width)
         };
         let response = panel
@@ -1855,8 +1894,8 @@ impl Workspace {
                     let (hr, _) = ui.allocate_exact_size(vec2(width, HEADER_H), Sense::hover());
                     let hovered = ui.rect_contains_pointer(hr);
                     let p = ui.painter();
-                    p.rect_filled(hr, 0, if hovered { BG3 } else { BG2 });
-                    p.hline(hr.x_range(), hr.top() + 0.5, (1.0, HI));
+                    p.rect_filled(hr, 0, if hovered { BG4 } else { HEAD });
+                    p.hline(hr.x_range(), hr.top() + 0.5, (1.0, LINE));
                     p.hline(hr.x_range(), hr.bottom() - 0.5, (1.0, LINE));
                     // dock button: click = menu, drag = move
                     let dock_rect = Rect::from_center_size(
@@ -1882,23 +1921,28 @@ impl Workspace {
                     ui.painter()
                         .circle_filled(dock_rect.center(), 1.8, dock_color);
                     self.dock_menu(&dock, id);
-                    let mut x = hr.left() + 24.0;
+                    // Accent tick, then the palette name in the heaviest weight of the tray.
+                    let x = hr.left() + 26.0;
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(pos2(x, hr.center().y), vec2(3.0, 16.0)),
+                        1,
+                        ACC,
+                    );
                     if !floating {
-                        chevron(ui.painter(), pos2(x + 4.0, hr.center().y), open, FG2);
-                        x += 14.0;
+                        chevron(ui.painter(), hr.right_center() - vec2(14.0, 0.0), open, FG2);
                     }
                     ui.painter().text(
-                        pos2(x + 2.0, hr.center().y),
+                        pos2(x + 8.0, hr.center().y),
                         Align2::LEFT_CENTER,
                         id.name(),
-                        FontId::proportional(13.0),
+                        font(14.0, Weight::SemiBold),
                         FG,
                     );
                     if floating {
                         if let Place::Tray(side) = state.place {
                             tag(
                                 ui.painter(),
-                                hr.right_center() - vec2(6.0, 0.0),
+                                hr.right_center() - vec2(10.0, 0.0),
                                 &format!("{} tray", side.name().to_lowercase()),
                             );
                         }
@@ -2004,19 +2048,20 @@ impl Workspace {
         let open = *self.layout.sections.get(&key).unwrap_or(&default_open);
         let (r, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), SECTION_H), Sense::click());
+        // Section titles: small capitals on the tray, a divider above, the chevron and any
+        // state on the right. Palette titles stay the bolder level above them.
         let p = ui.painter();
-        p.rect_filled(r, 0, if resp.hovered() { BG3 } else { BG2 });
-        p.hline(r.x_range(), r.top() + 0.5, (1.0, LINE));
-        chevron(p, r.left_center() + vec2(12.0, 0.0), open, FG2);
-        p.text(
-            r.left_center() + vec2(22.0, 0.0),
-            Align2::LEFT_CENTER,
-            title,
-            FontId::proportional(12.5),
-            FG,
-        );
+        if resp.hovered() {
+            p.rect_filled(r, 0, BG3);
+        }
+        p.hline(r.x_range(), r.top() + 0.5, (1.0, LINE2));
+        let color = if resp.hovered() || open { FG2 } else { FG3 };
+        let title_job = caps(title, 11.5, if open { FG2 } else { Color32::from_rgb(160, 167, 175) });
+        let galley = p.layout_job(title_job);
+        p.galley(pos2(r.left() + 12.0, r.center().y - galley.size().y * 0.5), galley, FG2);
+        chevron(p, r.right_center() - vec2(14.0, 0.0), open, color);
         if let Some(t) = tag_text {
-            tag(p, r.right_center() - vec2(6.0, 0.0), t);
+            tag(p, r.right_center() - vec2(28.0, 0.0), t);
         }
         if resp.clicked() {
             if open == default_open {
@@ -2047,13 +2092,13 @@ impl Workspace {
             if ws.section(ui, pal, sid, title, tag_text, default_open) {
                 Frame::NONE
                     .inner_margin(Margin {
-                        left: 7,
-                        right: 7,
-                        top: 5,
-                        bottom: 7,
+                        left: 12,
+                        right: 12,
+                        top: 4,
+                        bottom: 12,
                     })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.spacing_mut().item_spacing.y = 6.0;
                         ui.set_width(ui.available_width());
                         ui.add_enabled_ui(enabled, |ui| body(ws, ui));
                     });
@@ -2228,17 +2273,14 @@ impl Workspace {
                             let mut drag = ws.curve_drag.filter(|d| d.0 == size).map(|d| d.1);
                             let curve = if size { &mut t.size_curve } else { &mut t.intensity_curve };
                             pressure_curve_editor(ui, curve, &mut drag, live);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                let w = (ui.available_width() - 9.0) / 4.0;
-                                for name in crate::pressure::PressureCurve::PRESETS {
-                                    let preset = crate::pressure::PressureCurve::preset(name);
-                                    let on = *curve == preset;
-                                    if ui.add(egui::Button::new(RichText::new(name).size(11.5)).selected(on).min_size(vec2(w, 18.0))).clicked() {
-                                        *curve = preset;
-                                    }
-                                }
-                            });
+                            let presets = crate::pressure::PressureCurve::PRESETS;
+                            let at = presets
+                                .iter()
+                                .position(|name| *curve == crate::pressure::PressureCurve::preset(name))
+                                .unwrap_or(usize::MAX);
+                            if let Some(i) = seg(ui, &presets, at, false) {
+                                *curve = crate::pressure::PressureCurve::preset(presets[i]);
+                            }
                             if drag.is_some() {
                                 ws.curve_drag = drag.map(|i| (size, i));
                             } else if ws.curve_drag.is_some_and(|d| d.0 == size) {
@@ -2436,16 +2478,10 @@ impl Workspace {
                     ui.horizontal(|ui| {
                         let w = (ui.available_width() - 3.0) * 0.5;
                         a.undo |= ui
-                            .add_enabled(
-                                m.can_undo,
-                                egui::Button::new("Undo").min_size(vec2(w, 20.0)),
-                            )
+                            .add_enabled_ui(m.can_undo, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Undo").truncate())).inner
                             .clicked();
                         a.redo |= ui
-                            .add_enabled(
-                                m.can_redo,
-                                egui::Button::new("Redo").min_size(vec2(w, 20.0)),
-                            )
+                            .add_enabled_ui(m.can_redo, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Redo").truncate())).inner
                             .clicked();
                     });
                     kv(
@@ -2876,11 +2912,11 @@ impl Workspace {
                         use crate::LayerOp;
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 4.0) * 0.5;
-                            if ui.add(egui::Button::new("New").min_size(vec2(w, 20.0))).on_hover_text("A new layer, recording").clicked() {
+                            if ui.add_sized([w, CONTROL_H], egui::Button::new("New").truncate()).on_hover_text("A new layer, recording").clicked() {
                                 a.layer = Some(LayerOp::New);
                             }
                             if ui
-                                .add_enabled(!m.layers.is_empty(), egui::Button::new("Bake All").min_size(vec2(w, 20.0)))
+                                .add_enabled_ui(!m.layers.is_empty(), |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Bake All").truncate())).inner
                                 .on_hover_text("Keep every layer's effect in the sculpt and remove the layers")
                                 .clicked()
                             {
@@ -2922,10 +2958,10 @@ impl Workspace {
                             }
                             ui.horizontal(|ui| {
                                 let w = (ui.available_width() - 4.0) * 0.5;
-                                if ui.add(egui::Button::new("Delete").min_size(vec2(w, 20.0))).on_hover_text("Remove the layer and its effect").clicked() {
+                                if ui.add_sized([w, CONTROL_H], egui::Button::new("Delete").truncate()).on_hover_text("Remove the layer and its effect").clicked() {
                                     a.layer = Some(LayerOp::Delete(i));
                                 }
-                                if ui.add(egui::Button::new("Bake").min_size(vec2(w, 20.0))).on_hover_text("Keep its effect in the sculpt and remove the layer").clicked() {
+                                if ui.add_sized([w, CONTROL_H], egui::Button::new("Bake").truncate()).on_hover_text("Keep its effect in the sculpt and remove the layer").clicked() {
                                     a.layer = Some(LayerOp::Bake(i));
                                 }
                             });
@@ -2997,7 +3033,7 @@ impl Workspace {
                             let w = (ui.available_width() - 4.0) * 0.5;
                             ui.add_enabled_ui(m.level > 0, |ui| {
                                 if ui
-                                    .add(egui::Button::new("Del Lower").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Del Lower").truncate())
                                     .on_hover_text("Make this level the base, deleting the ones below · clears undo")
                                     .clicked()
                                 {
@@ -3006,7 +3042,7 @@ impl Workspace {
                             });
                             ui.add_enabled_ui(m.level < top, |ui| {
                                 if ui
-                                    .add(egui::Button::new("Del Higher").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Del Higher").truncate())
                                     .on_hover_text("Delete the levels above this one · clears undo")
                                     .clicked()
                                 {
@@ -3020,14 +3056,14 @@ impl Workspace {
                             ui.horizontal(|ui| {
                                 let w = (ui.available_width() - 4.0) * 0.5;
                                 if ui
-                                    .add_enabled(m.hidden > 0, egui::Button::new("Del Hidden").min_size(vec2(w, 20.0)))
+                                    .add_enabled_ui(m.hidden > 0, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new("Del Hidden").truncate())).inner
                                     .on_hover_text("Delete the hidden polygons")
                                     .clicked()
                                 {
                                     a.del_hidden = true;
                                 }
                                 if ui
-                                    .add(egui::Button::new("Close Holes").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Close Holes").truncate())
                                     .on_hover_text("Cap every open border, each cap a new polygroup")
                                     .clicked()
                                 {
@@ -3054,7 +3090,7 @@ impl Workspace {
                             let can = m.wedge_refusal.is_none() || m.wedge_on;
                             ui.add_enabled_ui(can, |ui| {
                                 let r = ui
-                                    .add(egui::Button::new("Remesh").selected(m.wedge_on).min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Remesh").selected(m.wedge_on).truncate())
                                     .on_hover_text("Remesh into an even, closed surface and keep Remesh on, so Ctrl + drag on the background remeshes again (ZBrush: DynaMesh)");
                                 let r = match m.wedge_refusal {
                                     Some(why) => r.on_disabled_hover_text(why),
@@ -3066,7 +3102,7 @@ impl Workspace {
                             });
                             ui.add_enabled_ui(m.wedge_on && m.wedge_refusal.is_none(), |ui| {
                                 if ui
-                                    .add(egui::Button::new("Update").truncate().min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Update").truncate())
                                     .on_hover_text("Remesh again now · Ctrl + drag on the background")
                                     .clicked()
                                 {
@@ -3115,7 +3151,7 @@ impl Workspace {
                         // ZBrush: half, the same or double the subtool's polygons now.
                         let now = m.triangles as f32 / 2000.0;
                         for (label, k) in [("Half", 0.5), ("Same", 1.0), ("Double", 2.0)] {
-                            if ui.add(egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(w, 20.0))).on_hover_text(format!("Target {label}: of the quads the subtool has now")).clicked() {
+                            if ui.add_sized([w, CONTROL_H], egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(format!("Target {label}: of the quads the subtool has now")).clicked() {
                                 ws.zremesh.target_k = (now * k).clamp(0.1, 100.0);
                             }
                         }
@@ -3144,14 +3180,14 @@ impl Workspace {
                             ui.horizontal(|ui| {
                                 let w = (ui.available_width() - 4.0) * 0.5;
                                 if ui
-                                    .add(egui::Button::new("Show all").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Show all").truncate())
                                     .on_hover_text("Ctrl + Shift + click on the background")
                                     .clicked()
                                 {
                                     a.show_all = true;
                                 }
                                 if ui
-                                    .add(egui::Button::new("Invert").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Invert").truncate())
                                     .on_hover_text("Swap hidden and visible · Ctrl + Shift + drag on the background")
                                     .clicked()
                                 {
@@ -3161,14 +3197,14 @@ impl Workspace {
                             ui.horizontal(|ui| {
                                 let w = (ui.available_width() - 4.0) * 0.5;
                                 if ui
-                                    .add(egui::Button::new("Grow").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Grow").truncate())
                                     .on_hover_text("Show one more ring of polygons around the visible ones")
                                     .clicked()
                                 {
                                     a.grow_visibility = Some(true);
                                 }
                                 if ui
-                                    .add(egui::Button::new("Shrink").min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new("Shrink").truncate())
                                     .on_hover_text("Hide the outer ring of the visible polygons")
                                     .clicked()
                                 {
@@ -3290,7 +3326,7 @@ impl Workspace {
                             ] {
                                 let on = m.primitive.current() == segments;
                                 if ui
-                                    .add(egui::Button::new(label).selected(on).min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new(label).selected(on).truncate())
                                     .on_hover_text(hint)
                                     .clicked()
                                 {
@@ -3661,7 +3697,7 @@ impl Workspace {
                                 ("Iso", (0.6, 0.35)),
                             ] {
                                 if ui
-                                    .add(egui::Button::new(label).min_size(vec2(w, 20.0)))
+                                    .add_sized([w, CONTROL_H], egui::Button::new(label).truncate())
                                     .clicked()
                                 {
                                     a.view = Some(view);
@@ -3685,7 +3721,7 @@ impl Workspace {
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 6.0) / 3.0;
                             if ui
-                                .add(egui::Button::new("Reset").min_size(vec2(w, 20.0)))
+                                .add_sized([w, CONTROL_H], egui::Button::new("Reset").truncate())
                                 .clicked()
                             {
                                 // The document colours are not layout: they stay.
@@ -3695,7 +3731,7 @@ impl Workspace {
                                 ws.flash(ui.ctx(), "Layout reset".to_string());
                             }
                             if ui
-                                .add(egui::Button::new("Collapse all").min_size(vec2(w, 20.0)))
+                                .add_sized([w, CONTROL_H], egui::Button::new("Collapse all").truncate())
                                 .clicked()
                             {
                                 for p in &mut ws.layout.palettes {
@@ -3703,7 +3739,7 @@ impl Workspace {
                                 }
                             }
                             if ui
-                                .add(egui::Button::new("Expand all").min_size(vec2(w, 20.0)))
+                                .add_sized([w, CONTROL_H], egui::Button::new("Expand all").truncate())
                                 .clicked()
                             {
                                 for p in &mut ws.layout.palettes {
@@ -3948,8 +3984,9 @@ impl Workspace {
                         "Orthographic"
                     };
                     let resp = ui.add(
-                        egui::Button::new(RichText::new(projection).size(12.0).color(FG2))
-                            .min_size(vec2(0.0, 18.0)),
+                        egui::Button::new(RichText::new(projection).font(font(12.5, Weight::Medium)).color(FG))
+                            .fill(Color32::from_rgba_unmultiplied(20, 22, 24, 220))
+                            .min_size(vec2(0.0, 24.0)),
                     );
                     egui::Popup::menu(&resp).frame(popup_frame()).show(|ui| {
                         for (label, yaw, pitch) in [
@@ -3964,7 +4001,13 @@ impl Workspace {
                         }
                     });
                     let active = m.subtools.iter().find(|r| r.active).map_or("", |r| r.name.as_str());
-                    ui.label(RichText::new(format!("/  {active}")).size(12.0).color(FG3));
+                    Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(20, 22, 24, 200))
+                        .corner_radius(4)
+                        .inner_margin(Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(active).font(font(12.5, Weight::Regular)).color(FG2));
+                        });
                 });
             });
         if !self.focus {
@@ -3976,9 +4019,9 @@ impl Workspace {
                     // Project the world axes with the live camera; draw back-facing ones
                     // first and dimmer.
                     let mut axes = [
-                        ("X", ACC, m.axes[0], (std::f32::consts::FRAC_PI_2, 0.0)),
-                        ("Y", FG2, m.axes[1], (0.0, std::f32::consts::FRAC_PI_2)),
-                        ("Z", Color32::from_rgb(122, 169, 214), m.axes[2], (0.0, 0.0)),
+                        ("X", Color32::from_rgb(240, 127, 110), m.axes[0], (std::f32::consts::FRAC_PI_2, 0.0)),
+                        ("Y", Color32::from_rgb(127, 211, 106), m.axes[1], (0.0, std::f32::consts::FRAC_PI_2)),
+                        ("Z", Color32::from_rgb(120, 168, 240), m.axes[2], (0.0, 0.0)),
                     ];
                     axes.sort_by(|a, b| a.2[2].total_cmp(&b.2[2]));
                     for (label, color, [x, y, depth], view) in axes {
@@ -3996,7 +4039,7 @@ impl Workspace {
                             label_pos,
                             Align2::CENTER_CENTER,
                             label,
-                            FontId::monospace(11.0),
+                            font(11.5, Weight::SemiBold),
                             color.gamma_multiply(dim),
                         );
                         if ui
@@ -4012,18 +4055,23 @@ impl Workspace {
                     }
                 });
         }
-        painter.text(
-            pos2(canvas.left() + 10.0, canvas.bottom() - 12.0),
-            Align2::LEFT_CENTER,
-            format!(
-                "Brush {} · r {:.2} · s {:.2}",
+        {
+            let text = format!(
+                "{} · Size {:.2} · Z {:.0} · {}",
                 m.brush.kind.name(),
                 m.brush.radius,
-                m.brush.strength
-            ),
-            FontId::proportional(12.0),
-            FG3,
-        );
+                m.brush.strength * 100.0,
+                if self.subtract { "Zsub" } else { "Zadd" }
+            );
+            let galley = painter.layout_no_wrap(text, font(12.5, Weight::Regular), FG2);
+            let chip = Rect::from_min_size(
+                pos2(canvas.left() + 8.0, canvas.bottom() - 8.0 - galley.size().y - 10.0),
+                galley.size() + vec2(20.0, 10.0),
+            );
+            painter.rect_filled(chip, 4, Color32::from_rgba_unmultiplied(20, 22, 24, 220));
+            painter.rect_stroke(chip, 4, Stroke::new(1.0, LINE2), StrokeKind::Inside);
+            painter.galley(chip.min + vec2(10.0, 5.0), galley, FG2);
+        }
         if self.focus {
             painter.text(
                 pos2(canvas.right() - 10.0, canvas.top() + 14.0),
@@ -4290,13 +4338,21 @@ pub fn zslider_scaled(
     line: bool,
     decimals: usize,
 ) -> bool {
+    let _ = line;
     let (min, max) = (*range.start(), *range.end());
     let (r, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
+        ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_H), Sense::click_and_drag());
+    // ZBrush keeps the name on the bar; the value gets a field of its own on the right so
+    // it never sits on the moving fill.
+    let value_text = format!("{:.*}", decimals, *value);
+    let value_galley = ui.painter().layout_no_wrap(value_text, font(13.0, Weight::SemiBold), FG);
+    let value_w = (value_galley.size().x + 16.0).max(48.0).min(r.width() * 0.4);
+    let field = Rect::from_min_max(pos2(r.right() - value_w, r.top()), r.max);
+    let bar = Rect::from_min_max(r.min, pos2(field.left() - 4.0, r.bottom()));
     let mut changed = false;
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let f = ((p.x - r.left()) / r.width()).clamp(0.0, 1.0);
+            let f = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
             let v = scale.value(f, min, max);
             if v != *value {
                 *value = v;
@@ -4307,70 +4363,31 @@ pub fn zslider_scaled(
     let frac = scale.position(*value, min, max);
     let p = ui.painter();
     // Disabled UIs already apply the theme opacity to their painter.
-    p.rect_filled(r, 2, if line { BG2 } else { BG3 });
-    if !line {
-        p.hline(r.x_range(), r.top() + 1.5, (1.0, HI));
-    }
-    p.rect_stroke(r, 2, Stroke::new(1.0, LINE), StrokeKind::Inside);
-    if line {
-        let fill = Rect::from_min_max(
-            pos2(r.left() + 1.0, r.bottom() - 4.0),
-            pos2(r.left() + 1.0 + frac * (r.width() - 2.0), r.bottom() - 1.0),
-        );
-        p.rect_filled(fill, 0, ACC);
-    } else {
-        let fill = Rect::from_min_max(
-            r.min + vec2(1.0, 1.0),
-            pos2(r.left() + 1.0 + frac * (r.width() - 2.0), r.bottom() - 1.0),
-        );
-        p.rect_filled(fill, 0, ACC_DIM);
-        p.vline(
-            fill.right(),
-            fill.y_range(),
-            (1.0, ACC_LINE),
+    p.rect_filled(bar, 4, if resp.hovered() { BG4 } else { BG3 });
+    // Clay fill up to the value with an accent rule along its bottom edge: the position
+    // reads at a glance without a marker crossing the name.
+    let x = bar.left() + 1.0 + frac * (bar.width() - 2.0);
+    if frac > 0.0 {
+        let fill = Rect::from_min_max(bar.min + vec2(1.0, 1.0), pos2(x, bar.bottom() - 1.0));
+        p.rect_filled(fill, CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, ACC_FILL);
+        p.rect_filled(
+            Rect::from_min_max(pos2(fill.left(), fill.bottom() - 2.0), fill.max),
+            CornerRadius { nw: 0, sw: 3, ne: 0, se: 0 },
+            ACC,
         );
     }
-    let ty = if line {
-        r.center().y - 2.0
-    } else {
-        r.center().y
-    };
-    // Keep numbers on a neutral surface instead of over the varying bar fill.
-    // The full bar retains its original click/drag range.
-    let value_text = format!("{:.*}", decimals, *value);
-    let value_galley = p.layout_no_wrap(
-        value_text,
-        FontId::monospace(12.0),
-        FG,
-    );
-    let value_width = (value_galley.size().x + 12.0)
-        .max(42.0)
-        .min(r.width() * 0.5);
-    let value_rect = Rect::from_min_max(
-        pos2(r.right() - value_width, r.top() + 1.0),
-        pos2(
-            r.right() - 1.0,
-            if line { r.bottom() - 4.0 } else { r.bottom() - 1.0 },
-        ),
-    );
-    p.rect_filled(value_rect, 0, BG2);
-    p.vline(value_rect.left(), value_rect.y_range(), (1.0, LINE2));
-    let label_painter = p.with_clip_rect(
-        Rect::from_min_max(r.min, pos2(value_rect.left() - 4.0, r.bottom()))
-            .intersect(p.clip_rect()),
-    );
-    label_painter.text(
-        pos2(r.left() + 6.0, ty),
+    p.rect_stroke(bar, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    p.with_clip_rect(bar.shrink(1.0).intersect(p.clip_rect())).text(
+        pos2(bar.left() + 9.0, bar.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
+        font(13.0, Weight::Medium),
         FG,
     );
+    p.rect_filled(field, 4, BG0);
+    p.rect_stroke(field, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
     p.galley(
-        pos2(
-            r.right() - 6.0 - value_galley.size().x,
-            ty - value_galley.size().y * 0.5,
-        ),
+        pos2(field.right() - 8.0 - value_galley.size().x, field.center().y - value_galley.size().y * 0.5),
         value_galley,
         FG,
     );
@@ -4379,42 +4396,42 @@ pub fn zslider_scaled(
 
 /// Segmented buttons. Returns the index clicked this frame.
 fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usize> {
-    let h = if tall { 32.0 } else { 22.0 };
+    let h = if tall { 32.0 } else { CONTROL_H };
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let enabled = ui.is_enabled();
     let w = r.width() / labels.len() as f32;
     let mut clicked = None;
+    ui.painter().rect_filled(r, 4, BG3);
     for (i, label) in labels.iter().enumerate() {
         let cell = Rect::from_min_size(r.min + vec2(w * i as f32, 0.0), vec2(w, h));
         let resp = ui.interact(cell, ui.scope_id().with(("seg", label, i)), Sense::click());
         let on = i == selected;
         let p = ui.painter();
-        let fill = if on && enabled {
-            ACC
-        } else if on {
-            BG4
-        } else if resp.hovered() {
-            BG4
-        } else {
-            BG3
+        let corner = |left: bool, right: bool| CornerRadius {
+            nw: if left { 4 } else { 0 },
+            sw: if left { 4 } else { 0 },
+            ne: if right { 4 } else { 0 },
+            se: if right { 4 } else { 0 },
         };
-        p.rect_filled(cell, 0, fill);
-        if !on {
-            p.hline(cell.x_range(), cell.top() + 0.5, (1.0, HI));
+        let round = corner(i == 0, i + 1 == labels.len());
+        if on {
+            p.rect_filled(cell, round, if enabled { ACC } else { BG4 });
+        } else if resp.hovered() {
+            p.rect_filled(cell, round, BG4);
         }
         p.text(
             cell.center(),
             Align2::CENTER_CENTER,
             *label,
-            FontId::proportional(13.0),
-            if on && enabled { ACC_FG } else { FG },
+            font(13.0, if on { Weight::SemiBold } else { Weight::Medium }),
+            if on && enabled { ACC_FG } else if on { FG } else { FG2 },
         );
         if resp.clicked() {
             clicked = Some(i);
         }
     }
     let p = ui.painter();
-    p.rect_stroke(r, 2, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    p.rect_stroke(r, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
     for i in 1..labels.len() {
         p.vline(r.left() + w * i as f32, r.y_range(), (1.0, LINE));
     }
@@ -4424,29 +4441,14 @@ fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usiz
 fn small_toggle(ui: &mut Ui, label: &str, on: bool, size: Vec2) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
-    p.rect_filled(
-        r,
-        2,
-        if on {
-            ACC_DIM
-        } else if resp.hovered() {
-            BG4
-        } else {
-            BG3
-        },
-    );
-    p.rect_stroke(
-        r,
-        2,
-        Stroke::new(1.0, if on { ACC_LINE } else { LINE }),
-        StrokeKind::Inside,
-    );
+    p.rect_filled(r, 4, if on { ACC } else if resp.hovered() { BG4 } else { BG3 });
+    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC } else { LINE }), StrokeKind::Inside);
     p.text(
         r.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(11.0),
-        FG,
+        font(12.5, if on { Weight::SemiBold } else { Weight::Medium }),
+        if on { ACC_FG } else { FG },
     );
     resp
 }
@@ -4468,43 +4470,42 @@ fn big_button(
             Sense::hover()
         },
     );
-    let alpha = if enabled { 1.0 } else { 0.6 };
+    // Shelf modes (tall) fill with the accent when on; view toggles get a clay tint and an
+    // accent border so several can be on at once without shouting.
+    let mode = size.y > 52.0;
+    let alpha = if enabled { 1.0 } else { 0.55 };
     let p = ui.painter();
-    let fill = if on && size.y > 42.0 {
+    let fill = if on && mode {
         ACC
     } else if on {
         ACC_DIM
     } else if resp.hovered() && enabled {
         BG4
-    } else {
+    } else if mode {
         BG3
+    } else {
+        TILE
     };
-    p.rect_filled(r, 3, fill.gamma_multiply(alpha));
-    let border = if on && size.y <= 42.0 { ACC_LINE } else { LINE };
-    p.rect_stroke(
-        r,
-        3,
-        Stroke::new(1.0, border.gamma_multiply(alpha)),
-        StrokeKind::Inside,
-    );
-    if !(on && size.y > 42.0) {
-        p.hline(r.x_range().shrink(1.0), r.top() + 1.5, (1.0, HI));
-    }
+    p.rect_filled(r, 4, fill.gamma_multiply(alpha));
+    let border = if on { ACC } else { LINE };
+    p.rect_stroke(r, 4, Stroke::new(1.0, border.gamma_multiply(alpha)), StrokeKind::Inside);
     let color = if !enabled {
         FG3
-    } else if on && size.y > 42.0 {
+    } else if on && mode {
         ACC_FG
-    } else if on || (resp.hovered() && enabled) {
+    } else if on {
+        Color32::from_rgb(255, 210, 189)
+    } else if resp.hovered() {
         FG
     } else {
         FG2
     };
-    glyph(p, r.center() - vec2(0.0, 7.0), icon, color);
+    glyph(p, r.center() - vec2(0.0, if mode { 8.0 } else { 7.0 }), icon, color);
     p.text(
-        r.center_bottom() - vec2(0.0, 9.0),
+        r.center_bottom() - vec2(0.0, if mode { 11.0 } else { 9.5 }),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(12.0),
+        font(if mode { 12.0 } else { 11.5 }, Weight::Medium),
         color,
     );
     resp
@@ -4515,75 +4516,71 @@ enum Thumb {
     Glyph(&'static str),
 }
 
-/// Left-shelf thumbnail: 84px image with a label below.
-fn thumb(ui: &mut Ui, content: Thumb, label: &str, on: bool, dim: bool) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(vec2(86.0, 100.0), Sense::click());
-    let im = Rect::from_min_size(r.min + vec2(1.0, 0.0), vec2(84.0, 84.0));
+/// Left-shelf thumbnail: a caption (what it is), the image, and its current name.
+fn thumb(ui: &mut Ui, caption: &str, content: Thumb, label: &str, on: bool, dim: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(86.0, 106.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(im, 3, BG2);
-    p.hline(im.x_range().shrink(1.0), im.top() + 1.5, (1.0, HI));
+    p.rect_filled(r, 4, if resp.hovered() { BG3 } else { TILE });
+    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC } else { LINE }), StrokeKind::Inside);
+    let cap = p.layout_job(caps(caption, 10.5, FG3));
+    p.galley(pos2(r.center().x - cap.size().x * 0.5, r.top() + 6.0), cap, FG3);
+    let im = Rect::from_center_size(pos2(r.center().x, r.top() + 52.0), vec2(60.0, 60.0));
     match content {
         Thumb::Texture(tex) => {
-            p.image(
-                tex,
-                im.shrink(1.0),
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            p.image(tex, im, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
         Thumb::Glyph(name) => glyph_large(p, im.center(), name, if dim { FG3 } else { FG2 }),
     }
-    p.rect_stroke(
-        im,
-        3,
-        Stroke::new(1.0, if on { ACC_LINE } else { LINE }),
-        StrokeKind::Inside,
-    );
-    if on {
-        p.rect_stroke(
-            im.expand(1.0),
-            4,
-            Stroke::new(1.0, ACC_DIM),
-            StrokeKind::Outside,
-        );
-    }
-    let color = if dim {
-            FG3
-        } else if resp.hovered() {
-            FG
-        } else {
-            FG2
-        };
-    let mut job = egui::text::LayoutJob::simple(label.to_owned(), FontId::proportional(11.5), color, 84.0);
+    let color = if dim { FG3 } else { FG };
+    let mut job = egui::text::LayoutJob::simple(label.to_owned(), font(12.0, Weight::Medium), color, 80.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let galley = p.layout_job(job);
-    p.galley(pos2(r.center().x-galley.size().x*0.5,r.bottom()-7.0-galley.size().y*0.5), galley, color);
+    p.galley(pos2(r.center().x - galley.size().x * 0.5, r.bottom() - 10.0 - galley.size().y * 0.5), galley, color);
     resp.on_hover_text(label)
 }
 
 fn brush_tile(
     ui: &mut Ui, tex: TextureId, name: &str, key: usize, on: bool, width: f32,
 ) -> egui::Response {
-    let label=ui.painter().layout(name.to_owned(),FontId::proportional(11.5),if on{FG}else{FG2},width-8.0);
-    let height=width+label.size().y.max(28.0)+5.0;
-    let (r,resp)=ui.allocate_exact_size(vec2(width,height),Sense::click());
-    let p=ui.painter();p.rect_filled(r,3,if on{ACC_DIM}else if resp.hovered(){BG4}else{BG3});
-    p.rect_stroke(r,3,Stroke::new(1.0,if on{ACC_LINE}else{LINE}),StrokeKind::Inside);
-    let im=Rect::from_min_size(r.min+vec2(3.0,3.0),vec2(width-6.0,width-6.0));
-    p.image(tex,im,Rect::from_min_max(Pos2::ZERO,pos2(1.0,1.0)),Color32::WHITE);
+    let color = if on { Color32::WHITE } else { FG2 };
+    let label = ui.painter().layout(
+        name.to_owned(),
+        font(12.0, if on { Weight::SemiBold } else { Weight::Regular }),
+        color,
+        width - 6.0,
+    );
+    let height = width + label.size().y.max(15.0) + 4.0;
+    let (r, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(r, 4, if on { ACC_DIM } else if resp.hovered() { BG4 } else { TILE });
+    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC } else { LINE }), StrokeKind::Inside);
+    let im = Rect::from_min_size(r.min + vec2(4.0, 4.0), vec2(width - 8.0, width - 8.0));
+    p.image(tex, im, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
     if (1..=9).contains(&key) {
-        p.text(im.right_top()+vec2(-4.0,3.0),Align2::RIGHT_TOP,key.to_string(),FontId::monospace(10.5),FG);
+        p.text(im.right_top() + vec2(-3.0, 2.0), Align2::RIGHT_TOP, key.to_string(), font(11.0, Weight::SemiBold), FG);
     }
-    p.galley(pos2(r.center().x-label.size().x*0.5,r.top()+width),label,FG);
-    resp.on_hover_text(if (1..=9).contains(&key){format!("{name} · {key}")}else{name.to_owned()})
+    p.galley(pos2(r.center().x - label.size().x * 0.5, r.top() + width - 2.0), label, color);
+    resp.on_hover_text(if (1..=9).contains(&key) { format!("{name} · {key}") } else { name.to_owned() })
 }
 
-/// HSV picker: saturation/value square plus a hue strip.
+/// HSV picker: saturation/value square plus a hue strip on its right (left shelf).
 fn color_picker(ui: &mut Ui, color: &mut Hsva) {
     let (r, _) = ui.allocate_exact_size(vec2(86.0, 72.0), Sense::hover());
     let sv = Rect::from_min_max(r.min, pos2(r.right() - 15.0, r.bottom()));
     let hue = Rect::from_min_max(pos2(r.right() - 12.0, r.top()), r.max);
+    hsv_picker(ui, color, sv, hue, false);
+}
+
+/// A large square picker with the hue bar underneath it (Space menu).
+fn color_picker_stacked(ui: &mut Ui, color: &mut Hsva, width: f32) {
+    let (r, _) = ui.allocate_exact_size(vec2(width, width + 22.0), Sense::hover());
+    let sv = Rect::from_min_size(r.min, vec2(width, width));
+    let hue = Rect::from_min_max(pos2(r.left(), r.bottom() - 14.0), r.max);
+    hsv_picker(ui, color, sv, hue, true);
+}
+
+fn hsv_picker(ui: &mut Ui, color: &mut Hsva, sv: Rect, hue: Rect, hue_across: bool) {
     let sv_resp = ui.interact(sv, ui.scope_id().with("picker-sv"), Sense::click_and_drag());
     if sv_resp.dragged() || sv_resp.clicked() {
         if let Some(p) = sv_resp.interact_pointer_pos() {
@@ -4591,14 +4588,15 @@ fn color_picker(ui: &mut Ui, color: &mut Hsva) {
             color.v = 1.0 - ((p.y - sv.top()) / sv.height()).clamp(0.0, 1.0);
         }
     }
-    let hue_resp = ui.interact(
-        hue,
-        ui.scope_id().with("picker-hue"),
-        Sense::click_and_drag(),
-    );
+    let hue_resp = ui.interact(hue, ui.scope_id().with("picker-hue"), Sense::click_and_drag());
     if hue_resp.dragged() || hue_resp.clicked() {
         if let Some(p) = hue_resp.interact_pointer_pos() {
-            color.h = ((p.y - hue.top()) / hue.height()).clamp(0.0, 0.999);
+            let t = if hue_across {
+                (p.x - hue.left()) / hue.width()
+            } else {
+                (p.y - hue.top()) / hue.height()
+            };
+            color.h = t.clamp(0.0, 0.999);
         }
     }
     let p = ui.painter();
@@ -4613,21 +4611,25 @@ fn color_picker(ui: &mut Ui, color: &mut Hsva) {
     mesh.add_triangle(0, 2, 3);
     p.add(egui::Shape::mesh(mesh));
     p.rect_stroke(sv, 0, Stroke::new(1.0, LINE), StrokeKind::Inside);
-    let marker = pos2(
-        sv.left() + color.s * sv.width(),
-        sv.top() + (1.0 - color.v) * sv.height(),
-    );
-    p.circle_stroke(marker, 4.5, Stroke::new(1.0, Color32::BLACK));
-    p.circle_stroke(marker, 3.5, Stroke::new(1.5, Color32::WHITE));
+    let marker = pos2(sv.left() + color.s * sv.width(), sv.top() + (1.0 - color.v) * sv.height());
+    let big = sv.width() > 100.0;
+    p.circle_stroke(marker, if big { 6.5 } else { 4.5 }, Stroke::new(1.0, Color32::BLACK));
+    p.circle_stroke(marker, if big { 5.5 } else { 3.5 }, Stroke::new(1.5, Color32::WHITE));
     // hue strip
     let mut strip = egui::Mesh::default();
     let steps = 12;
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
         let c = Color32::from(Hsva::new(t.min(0.999), 1.0, 1.0, 1.0));
-        let y = hue.top() + t * hue.height();
-        strip.colored_vertex(pos2(hue.left(), y), c);
-        strip.colored_vertex(pos2(hue.right(), y), c);
+        if hue_across {
+            let x = hue.left() + t * hue.width();
+            strip.colored_vertex(pos2(x, hue.top()), c);
+            strip.colored_vertex(pos2(x, hue.bottom()), c);
+        } else {
+            let y = hue.top() + t * hue.height();
+            strip.colored_vertex(pos2(hue.left(), y), c);
+            strip.colored_vertex(pos2(hue.right(), y), c);
+        }
         if i > 0 {
             let b = (i * 2) as u32;
             strip.add_triangle(b - 2, b - 1, b);
@@ -4636,26 +4638,23 @@ fn color_picker(ui: &mut Ui, color: &mut Hsva) {
     }
     p.add(egui::Shape::mesh(strip));
     p.rect_stroke(hue, 0, Stroke::new(1.0, LINE), StrokeKind::Inside);
-    let hy = hue.top() + color.h * hue.height();
-    let hm = Rect::from_min_max(
-        pos2(hue.left() - 2.0, hy - 2.0),
-        pos2(hue.right() + 2.0, hy + 2.0),
-    );
-    p.rect_stroke(
-        hm.expand(1.0),
-        0,
-        Stroke::new(1.0, Color32::BLACK),
-        StrokeKind::Outside,
-    );
+    let hm = if hue_across {
+        let hx = hue.left() + color.h * hue.width();
+        Rect::from_min_max(pos2(hx - 2.0, hue.top() - 2.0), pos2(hx + 2.0, hue.bottom() + 2.0))
+    } else {
+        let hy = hue.top() + color.h * hue.height();
+        Rect::from_min_max(pos2(hue.left() - 2.0, hy - 2.0), pos2(hue.right() + 2.0, hy + 2.0))
+    };
+    p.rect_stroke(hm.expand(1.0), 0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
     p.rect_stroke(hm, 0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
 }
 
 fn menu_item(ui: &mut Ui, label: &str, marked: bool) -> egui::Response {
     let (r, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width().max(140.0), 22.0), Sense::click());
+        ui.allocate_exact_size(vec2(ui.available_width().max(150.0), 26.0), Sense::click());
     let p = ui.painter();
     if resp.hovered() {
-        p.rect_filled(r, 2, ACC);
+        p.rect_filled(r, 3, ACC);
     }
     let color = if resp.hovered() { ACC_FG } else { FG };
     if marked {
@@ -4665,7 +4664,7 @@ fn menu_item(ui: &mut Ui, label: &str, marked: bool) -> egui::Response {
         r.left_center() + vec2(22.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
+        font(13.0, Weight::Regular),
         color,
     );
     resp
@@ -4686,14 +4685,14 @@ fn popup_frame() -> Frame {
 }
 
 fn shelf_separator(ui: &mut Ui) {
-    ui.add_space(5.0);
-    let (r, _) = ui.allocate_exact_size(vec2(1.0, SHELF_H), Sense::hover());
+    ui.add_space(6.0);
+    let (r, _) = ui.allocate_exact_size(vec2(1.0, SHELF_H - 18.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), (1.0, LINE));
-    ui.add_space(5.0);
+    ui.add_space(6.0);
 }
 
 fn nav_separator(ui: &mut Ui) {
-    let (r, _) = ui.allocate_exact_size(vec2(36.0, 3.0), Sense::hover());
+    let (r, _) = ui.allocate_exact_size(vec2(40.0, 3.0), Sense::hover());
     ui.painter().hline(r.x_range(), r.center().y, (1.0, LINE));
 }
 
@@ -4702,32 +4701,22 @@ fn tag(p: &egui::Painter, right_center: Pos2, text: &str) {
 }
 
 fn tag_colored(p: &egui::Painter, right_center: Pos2, text: &str, accent: bool) {
-    let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(11.0), FG3);
-    let rect = Rect::from_min_max(
-        right_center - vec2(galley.size().x + 10.0, 8.0),
-        right_center + vec2(0.0, 8.0),
-    );
-    let color = if accent { ACC } else { FG3 };
-    p.rect_stroke(
-        rect,
-        2,
-        Stroke::new(1.0, if accent { ACC_LINE } else { LINE2 }),
-        StrokeKind::Inside,
-    );
-    p.galley(
-        rect.min + vec2(5.0, (16.0 - galley.size().y) * 0.5),
-        galley,
-        color,
+    p.text(
+        right_center,
+        Align2::RIGHT_CENTER,
+        text,
+        font(12.0, Weight::Medium),
+        if accent { ACC_TEXT } else { FG3 },
     );
 }
 
 fn note(ui: &mut Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(FG3)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).font(font(12.0, Weight::Regular)).color(FG3)).wrap());
 }
 
 fn kv(ui: &mut Ui, key: &str, value: &str) {
-    let key_font = FontId::proportional(13.0);
-    let value_font = FontId::monospace(12.0);
+    let key_font = font(13.0, Weight::Regular);
+    let value_font = font(13.0, Weight::Medium);
     let key_width = ui
         .painter()
         .layout_no_wrap(key.to_owned(), key_font.clone(), FG2)
@@ -4748,7 +4737,7 @@ fn kv(ui: &mut Ui, key: &str, value: &str) {
         });
     } else {
         ui.horizontal(|ui| {
-            ui.set_height(18.0);
+            ui.set_height(22.0);
             ui.label(key_text);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(value_text);
@@ -4760,38 +4749,38 @@ fn kv(ui: &mut Ui, key: &str, value: &str) {
 /// A SubTool list line: name and size, highlighted when active, with an eye toggle on the
 /// right. Returns (row clicked, eye clicked).
 fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
-    let eye_rect = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(22.0, 22.0));
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let eye_rect = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(24.0, 24.0));
     let eye = ui.interact(eye_rect, Id::unique(("subtool-eye", index)), Sense::click());
     let p = ui.painter();
     p.rect_filled(
         r,
-        2,
+        4,
         if row.active {
             ACC_DIM
         } else if resp.hovered() {
             BG4
         } else {
-            BG3
+            TILE
         },
     );
     p.rect_stroke(
         r,
-        2,
-        Stroke::new(1.0, if row.active { ACC_LINE } else { LINE }),
+        4,
+        Stroke::new(1.0, if row.active { ACC } else { LINE }),
         StrokeKind::Inside,
     );
     let text = if row.visible || row.active { FG } else { FG3 };
     p.text(
-        pos2(r.left() + 8.0, r.top() + 10.0),
+        pos2(r.left() + 10.0, r.top() + 13.0),
         Align2::LEFT_CENTER,
         &row.name,
-        FontId::proportional(13.0),
+        font(13.0, if row.active { Weight::SemiBold } else { Weight::Medium }),
         text,
     );
     if row.boolean != crate::boolean::BoolOp::Add {
         p.text(
-            pos2(eye_rect.left() - 6.0, r.top() + 10.0),
+            pos2(eye_rect.left() - 6.0, r.top() + 13.0),
             Align2::RIGHT_CENTER,
             row.boolean.glyph(),
             FontId::proportional(14.0),
@@ -4802,21 +4791,21 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
         "stand-in did not fit on the GPU".to_string()
     } else if row.top > 0 {
         format!(
-            "{} v · SDiv {} of {} · {} MB",
+            "{} vertices · SDiv {} of {} · {} MB",
             crate::fmt_count(row.vertices),
             row.level,
             row.top,
             row.bytes / 1_000_000
         )
     } else {
-        format!("{} v · {} MB", crate::fmt_count(row.vertices), row.bytes / 1_000_000)
+        format!("{} vertices · {} MB", crate::fmt_count(row.vertices), row.bytes / 1_000_000)
     };
     p.text(
-        pos2(r.left() + 8.0, r.bottom() - 9.0),
+        pos2(r.left() + 10.0, r.bottom() - 12.0),
         Align2::LEFT_CENTER,
         detail,
-        FontId::monospace(11.0),
-        FG3,
+        font(12.0, Weight::Regular),
+        FG2,
     );
     // Eye: an outline with a pupil, crossed out when hidden.
     let c = eye_rect.center();
@@ -4852,7 +4841,7 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
 /// ZBrush-style deformation slider: drag sets a value in -100..100 from the centre, release
 /// returns it and the slider springs back to 0.
 fn spring_slider(ui: &mut Ui, kind: Deform, drag: &mut Option<(Deform, f32)>) -> Option<f32> {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::drag());
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_H), Sense::drag());
     let value_at = |p: Pos2| ((p.x - r.center().x) / (r.width() * 0.5) * 100.0).clamp(-100.0, 100.0);
     let mut released = None;
     if resp.drag_started() || resp.dragged() {
@@ -4872,36 +4861,37 @@ fn spring_slider(ui: &mut Ui, kind: Deform, drag: &mut Option<(Deform, f32)>) ->
         _ => 0.0,
     };
     let p = ui.painter();
-    p.rect_filled(r, 2, if resp.hovered() || value != 0.0 { BG4 } else { BG3 });
+    p.rect_filled(r, 4, if resp.hovered() || value != 0.0 { BG4 } else { BG3 });
+    p.rect_stroke(r, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
     let cx = r.center().x;
     let x = cx + value / 100.0 * r.width() * 0.5;
     if value != 0.0 {
         p.rect_filled(
             Rect::from_x_y_ranges(cx.min(x)..=cx.max(x), r.y_range()),
             2,
-            ACC_DIM,
+            ACC_FILL,
         );
     }
-    p.vline(cx, r.y_range().shrink(4.0), Stroke::new(1.0, LINE2));
+    p.vline(cx, r.y_range().shrink(4.0), Stroke::new(1.0, FG3));
     p.text(
         pos2(r.left() + 6.0, r.center().y),
         Align2::LEFT_CENTER,
         kind.label(),
-        FontId::proportional(12.5),
+        font(13.0, Weight::Medium),
         FG,
     );
     p.text(
         pos2(r.right() - 6.0, r.center().y),
         Align2::RIGHT_CENTER,
         format!("{value:+.0}"),
-        FontId::monospace(12.0),
-        if value != 0.0 { ACC } else { FG3 },
+        font(13.0, Weight::SemiBold),
+        if value != 0.0 { ACC_TEXT } else { FG3 },
     );
     released
 }
 
 fn full_button(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.add_sized([ui.available_width(), 22.0], egui::Button::new(label))
+    ui.add_sized([ui.available_width(), CONTROL_H], egui::Button::new(label))
 }
 
 fn chevron(p: &egui::Painter, center: Pos2, open: bool, color: Color32) {
@@ -5139,6 +5129,25 @@ fn glyph_large(p: &egui::Painter, c: Pos2, name: &str, color: Color32) {
 
 // ---------------------------------------------------------------- theme
 pub fn theme(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, bytes) in [
+        ("inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]),
+        ("inter-medium", &include_bytes!("../assets/fonts/Inter-Medium.ttf")[..]),
+        ("inter-semibold", &include_bytes!("../assets/fonts/Inter-SemiBold.ttf")[..]),
+    ] {
+        fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+    }
+    let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    for (family, first) in [
+        (egui::FontFamily::Proportional, "inter"),
+        (egui::FontFamily::Name("medium".into()), "inter-medium"),
+        (egui::FontFamily::Name("semibold".into()), "inter-semibold"),
+    ] {
+        let mut list = vec![first.to_string()];
+        list.extend(fallback.iter().cloned());
+        fonts.families.insert(family, list);
+    }
+    ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = BG1;
@@ -5161,7 +5170,7 @@ pub fn theme(ctx: &egui::Context) {
         &mut style.visuals.widgets.active,
         &mut style.visuals.widgets.open,
     ] {
-        widget.corner_radius = CornerRadius::same(2);
+        widget.corner_radius = CornerRadius::same(4);
         widget.bg_stroke = Stroke::new(1.0, LINE);
         widget.fg_stroke = Stroke::new(1.0, FG);
         widget.expansion = 0.0;
@@ -5175,10 +5184,10 @@ pub fn theme(ctx: &egui::Context) {
     style.visuals.widgets.open.bg_fill = BG4;
     style.visuals.widgets.open.weak_bg_fill = BG4;
     style.spacing.item_spacing = vec2(3.0, 3.0);
-    style.spacing.button_padding = vec2(9.0, 3.0);
-    style.spacing.interact_size = vec2(22.0, 22.0);
-    style.spacing.icon_width = 14.0;
-    style.spacing.icon_width_inner = 9.0;
+    style.spacing.button_padding = vec2(10.0, 4.0);
+    style.spacing.interact_size = vec2(24.0, 24.0);
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 10.0;
     style.spacing.icon_spacing = 7.0;
     style.spacing.menu_margin = Margin::same(3);
     style.spacing.scroll = egui::style::ScrollStyle::thin();
@@ -5187,10 +5196,10 @@ pub fn theme(ctx: &egui::Context) {
         .insert(egui::TextStyle::Body, FontId::proportional(13.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+        .insert(egui::TextStyle::Button, font(13.0, Weight::Medium));
     style
         .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(11.0));
+        .insert(egui::TextStyle::Small, FontId::proportional(12.0));
     style
         .text_styles
         .insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
@@ -5335,17 +5344,22 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(shape) if shape.galley.job.text == text => Some(shape.pos),
+                egui::Shape::Text(shape) if same_text(&shape.galley.job.text, text) => Some(shape.pos),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("text {text:?} was not rendered"))
+    }
+
+    /// Section titles render in capitals; tests name them as written.
+    pub(crate) fn same_text(shown: &str, text: &str) -> bool {
+        shown == text || shown == text.to_uppercase()
     }
 
     fn text_count(output: &egui::FullOutput, text: &str) -> usize {
         output
             .shapes
             .iter()
-            .filter(|shape| matches!(&shape.shape, egui::Shape::Text(s) if s.galley.job.text == text))
+            .filter(|shape| matches!(&shape.shape, egui::Shape::Text(s) if same_text(&s.galley.job.text, text)))
             .count()
     }
 

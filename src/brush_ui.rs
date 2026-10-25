@@ -490,10 +490,11 @@ impl Workspace {
         } else {
             self.assets.alpha.clone()
         };
-        let label = format!("{} {}", if texture { "Texture" } else { "Alpha" }, p.name());
+        let label = p.name().to_string();
         let tex = self.pattern_texture(ui.ctx(), &p, texture);
         let resp = thumb(
             ui,
+            if texture { "Texture" } else { "Alpha" },
             if p == Pattern::Off {
                 Thumb::Glyph(if texture { "texture" } else { "alpha" })
             } else {
@@ -501,7 +502,7 @@ impl Workspace {
             },
             &label,
             false,
-            false,
+            p == Pattern::Off,
         );
         egui::Popup::from_toggle_button_response(&resp)
             .align(egui::RectAlign::RIGHT_START)
@@ -517,57 +518,30 @@ impl Workspace {
     }
 
     pub(super) fn brush_palette(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
-        if full_button(ui, &format!("All Brushes ({})", BrushKind::ALL.len()))
-            .on_hover_text("Open brush catalog · B")
-            .clicked()
-        {
-            self.open_brush_catalog(ui.next_widget_position());
-        }
-        if let Some(i) = seg(
-            ui,
-            &["Sculpt", "Mask"],
-            self.brush_ui.palette_masks as usize,
-            false,
-        ) {
-            let kind = if i == 1 {
-                self.mask_brush
-            } else {
-                self.brush_ui.last_sculpt
-            };
-            self.select_brush(m.brush, kind);
-        }
-        let width = (ui.available_width() - 4.0) * 0.5;
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let kind = m.brush.kind;
-            let tex = self.texture(ui.ctx(), Some(kind), self.subtract);
-            if compact_brush_tile(ui, tex, kind, true, width, true).clicked() {
-                self.open_brush_catalog(ui.next_widget_position());
+        let all = format!("All ({})", BrushKind::ALL.len());
+        let at = self.brush_ui.palette_masks as usize;
+        let tabs = ui.scope(|ui| seg(ui, &["Sculpt", "Mask", &all], at, false));
+        match tabs.inner {
+            Some(2) => self.open_brush_catalog(tabs.response.rect.right_top() + vec2(6.0, 0.0)),
+            Some(i) if i != at => {
+                let kind = if i == 1 {
+                    self.mask_brush
+                } else {
+                    self.brush_ui.last_sculpt
+                };
+                self.select_brush(m.brush, kind);
             }
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                let recent: Vec<_> = self
-                    .brush_ui
-                    .recent
-                    .iter()
-                    .copied()
-                    .filter(|k| *k != kind)
-                    .take(2)
-                    .collect();
-                for k in recent {
-                    let tex = self.texture(ui.ctx(), Some(k), self.subtract);
-                    if compact_brush_tile(ui, tex, k, false, width, false).clicked() {
-                        self.choose_brush(m, k);
-                    }
-                }
-            });
-        });
-        // A fixed working set keeps the side palette small as the full catalog grows.
+            _ => {}
+        }
+        ui.add_space(2.0);
+        // A fixed working set keeps the side palette small and its tiles in place as the
+        // full catalog grows; the last row holds the active and recent brushes from outside it.
         if self.brush_ui.palette_masks {
             self.mask_picker(ui, m);
             return;
         }
-        let picks = [
+        let fixed = [
+            BrushKind::Draw,
             BrushKind::Clay,
             BrushKind::ClayBuildup,
             BrushKind::DamStandard,
@@ -581,12 +555,32 @@ impl Workspace {
             BrushKind::Smooth,
             BrushKind::Paint,
         ];
-        for row in picks.chunks(2) {
+        let mut kinds = fixed.to_vec();
+        let active = m.brush.kind;
+        let recent = std::iter::once(active).chain(self.brush_ui.recent.iter().copied());
+        // Fill the last row from the active and recent brushes, then common ones.
+        let common = [BrushKind::Inflate, BrushKind::ClayTubes, BrushKind::Flatten, BrushKind::HPolish];
+        for k in recent.chain(common) {
+            if kinds.len() == 15 {
+                break;
+            }
+            if !kinds.contains(&k) && !k.is_mask() {
+                kinds.push(k);
+            }
+        }
+        self.brush_grid(ui, m, &kinds, |k| active == k);
+    }
+
+    /// Three-column grid of brush tiles; a click chooses the brush.
+    fn brush_grid(&mut self, ui: &mut Ui, m: &mut Model<'_>, kinds: &[BrushKind], on: impl Fn(BrushKind) -> bool) {
+        let gap = 6.0;
+        let width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+        for row in kinds.chunks(3) {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = gap;
                 for &k in row {
-                    let tex = self.texture(ui.ctx(), Some(k), self.subtract);
-                    if compact_brush_tile(ui, tex, k, m.brush.kind == k, width, false).clicked() {
+                    let tex = self.texture(ui.ctx(), Some(k), self.subtract && !k.is_mask());
+                    if compact_brush_tile(ui, tex, k, on(k), width).clicked() {
                         self.choose_brush(m, k);
                     }
                 }
@@ -595,7 +589,6 @@ impl Workspace {
     }
 
     pub(super) fn mask_picker(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
-        let width = (ui.available_width() - 4.0) * 0.5;
         let kinds = [
             BrushKind::MaskPen,
             BrushKind::MaskSoft,
@@ -604,18 +597,8 @@ impl Workspace {
             BrushKind::MaskCircle,
             BrushKind::MaskLine,
         ];
-        for row in kinds.chunks(2) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for &k in row {
-                    let tex = self.texture(ui.ctx(), Some(k), false);
-                    if compact_brush_tile(ui, tex, k, self.mask_brush == k, width, false).clicked()
-                    {
-                        self.choose_brush(m, k);
-                    }
-                }
-            });
-        }
+        let active = self.mask_brush;
+        self.brush_grid(ui, m, &kinds, |k| active == k);
     }
 
     pub(super) fn brush_catalog_ui(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
@@ -847,45 +830,60 @@ impl Workspace {
         }
         let area = egui::Area::new(Id::unique("quick-menu"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pos - vec2(130.0, 20.0))
+            .fixed_pos(pos - vec2(208.0, 20.0))
             .show(&ctx, |ui| {
                 popup_frame().show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                     ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
-                            ui.set_width(94.0);
-                            color_picker(ui, &mut self.color);
+                            // A big square, the hue bar under it, then the colour line and
+                            // the buttons underneath.
+                            let width = 172.0;
+                            ui.set_width(width);
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            color_picker_stacked(ui, &mut self.color, width);
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 let (r, _) =
-                                    ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                                ui.painter().rect_filled(r, 0, Color32::from(self.color));
+                                    ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                                ui.painter().rect_filled(r, 3, Color32::from(self.color));
+                                ui.painter().rect_stroke(r, 3, Stroke::new(1.0, LINE), StrokeKind::Inside);
                                 let [r, g, b] = self.color.to_srgb();
                                 ui.label(
                                     RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
-                                        .font(FontId::monospace(10.5))
-                                        .color(FG2),
+                                        .font(font(13.0, Weight::Medium))
+                                        .color(FG),
                                 );
                             });
-                            if ui.button("Swap colors").clicked() {
+                            if ui
+                                .add_sized([width, CONTROL_H], egui::Button::new("Swap colors"))
+                                .clicked()
+                            {
                                 std::mem::swap(&mut self.color, &mut self.color2);
                             }
                             let modes_enabled =
                                 !m.brush.kind.is_mask() && m.brush.kind != BrushKind::ClipLine;
-                            ui.add_enabled(
-                                modes_enabled,
-                                egui::Checkbox::new(&mut m.brush.paint, "RGB"),
-                            );
-                            if ui
-                                .add_enabled(
-                                    modes_enabled,
-                                    egui::Checkbox::new(&mut m.brush.sculpt, "Sculpt"),
-                                )
-                                .changed()
-                                && m.brush.sculpt
-                                && m.brush.kind == BrushKind::Paint
-                            {
-                                m.brush.kind = BrushKind::Draw;
-                            }
+                            ui.add_enabled_ui(modes_enabled, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let w = (width - 4.0) * 0.5;
+                                    if ui
+                                        .add_sized([w, CONTROL_H], egui::Button::new("RGB").selected(m.brush.paint))
+                                        .clicked()
+                                    {
+                                        m.brush.paint = !m.brush.paint;
+                                    }
+                                    if ui
+                                        .add_sized([w, CONTROL_H], egui::Button::new("Sculpt").selected(m.brush.sculpt))
+                                        .clicked()
+                                    {
+                                        m.brush.sculpt = !m.brush.sculpt;
+                                        if m.brush.sculpt && m.brush.kind == BrushKind::Paint {
+                                            m.brush.kind = BrushKind::Draw;
+                                        }
+                                    }
+                                });
+                            });
                         });
                         ui.separator();
                         ui.vertical(|ui| {
@@ -1011,65 +1009,33 @@ impl Workspace {
     }
 }
 
-/// ZBrush-style side-palette cells: one hero preview, small paired working brushes.
+/// Brush palette cell: the preview sphere over the brush name.
 fn compact_brush_tile(
     ui: &mut Ui,
     tex: TextureId,
     kind: BrushKind,
     on: bool,
     width: f32,
-    hero: bool,
 ) -> egui::Response {
-    let height = if hero { 104.0 } else { 50.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let size = (width - 16.0).clamp(36.0, 52.0);
+    let (r, resp) = ui.allocate_exact_size(vec2(width, size + 30.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(
-        r,
-        1,
-        if on {
-            ACC_DIM
-        } else if resp.hovered() {
-            BG4
-        } else {
-            BG2
-        },
-    );
-    p.rect_stroke(
-        r,
-        1,
-        Stroke::new(1.0, if on { ACC_LINE } else { LINE }),
-        StrokeKind::Inside,
-    );
-    let size = if hero { (width - 6.0).min(80.0) } else { 33.0 };
-    let image_rect = Rect::from_min_size(
-        pos2(r.center().x - size * 0.5, r.top() + 2.0),
-        vec2(size, size),
-    );
-    p.image(
-        tex,
-        image_rect,
-        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-    let color = if on { FG } else { FG2 };
+    p.rect_filled(r, 4, if on { ACC_DIM } else if resp.hovered() { BG4 } else { TILE });
+    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC } else { LINE }), StrokeKind::Inside);
+    let image_rect = Rect::from_min_size(pos2(r.center().x - size * 0.5, r.top() + 5.0), vec2(size, size));
+    p.image(tex, image_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+    let color = if on { Color32::WHITE } else { FG2 };
     let mut job = egui::text::LayoutJob::simple(
         kind.name().to_owned(),
-        FontId::proportional(11.5),
+        font(12.0, if on { Weight::SemiBold } else { Weight::Regular }),
         color,
-        width - 4.0,
+        width - 6.0,
     );
-    job.wrap.max_rows = if hero { 2 } else { 1 };
+    job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let galley = p.layout_job(job);
-    let text_rect = Rect::from_min_size(
-        pos2(
-            r.center().x - galley.size().x * 0.5,
-            r.bottom() - galley.size().y - 2.0,
-        ),
-        galley.size(),
-    );
-    p.with_clip_rect(r.intersect(p.clip_rect()))
-        .galley(text_rect.min, galley, color);
+    let at = pos2(r.center().x - galley.size().x * 0.5, r.bottom() - 7.0 - galley.size().y);
+    p.with_clip_rect(r.intersect(p.clip_rect())).galley(at, galley, color);
     resp.on_hover_text(format!("{}\n{}", kind.name(), kind.description()))
 }
 
@@ -1214,7 +1180,7 @@ mod tests {
         out.shapes
             .iter()
             .find_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.job.text == label && predicate(t.pos) => {
+                egui::Shape::Text(t) if super::super::tests::same_text(&t.galley.job.text, label) && predicate(t.pos) => {
                     Some(t.pos)
                 }
                 _ => None,
@@ -1372,8 +1338,8 @@ mod tests {
         let out = frame(&mut a, vec![]);
         let button = text(
             &out,
-            &format!("All Brushes ({})", BrushKind::ALL.len()),
-            |p| p.x < 200.0,
+            &format!("All ({})", BrushKind::ALL.len()),
+            |p| p.x < 300.0,
         );
         click(&mut a, button + vec2(5.0, 3.0));
         assert!(a.workspace.brush_catalog_open());
