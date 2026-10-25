@@ -65,10 +65,17 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
     };
     let shape = |p: Vec2| {
         let sphere = radius - warp(p).length();
-        if kind == Some(BrushKind::ClipLine) {
-            sphere.min(0.30 - p.x)
-        } else {
-            sphere
+        match kind {
+            Some(BrushKind::ClipLine) => sphere.min(0.30 - p.x),
+            // The outline pushed onto a square or an ellipse.
+            Some(BrushKind::ClipRect) => sphere.min(0.56 - p.x.abs().max(p.y.abs())),
+            Some(BrushKind::ClipCircle) => sphere.min((0.66 - (p / Vec2::new(1.0, 0.72)).length()) * 0.8),
+            // Cut away: a slanted edge, a smaller square, a disc, a lasso.
+            Some(BrushKind::TrimCurve) => sphere.min(0.22 + p.y * 0.35 - p.x),
+            Some(BrushKind::TrimRect) => sphere.min(0.44 - p.x.abs().max(p.y.abs())),
+            Some(BrushKind::TrimCircle) => sphere.min(0.52 - p.length()),
+            Some(BrushKind::TrimLasso) => sphere.min(0.5 - (p.x.abs() * 0.7 + p.y.abs() + p.x * 0.2)),
+            _ => sphere,
         }
     };
     let height = |p: Vec2| -> f32 {
@@ -204,6 +211,32 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                 let d = distance(p, &curve);
                 (0.085f32 * 0.085 - d * d).max(0.0).sqrt() * 1.1
             }
+            Some(BrushKind::SmoothStronger) => noise(p * 1.2) * 0.03 * (1.0 - soft(d, 0.26)),
+            Some(BrushKind::Slash) => -soft(d, 0.020) * 0.13 * sign + soft(d - 0.038, 0.014) * 0.022 * sign,
+            Some(BrushKind::PenA) => soft(s, 0.022) * 0.05 * sign,
+            Some(BrushKind::PenS) => soft(s, 0.05) * 0.035 * sign,
+            Some(BrushKind::Noise) => noise(p * 1.6) * 0.035 * soft(p.length(), 0.5) * sign,
+            // Clay sagging toward the bottom.
+            Some(BrushKind::Gravity) => soft(p.distance(Vec2::new(0.0, 0.42)), 0.26) * 0.09 - soft(p.distance(Vec2::new(0.0, 0.05)), 0.2) * 0.02,
+            // Ridges wound round the middle.
+            Some(BrushKind::Spiral) => {
+                let l = p.length();
+                let a = p.y.atan2(p.x) + l * 9.0;
+                (a * 3.0).sin() * 0.02 * soft(l, 0.5)
+            }
+            // A thin cut through, with the far side in another polygroup.
+            Some(BrushKind::KnifeCurve) => -soft((p.x + p.y * 0.45).abs(), 0.012) * 0.06,
+            Some(
+                BrushKind::SelectRect
+                | BrushKind::SelectLasso
+                | BrushKind::ClipRect
+                | BrushKind::ClipCircle
+                | BrushKind::TrimCurve
+                | BrushKind::TrimRect
+                | BrushKind::TrimCircle
+                | BrushKind::TrimLasso
+                | BrushKind::SliceCurve,
+            ) => 0.0,
             Some(
                 BrushKind::ClipLine
                 | BrushKind::MaskPen
@@ -243,6 +276,25 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
             if kind == Some(BrushKind::Paint) {
                 let f = (-(distance(p, &spiral) / 0.09).powi(2) * 2.0).exp();
                 color = color.lerp(Vec3::new(0.90, 0.36, 0.23), f * 0.85);
+            }
+            // Select: what is hidden goes dark. Slice and Knife: the far side's polygroup.
+            match kind {
+                Some(BrushKind::SelectRect) => {
+                    if p.x.abs().max(p.y.abs()) > 0.42 {
+                        color *= 0.28;
+                    }
+                }
+                Some(BrushKind::SelectLasso) => {
+                    if p.x.abs() * 0.7 + p.y.abs() + p.x * 0.2 > 0.45 {
+                        color *= 0.28;
+                    }
+                }
+                Some(BrushKind::SliceCurve | BrushKind::KnifeCurve) => {
+                    if p.x + p.y * 0.45 > 0.0 {
+                        color = color.lerp(Vec3::new(0.35, 0.62, 0.85), 0.7);
+                    }
+                }
+                _ => {}
             }
             if let Some(k) = kind.filter(|k| k.is_mask()) {
                 let coverage = match k {

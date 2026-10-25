@@ -12,6 +12,7 @@ mod symmetry;
 mod detail_brush;
 mod curve;
 mod curve_tube;
+mod cut;
 mod deform;
 mod gizmo;
 mod insert_mesh;
@@ -2559,6 +2560,80 @@ impl App {
             .map(|(t, &i)| (!mesh.visible(t as u32) || (i != 0) == hide) as u8)
             .collect();
         self.apply_hidden(hidden, if hide { "Hide rectangle" } else { "Select rectangle" });
+    }
+
+    /// F11: the window fills the screen (borderless), or goes back to a window.
+    fn toggle_fullscreen(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            let full = window.fullscreen().is_some();
+            window.set_fullscreen((!full).then_some(winit::window::Fullscreen::Borderless(None)));
+            self.workspace.notify(if full { "Window" } else { "Fullscreen · F11 to leave" });
+        }
+    }
+
+    /// Select Rect / Select Lasso: keep the triangles marked in `inside` shown and hide the
+    /// rest, or with `hide` (Alt) hide them. An outline around no visible polygon inverts
+    /// visibility, as Ctrl + Shift does.
+    fn select_tris(&mut self, inside: Vec<u8>, hide: bool, what: &str) {
+        let mesh = self.doc.mesh();
+        if inside.len() != mesh.triangle_count() {
+            return;
+        }
+        let any = inside.par_iter().enumerate().any(|(t, &i)| i != 0 && mesh.visible(t as u32));
+        if !any {
+            self.invert_visibility();
+            return;
+        }
+        let hidden: Vec<u8> = inside
+            .par_iter()
+            .enumerate()
+            .map(|(t, &i)| (!mesh.visible(t as u32) || (i != 0) == hide) as u8)
+            .collect();
+        self.apply_hidden(hidden, what);
+    }
+
+    /// Trim Rect / Circle / Lasso: keep what the outline covers through the whole model (or,
+    /// with Alt, cut it away), by the boolean remesher at Make Boolean Mesh's resolution. With
+    /// Alt and X symmetry the mirrored outline cuts too.
+    fn trim_shape(&mut self, g: &surface_tools::Gesture) {
+        if g.tiny() {
+            return;
+        }
+        let screen = self.surface_screen();
+        let mesh = self.doc.mesh();
+        let (lo, hi) = mesh
+            .positions
+            .par_iter()
+            .filter_map(|&p| screen.ndc_z(p))
+            .fold(|| (f32::MAX, f32::MIN), |(a, b), z| (a.min(z), b.max(z)))
+            .reduce(|| (f32::MAX, f32::MIN), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        if lo > hi {
+            return;
+        }
+        // A little in front of the model and behind it (depth runs 0 near to 1 far).
+        let margin = ((hi - lo) * 0.25).max(1e-4);
+        let (near, far) = ((lo - margin).max(lo * 0.5), (hi + margin).min(0.999_999).max(hi));
+        let Some(prism) = cut::prism(&g.outline(), |s, z| screen.unproject(s, z), near, far) else {
+            return;
+        };
+        let op = if g.alternate { boolean::BoolOp::Subtract } else { boolean::BoolOp::Intersect };
+        let mirror = (g.alternate && self.workspace.symmetry).then(|| {
+            let positions: Vec<Vec3> = prism.positions.iter().map(|p| Vec3::new(-p.x, p.y, p.z)).collect();
+            let mut indices = prism.indices.clone();
+            for t in indices.chunks_mut(3) {
+                t.swap(1, 2);
+            }
+            SculptMesh::from_raw(positions, indices)
+        });
+        let resolution = self.workspace.boolean_resolution.round() as u32;
+        let name = g.kind.name();
+        self.topology_op(name, |m| {
+            let mut parts = vec![(m, boolean::BoolOp::Add), (&prism, op)];
+            if let Some(mirror) = mirror.as_ref() {
+                parts.push((mirror, boolean::BoolOp::Subtract));
+            }
+            boolean::make_mesh(&parts, resolution).ok().map(|r| r.0)
+        });
     }
 
     /// Set the polygroups of the shown level (and through it every level) to `groups`,
@@ -5976,16 +6051,56 @@ impl App {
             return true;
         }
         let screen=self.surface_screen();let level=self.doc.active();
-        if g.kind==BrushKind::ClipLine {
-            let symmetry=self.workspace.symmetry.then(||self.clip_side(&g));
-            if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,symmetry) {
-                let chunks=self.doc.finish_stroke(level,before);
-                self.history.push(UndoStep::Stroke {level,chunks});
-                self.subtools[self.active_tool].bounds=self.doc.bounds();
+        match g.kind {
+            BrushKind::ClipLine => {
+                let symmetry=self.workspace.symmetry.then(||self.clip_side(&g));
+                if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,symmetry) {
+                    let chunks=self.doc.finish_stroke(level,before);
+                    self.history.push(UndoStep::Stroke {level,chunks});
+                    self.subtools[self.active_tool].bounds=self.doc.bounds();
+                }
             }
-        } else if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.sym()) {
-            let old=mask::replace(self.doc.mesh_mut(),new);
-            self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
+            BrushKind::ClipRect | BrushKind::ClipCircle => {
+                if let Some(before)=surface_tools::clip_shape(self.doc.mesh_mut(),screen,&g,self.workspace.sym()) {
+                    let chunks=self.doc.finish_stroke(level,before);
+                    self.history.push(UndoStep::Stroke {level,chunks});
+                    self.history.name_last(g.kind.name());
+                    self.subtools[self.active_tool].bounds=self.doc.bounds();
+                }
+            }
+            BrushKind::SelectRect | BrushKind::SelectLasso => {
+                if g.tiny() {
+                    // A click: isolate the polygroup under it, or on the background show all.
+                    let hit=if self.in_canvas_border() {None} else {let (o,d)=self.cursor_ray();self.mesh().raycast(o,d).map(|h|h.tri)};
+                    match hit {
+                        Some(tri) => self.isolate_group(tri, g.alternate),
+                        None => self.show_all(),
+                    }
+                } else {
+                    let inside=surface_tools::tris_in_gesture(self.doc.mesh(),screen,&g);
+                    self.select_tris(inside,g.alternate,g.kind.name());
+                }
+            }
+            BrushKind::TrimCurve | BrushKind::SliceCurve | BrushKind::KnifeCurve => {
+                if !g.tiny() {
+                    let side=self.workspace.symmetry.then(||self.clip_side(&g));
+                    let what=match g.kind {
+                        BrushKind::TrimCurve=>cut::LineCut::Trim,
+                        BrushKind::SliceCurve=>cut::LineCut::Slice,
+                        _=>cut::LineCut::Knife,
+                    };
+                    if let Some(d)=surface_tools::line_distance(self.doc.mesh(),screen,&g,side) {
+                        self.topology_op(g.kind.name(),|m|cut::line_cut(m,&d,what));
+                    }
+                }
+            }
+            BrushKind::TrimRect | BrushKind::TrimCircle | BrushKind::TrimLasso => self.trim_shape(&g),
+            _ => {
+                if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.sym()) {
+                    let old=mask::replace(self.doc.mesh_mut(),new);
+                    self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
+                }
+            }
         }
         self.update_hover();true
     }
@@ -6160,9 +6275,18 @@ impl App {
             // The press that closes a popup or menu does nothing else.
             return;
         }
-        let tool=if self.brush.kind==BrushKind::ClipLine && (!self.modifiers.control_key()||self.modifiers.shift_key()) {BrushKind::ClipLine}
-            else if self.modifiers.control_key() {self.workspace.mask_brush}else{self.brush.kind};
-        if free && tool.is_shape() && (!self.modifiers.shift_key() || !self.modifiers.control_key() || tool==BrushKind::ClipLine) {
+        // ZBrush: Ctrl + Shift uses the Ctrl + Shift tool (the last Select, Clip, Trim, Slice
+        // or Knife brush picked), Ctrl the mask brush, a plain drag the brush itself.
+        let (ctrl, shift) = (self.modifiers.control_key(), self.modifiers.shift_key());
+        let tool = if ctrl && shift {
+            self.workspace.gesture_tool
+        } else if ctrl {
+            self.workspace.mask_brush
+        } else {
+            self.brush.kind
+        };
+        // Select Rect on Ctrl + Shift keeps its own press (a click on a polygroup isolates it).
+        if free && tool.is_shape() && !(ctrl && shift && tool == BrushKind::SelectRect) {
             self.begin_gesture(tool);return;
         }
         if self.modifiers.control_key() && self.modifiers.shift_key() {
@@ -6339,6 +6463,7 @@ impl App {
             KeyCode::BracketRight => self.brush.radius = (self.brush.radius * 1.25).min(2.0),
             KeyCode::KeyF => self.frame_camera(),
             KeyCode::Home => self.home_camera(),
+            KeyCode::F11 => self.toggle_fullscreen(),
             KeyCode::KeyP if shift => self.workspace.grid = !self.workspace.grid,
             KeyCode::KeyP => self.workspace.perspective = !self.workspace.perspective,
             KeyCode::KeyB => self.workspace.open_brush_catalog(self.cursor_pos()),
@@ -6530,6 +6655,9 @@ impl App {
         if actions.quicksave {
             self.quicksave();
         }
+        if actions.fullscreen {
+            self.toggle_fullscreen();
+        }
         if let Some(op) = actions.layer {
             self.layer_op(op);
         }
@@ -6662,6 +6790,15 @@ impl App {
         let (Some(window), Some(state)) = (self.window.clone(), self.egui_state.as_mut()) else {
             return;
         };
+        // Preferences › UI scale; egui's own Ctrl + plus / minus zoom is kept in step.
+        let zoom = self.egui_ctx.zoom_factor();
+        if (zoom - self.workspace.applied_scale).abs() > 1e-3 {
+            self.workspace.layout.ui_scale = zoom.clamp(workspace::UI_SCALES[0], workspace::UI_SCALES[workspace::UI_SCALES.len() - 1]);
+        }
+        if (zoom - self.workspace.layout.ui_scale).abs() > 1e-3 {
+            self.egui_ctx.set_zoom_factor(self.workspace.layout.ui_scale);
+        }
+        self.workspace.applied_scale = self.workspace.layout.ui_scale;
         let raw = state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let full = ctx.run_ui(raw, |ui| self.ui(ui));
@@ -7769,6 +7906,14 @@ fn main() {
         app.snapshot_to = Some((path.clone(), frames));
         // `--snapshot-ui`: the whole window with the interface (for UI reviews).
         app.snapshot_ui = args.iter().any(|a| a == "--snapshot-ui");
+    }
+    // `--customize`: start in Customize shelves mode (for snapshots of it).
+    app.workspace.customize = args.iter().any(|a| a == "--customize");
+    // `--about`: start with About Klay open (for snapshots of it).
+    app.workspace.about_open = args.iter().any(|a| a == "--about");
+    // `--theme NAME`: start in this interface theme (Preferences › Theme).
+    if let Some(name) = flag("--theme") {
+        app.workspace.layout.theme = name.clone();
     }
     // `--space-menu`: start with the Space menu open (for snapshots of it).
     if args.iter().any(|a| a == "--space-menu") {
@@ -9340,10 +9485,108 @@ mod surface_input_tests {
         app.modifiers=if alt {ModifiersState::ALT}else{ModifiersState::empty()};
         let a=c+Vec2::new(-80.0,-60.0);let b=c+Vec2::new(80.0,60.0);
         app.cursor_moved(a,false);app.left_press(false,false);
-        if kind==BrushKind::MaskLasso {
+        if kind.shape()==Some(sculpt::Shape::Lasso) {
             for p in [Vec2::new(b.x,a.y),b,Vec2::new(a.x,b.y),a] {app.cursor_moved(p,false);}
         } else {app.cursor_moved(b,false);}
         app.left_release();app.modifiers=ModifiersState::empty();
+    }
+    /// Drag a straight line across the model, `dy` pixels above its middle.
+    fn line(app:&mut App,kind:BrushKind,dy:f32,mods:ModifiersState) {
+        let c=app.project(Vec3::ZERO);
+        if mods.is_empty() {app.workspace.select_brush(&mut app.brush,kind);}
+        app.modifiers=mods;
+        app.cursor_moved(c+Vec2::new(-500.0,dy),false);app.left_press(false,false);
+        app.cursor_moved(c+Vec2::new(500.0,dy),false);app.left_release();
+        app.modifiers=ModifiersState::empty();
+    }
+    fn closed(m:&SculptMesh)->bool {
+        let mut count:std::collections::HashMap<(u32,u32),i32>=std::collections::HashMap::new();
+        for t in m.indices.chunks(3) {for k in 0..3 {*count.entry((t[k],t[(k+1)%3])).or_insert(0)+=1;}}
+        count.iter().all(|(&(a,b),&c)|c==1&&count.get(&(b,a))==Some(&1))
+    }
+    #[test]
+    fn select_rect_and_lasso_keep_what_they_cover_and_alt_hides_it() {
+        for kind in [BrushKind::SelectRect,BrushKind::SelectLasso] {
+            let mut a=app();let n=a.mesh().triangle_count();
+            drag(&mut a,kind,false);
+            let shown=(0..n as u32).filter(|&t|a.mesh().visible(t)).count();
+            assert!(shown>0 && shown<n,"{kind:?}: {shown} of {n}");
+            a.history.undo(&mut a.doc);
+            assert_eq!((0..n as u32).filter(|&t|a.mesh().visible(t)).count(),n);
+            drag(&mut a,kind,true);
+            let hidden=(0..n as u32).filter(|&t|!a.mesh().visible(t)).count();
+            assert!(hidden>0 && hidden<n && hidden+shown<=n+n/10,"{kind:?} alt: {hidden}");
+        }
+    }
+    #[test]
+    fn clip_rect_and_circle_press_the_model_into_the_outline() {
+        for kind in [BrushKind::ClipRect,BrushKind::ClipCircle] {
+            let mut a=app();let before=a.mesh().positions.clone();
+            drag(&mut a,kind,false);
+            let c=a.project(Vec3::ZERO);let (lo,hi)=(c+Vec2::new(-80.0,-60.0),c+Vec2::new(80.0,60.0));
+            let screen=a.surface_screen();
+            for p in &a.mesh().positions {
+                let s=screen.project(*p).unwrap()+a.canvas_origin();
+                assert!(s.x>lo.x-1.5&&s.x<hi.x+1.5&&s.y>lo.y-1.5&&s.y<hi.y+1.5,"{kind:?} {s:?}");
+                if kind==BrushKind::ClipCircle {
+                    let q=(s-c)/Vec2::new(80.0,60.0);assert!(q.length()<1.02,"{q:?}");
+                }
+            }
+            assert_ne!(a.mesh().positions,before);
+            a.history.undo(&mut a.doc);assert_eq!(a.mesh().positions,before,"{kind:?} undo");
+        }
+    }
+    #[test]
+    fn trim_slice_and_knife_curves_cut_along_the_line() {
+        // Trim: the side the arrow points to is gone and the cut is closed flat.
+        let mut a=app();let before=(a.mesh().vertex_count(),a.mesh().triangle_count());
+        let c=a.project(Vec3::ZERO);
+        let (s,e)=(c+Vec2::new(-500.0,-100.0),c+Vec2::new(500.0,-100.0));
+        let plane=a.surface_screen().plane(s-a.canvas_origin(),e-a.canvas_origin()).unwrap();
+        line(&mut a,BrushKind::TrimCurve,-100.0,ModifiersState::empty());
+        let m=a.mesh();
+        assert!(m.positions.iter().all(|p|plane.truncate().dot(*p)+plane.w<1e-4),"something is left past the cut");
+        assert!(closed(m),"the trimmed model is closed");
+        assert!(m.group_count()>=2,"the cap has its own polygroup");
+        a.history.undo(&mut a.doc);
+        assert_eq!((a.mesh().vertex_count(),a.mesh().triangle_count()),before);
+        // Slice: same surface, one more polygroup, no triangle across the line.
+        let mut a=app();let groups=a.mesh().group_count();
+        line(&mut a,BrushKind::SliceCurve,-100.0,ModifiersState::empty());
+        assert_eq!(a.mesh().group_count(),groups+1);
+        assert!(closed(a.mesh()));
+        // Knife: two closed pieces with polygroups of their own.
+        let mut a=app();
+        line(&mut a,BrushKind::KnifeCurve,-100.0,ModifiersState::empty());
+        assert!(closed(a.mesh()));
+        assert!(a.mesh().group_count()>=groups+2);
+    }
+    #[test]
+    fn trim_rect_keeps_only_what_is_inside_through_the_model() {
+        let mut a=app();a.workspace.boolean_resolution=96.0;
+        drag(&mut a,BrushKind::TrimRect,false);
+        let c=a.project(Vec3::ZERO);let (lo,hi)=(c+Vec2::new(-80.0,-60.0),c+Vec2::new(80.0,60.0));
+        let screen=a.surface_screen();let slack=12.0;
+        assert!(a.mesh().vertex_count()>100);
+        for p in &a.mesh().positions {
+            let s=screen.project(*p).unwrap()+a.canvas_origin();
+            assert!(s.x>lo.x-slack&&s.x<hi.x+slack&&s.y>lo.y-slack&&s.y<hi.y+slack,"{s:?}");
+        }
+        assert!(closed(a.mesh()));
+        a.history.undo(&mut a.doc);
+        assert!(a.mesh().positions.iter().all(|p|(p.length()-1.0).abs()<0.05),"undo brings the sphere back");
+    }
+    #[test]
+    fn ctrl_shift_uses_the_last_picked_gesture_tool() {
+        let mut a=app();
+        a.workspace.select_brush(&mut a.brush,BrushKind::SliceCurve);
+        a.workspace.select_brush(&mut a.brush,BrushKind::Draw);
+        assert_eq!(a.workspace.gesture_tool,BrushKind::SliceCurve);
+        let (groups,before)=(a.mesh().group_count(),a.mesh().positions.len());
+        line(&mut a,BrushKind::Draw,-100.0,ModifiersState::CONTROL|ModifiersState::SHIFT);
+        assert_eq!(a.brush.kind,BrushKind::Draw);
+        assert_eq!(a.mesh().group_count(),groups+1);
+        assert!(a.mesh().positions.len()>before);
     }
     #[test]
     fn direct_mask_shapes_commit_and_undo_without_sculpting() {

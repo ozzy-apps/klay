@@ -27,9 +27,9 @@ impl BrushGroup {
             Self::All => true,
             Self::Mask => k.is_mask(),
             Self::Detail => k.is_detail(),
-            Self::Clip => k == BrushKind::ClipLine,
+            Self::Clip => k.is_gesture(),
             Self::Curve => k.is_insert() || k.is_imm() || k.is_zmodeler(),
-            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && !k.is_imm() && !k.is_zmodeler() && k != BrushKind::ClipLine,
+            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && !k.is_imm() && !k.is_zmodeler() && !k.is_gesture(),
         }
     }
 }
@@ -231,7 +231,7 @@ impl Workspace {
         }
         let was_special = brush.kind == BrushKind::Paint
             || brush.kind.is_mask()
-            || brush.kind == BrushKind::ClipLine;
+            || brush.kind.is_gesture();
         brush.kind = kind;
         self.brush_ui.palette_masks = kind.is_mask();
         if !kind.is_mask() {
@@ -242,7 +242,9 @@ impl Workspace {
             brush.sculpt = false;
             brush.paint = false;
             self.mode = Mode::Draw;
-        } else if kind == BrushKind::ClipLine {
+        } else if kind.is_gesture() {
+            // Picking one also makes it the Ctrl + Shift tool, as in ZBrush.
+            self.gesture_tool = kind;
             brush.sculpt = true;
             brush.paint = false;
             self.mode = Mode::Draw;
@@ -259,7 +261,7 @@ impl Workspace {
     }
 
     pub(super) fn paint_modes(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
-        if m.brush.kind.is_mask() || m.brush.kind == BrushKind::ClipLine {
+        if m.brush.kind.is_mask() || m.brush.kind.is_gesture() {
             ui.label(if m.brush.kind.is_mask() {
                 "Mask"
             } else {
@@ -411,11 +413,11 @@ impl Workspace {
                         ui.allocate_exact_size(vec2(width, width + 22.0), Sense::click());
                     let on = p == &selected;
                     let painter = ui.painter();
-                    painter.rect_filled(r, 2, if on { ACC_DIM } else { BG3 });
+                    painter.rect_filled(r, 2, if on { ACC_DIM() } else { BG3() });
                     painter.rect_stroke(
                         r,
                         2,
-                        Stroke::new(1.0, if on { ACC_LINE } else { LINE }),
+                        Stroke::new(1.0, if on { ACC_LINE() } else { LINE() }),
                         StrokeKind::Inside,
                     );
                     if p != &Pattern::Off {
@@ -429,12 +431,12 @@ impl Workspace {
                             Color32::WHITE,
                         );
                     } else {
-                        glyph_large(painter, r.center() - vec2(0.0, 9.0), "alpha", FG3);
+                        glyph_large(painter, r.center() - vec2(0.0, 9.0), "alpha", FG3());
                     }
                     let mut job = egui::text::LayoutJob::simple(
                         p.name().to_owned(),
                         FontId::proportional(11.5),
-                        FG,
+                        FG(),
                         width - 6.0,
                     );
                     job.wrap.max_rows = 1;
@@ -445,7 +447,7 @@ impl Workspace {
                         .galley(
                             pos2(r.center().x - galley.size().x * 0.5, r.bottom() - 19.0),
                             galley,
-                            FG,
+                            FG(),
                         );
                     let resp = resp.on_hover_text(p.name());
                     if resp.clicked() {
@@ -691,7 +693,7 @@ impl Workspace {
                         ui.label(
                             RichText::new(hint)
                                 .font(font(12.5, Weight::Regular))
-                                .color(if typed.is_some() { ACC_TEXT } else { FG3 }),
+                                .color(if typed.is_some() { ACC_TEXT() } else { FG3() }),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             close |= ui.button("Close").clicked();
@@ -744,7 +746,7 @@ impl Workspace {
                                         .filter(|k| group.accepts(*k))
                                         .collect();
                                     if !recent.is_empty() && self.brush_ui.search.is_empty() && typed.is_none() {
-                                        ui.label(RichText::new("Quick Pick").size(12.0).color(FG2));
+                                        ui.label(RichText::new("Quick Pick").size(12.0).color(FG2()));
                                         ui.horizontal(|ui| {
                                             for k in recent {
                                                 let tex =
@@ -856,13 +858,13 @@ impl Workspace {
                             let k = self.brush_ui.preview.unwrap_or(m.brush.kind);
                             let tex = self.texture(ui.ctx(), Some(k), self.subtract);
                             ui.add(egui::Image::new((tex, vec2(136.0, 136.0))));
-                            ui.label(RichText::new(k.name()).size(15.0).color(FG));
+                            ui.label(RichText::new(k.name()).size(15.0).color(FG()));
                             ui.label(
                                 RichText::new(format!("Base type: {}", k.base_type()))
                                     .size(12.0)
-                                    .color(FG2),
+                                    .color(FG2()),
                             );
-                            ui.label(RichText::new(k.description()).size(12.0).color(FG2));
+                            ui.label(RichText::new(k.description()).size(12.0).color(FG2()));
                         });
                     });
                 });
@@ -912,12 +914,12 @@ impl Workspace {
                                 let (r, _) =
                                     ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                                 ui.painter().rect_filled(r, 3, Color32::from(self.color));
-                                ui.painter().rect_stroke(r, 3, Stroke::new(1.0, LINE), StrokeKind::Inside);
+                                ui.painter().rect_stroke(r, 3, Stroke::new(1.0, LINE()), StrokeKind::Inside);
                                 let [r, g, b] = self.color.to_srgb();
                                 ui.label(
                                     RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
                                         .font(font(13.0, Weight::Medium))
-                                        .color(FG),
+                                        .color(FG()),
                                 );
                             });
                             if ui
@@ -982,7 +984,7 @@ impl Workspace {
                                 2,
                             );
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Brushes").size(11.5).color(FG2));
+                                ui.label(RichText::new("Brushes").size(11.5).color(FG2()));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui.small_button("All Brushes · B").clicked() {
                                         self.open_brush_catalog(pos);
@@ -1085,11 +1087,11 @@ fn compact_brush_tile(
     let size = (width - 16.0).clamp(36.0, 52.0);
     let (r, resp) = ui.allocate_exact_size(vec2(width, size + 30.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(r, 4, if on { ACC_DIM } else if resp.hovered() { BG4 } else { TILE });
-    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC } else { LINE }), StrokeKind::Inside);
+    p.rect_filled(r, 4, if on { ACC_DIM() } else if resp.hovered() { BG4() } else { TILE() });
+    p.rect_stroke(r, 4, Stroke::new(1.0, if on { ACC() } else { LINE() }), StrokeKind::Inside);
     let image_rect = Rect::from_min_size(pos2(r.center().x - size * 0.5, r.top() + 5.0), vec2(size, size));
     p.image(tex, image_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-    let color = if on { Color32::WHITE } else { FG2 };
+    let color = if on { FG() } else { FG2() };
     let mut job = egui::text::LayoutJob::simple(
         kind.name().to_owned(),
         font(12.0, if on { Weight::SemiBold } else { Weight::Regular }),
@@ -1296,7 +1298,20 @@ mod tests {
         a.workspace.open_brush_catalog(pos2(320.0, 140.0));
         frame(&mut a, vec![]);
         let out = frame(&mut a, vec![]);
-        let at = text(&out, "Mask Line", |p| p.x > 300.0);
+        // A brush tile well down the catalog's grid (right of the left tray).
+        let name = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.pos.x > 330.0 && t.pos.y > 450.0 && t.pos.y < 700.0 && BrushKind::ALL.iter().any(|k| k.name() == t.galley.job.text) => {
+                    Some((t.pos.y, t.galley.job.text.clone()))
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, n)| n)
+            .expect("a brush tile in the grid");
+        let at = text(&out, &name, |p| p.x > 330.0 && p.y > 450.0);
         let before = a.brush.kind;
         let press = |pressed| egui::Event::PointerButton {
             pos: at,
@@ -1318,7 +1333,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }]);
         let out = frame(&mut a, vec![]);
-        let after = text(&out, "Mask Line", |p| p.x > 300.0);
+        let after = text(&out, &name, |p| p.x > 330.0 && p.y > 100.0);
         assert!(after.y < at.y - 100.0, "{at:?} -> {after:?}");
         assert_eq!(a.brush.kind, before);
         assert!(a.workspace.brush_catalog_open());
@@ -1399,7 +1414,16 @@ mod tests {
         assert_eq!(a.doc.mesh().positions, before);
         frame(&mut a, vec![]);
         let out = frame(&mut a, vec![]);
-        let at = text(&out, "Dam Standard", |p| p.x > 300.0);
+        // The catalog's tile (the catalog's grid is clipped to its wide scroll area, the
+        // tray's to the tray).
+        let at = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Dam Standard" && s.clip_rect.width() > 400.0 => Some(t.pos),
+                _ => None,
+            })
+            .expect("Dam Standard in the catalog");
         click(&mut a, at + vec2(5.0, 4.0));
         assert_eq!(a.brush.kind, BrushKind::DamStandard);
         assert!(!a.workspace.brush_catalog_open());

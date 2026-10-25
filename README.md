@@ -42,6 +42,7 @@ cargo run --release -- --demo-brushes --symmetry y,rz8 --snapshot out.png   # st
 cargo run --release -- --snapshot ui.png --snapshot-ui               # save the whole window, interface included, after start-up and quit
 cargo run --release -- --space-menu                                  # start with the Space menu open
 cargo run --release -- --brush-catalog                               # start with the B catalog open
+cargo run --release -- --theme "Graphite Blue"                       # start in an interface theme (Preferences › Theme)
 cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
 cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
@@ -362,6 +363,33 @@ Klay keeps triangles, so ZModeler pairs them into quads the way PolyF shows them
 remembers the pairing from one action to the next. Each action is one undo step; it needs
 a subtool without subdivision levels. Not yet: Crease, Slide, Spin Poly and the rest of
 ZBrush's long list.
+
+### Brushes added in 0.23
+
+- **Sculpt**: Smooth Stronger, Slash, Pen A, Pen S, Noise, Gravity and Spiral (drag to twist
+  the surface round the press point). Elastic is now named **Move Elastic**.
+- **Ctrl + Shift tools**, as in ZBrush: picking one of them makes it the tool Ctrl + Shift
+  uses; as the current brush a plain drag uses it too. Alt works on the other side.
+  - **Select Rect / Select Lasso**: what the outline covers stays shown, the rest is hidden.
+  - **Clip Rect / Clip Circle**: the model is pressed into the outline all the way through.
+  - **Trim Curve**: the arrow's side is cut away exactly along the line and closed flat.
+  - **Trim Rect / Circle / Lasso**: only what is inside is kept, rebuilt as a closed surface by
+    the boolean remesher (Mesh › Boolean's resolution), as ZBrush trims a DynaMesh.
+  - **Slice Curve**: polygons are cut along the line and the arrow's side becomes a new polygroup.
+  - **Knife Curve**: the model is cut into two closed pieces with polygroups of their own
+    (Groups Split separates them).
+  Trim, Slice and Knife need a subtool without subdivision levels and are one undo step each.
+
+### Interface: scale, themes, shelves
+
+- **F11** switches fullscreen. **Preferences › Interface › UI scale** sizes the whole interface
+  from 80 to 200 % (Ctrl + plus / minus too).
+- **Preferences › Theme** has seven themes and your own: change a theme's panel, text and accent
+  colours (a built-in theme is copied first), name it, add or delete themes.
+- **Preferences › Interface › Customize** lets you drag the top shelf's groups and the right
+  shelf's buttons into a new order and click them to hide or show them; **Reset shelves** undoes
+  it. Palettes dock to any tray by the ring left of their name.
+- Scale, theme, custom themes and shelves are saved with the workspace.
 
 ### Canvas and Document
 

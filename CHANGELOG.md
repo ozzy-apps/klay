@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.23.0 — 2026-10-25
+
+- 17 new brushes (66 in all):
+  - Sculpt: Smooth Stronger (four relax passes a dab), Slash (a thin, sharp-lipped cut), Pen A and Pen S (crisp and soft raised lines), Noise (surface noise that settles at its height within a stroke), Gravity (pulls the surface down world −Y), Spiral (a drag brush that twists the surface round the press point).
+  - Elastic is now named Move Elastic, as in ZBrush.
+  - The Ctrl + Shift family: Select Rect and Select Lasso (keep what the outline covers shown, Alt hides it), Clip Rect and Clip Circle (press the model into the outline all the way through, Alt pushes the inside out), Trim Curve (cut away the arrow's side exactly along the line and close it flat), Trim Rect / Circle / Lasso (keep only what is inside, through the boolean remesher), Slice Curve (cut polygons along the line, the arrow's side a new polygroup) and Knife Curve (two closed pieces with polygroups of their own). Picking one makes it the Ctrl + Shift tool, as in ZBrush; as the current brush a plain drag uses it.
+  - Every new brush has a two-letter code (B S S, B S A, B P N, B N O, B G R, B S W, B S R, B S L, B T C, B S C, B K C…); Sharpen moved to S N and Scrape to S B for Select Rect and Slice Curve.
+- Interface:
+  - F11 switches fullscreen (also Preferences › Interface).
+  - Preferences › Interface › UI scale: 80–200 % in steps, saved with the workspace; egui's Ctrl + plus / minus zoom stays in step.
+  - Preferences › Theme: seven themes (Klay Dark, ZBrush Classic, Graphite Blue, Moss, Plum, Studio Light, High Contrast) and your own: change a theme's panel, text and accent colours (a built-in one is copied first), name it, make new ones, delete them; every other colour is derived. Saved with the workspace.
+  - Preferences › Interface › Customize: drag the top shelf's groups and the right shelf's buttons to new places, click one to hide or show it; Reset shelves puts them back. Saved with the workspace. (Palettes already dock to any tray by their ring button.)
+  - About Klay: "Made with love by Ozzy ♥" and "Found a bug? Have a request?" with a mail link to klay@ozzy.co.nl.
+- New flags: --theme NAME, --about, --customize (snapshots).
+- Verification: 273 release tests (new: exact plane cuts that close flat, slice and knife pieces, ear clipping, prisms; Select, Clip, Trim, Slice and Knife through the input path with undo; Ctrl + Shift remembering its tool; Smooth Stronger, Gravity, Noise and Spiral behaviour plus undo, masks and symmetry for the new sculpt brushes; theme contrast for every preset; layout round trip with scale, theme and shelves; dragging a shelf button in Customize mode; the About lines); every native self-test passes on the GPU.
+
 ## 0.22.1 — 2026-10-25
 
 - Pen drag scrolls the brush catalog (B), the Alpha and Texture shelf pop-ups and the History list, like the trays; a drag that started on a brush tile scrolls instead of picking it.

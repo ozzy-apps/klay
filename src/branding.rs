@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+/// About Klay: where bug reports and requests go.
+pub const CONTACT: &str = "klay@ozzy.co.nl";
 pub const LANGUAGE: &str = "Rust";
 
 fn logo() -> &'static image::RgbaImage {

@@ -1,7 +1,7 @@
 //! Screen-space masking gestures and topology-preserving line clipping.
 use crate::mesh::SculptMesh;
 use crate::multires::ChunkData;
-use crate::sculpt::BrushKind;
+use crate::sculpt::{BrushKind, Shape};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 
@@ -19,6 +19,19 @@ impl Screen {
         }
         let ndc = q.truncate() / q.w;
         Some(Vec2::new(ndc.x + 1.0, 1.0 - ndc.y) * self.size * 0.5)
+    }
+
+    /// The point at screen pixel `s` and normalized depth `z` (as `ndc_z` gives it).
+    pub fn unproject(self, s: Vec2, z: f32) -> Vec3 {
+        let ndc = Vec4::new(s.x / self.size.x * 2.0 - 1.0, 1.0 - s.y / self.size.y * 2.0, z, 1.0);
+        let q = self.matrix.inverse() * ndc;
+        q.truncate() / q.w
+    }
+
+    /// Normalized device depth of `p`.
+    pub fn ndc_z(self, p: Vec3) -> Option<f32> {
+        let q = self.matrix * p.extend(1.0);
+        (q.w > 1e-6 && q.is_finite()).then(|| q.z / q.w)
     }
 
     /// Homogeneous screen line transformed back into a world-space clipping plane.
@@ -63,7 +76,7 @@ impl Gesture {
     }
 
     pub fn update(&mut self, mut p: Vec2, snap: bool, alternate: bool) {
-        if snap && matches!(self.kind, BrushKind::ClipLine | BrushKind::MaskLine) {
+        if snap && self.kind.shape() == Some(Shape::Line) {
             let d = p - self.start;
             let angle = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round()
                 * std::f32::consts::FRAC_PI_4;
@@ -71,7 +84,7 @@ impl Gesture {
         }
         self.end = p;
         self.alternate = alternate;
-        if self.kind == BrushKind::MaskLasso
+        if self.kind.shape() == Some(Shape::Lasso)
             && self
                 .points
                 .last()
@@ -88,18 +101,18 @@ impl Gesture {
     pub fn contains(&self, p: Vec2) -> bool {
         let lo = self.start.min(self.end);
         let hi = self.start.max(self.end);
-        match self.kind {
-            BrushKind::MaskRect => (p - lo).min_element() >= 0.0 && (hi - p).min_element() >= 0.0,
-            BrushKind::MaskCircle => {
+        match self.kind.shape() {
+            Some(Shape::Rect) => (p - lo).min_element() >= 0.0 && (hi - p).min_element() >= 0.0,
+            Some(Shape::Circle) => {
                 let radius = (hi - lo) * 0.5;
                 radius.min_element() > 1.0
                     && ((p - (lo + hi) * 0.5) / radius).length_squared() <= 1.0
             }
-            BrushKind::MaskLine => {
+            Some(Shape::Line) => {
                 let d = self.end - self.start;
                 d.length_squared() > 4.0 && d.perp_dot(p - self.start) < 0.0
             }
-            BrushKind::MaskLasso => {
+            Some(Shape::Lasso) => {
                 if self.points.len() < 3 {
                     return false;
                 }
@@ -115,9 +128,172 @@ impl Gesture {
                 }
                 inside
             }
-            _ => false,
+            None => false,
         }
     }
+
+    /// The outline as a closed polygon in pixels (rectangle, 64-sided ellipse or lasso).
+    pub fn outline(&self) -> Vec<Vec2> {
+        let lo = self.start.min(self.end);
+        let hi = self.start.max(self.end);
+        match self.kind.shape() {
+            Some(Shape::Rect) => vec![lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)],
+            Some(Shape::Circle) => {
+                let (c, r) = ((lo + hi) * 0.5, (hi - lo) * 0.5);
+                (0..64)
+                    .map(|i| {
+                        let a = i as f32 / 64.0 * std::f32::consts::TAU;
+                        c + Vec2::new(a.cos(), a.sin()) * r
+                    })
+                    .collect()
+            }
+            Some(Shape::Lasso) => self.points.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the gesture is too small to mean anything (a click).
+    pub fn tiny(&self) -> bool {
+        if self.kind.shape() == Some(Shape::Lasso) {
+            self.points.len() < 3
+        } else {
+            self.start.distance(self.end) < 3.0
+        }
+    }
+}
+
+/// Nearest point of the closed outline `poly` to `p`.
+fn nearest_on_outline(poly: &[Vec2], p: Vec2) -> Vec2 {
+    let mut best = (f32::MAX, p);
+    for k in 0..poly.len() {
+        let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+        let d = b - a;
+        let t = ((p - a).dot(d) / d.length_squared().max(1e-12)).clamp(0.0, 1.0);
+        let q = a + d * t;
+        let e = q.distance_squared(p);
+        if e < best.0 {
+            best = (e, q);
+        }
+    }
+    best.1
+}
+
+/// Clip Rect / Clip Circle: every visible vertex whose screen position is outside the
+/// outline (inside with Alt) moves, at its own depth, to the outline's nearest point, so the
+/// model is pressed into the outline's shape all the way through. With symmetry the mirrored
+/// outline presses the other side. Returns the positions it replaced, per chunk.
+pub fn clip_shape(
+    mesh: &mut SculptMesh,
+    screen: Screen,
+    gesture: &Gesture,
+    symmetry: impl Into<crate::symmetry::Symmetry>,
+) -> Option<ChunkData> {
+    if gesture.tiny() {
+        return None;
+    }
+    let poly = gesture.outline();
+    if poly.len() < 3 {
+        return None;
+    }
+    let images = symmetry.into().images();
+    let ellipse = gesture.kind.shape() == Some(Shape::Circle);
+    let (lo, hi) = (gesture.start.min(gesture.end), gesture.start.max(gesture.end));
+    let (centre, radii) = ((lo + hi) * 0.5, ((hi - lo) * 0.5).max(Vec2::splat(1.0)));
+    let target = |s: Vec2| -> Option<Vec2> {
+        let inside = gesture.contains(s);
+        if inside != gesture.alternate {
+            return None;
+        }
+        // Onto the ellipse along its radius (a squashed circle stays a squashed circle).
+        Some(if ellipse {
+            let q = (s - centre) / radii;
+            centre + q.normalize_or(Vec2::X) * radii
+        } else {
+            nearest_on_outline(&poly, s)
+        })
+    };
+    let moved = |v: usize| -> Option<Vec3> {
+        if !mesh.shown.is_empty() && mesh.shown[v] == 0 {
+            return None;
+        }
+        let p = mesh.positions[v];
+        for k in 0..images.len() {
+            let own = images.unmap(k, p);
+            let (Some(s), Some(z)) = (screen.project(own), screen.ndc_z(own)) else { continue };
+            if let Some(t) = target(s) {
+                let q = images.map(k, screen.unproject(t, z));
+                let freedom = crate::mask::freedom(&mesh.mask, v as u32);
+                return Some(p + (q - p) * freedom);
+            }
+        }
+        None
+    };
+    let changed: Vec<_> = mesh
+        .chunks
+        .par_iter()
+        .enumerate()
+        .filter_map(|(id, c)| {
+            let (a, b) = c.range();
+            let mut any = false;
+            let new: Vec<Vec3> = (a..b)
+                .map(|v| match moved(v) {
+                    Some(q) if q.is_finite() && q.distance_squared(mesh.positions[v]) > 1e-16 => {
+                        any = true;
+                        q
+                    }
+                    _ => mesh.positions[v],
+                })
+                .collect();
+            any.then(|| (id as u32, mesh.positions[a..b].to_vec(), new))
+        })
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    let mut before = Vec::with_capacity(changed.len());
+    let mut after = Vec::with_capacity(changed.len());
+    for (id, old, new) in changed {
+        before.push((id, old));
+        after.push((id, new));
+    }
+    let ids: Vec<_> = after.iter().map(|(id, _)| *id).collect();
+    mesh.restore_chunks(&after);
+    mesh.finish_edit(&ids);
+    Some(before)
+}
+
+/// Select Rect / Select Lasso: 1 for every triangle whose middle the outline covers.
+pub fn tris_in_gesture(mesh: &SculptMesh, screen: Screen, gesture: &Gesture) -> Vec<u8> {
+    (0..mesh.triangle_count())
+        .into_par_iter()
+        .map(|t| {
+            let c = (0..3).map(|k| mesh.positions[mesh.indices[3 * t + k] as usize]).sum::<Vec3>() / 3.0;
+            screen.project(c).is_some_and(|s| gesture.contains(s)) as u8
+        })
+        .collect()
+}
+
+/// Signed distance per vertex from a line gesture's cut, for `cut::line_cut`: positive on
+/// the arrow's side (negative with Alt). The cut is the plane through the line along the
+/// view. With X symmetry, `side` is the half the line was drawn on: that half is cut by the
+/// line's plane and the other by its mirror image.
+pub fn line_distance(mesh: &SculptMesh, screen: Screen, gesture: &Gesture, side: Option<f32>) -> Option<Vec<f32>> {
+    let mut plane = screen.plane(gesture.start, gesture.end)?;
+    // `plane` is positive on the side `clip_line` removes: the arrow's side.
+    if gesture.alternate {
+        plane = -plane;
+    }
+    let mirrored = Vec4::new(-plane.x, plane.y, plane.z, plane.w);
+    let at = |pl: Vec4, p: Vec3| pl.truncate().dot(p) + pl.w;
+    Some(
+        mesh.positions
+            .par_iter()
+            .map(|&p| match side {
+                Some(s) if plane.x.abs() > 1e-6 && p.x * s < 0.0 => at(mirrored, p),
+                _ => at(plane, p),
+            })
+            .collect(),
+    )
 }
 
 /// Shape masks select all visible vertices through the view depth; with symmetry a vertex
@@ -130,12 +306,12 @@ pub fn mask_shape(
     symmetry: impl Into<crate::symmetry::Symmetry>,
 ) -> Option<Vec<u8>> {
     let images = symmetry.into().images();
-    if gesture.start.distance(gesture.end) < 3.0 && gesture.kind != BrushKind::MaskLasso {
+    if gesture.start.distance(gesture.end) < 3.0 && gesture.kind.shape() != Some(Shape::Lasso) {
         return None;
     }
     let step =
         (strength.clamp(0.0, 1.0) * 255.0).round() as i16 * if gesture.alternate { -1 } else { 1 };
-    let bounds = if gesture.kind == BrushKind::MaskLasso {
+    let bounds = if gesture.kind.shape() == Some(Shape::Lasso) {
         Some(gesture.points.iter().fold(
             (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
             |(lo, hi), &p| (lo.min(p), hi.max(p)),

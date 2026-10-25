@@ -64,10 +64,38 @@ pub enum BrushKind {
     InsertMesh,
     /// ZModeler (ZBrush): polygon modelling on points, edges and polygons (`zmodeler.rs`).
     ZModeler,
+    SmoothStronger,
+    Slash,
+    PenA,
+    PenS,
+    Noise,
+    Gravity,
+    /// A drag brush that twists the surface round the press point.
+    Spiral,
+    /// The Ctrl + Shift family (ZBrush): screen gestures that hide, flatten, cut or regroup.
+    SelectRect,
+    SelectLasso,
+    ClipRect,
+    ClipCircle,
+    TrimCurve,
+    TrimRect,
+    TrimCircle,
+    TrimLasso,
+    SliceCurve,
+    KnifeCurve,
+}
+
+/// The outline a screen gesture draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    Rect,
+    Circle,
+    Lasso,
+    Line,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 49] = [
+    pub const ALL: [BrushKind; 66] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -95,6 +123,9 @@ impl BrushKind {
         Self::ClayTubes, Self::HPolish, Self::TrimAdaptive, Self::Planar, Self::TrimSmoothBorder,
         Self::MoveTopological, Self::InflateBalloon, Self::Magnify, Self::OrbCracks,
         Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks, Self::Morph, Self::InsertMesh, Self::ZModeler,
+        Self::SmoothStronger, Self::Slash, Self::PenA, Self::PenS, Self::Noise, Self::Gravity, Self::Spiral,
+        Self::SelectRect, Self::SelectLasso, Self::ClipRect, Self::ClipCircle, Self::TrimCurve, Self::TrimRect,
+        Self::TrimCircle, Self::TrimLasso, Self::SliceCurve, Self::KnifeCurve,
     ];
 
     pub fn name(self) -> &'static str {
@@ -118,7 +149,7 @@ impl BrushKind {
             BrushKind::Scrape => "Scrape",
             BrushKind::Nudge => "Nudge",
             BrushKind::Sharpen => "Sharpen",
-            BrushKind::Elastic => "Elastic",
+            BrushKind::Elastic => "Move Elastic",
             BrushKind::SnakeHook => "Snake Hook",
             Self::MaskPen => "Mask Pen", Self::MaskSoft => "Mask Soft",
             Self::MaskRect => "Mask Rect", Self::MaskLasso => "Mask Lasso",
@@ -135,6 +166,14 @@ impl BrushKind {
             Self::Morph => "Morph",
             Self::InsertMesh => "IMM Primitives",
             Self::ZModeler => "ZModeler",
+            Self::SmoothStronger => "Smooth Stronger", Self::Slash => "Slash",
+            Self::PenA => "Pen A", Self::PenS => "Pen S", Self::Noise => "Noise",
+            Self::Gravity => "Gravity", Self::Spiral => "Spiral",
+            Self::SelectRect => "Select Rect", Self::SelectLasso => "Select Lasso",
+            Self::ClipRect => "Clip Rect", Self::ClipCircle => "Clip Circle",
+            Self::TrimCurve => "Trim Curve", Self::TrimRect => "Trim Rect",
+            Self::TrimCircle => "Trim Circle", Self::TrimLasso => "Trim Lasso",
+            Self::SliceCurve => "Slice Curve", Self::KnifeCurve => "Knife Curve",
         }
     }
 
@@ -157,16 +196,39 @@ impl BrushKind {
             Self::Morph=>"Morph",
             Self::InsertMesh=>"InsertMesh",
             Self::ZModeler=>"ZModeler",
+            Self::SmoothStronger=>"Smooth",
+            Self::Slash|Self::PenA|Self::PenS=>"Standard",
+            Self::Noise=>"Noise",Self::Gravity=>"Gravity",Self::Spiral=>"Deform",
+            Self::SelectRect|Self::SelectLasso=>"Select",
+            Self::ClipRect|Self::ClipCircle=>"Clip",
+            Self::TrimCurve|Self::TrimRect|Self::TrimCircle|Self::TrimLasso=>"Trim",
+            Self::SliceCurve=>"Slice",Self::KnifeCurve=>"Knife",
         }
     }
 
-    pub fn is_drag(self) -> bool { matches!(self,Self::Grab|Self::Elastic|Self::SnakeHook|Self::MoveTopological) }
+    pub fn is_drag(self) -> bool { matches!(self,Self::Grab|Self::Elastic|Self::SnakeHook|Self::MoveTopological|Self::Spiral) }
     pub fn gpu_drag(self) -> bool { matches!(self,Self::Grab|Self::SnakeHook|Self::MoveTopological) }
     /// A square footprint turned along the stroke (ZBrush: the square alphas of ClayTubes,
     /// hPolish and MalletFast) instead of a round falloff.
     pub fn is_square(self) -> bool { matches!(self,Self::ClayTubes|Self::HPolish|Self::MalletFast) }
     pub fn is_mask(self) -> bool { self.base_type()=="Mask" }
-    pub fn is_shape(self) -> bool { matches!(self,Self::MaskRect|Self::MaskLasso|Self::MaskCircle|Self::MaskLine|Self::ClipLine) }
+    pub fn is_shape(self) -> bool { self.shape().is_some() }
+    /// ZBrush's Ctrl + Shift tools: Select, Clip, Trim, Slice and Knife. Picking one makes
+    /// it the Ctrl + Shift tool; as the current brush a plain drag uses it too.
+    pub fn is_gesture(self) -> bool {
+        matches!(self, Self::ClipLine | Self::SelectRect | Self::SelectLasso | Self::ClipRect | Self::ClipCircle
+            | Self::TrimCurve | Self::TrimRect | Self::TrimCircle | Self::TrimLasso | Self::SliceCurve | Self::KnifeCurve)
+    }
+    /// The outline a screen gesture draws, for the mask shapes and the Ctrl + Shift tools.
+    pub fn shape(self) -> Option<Shape> {
+        Some(match self {
+            Self::MaskRect | Self::SelectRect | Self::ClipRect | Self::TrimRect => Shape::Rect,
+            Self::MaskCircle | Self::ClipCircle | Self::TrimCircle => Shape::Circle,
+            Self::MaskLasso | Self::SelectLasso | Self::TrimLasso => Shape::Lasso,
+            Self::MaskLine | Self::ClipLine | Self::TrimCurve | Self::SliceCurve | Self::KnifeCurve => Shape::Line,
+            _ => return None,
+        })
+    }
     pub fn is_detail(self) -> bool { matches!(self,Self::Zipper|Self::Stitch|Self::Rake) }
     /// Adds geometry along a curve instead of moving the surface (ZBrush: curve insert brushes).
     pub fn is_insert(self) -> bool { matches!(self,Self::CurveTube) }
@@ -176,7 +238,7 @@ impl BrushKind {
     pub fn is_zmodeler(self) -> bool { self == Self::ZModeler }
     /// Strokes as one stamp you size and turn (DragRect) or slide (DragDot): the dab brushes.
     pub fn stamps(self) -> bool {
-        !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_imm() && !self.is_zmodeler() && !self.is_mask() && self != Self::ClipLine
+        !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_imm() && !self.is_zmodeler() && !self.is_mask() && !self.is_gesture()
     }
 
     /// ZBrush's two-letter brush code: B, then these two letters picks the brush (B S T
@@ -200,9 +262,9 @@ impl BrushKind {
             Self::Blob => "BL",
             Self::Layer => "LA",
             Self::Fill => "FI",
-            Self::Scrape => "SC",
+            Self::Scrape => "SB",
             Self::Nudge => "NU",
-            Self::Sharpen => "SR",
+            Self::Sharpen => "SN",
             Self::Elastic => "ME",
             Self::SnakeHook => "SH",
             Self::MaskPen => "MP",
@@ -233,6 +295,23 @@ impl BrushKind {
             Self::Morph => "MO",
             Self::InsertMesh => "IP",
             Self::ZModeler => "ZM",
+            Self::SmoothStronger => "SS",
+            Self::Slash => "SA",
+            Self::PenA => "PN",
+            Self::PenS => "PS",
+            Self::Noise => "NO",
+            Self::Gravity => "GR",
+            Self::Spiral => "SW",
+            Self::SelectRect => "SR",
+            Self::SelectLasso => "SL",
+            Self::ClipRect => "CQ",
+            Self::ClipCircle => "CI",
+            Self::TrimCurve => "TC",
+            Self::TrimRect => "TR",
+            Self::TrimCircle => "TI",
+            Self::TrimLasso => "TL",
+            Self::SliceCurve => "SC",
+            Self::KnifeCurve => "KC",
         }
     }
 
@@ -256,7 +335,7 @@ impl BrushKind {
             Self::Scrape=>"Shave raised clay into a flat facet. Alt fills.",
             Self::Nudge=>"Push clay along the stroke direction. Alt reverses.",
             Self::Sharpen=>"Enhance local surface detail. Alt relaxes.",
-            Self::Elastic=>"Pull a broad area with directional surface deformation.",
+            Self::Elastic=>"Move a broad area elastically: the surface around the pull follows it and keeps its volume.",
             Self::SnakeHook=>"Pull a tapered tip. Divide for finer topology before long pulls.",
             Self::MaskPen=>"Paint a mask. Alt erases. Ctrl temporarily uses the selected mask brush.",
             Self::MaskSoft=>"Paint a broad soft mask. Alt erases.",
@@ -286,6 +365,23 @@ impl BrushKind {
             Self::Morph=>"Brush the surface back to the stored Morph Target (Mesh › Morph Target › StoreMT).",
             Self::ZModeler=>"Polygon modelling: hover a point, edge or polygon and click or drag. Polygons: QMesh, Extrude, Inset, Delete, Polygroup; edges: Insert an edge loop, Delete; points: Move. Pick actions and targets in Brush › ZModeler. Needs a subtool without subdivision levels.",
             Self::InsertMesh=>"Drag on the model to insert a mesh standing on the surface; the drag sets its size. Pick Sphere, Cube, Cylinder or Ring in Brush › Insert Mesh. It becomes a new polygroup and the rest is masked, ready for Transpose. Needs a subtool without subdivision levels.",
+            Self::SmoothStronger=>"Smooth much harder than Smooth: several relax passes per dab, for lumpy or noisy surface.",
+            Self::Slash=>"Cut a thin, sharp-edged slash. Alt raises a sharp ridge.",
+            Self::PenA=>"Draw a thin, crisp raised line, like a pen. Alt engraves it.",
+            Self::PenS=>"Draw a soft, narrow raised line. Alt engraves it.",
+            Self::Noise=>"Brush surface noise into the model; going over the same place in one stroke does not deepen it, a new stroke adds another layer. Alt inverts it.",
+            Self::Gravity=>"Pull the surface down (world −Y), as if it sagged. Alt pulls it up.",
+            Self::Spiral=>"Drag to twist the surface round the press point; drag farther for more turns. Alt twists the other way.",
+            Self::SelectRect=>"Drag a rectangle: what it covers stays shown, the rest is hidden. Alt hides what it covers. Click a polygroup to isolate it, the background to show all.",
+            Self::SelectLasso=>"Draw a lasso: what it covers stays shown, the rest is hidden. Alt hides what it covers.",
+            Self::ClipRect=>"Drag a rectangle: the surface outside it is pushed onto its edge, through the whole model. Alt pushes the inside out to the edge.",
+            Self::ClipCircle=>"Drag an ellipse: the surface outside it is pushed onto its edge (round off a form seen from the front). Alt pushes the inside out.",
+            Self::TrimCurve=>"Drag a line: the side the arrow points to is cut away and the cut is closed flat. Alt flips sides; Shift snaps the angle. Needs a subtool without subdivision levels.",
+            Self::TrimRect=>"Drag a rectangle: only what is inside is kept, rebuilt as a closed remeshed surface. Alt cuts the inside away. Needs a subtool without subdivision levels.",
+            Self::TrimCircle=>"Drag an ellipse: only what is inside is kept, rebuilt as a closed remeshed surface. Alt cuts the inside away. Needs a subtool without subdivision levels.",
+            Self::TrimLasso=>"Draw a lasso: only what is inside is kept, rebuilt as a closed remeshed surface. Alt cuts the inside away. Needs a subtool without subdivision levels.",
+            Self::SliceCurve=>"Drag a line: polygons are cut along it and the arrow's side becomes a new polygroup. Needs a subtool without subdivision levels.",
+            Self::KnifeCurve=>"Drag a line: the model is cut through along it into two closed pieces with polygroups of their own (Groups Split separates them). Needs a subtool without subdivision levels.",
         }
     }
 }
@@ -658,6 +754,10 @@ struct GrabState {
     /// image and weight. Empty when no vertex is shared. Such a grab runs on the CPU.
     overlap_of: Vec<u32>,
     overlaps: Vec<Vec<(u8, f32)>>,
+    /// Spiral: the axis it twists round (the view direction at the press, in the brush's
+    /// own frame) and the turn's sign (Alt reverses it).
+    axis: Vec3,
+    turn: f32,
 }
 
 /// Data the renderer needs to run a grab on the GPU.
@@ -801,6 +901,19 @@ fn grab_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
 }
 
 fn drag_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
+    if g.kind == BrushKind::Spiral {
+        // Twist round the press point: the farther the drag, the more turns; the weight
+        // fades the angle out to the brush's edge, and the twist is pulled along a little.
+        let angle = g.delta.length() / g.radius * 2.2 * g.turn;
+        return grab_copies(g, i)
+            .map(|(k, w)| {
+                let own = images.unmap(k, g.orig[i]);
+                let rel = own - g.anchor;
+                let turned = glam::Quat::from_axis_angle(g.axis, angle * w) * rel;
+                images.map(k, turned - rel + g.delta * (0.25 * w))
+            })
+            .sum();
+    }
     if g.kind != BrushKind::Elastic { return grab_offset(images, g, i); }
     grab_copies(g, i)
         .map(|(k, w)| {
@@ -1025,7 +1138,7 @@ impl Stroke {
         view_dir: Vec3,
         ray: (Vec3, Vec3),
     ) {
-        if brush.kind.is_mask() || brush.kind==BrushKind::ClipLine { return; }
+        if brush.kind.is_mask() || brush.kind.is_gesture() { return; }
         self.view = view_dir;
         if brush.kind.is_detail() && brush.sculpt {
             let Some(previous)=self.last_dab else {self.last_dab=Some(hit);return;};
@@ -1215,6 +1328,49 @@ impl Stroke {
                     target.map_or(p, |t| p.lerp(t[v as usize], (k * w[i]).min(1.0)))
                 });
             }
+            BrushKind::SmoothStronger => {
+                // Several full relax passes per dab, each from the last.
+                let k = (brush.strength * 0.95).min(1.0);
+                for pass in 0..4 {
+                    if pass > 0 {
+                        mesh.scatter_positions(&sel, new);
+                    }
+                    let mesh = &*mesh;
+                    sel.par_map_into(new, |i, v| {
+                        let nb = mesh.neighbors(v);
+                        let p = mesh.positions[v as usize];
+                        if nb.is_empty() {
+                            return p;
+                        }
+                        let avg = nb.iter().map(|&n| mesh.positions[n as usize]).sum::<Vec3>() / nb.len() as f32;
+                        p.lerp(avg, (k * w[i]).min(1.0))
+                    });
+                }
+            }
+            BrushKind::Noise => {
+                // Toward a fixed noise height over where each vertex was when the stroke
+                // began: overlapping dabs and strokes reach it but never stack past it.
+                let (copies, copy) = (images, k);
+                let amount = r * 0.05 * brush.strength * sign;
+                let snapshots = &self.snapshots;
+                let index = &self.snapshot_index;
+                sel.par_map_into(new, |i, v| {
+                    let c = mesh.vert_chunk[v as usize];
+                    let old = snapshots[index[&c]].1[(v - mesh.chunks[c as usize].vert_start) as usize];
+                    let p = mesh.positions[v as usize];
+                    let n = mesh.normal_at(v);
+                    let q = copies.unmap(copy, old) * (3.0 / r.max(1e-6));
+                    let wave = (q.x * 1.3 + (q.y * 0.7).sin()).sin() * (q.y * 1.7 - q.z * 0.6).sin() * (q.z * 1.1 + q.x * 0.9).cos()
+                        + 0.5 * (q.x * 3.1 - q.z * 2.3).sin() * (q.y * 2.9 + q.x * 1.7).sin();
+                    let current = (p - old).dot(n);
+                    p + n * ((wave * amount - current) * w[i].min(1.0))
+                });
+            }
+            BrushKind::Gravity => {
+                // Down the world's Y; every copy pulls down too (a mirror keeps "down").
+                let amount = brush.strength * r * 0.05 * sign;
+                sel.par_map_into(new, |i, v| mesh.positions[v as usize] - Vec3::Y * (amount * w[i]));
+            }
             BrushKind::Smooth | BrushKind::SmoothValleys | BrushKind::SmoothPeaks => {
                 let k = brush.strength * 0.5;
                 let kind = brush.kind;
@@ -1309,7 +1465,8 @@ impl Stroke {
                     p+n*amount+border
                 });
             }
-            BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::OrbCracks | BrushKind::Magnify => {
+            BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::OrbCracks | BrushKind::Magnify
+            | BrushKind::Slash | BrushKind::PenA | BrushKind::PenS => {
                 let kind = brush.kind;
                 let (copies, copy) = (images, k);
                 let images = &self.images;
@@ -1318,7 +1475,7 @@ impl Stroke {
                     let k=sel.image(i);
                     let (c,n)=(images.map(k,hit),images.map(k,hit_normal));
                     let delta=c-p;let tangent=delta-n*delta.dot(n);
-                    let width=if kind==BrushKind::OrbCracks {0.13}else{0.24};
+                    let width=match kind {BrushKind::OrbCracks=>0.13,BrushKind::Slash=>0.11,BrushKind::PenA=>0.14,BrushKind::PenS=>0.30,_=>0.24};
                     let tight=(-((sel.dist[i]/r)/width).powi(2)).exp();
                     let (pinch,cut)=match kind {
                         BrushKind::Pinch=>(0.28,0.0),
@@ -1326,6 +1483,11 @@ impl Stroke {
                         BrushKind::OrbCracks=>(0.12,0.16),
                         // Spread outward and swell: Pinch turned inside out.
                         BrushKind::Magnify=>(-0.22,-0.025),
+                        // A deep, narrow cut with its sides drawn in: a blade's slash.
+                        BrushKind::Slash=>(0.10,0.17),
+                        // Raised lines: crisp and narrow, or soft.
+                        BrushKind::PenA=>(0.05,-0.10),
+                        BrushKind::PenS=>(0.0,-0.06),
                         _=>(0.06,0.1),
                     };
                     // Orb Cracks: the depth wanders along the cut, so it reads as a crack,
@@ -1339,7 +1501,7 @@ impl Stroke {
                 });
             }
             BrushKind::Paint=>unreachable!(),
-            BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::MoveTopological => unreachable!(),
+            BrushKind::Grab | BrushKind::Elastic | BrushKind::SnakeHook | BrushKind::MoveTopological | BrushKind::Spiral => unreachable!(),
             _ => unreachable!("gesture and detail tools are handled before normal dabs"),
         }
         mesh.scatter_positions(&sel, new);
@@ -1488,7 +1650,7 @@ impl Stroke {
             let mask = &mesh.mask;
             let weight = |i: usize, d: f32, k: usize| {
                 let f = focal_falloff(d, r, brush.focal_shift);
-                let profile = match brush.kind { BrushKind::SnakeHook => f.powi(3), BrushKind::Elastic => f.sqrt(), _ => f };
+                let profile = match brush.kind { BrushKind::SnakeHook => f.powi(3), BrushKind::Elastic => f.sqrt(), BrushKind::Spiral => f * f, _ => f };
                 profile * self.stamp_weight(&self.images, k, mesh.positions[sel.verts[i] as usize], hit, view_dir, r)
                     * crate::mask::freedom(mask, sel.verts[i])
             };
@@ -1545,6 +1707,8 @@ impl Stroke {
                 radius: r,
                 overlap_of,
                 overlaps,
+                axis: view_dir.normalize_or(Vec3::Z),
+                turn: if self.invert { -1.0 } else { 1.0 },
             });
             return;
         }
@@ -1592,7 +1756,8 @@ impl Stroke {
             && !kind.is_detail()
             && !kind.is_insert()
             && !kind.is_imm()
-            && !matches!(kind, BrushKind::Paint | BrushKind::Layer | BrushKind::Morph | BrushKind::ClipLine)
+            && !kind.is_gesture()
+            && !matches!(kind, BrushKind::Paint | BrushKind::Layer | BrushKind::Morph | BrushKind::Noise)
     }
 
     pub fn end(mut self, mesh: &mut SculptMesh) -> Option<ChunkData> {
@@ -2047,12 +2212,100 @@ mod advanced_brush_tests {
     use crate::primitive::Primitive;
 
     /// The twelve brushes added in 0.7.
-    const ADDED: [BrushKind; 12] = [
+    const ADDED: [BrushKind; 19] = [
         BrushKind::ClayTubes, BrushKind::HPolish, BrushKind::TrimAdaptive, BrushKind::Planar,
         BrushKind::TrimSmoothBorder, BrushKind::MoveTopological, BrushKind::InflateBalloon,
         BrushKind::Magnify, BrushKind::OrbCracks, BrushKind::MalletFast, BrushKind::SmoothValleys,
-        BrushKind::SmoothPeaks,
+        BrushKind::SmoothPeaks, BrushKind::SmoothStronger, BrushKind::Slash, BrushKind::PenA,
+        BrushKind::PenS, BrushKind::Noise, BrushKind::Gravity, BrushKind::Spiral,
     ];
+
+    /// Mean distance of each vertex from its neighbours' mean: how rough the surface is.
+    fn roughness(m: &SculptMesh) -> f32 {
+        (0..m.vertex_count() as u32)
+            .map(|v| {
+                let nb = m.neighbors(v);
+                let mean = nb.iter().map(|&n| m.positions[n as usize]).sum::<Vec3>() / nb.len().max(1) as f32;
+                m.positions[v as usize].distance(mean)
+            })
+            .sum::<f32>()
+            / m.vertex_count() as f32
+    }
+
+    #[test]
+    fn smooth_stronger_smooths_more_than_smooth_in_one_stroke() {
+        let mut soft = bumpy(24);
+        let mut hard = bumpy(24);
+        let start = Vec3::new(-0.1, 0.05, 1.0);
+        let r0 = roughness(&soft);
+        stroke(&mut soft, BrushKind::Smooth, false, false, false, start);
+        stroke(&mut hard, BrushKind::SmoothStronger, false, false, false, start);
+        let (r1, r2) = (roughness(&soft), roughness(&hard));
+        assert!(r2 < r1 && r1 < r0, "{r0} {r1} {r2}");
+    }
+
+    #[test]
+    fn gravity_pulls_down_only_and_alt_pulls_up() {
+        for invert in [false, true] {
+            let mut m = sphere(24);
+            let before = m.positions.clone();
+            stroke(&mut m, BrushKind::Gravity, invert, false, false, Vec3::new(-0.1, 0.05, 1.0));
+            let mut moved = 0;
+            for (a, b) in before.iter().zip(&m.positions) {
+                let d = *b - *a;
+                if d.length() > 1e-6 {
+                    moved += 1;
+                    assert!(d.x.abs() < 1e-6 && d.z.abs() < 1e-6, "{d:?}");
+                    assert!((d.y < 0.0) != invert, "{d:?}");
+                }
+            }
+            assert!(moved > 10);
+        }
+    }
+
+    #[test]
+    fn noise_reaches_its_height_without_stacking_within_a_stroke() {
+        let start = Vec3::new(-0.1, 0.05, 1.0);
+        let brush = Brush { kind: BrushKind::Noise, radius: 0.4, strength: 0.8, ..Brush::default() };
+        let scrub = |passes: usize| {
+            let mut m = sphere(40);
+            let before = m.positions.clone();
+            let mut s = Stroke::begin(false, false, false);
+            for k in 0..passes * 4 {
+                // Back and forth over the same stretch.
+                let i = if (k / 4) % 2 == 0 { k % 4 } else { 3 - k % 4 };
+                let hit = start + Vec3::X * (0.08 * i as f32);
+                let n = hit.normalize_or(Vec3::Z);
+                s.dab(&mut m, &brush, hit, n, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+            }
+            before.iter().zip(&m.positions).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max)
+        };
+        let (one, many) = (scrub(1), scrub(10));
+        assert!(one > 1e-4, "noise moved the surface: {one}");
+        // Ten passes in one stroke settle on the noise height instead of adding up.
+        assert!(many < one * 2.0, "{one} → {many}");
+    }
+
+    #[test]
+    fn spiral_turns_the_surface_round_the_press_point() {
+        let mut m = sphere(32);
+        let before = m.positions.clone();
+        let centre = Vec3::new(0.0, 0.0, 1.0);
+        stroke(&mut m, BrushKind::Spiral, false, false, false, centre);
+        // Points near the press move mostly round it (across the view), not toward it.
+        let (mut round, mut radial) = (0.0f32, 0.0f32);
+        for (a, b) in before.iter().zip(&m.positions) {
+            let d = *b - *a;
+            let rel = Vec3::new(a.x - centre.x, a.y - centre.y, 0.0);
+            if d.length() < 1e-5 || rel.length() < 1e-3 || rel.length() > 0.3 {
+                continue;
+            }
+            let around = Vec3::Z.cross(rel).normalize();
+            round += d.dot(around).abs();
+            radial += d.dot(rel.normalize()).abs();
+        }
+        assert!(round > radial, "twist {round} vs pull {radial}");
+    }
 
     fn sphere(n: u32) -> SculptMesh {
         let (p, i) = crate::mesh::cube_sphere(n, 1.0);
