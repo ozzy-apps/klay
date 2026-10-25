@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.0 — 2026-10-25
+
+- Squash and stretch along one axis: Transpose Scale mode's middle circle (along the action line), Gizmo 3D axis boxes, and Deformation › Size X / Y / Z toggles. Flattening a sphere works; masks hold; live preview; one undo step.
+- Gizmo 3D pivot and orientation: Alt + click the model (on the surface, Y along the normal), Alt + drag a handle (the gizmo alone), Unmasked Center and Reset; the gizmo rides along with its moves, turns and undo.
+- Tablet Pressure per brush: Global or the brush's own Size / Z Intensity toggles and curves.
+- IMM Primitives (Insert Mesh) brush: drag to insert a Sphere, Cube, Cylinder or Ring on the surface, sized by the drag and as dense as the model; new polygroup, the rest masked, symmetry copies, one undo step (catalog: 48 tools; the Curve filter is now Insert).
+- New --selftest-insert.
+- Verification: 235 release tests (new: stretch maths, inverse, matrix and masked weights; Size on picked axes; middle-circle squash through the input path; gizmo axis boxes, turned gizmos, Alt-drag, Alt-click and Reset; per-brush pressure; inserts standing on the surface with outward mirror copies, mask, undo/redo and the refusal with levels); every native self-test passes on the GPU.
+
 ## 0.14.0 — 2026-10-24
 
 - Stroke › Alpha rotation: Fixed (Angle), Follow (rolls with the stroke) or Random (per dab), for sculpt, paint and mask stamps.

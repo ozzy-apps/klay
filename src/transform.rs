@@ -7,7 +7,8 @@
 //!
 //! - Move: the middle circle moves the subtool in the view plane.
 //! - Scale: the end circle scales about the start by the ratio of the cursor's distance to
-//!   the start over the press's (the start circle scales about the end).
+//!   the start over the press's (the start circle scales about the end); the middle circle
+//!   squashes or stretches along the line only (flatten a sphere).
 //! - Rotate: the end circle rotates about the start around the view axis by the angle the
 //!   cursor turns through (the start circle rotates about the end).
 //!
@@ -17,16 +18,22 @@
 use crate::camera::Camera;
 use glam::{Mat4, Quat, Vec2, Vec3};
 
-/// The map `p -> center + scale * rotation (p - center) + translate`: a rotation and a
-/// uniform scale about `center`, then a translation. Loop subdivision weights sum to one, so
-/// subdivision commutes with it: every level of a stack maps exactly by mapping positions
-/// and turning the offsets by `scale * rotation`.
+/// The map `p -> center + scale * rotation * stretch (p - center) + translate`: a stretch
+/// along one axis (`axis`, by `stretch`; 1 is none), a rotation and a uniform scale about
+/// `center`, then a translation. Loop subdivision weights sum to one, so subdivision
+/// commutes with it: every level of a stack maps exactly by mapping positions and mapping
+/// the offsets by the linear part.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Affine {
     pub center: Vec3,
     pub rotation: Quat,
     pub scale: f32,
     pub translate: Vec3,
+    /// Unit axis of the stretch.
+    pub axis: Vec3,
+    /// Factor along `axis` (ZBrush: Transpose Scale's middle circle, the Gizmo's axis
+    /// scale boxes, Deformation › Size with one or two axes): 0.5 squashes to half.
+    pub stretch: f32,
 }
 
 impl Affine {
@@ -35,6 +42,8 @@ impl Affine {
         rotation: Quat::IDENTITY,
         scale: 1.0,
         translate: Vec3::ZERO,
+        axis: Vec3::Z,
+        stretch: 1.0,
     };
 
     pub fn translation(t: Vec3) -> Self {
@@ -60,12 +69,46 @@ impl Affine {
         }
     }
 
+    /// Squash or stretch along `axis` (any length) by `factor` about `center`.
+    pub fn stretching(center: Vec3, axis: Vec3, factor: f32) -> Self {
+        Self {
+            center,
+            axis: axis.normalize_or(Vec3::Z),
+            stretch: factor,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// Scale about `center` by `factors` along X, Y and Z, when at most two differ (an even
+    /// scale and a stretch along the odd axis out): Deformation › Size with axes picked.
+    pub fn axis_scaling(center: Vec3, factors: Vec3) -> Self {
+        let f = factors.to_array();
+        // The odd one out: the factor the other two share.
+        let (odd, even) = if f[1] == f[2] {
+            (0, f[1])
+        } else if f[0] == f[2] {
+            (1, f[0])
+        } else {
+            (2, f[0])
+        };
+        let mut axis = Vec3::ZERO;
+        axis[odd] = 1.0;
+        Self {
+            center,
+            scale: even,
+            axis,
+            stretch: f[odd] / even,
+            ..Self::IDENTITY
+        }
+    }
+
     pub fn apply(&self, p: Vec3) -> Vec3 {
         self.center + self.apply_vector(p - self.center) + self.translate
     }
 
     /// The linear part: how offsets and other directions map.
     pub fn apply_vector(&self, v: Vec3) -> Vec3 {
+        let v = if self.stretch == 1.0 { v } else { v + self.axis * (v.dot(self.axis) * (self.stretch - 1.0)) };
         if self.rotation == Quat::IDENTITY {
             v * self.scale
         } else {
@@ -75,42 +118,70 @@ impl Affine {
 
     /// True when the linear part is the identity (a pure translation or nothing).
     pub fn is_translation(&self) -> bool {
-        self.scale == 1.0 && self.rotation == Quat::IDENTITY
+        self.scale == 1.0 && self.rotation == Quat::IDENTITY && self.stretch == 1.0
+    }
+
+    /// True when the map keeps every box a box, corners to corners in the same order: no
+    /// rotation, no mirroring, and a stretch only along a world axis.
+    pub fn keeps_boxes(&self) -> bool {
+        let aligned = self.stretch == 1.0 || (self.stretch > 0.0 && self.axis.abs().max_element() > 0.99999);
+        self.rotation == Quat::IDENTITY && self.scale > 0.0 && aligned
+    }
+
+    /// True when normals keep their direction relative to the surface up to the rotation:
+    /// no stretch.
+    pub fn is_similarity(&self) -> bool {
+        self.stretch == 1.0
+    }
+
+    /// About how much face areas grow: the square of the scale times the square root of
+    /// the stretch (faces across the axis keep their area, faces along it take all of it).
+    pub fn area_factor(&self) -> f32 {
+        self.scale * self.scale * self.stretch.abs().sqrt()
     }
 
     pub fn is_identity(&self) -> bool {
         self.is_translation() && self.translate == Vec3::ZERO
     }
 
-    /// The exact inverse, in the same form: `p = (c + t) + (1/s) R⁻¹ (p' - (c + t)) - t`.
+    /// The exact inverse, in the same form: `p = (c + t) + L⁻¹ (p' - (c + t)) - t`, where
+    /// `L⁻¹ = (1/s) S⁻¹ R⁻¹ = (1/s) R⁻¹ S'⁻¹` with `S'` the stretch along the turned axis.
     pub fn inverse(&self) -> Self {
         Self {
             center: self.center + self.translate,
             rotation: self.rotation.inverse(),
             scale: 1.0 / self.scale,
             translate: -self.translate,
+            axis: self.rotation * self.axis,
+            stretch: 1.0 / self.stretch,
         }
+    }
+
+    /// The linear part as a matrix.
+    pub fn linear(&self) -> glam::Mat3 {
+        let a = self.axis;
+        let stretch = glam::Mat3::IDENTITY + glam::Mat3::from_cols(a * a.x, a * a.y, a * a.z) * (self.stretch - 1.0);
+        glam::Mat3::from_quat(self.rotation) * stretch * self.scale
     }
 
     /// The same map as a matrix, for the vertex shader.
     pub fn matrix(&self) -> Mat4 {
-        Mat4::from_translation(self.center + self.translate)
-            * Mat4::from_scale_rotation_translation(Vec3::splat(self.scale), self.rotation, Vec3::ZERO)
-            * Mat4::from_translation(-self.center)
+        Mat4::from_translation(self.center + self.translate) * Mat4::from_mat3(self.linear()) * Mat4::from_translation(-self.center)
     }
 }
 
 /// A map applied only part of the way, vertex by vertex: the rotation angle, the
-/// logarithm of the scale and the translation are multiplied by a weight in 0..1 (how free
-/// the vertex is of the mask). For a pure translation, or a rotation and scale about a
-/// centre with no translation (every Transpose and Deformation map), the weighted map of
-/// the inverse is exactly the inverse of the weighted map, so a masked transform undoes
-/// with the same weights.
+/// logarithms of the scale and stretch and the translation are multiplied by a weight in
+/// 0..1 (how free the vertex is of the mask). For a pure translation, or a rotation and
+/// scale or a stretch and scale about a centre with no translation (every Transpose, Gizmo
+/// and Deformation map), the weighted map of the inverse is exactly the inverse of the
+/// weighted map, so a masked transform undoes with the same weights.
 pub struct Partial {
     map: Affine,
     axis: Vec3,
     angle: f32,
     ln_scale: f32,
+    ln_stretch: f32,
 }
 
 impl Partial {
@@ -121,6 +192,7 @@ impl Partial {
             axis,
             angle,
             ln_scale: map.scale.ln(),
+            ln_stretch: map.stretch.ln(),
         }
     }
 
@@ -140,6 +212,8 @@ impl Partial {
             },
             scale: (self.ln_scale * w).exp(),
             translate: self.map.translate * w,
+            axis: self.map.axis,
+            stretch: (self.ln_stretch * w).exp(),
         }
     }
 }
@@ -191,6 +265,17 @@ pub fn scale_map(view: &View, pivot: Vec3, from: Vec2, to: Vec2) -> Affine {
         return Affine::IDENTITY;
     }
     Affine::scaling(pivot, (b / a).clamp(MIN_SCALE, MAX_SCALE))
+}
+
+/// Squash or stretch along the action line about its middle (ZBrush: Scale mode's middle
+/// circle): right stretches, left squashes, twice or half as long per 150 pixels.
+pub fn stretch_map(line: &ActionLine, from: Vec2, to: Vec2) -> Affine {
+    let axis = line.end - line.start;
+    if axis.length_squared() < 1e-12 {
+        return Affine::IDENTITY;
+    }
+    let k = ((to.x - from.x) / 150.0).exp2().clamp(MIN_SCALE, MAX_SCALE);
+    Affine::stretching(line.mid(), axis, k)
 }
 
 /// Rotate about `pivot` around the line of sight through it, by the angle the cursor turned
@@ -308,6 +393,7 @@ mod tests {
             rotation: Quat::from_axis_angle(Vec3::new(1.0, 2.0, -0.5).normalize(), 0.9),
             scale: 1.7,
             translate: Vec3::new(-0.4, 1.1, 0.25),
+            ..Affine::IDENTITY
         }
     }
 
@@ -365,6 +451,51 @@ mod tests {
                 assert!((r - r0 * m.scale.sqrt()).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    fn stretches_map_one_axis_and_invert_exactly() {
+        let m = Affine {
+            axis: Vec3::new(0.3, -1.0, 0.4).normalize(),
+            stretch: 0.35,
+            ..sample()
+        };
+        let inv = m.inverse();
+        let mat = m.matrix();
+        for p in [Vec3::ZERO, Vec3::new(1.0, -2.0, 3.0), Vec3::new(-0.7, 0.1, 0.4)] {
+            let q = m.apply(p);
+            assert!((inv.apply(q) - p).length() < 1e-5, "inverse");
+            assert!((mat.transform_point3(p) - q).length() < 1e-5, "matrix");
+            assert!((m.linear() * (p - m.center) - m.apply_vector(p - m.center)).length() < 1e-5);
+        }
+        // A pure stretch scales lengths along the axis only.
+        let s = Affine::stretching(Vec3::new(0.0, 1.0, 0.0), Vec3::Y * 3.0, 0.25);
+        assert_eq!(s.apply(Vec3::new(0.0, 3.0, 0.0)), Vec3::new(0.0, 1.5, 0.0));
+        assert_eq!(s.apply(Vec3::new(2.0, 1.0, -1.0)), Vec3::new(2.0, 1.0, -1.0));
+        assert!(s.keeps_boxes() && !s.is_similarity() && !s.is_translation());
+        assert!(!Affine::stretching(Vec3::ZERO, Vec3::ONE, 2.0).keeps_boxes());
+        // Masked: a stretch with a scale undoes with the same weights.
+        let m = Affine { scale: 1.3, ..Affine::stretching(Vec3::X, Vec3::new(1.0, 1.0, 0.0), 0.4) };
+        let (part, back) = (Partial::new(&m), Partial::new(&m.inverse()));
+        let p = Vec3::new(0.4, -0.3, 1.2);
+        for w in [0.0, 0.3, 0.7, 1.0] {
+            assert!((back.at(w).apply(part.at(w).apply(p)) - p).length() < 1e-5, "w {w}");
+        }
+        // Size on picked axes: X and Z by 2, Y kept.
+        let m = Affine::axis_scaling(Vec3::ZERO, Vec3::new(2.0, 1.0, 2.0));
+        assert!((m.apply(Vec3::ONE) - Vec3::new(2.0, 1.0, 2.0)).length() < 1e-6);
+        let m = Affine::axis_scaling(Vec3::ZERO, Vec3::new(1.0, 1.0, 0.5));
+        assert!((m.apply(Vec3::ONE) - Vec3::new(1.0, 1.0, 0.5)).length() < 1e-6);
+        assert_eq!(Affine::axis_scaling(Vec3::ZERO, Vec3::splat(1.5)).stretch, 1.0);
+    }
+
+    #[test]
+    fn the_middle_circle_squashes_along_the_line() {
+        let line = ActionLine { start: Vec3::new(0.0, 1.0, 0.0), end: Vec3::new(0.0, -1.0, 0.0) };
+        let m = stretch_map(&line, Vec2::new(500.0, 400.0), Vec2::new(350.0, 420.0));
+        assert!((m.stretch - 0.5).abs() < 1e-5);
+        assert!((m.apply(Vec3::Y) - Vec3::Y * 0.5).length() < 1e-6);
+        assert!((m.apply(Vec3::X) - Vec3::X).length() < 1e-6, "across the line stays");
     }
 
     #[test]

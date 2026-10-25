@@ -41,6 +41,8 @@ pub struct Uniforms {
     /// Symmetry for the brush ring: mirror bits (X 1, Y 2, Z 4), radial axis (0 X, 1 Y,
     /// 2 Z; -1 off) and radial count.
     pub sym: [f32; 4],
+    /// The Transpose preview's stretch: unit axis and the logarithm of the factor (0: none).
+    pub xf_stretch: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -1716,7 +1718,7 @@ impl Gfx {
     /// accumulator scale follows the change in face area.
     pub fn transform_level(&mut self, mesh: &mut SculptMesh, map: &crate::transform::Affine) {
         for b in self.levels.iter_mut().flatten() {
-            b.normal_scale /= map.scale * map.scale;
+            b.normal_scale /= map.area_factor();
         }
         if self.active_buffers().is_none() {
             return;
@@ -1727,7 +1729,7 @@ impl Gfx {
             Some((l, earlier)) if l == level => (level, m * earlier),
             _ => (level, m),
         });
-        let turns = map.rotation != glam::Quat::IDENTITY;
+        let turns = map.rotation != glam::Quat::IDENTITY || !map.is_similarity();
         for ch in &mut mesh.chunks {
             ch.dirty_pos = false;
             ch.dirty_nrm = turns;
@@ -1736,9 +1738,9 @@ impl Gfx {
 
     /// Normal accumulator scale after a map that did not go through
     /// [`transform_level`](Self::transform_level) (the shown level is uploaded again).
-    pub fn rescale_normals(&mut self, scale: f32) {
+    pub fn rescale_normals(&mut self, area_factor: f32) {
         for b in self.levels.iter_mut().flatten() {
-            b.normal_scale /= scale * scale;
+            b.normal_scale /= area_factor;
         }
     }
 

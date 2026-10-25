@@ -28,8 +28,8 @@ impl BrushGroup {
             Self::Mask => k.is_mask(),
             Self::Detail => k.is_detail(),
             Self::Clip => k == BrushKind::ClipLine,
-            Self::Curve => k.is_insert(),
-            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && k != BrushKind::ClipLine,
+            Self::Curve => k.is_insert() || k.is_imm(),
+            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && !k.is_imm() && k != BrushKind::ClipLine,
         }
     }
 }
@@ -670,7 +670,7 @@ impl Workspace {
                         }
                         if let Some(i) = seg(
                             ui,
-                            &["All", "Sculpt", "Mask", "Detail", "Clip", "Curve"],
+                            &["All", "Sculpt", "Mask", "Detail", "Clip", "Insert"],
                             BrushGroup::ALL
                                 .iter()
                                 .position(|g| *g == self.brush_ui.group)

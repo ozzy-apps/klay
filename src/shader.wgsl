@@ -24,6 +24,8 @@ struct Uniforms {
     border: vec4<f32>,
     // Symmetry (symmetry.rs): mirror bits X 1 Y 2 Z 4; radial axis (-1 off); radial count.
     sym: vec4<f32>,
+    // Transpose preview stretch: unit axis, w = log of the factor (0 none).
+    xf_stretch: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -38,6 +40,19 @@ fn mask_at(v: u32) -> f32 {
 }
 
 // Rotate `v` by `angle` about the unit `axis` (Rodrigues).
+// Stretch `v` along unit `axis` by `k`.
+fn stretch(v: vec3<f32>, axis: vec3<f32>, k: f32) -> vec3<f32> {
+    return v + axis * (dot(axis, v) * (k - 1.0));
+}
+
+// The live Transpose preview at weight `w` (1 - mask): stretch, rotation and scale about
+// the centre, then the move.
+fn preview_place(pos: vec3<f32>, w: f32) -> vec3<f32> {
+    let c = u.xf_center.xyz;
+    let s = stretch(pos - c, u.xf_stretch.xyz, exp(u.xf_stretch.w * w));
+    return c + rotate(s, u.xf_rotation.xyz, u.xf_rotation.w * w) * pow(u.xf_move.w, w) + u.xf_move.xyz * w;
+}
+
 fn rotate(v: vec3<f32>, axis: vec3<f32>, angle: f32) -> vec3<f32> {
     let c = cos(angle);
     let s = sin(angle);
@@ -117,10 +132,9 @@ fn vs_main(
         out.mask = m;
         if (previewing) {
             let w = 1.0 - m;
-            let angle = u.xf_rotation.w * w;
-            let c = u.xf_center.xyz;
-            p = c + rotate(pos - c, u.xf_rotation.xyz, angle) * pow(u.xf_move.w, w) + u.xf_move.xyz * w;
-            n = rotate(n, u.xf_rotation.xyz, angle);
+            p = preview_place(pos, w);
+            // Normals stretch the other way (inverse transpose), then turn.
+            n = rotate(stretch(n, u.xf_stretch.xyz, exp(-u.xf_stretch.w * w)), u.xf_rotation.xyz, u.xf_rotation.w * w);
         }
     }
     out.clip = u.view_proj * vec4<f32>(p, 1.0);

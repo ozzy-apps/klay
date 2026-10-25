@@ -113,6 +113,8 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                 let fade = ((0.62 - p.length()) * 3.2).clamp(0.0, 1.0);
                 (z.min(0.66 + p.x * 0.10) - z) * fade * fade * (3.0 - 2.0 * fade)
             }
+            // A ball set into the surface.
+            Some(BrushKind::InsertMesh) => (0.26f32.powi(2) - p.distance_squared(Vec2::new(0.05, 0.05))).max(0.0).sqrt() * 1.1,
             // A round swell along the stroke.
             Some(BrushKind::InflateBalloon) => {
                 (1.0 - (p.distance(Vec2::new(-0.05, 0.02)) / 0.42).powi(2)).max(0.0).sqrt() * 0.13 * sign

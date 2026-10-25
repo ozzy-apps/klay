@@ -39,9 +39,7 @@ fn place(pos: vec3<f32>, v: u32) -> vec3<f32> {
     if (u.display.w > 0.5) {
         m = mask_at(v);
     }
-    let w = 1.0 - m;
-    let c = u.xf_center.xyz;
-    return c + rotate(pos - c, u.xf_rotation.xyz, u.xf_rotation.w * w) * pow(u.xf_move.w, w) + u.xf_move.xyz * w;
+    return preview_place(pos, 1.0 - m);
 }
 
 // Corner `k` of drawn triangle `prim` in the world, as drawn.

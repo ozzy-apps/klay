@@ -14,6 +14,7 @@ mod curve;
 mod curve_tube;
 mod deform;
 mod gizmo;
+mod insert_mesh;
 mod layers;
 mod obj;
 mod pressure;
@@ -359,6 +360,25 @@ struct TransposeTest {
     ok: bool,
 }
 
+/// An Insert Mesh drag (IMM Primitives, see `insert_mesh.rs`): the mesh goes in at the
+/// press, at Draw Size, and is put in again at the drag's size until the release.
+#[derive(Clone, Debug)]
+struct InsertDrag {
+    /// The subtool as it was; everything after it is the inserted mesh.
+    keep: mesh::Extent,
+    at: Vec3,
+    normal: Vec3,
+    press: Vec2,
+    radius: f32,
+    group: u16,
+    /// The model's mean edge length, for the inserted mesh's density.
+    edge: f32,
+    shape: primitive::Primitive,
+    symmetry: symmetry::Symmetry,
+    /// The mask before (for undo).
+    mask: Vec<u8>,
+}
+
 /// A left drag in Move / Scale / Rotate mode (ZBrush Transpose, see `transform.rs`).
 #[derive(Clone, Copy, Debug)]
 enum TransposeDrag {
@@ -370,22 +390,25 @@ enum TransposeDrag {
         press: Vec2,
         ends: [bool; 2],
     },
-    /// Moving, scaling or rotating the active subtool about `anchor`. `map` is only shown
-    /// (the vertex shader applies it to the shown level) until the release applies it to
-    /// every level as one undo step.
+    /// Moving, scaling or rotating the active subtool about `anchor` (`squash`: Scale's
+    /// middle circle, along the line). `map` is only shown (the vertex shader applies it to
+    /// the shown level) until the release applies it to every level as one undo step.
     Act {
         mode: Mode,
+        squash: bool,
         anchor: Vec3,
         press: Vec2,
         line: ActionLine,
         map: Affine,
     },
-    /// Dragging a Gizmo 3D handle; `centre` is where the gizmo stood at the press.
+    /// Dragging a Gizmo 3D handle; `place` is where the gizmo stood at the press. `alone`
+    /// (Alt): the drag moves or turns the gizmo, not the model.
     Gizmo {
         handle: gizmo::Handle,
-        centre: Vec3,
+        place: gizmo::Place,
         press: Vec2,
         map: Affine,
+        alone: bool,
     },
 }
 
@@ -468,6 +491,8 @@ struct App {
     selftest_curve_state: CurveTest,
     /// `--selftest-tube`: phase and frames left before it (shares `selftest_curve_state`).
     selftest_tube: Option<(u8, u32)>,
+    /// `--selftest-insert`: likewise, for Insert Mesh.
+    selftest_insert: Option<(u8, u32)>,
     /// `--hold`: a self-test leaves the window open when it is done.
     selftest_hold: bool,
     /// `--selftest-clip`: frames left before the crossing Clip Line cuts.
@@ -492,6 +517,10 @@ struct App {
     /// The Transpose action line, kept between drags (shown in Move / Scale / Rotate mode).
     action_line: Option<ActionLine>,
     transpose: Option<TransposeDrag>,
+    insert: Option<InsertDrag>,
+    /// Where Gizmo 3D was put (Alt + click, Alt + drag) or carried by its drags, for the
+    /// subtool with this id; otherwise it stands at the subtool's centre, world-aligned.
+    gizmo_place: Option<(u64, gizmo::Place)>,
     mask_press: Option<MaskPress>,
     mask_stroke: Option<mask::MaskStroke>,
     gesture: Option<surface_tools::Gesture>,
@@ -620,6 +649,7 @@ impl App {
             selftest_curve: None,
             selftest_curve_state: CurveTest::default(),
             selftest_tube: None,
+            selftest_insert: None,
             selftest_hold: false,
             selftest_clip: None,
             cursor: Vec2::ZERO,
@@ -634,6 +664,8 @@ impl App {
             hover: None,
             action_line: None,
             transpose: None,
+            insert: None,
+            gizmo_place: None,
             mask_press: None,
             mask_stroke: None,
             gesture: None,
@@ -691,6 +723,7 @@ impl App {
             || self.select.is_some()
             || self.curve_draw.is_some()
             || self.curve.as_ref().is_some_and(|c| c.bend.is_some())
+            || self.insert.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -1072,7 +1105,7 @@ impl App {
             self.workspace.notify(format!("{} {:+.0} applied", kind.label(), value));
             return;
         }
-        self.apply_transform(subtool::deform_map(kind, value, self.doc.bounds()));
+        self.apply_transform(subtool::deform_map(kind, value, self.doc.bounds(), self.workspace.size_axes));
         self.workspace
             .notify(format!("{} {:+.0} applied", kind.label(), value));
     }
@@ -1129,7 +1162,7 @@ impl App {
             if clean {
                 gfx.transform_level(self.doc.mesh_mut(), map);
             } else {
-                gfx.rescale_normals(map.scale);
+                gfx.rescale_normals(map.area_factor());
             }
         }
         self.subtools[self.active_tool].bounds = self.doc.bounds();
@@ -1169,17 +1202,18 @@ impl App {
             if let Some(hit) = transform::hit_test(&self.view(), &line, press, self.scale) {
                 let act = |anchor| TransposeDrag::Act {
                     mode,
+                    squash: mode == Mode::Scale && hit == Hit::Inner(Part::Middle),
                     anchor,
                     press,
                     line,
                     map: Affine::IDENTITY,
                 };
                 let drag_line = |ends| TransposeDrag::Line { line, press, ends };
-                // ZBrush: the middle circle moves, the end circle scales or rotates about
-                // the start (the start circle about the end); the rings and the line move
-                // the line itself.
+                // ZBrush: the middle circle moves (Scale: squashes or stretches along the
+                // line), the end circle scales or rotates about the start (the start circle
+                // about the end); the rings and the line move the line itself.
                 let drag = match (mode, hit) {
-                    (Mode::Move, Hit::Inner(Part::Middle)) => act(line.mid()),
+                    (Mode::Move | Mode::Scale, Hit::Inner(Part::Middle)) => act(line.mid()),
                     (Mode::Scale | Mode::Rotate, Hit::Inner(Part::End)) => act(line.start),
                     (Mode::Scale | Mode::Rotate, Hit::Inner(Part::Start)) => act(line.end),
                     (_, Hit::Inner(Part::Start) | Hit::Ring(Part::Start)) => drag_line([true, false]),
@@ -1234,11 +1268,17 @@ impl App {
                     end: follow(line.end, ends[1]),
                 });
             }
-            TransposeDrag::Gizmo { handle, centre, press, map } => {
-                *map = gizmo::drag_map(&view, *centre, *handle, *press, to);
+            TransposeDrag::Gizmo { handle, place, press, map, alone } => {
+                *map = gizmo::drag_map(&view, place, *handle, *press, to);
+                if *alone {
+                    // The gizmo alone only moves and turns, about its own centre.
+                    map.scale = 1.0;
+                    map.stretch = 1.0;
+                }
             }
             TransposeDrag::Act {
                 mode,
+                squash,
                 anchor,
                 press,
                 line,
@@ -1246,6 +1286,7 @@ impl App {
             } => {
                 *map = match mode {
                     Mode::Move => transform::move_map(&view, *anchor, *press, to),
+                    Mode::Scale if *squash => transform::stretch_map(line, *press, to),
                     Mode::Scale => transform::scale_map(&view, *anchor, *press, to),
                     Mode::Rotate => transform::rotate_map(&view, *anchor, *press, to),
                     Mode::Draw => Affine::IDENTITY,
@@ -1270,9 +1311,19 @@ impl App {
                 None
             }
             TransposeDrag::Line { .. } => None,
-            TransposeDrag::Gizmo { handle, map, .. } => {
+            TransposeDrag::Gizmo { handle, place, map, alone, .. } => {
                 if map.is_identity() {
                     return None;
+                }
+                let id = self.subtools[self.active_tool].id;
+                if alone {
+                    self.gizmo_place = Some((id, place.mapped(&map)));
+                    self.status = "Gizmo moved".into();
+                    return None;
+                }
+                // The gizmo stays on the model: carried along and turned with it.
+                if self.gizmo_place.is_some() || map.rotation != glam::Quat::IDENTITY {
+                    self.gizmo_place = Some((id, place.mapped(&map)));
                 }
                 let ms = self.apply_transform(map);
                 self.status = format!("Gizmo {handle:?} applied in {ms:.0} ms");
@@ -1287,6 +1338,7 @@ impl App {
                 self.action_line = Some(line.mapped(&map));
                 self.status = match mode {
                     Mode::Move => format!("Moved by {:.3} in {ms:.0} ms", map.translate.length()),
+                    Mode::Scale if map.stretch != 1.0 => format!("Squashed along the line to {:.3} in {ms:.0} ms", map.stretch),
                     Mode::Scale => format!("Scaled by {:.3} in {ms:.0} ms", map.scale),
                     _ => format!(
                         "Rotated by {:.1}° in {ms:.0} ms",
@@ -1303,26 +1355,67 @@ impl App {
     /// one is in progress.
     fn preview_map(&self) -> Affine {
         match self.transpose {
-            Some(TransposeDrag::Act { map, .. }) | Some(TransposeDrag::Gizmo { map, .. }) => map,
+            Some(TransposeDrag::Act { map, .. }) | Some(TransposeDrag::Gizmo { map, alone: false, .. }) => map,
             _ => Affine::IDENTITY,
         }
     }
 
-    /// Where Gizmo 3D stands: the centre of the active subtool.
+    /// Where Gizmo 3D stands: where it was put for the active subtool, else its centre.
+    fn gizmo_place(&self) -> gizmo::Place {
+        match self.gizmo_place {
+            Some((id, place)) if id == self.subtools[self.active_tool].id => place,
+            _ => {
+                let b = self.doc.bounds();
+                gizmo::Place::at((b.min + b.max) * 0.5)
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn gizmo_centre(&self) -> Vec3 {
-        let b = self.doc.bounds();
-        (b.min + b.max) * 0.5
+        self.gizmo_place().centre
+    }
+
+    /// Gizmo 3D's buttons: to the centre of what is unmasked and shown (keeping its turn),
+    /// or back to the subtool's centre, world-aligned.
+    fn gizmo_pivot(&mut self, to_unmasked: bool) {
+        if !to_unmasked {
+            self.gizmo_place = None;
+            self.workspace.notify("Gizmo reset: subtool centre, world axes".to_string());
+            return;
+        }
+        let mesh = self.doc.mesh();
+        let free = |v: usize| mesh.mask.get(v).is_none_or(|&m| m < 128) && mesh.shown.get(v).is_none_or(|&s| s != 0);
+        let (sum, n) = (0..mesh.vertex_count()).filter(|&v| free(v)).fold((Vec3::ZERO, 0usize), |(s, n), v| (s + mesh.positions[v], n + 1));
+        if n == 0 {
+            self.workspace.notify("Everything is masked".to_string());
+            return;
+        }
+        let place = gizmo::Place { centre: sum / n as f32, rotation: self.gizmo_place().rotation };
+        self.gizmo_place = Some((self.subtools[self.active_tool].id, place));
+        self.workspace.notify("Gizmo at the unmasked centre".to_string());
     }
 
     /// A press in Move / Scale / Rotate mode with Gizmo 3D on: start dragging the handle
-    /// under it. Returns false when it is on none (the caller navigates).
+    /// under it (with Alt, the gizmo alone). Alt + click on the model puts the gizmo there,
+    /// turned to the surface. Returns false when it is on neither (the caller navigates).
     fn begin_gizmo(&mut self) -> bool {
-        let centre = self.gizmo_centre();
+        let place = self.gizmo_place();
         let press = self.canvas_cursor();
-        let Some(handle) = gizmo::hit(&self.view(), centre, press) else {
+        let alone = self.modifiers.alt_key();
+        let Some(handle) = gizmo::hit(&self.view(), &place, press) else {
+            if alone {
+                let (o, d) = self.cursor_ray();
+                if let Some(hit) = self.mesh().raycast(o, d) {
+                    let normal = if hit.normal.dot(d) > 0.0 { -hit.normal } else { hit.normal };
+                    self.gizmo_place = Some((self.subtools[self.active_tool].id, gizmo::Place::on_surface(hit.point, normal)));
+                    self.status = "Gizmo put on the surface".into();
+                    return true;
+                }
+            }
             return false;
         };
-        self.transpose = Some(TransposeDrag::Gizmo { handle, centre, press, map: Affine::IDENTITY });
+        self.transpose = Some(TransposeDrag::Gizmo { handle, place, press, map: Affine::IDENTITY, alone });
         self.hover = None;
         true
     }
@@ -1334,11 +1427,13 @@ impl App {
             return;
         }
         let view = self.view();
-        let (centre, active) = match self.transpose {
-            Some(TransposeDrag::Gizmo { handle, centre, map, .. }) => (map.apply(centre), Some(handle)),
-            _ => (self.gizmo_centre(), None),
+        let (place, active) = match self.transpose {
+            Some(TransposeDrag::Gizmo { handle, place, map, .. }) => (place.mapped(&map), Some(handle)),
+            _ => (self.gizmo_place(), None),
         };
-        let lit = active.or_else(|| gizmo::hit(&view, centre, self.canvas_cursor()));
+        let g = &place;
+        let centre = place.centre;
+        let lit = active.or_else(|| gizmo::hit(&view, g, self.canvas_cursor()));
         let to_pos = |p: Vec2| {
             let px = p + self.canvas_origin();
             egui::pos2(px.x / self.scale, px.y / self.scale)
@@ -1353,18 +1448,23 @@ impl App {
             painter.add(egui::Shape::line(pts.into_iter().map(to_pos).collect(), stroke));
         };
         let white = egui::Color32::from_rgb(235, 235, 235);
-        line(gizmo::ring(&view, centre, None, gizmo::VIEW_RING), egui::Stroke::new(width(gizmo::Handle::RotateView), shade(white, gizmo::Handle::RotateView)));
+        line(gizmo::ring(&view, g, None, gizmo::VIEW_RING), egui::Stroke::new(width(gizmo::Handle::RotateView), shade(white, gizmo::Handle::RotateView)));
         for a in 0..3 {
             let h = gizmo::Handle::Rotate(a);
-            line(gizmo::ring(&view, centre, Some(a), gizmo::RING), egui::Stroke::new(width(h), shade(colors[a], h)));
+            line(gizmo::ring(&view, g, Some(a), gizmo::RING), egui::Stroke::new(width(h), shade(colors[a], h)));
         }
         let c = view.project(centre);
         for a in 0..3 {
             let h = gizmo::Handle::Move(a);
-            let tip = gizmo::arrow_tip(&view, centre, a);
+            let tip = gizmo::arrow_tip(&view, g, a);
             let color = shade(colors[a], h);
             line(vec![c, tip], egui::Stroke::new(width(h) + 0.6, color));
             painter.circle_filled(to_pos(tip), 4.5, color);
+            let s = gizmo::Handle::Stretch(a);
+            let half = gizmo::AXIS_BOX / self.scale;
+            let at = to_pos(gizmo::axis_box(&view, g, a));
+            painter.rect_filled(egui::Rect::from_center_size(at, egui::vec2(half * 2.0, half * 2.0)), 1, shade(colors[a], s));
+            painter.rect_stroke(egui::Rect::from_center_size(at, egui::vec2(half * 2.0, half * 2.0)), 1, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(140)), egui::StrokeKind::Outside);
         }
         let free = gizmo::Handle::Free;
         painter.circle_stroke(to_pos(c), gizmo::FREE_RING / self.scale, egui::Stroke::new(width(free), shade(white, free)));
@@ -3402,6 +3502,74 @@ impl App {
         }
     }
 
+    /// `--selftest-insert`: Insert Mesh through the real input handlers on the GPU. Phase 0
+    /// drags one of each shape onto the model; phase 1 checks the GPU copy, undo and redo.
+    fn selftest_insert_phase(&mut self, phase: u8) -> Option<u8> {
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_curve_state.ok &= pass;
+            log::info!("selftest-insert: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let max_diff = |a: &[Vec3], b: &[Vec3]| a.par_iter().zip(b).map(|(x, y)| x.distance(*y)).reduce(|| 0.0, f32::max);
+        match phase {
+            0 => {
+                self.selftest_curve_state = CurveTest { ok: true, ..CurveTest::default() };
+                self.workspace.select_brush(&mut self.brush, BrushKind::InsertMesh);
+                self.pressure = None;
+                let b = self.doc.bounds();
+                let (centre, size) = ((b.min + b.max) * 0.5, (b.max - b.min).max_element());
+                let original = self.mesh().positions.clone();
+                let groups = self.mesh().group_count();
+                let c = self.project(centre);
+                let r = (self.project(centre + Vec3::X * size * 0.5) - c).length();
+                let mut times = Vec::new();
+                for (k, shape) in insert_mesh::SHAPES.into_iter().enumerate() {
+                    self.workspace.insert_shape = shape;
+                    let at = c + Vec2::new((k as f32 - 1.5) * r * 0.35, -r * 0.1);
+                    self.cursor_moved(at, false);
+                    let t = Instant::now();
+                    self.left_press(false, false);
+                    for i in 1..=12 {
+                        self.cursor_moved(at + Vec2::new(r * 0.12 * i as f32 / 12.0, 0.0), false);
+                    }
+                    self.left_release();
+                    times.push(t.elapsed().as_secs_f32() * 1000.0);
+                }
+                let n = original.len();
+                let added = self.mesh().vertex_count() - n;
+                let kept = max_diff(&self.mesh().positions[..n], &original) == 0.0;
+                let avg = times.iter().sum::<f32>() / times.len() as f32;
+                check(self, &format!("four shapes added {} vertices, {avg:.0} ms per drag of 12 rebuilds, the model untouched", fmt_count(added)), added > 0 && kept);
+                check(self, &format!("each is a polygroup of its own ({} → {})", groups, self.mesh().group_count()), self.mesh().group_count() == groups + 4);
+                let masked = self.mesh().mask.len() == self.mesh().vertex_count() && self.mesh().mask[..n].iter().all(|&m| m == 255);
+                check(self, "the model is masked, the last insert is not", masked && *self.mesh().mask.last().unwrap() == 0);
+                self.selftest_curve_state.original = original;
+                self.selftest_curve_state.bent = self.mesh().positions.clone();
+                Some(1)
+            }
+            _ => {
+                let t = std::mem::take(&mut self.selftest_curve_state);
+                self.selftest_curve_state.ok = t.ok;
+                if let Some(gpu) = self.gfx.as_ref().and_then(Gfx::read_positions) {
+                    let d = if gpu.len() >= t.bent.len() { max_diff(&gpu[..t.bent.len()], &t.bent) } else { f32::INFINITY };
+                    check(self, &format!("GPU copy of the model with its inserts matches the CPU ({d:.1e})"), d < 1e-6);
+                }
+                for _ in 0..4 {
+                    self.history.undo(&mut self.doc);
+                }
+                self.show_active_level();
+                check(self, "undo takes every insert back", self.mesh().positions == t.original);
+                for _ in 0..4 {
+                    self.history.redo(&mut self.doc);
+                }
+                self.show_active_level();
+                check(self, "redo brings them all back", self.mesh().positions == t.bent);
+                let ok = self.selftest_curve_state.ok;
+                log::info!("selftest-insert: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -3920,10 +4088,10 @@ impl App {
     /// Size, Intensity for Z and RGB Intensity).
     fn at_pressure(&self, brush: Brush) -> Brush {
         let Some(p) = self.pressure else { return brush };
-        let ws = &self.workspace;
+        let t = self.workspace.tablet(brush.kind);
         brush
-            .at_pressure(Some(ws.size_curve.eval(p)), ws.pressure_size, false)
-            .at_pressure(Some(ws.intensity_curve.eval(p)), false, ws.pressure_intensity)
+            .at_pressure(Some(t.size_curve.eval(p)), t.size, false)
+            .at_pressure(Some(t.intensity_curve.eval(p)), false, t.intensity)
     }
 
     fn apply_stroke(&mut self) {
@@ -4058,6 +4226,10 @@ impl App {
             };
             if !can {
                 break;
+            }
+            // A placed gizmo goes back and forth with the model.
+            if let (Some(m), Some((_, place))) = (map, self.gizmo_place.as_mut()) {
+                *place = place.mapped(&m);
             }
             match (map, by < 0) {
                 (Some(map), true) => self.transform_doc(&map, |app| app.history.undo(&mut app.doc)),
@@ -4226,6 +4398,87 @@ impl App {
         });
         self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.update_hover();
+    }
+
+    /// Insert Mesh press on the model: the mesh goes in there at Draw Size. With
+    /// subdivision levels it says why it cannot.
+    fn begin_insert(&mut self) {
+        if self.doc.count() > 1 {
+            self.workspace.notify("Insert Mesh adds geometry, which needs a subtool without subdivision levels · Del Lower first, or Append a subtool for it".to_string());
+            return;
+        }
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d) else {
+            return;
+        };
+        let normal = if hit.normal.dot(d) > 0.0 { -hit.normal } else { hit.normal };
+        let mesh = self.mesh();
+        self.insert = Some(InsertDrag {
+            keep: mesh.extent(),
+            at: hit.point,
+            normal,
+            press: self.cursor,
+            radius: self.brush.radius,
+            group: mesh.max_group().saturating_add(1),
+            edge: insert_mesh::mean_edge(mesh),
+            shape: self.workspace.insert_shape,
+            symmetry: self.workspace.sym(),
+            mask: mesh.mask.clone(),
+        });
+        self.hover = None;
+        self.place_insert();
+    }
+
+    /// Put the dragged mesh in again at its current size.
+    fn place_insert(&mut self) {
+        let Some(d) = self.insert.as_ref() else {
+            return;
+        };
+        let segments = insert_mesh::segments_for(d.shape, d.radius, d.edge);
+        let part = insert_mesh::inserted(d.shape, segments, d.at, d.normal, d.radius, d.symmetry, d.group);
+        let keep = d.keep;
+        self.doc.swap_part_in_place(keep, Some(&part));
+        self.show_swapped_part(keep);
+    }
+
+    /// The drag sizes the mesh: its radius reaches from the press point to the cursor (in
+    /// the view plane through it). A click keeps Draw Size.
+    fn insert_move(&mut self) {
+        let to = self.canvas_cursor();
+        let view = self.view();
+        let Some(d) = self.insert.as_ref() else {
+            return;
+        };
+        if (self.cursor - d.press).length() < 4.0 {
+            return;
+        }
+        let radius = (view.unproject_at(to, d.at) - d.at).length().max(d.edge);
+        if (radius / d.radius - 1.0).abs() > 0.01 {
+            self.insert.as_mut().unwrap().radius = radius;
+            self.place_insert();
+        }
+    }
+
+    /// Release: the inserted mesh stays, the rest of the subtool is masked (ZBrush), as one
+    /// undo step.
+    fn end_insert(&mut self) {
+        let Some(d) = self.insert.take() else {
+            return;
+        };
+        let n = self.mesh().vertex_count();
+        let mut mask = vec![255u8; d.keep.verts];
+        mask.resize(n, 0);
+        crate::mask::replace(self.doc.mesh_mut(), mask);
+        self.history.push(UndoStep::Steps(vec![
+            UndoStep::Part { keep: d.keep, part: None },
+            UndoStep::Mask { level: 0, data: crate::mask::MaskData::Whole(d.mask) },
+        ]));
+        self.history.name_last(&format!("Insert {}", d.shape.short()));
+        // A live CurveTube curve lets go: its part is no longer the last.
+        self.curve = None;
+        self.update_hover();
+        self.status = format!("Inserted {} (radius {:.3}): {} vertices as polygroup {}", d.shape.name(), d.radius, fmt_count(n - d.keep.verts), d.group);
+        log::info!("{}", self.status);
     }
 
     /// CurveTube release: a tube along `curve` (and its mirror image with symmetry) added
@@ -4897,6 +5150,8 @@ impl App {
             self.show_select_rect();
         } else if self.transpose.is_some() {
             self.transpose_move();
+        } else if self.insert.is_some() {
+            self.insert_move();
         } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
             self.mask_move();
         } else if self.curve_draw.is_some() {
@@ -4994,6 +5249,8 @@ impl App {
             log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
             if hit.is_none() {
                 self.begin_nav(MouseButton::Left);
+            } else if self.effective_brush().kind.is_imm() {
+                self.begin_insert();
             } else if self.curve_mode(self.effective_brush().kind) {
                 self.begin_curve();
             } else {
@@ -5024,6 +5281,7 @@ impl App {
         self.end_curve_bend();
         self.end_stroke();
         self.end_transpose();
+        self.end_insert();
         self.end_nav(MouseButton::Left);
     }
 
@@ -5337,6 +5595,9 @@ impl App {
         if actions.group_visible {
             self.pending_vis = Some(VisOp::GroupVisible);
         }
+        if actions.gizmo_center || actions.gizmo_reset {
+            self.gizmo_pivot(actions.gizmo_center);
+        }
         for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld)] {
             if on {
                 self.pending_geo = Some(op);
@@ -5553,6 +5814,16 @@ impl App {
                 self.selftest_tube = Some((phase, left - 1));
             }
         }
+        if let Some((phase, left)) = self.selftest_insert {
+            if left == 0 {
+                self.selftest_insert = self.selftest_insert_phase(phase).map(|next| (next, 10));
+                if self.selftest_insert.is_none() && !self.selftest_hold {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_insert = Some((phase, left - 1));
+            }
+        }
         if let Some((phase, left)) = self.selftest_curve {
             if left == 0 {
                 self.selftest_curve = self.selftest_curve_phase(phase).map(|next| (next, 10));
@@ -5726,6 +5997,7 @@ impl App {
             xf_center: preview.center.extend(if preview.is_identity() { 0.0 } else { 1.0 }).to_array(),
             xf_rotation: preview_axis.extend(preview_angle).to_array(),
             xf_move: preview.translate.extend(preview.scale).to_array(),
+            xf_stretch: preview.axis.extend(preview.stretch.ln()).to_array(),
             material: self.material_uniform(),
             cam_up: self.camera.up().extend(self.workspace.ambient).to_array(),
             back: {
@@ -6432,6 +6704,9 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-tube") {
         app.selftest_tube = Some((0, 20));
     }
+    if args.iter().any(|a| a == "--selftest-insert") {
+        app.selftest_insert = Some((0, 20));
+    }
     app.selftest_hold = args.iter().any(|a| a == "--hold");
     app.demo_brushes = args.iter().any(|a| a == "--demo-brushes");
     app.automated = args.iter().any(|a| {
@@ -6602,6 +6877,53 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    #[test]
+    fn insert_mesh_adds_a_masked_off_polygroup_sized_by_the_drag() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        app.workspace.select_brush(&mut app.brush, BrushKind::InsertMesh);
+        app.workspace.insert_shape = Primitive::Cube;
+        let before = app.doc.mesh().vertex_count();
+        let groups = app.doc.mesh().max_group();
+        let c = app.project(Vec3::new(0.0, 0.0, 1.0));
+        let press = |app: &mut App, to: Vec2| {
+            app.cursor_moved(c, false);
+            app.left_press(false, false);
+            for k in 1..=5 {
+                app.cursor_moved(c + (to - c) * (k as f32 / 5.0), false);
+            }
+            app.left_release();
+        };
+        press(&mut app, c + Vec2::new(60.0, 0.0));
+        let mesh = app.doc.mesh();
+        let n = mesh.vertex_count();
+        assert!(n > before, "the cube went in");
+        assert_eq!(mesh.max_group(), groups + 1);
+        // The old part is masked, the cube is not, and the cube sits on the front of the
+        // sphere, about as wide as the drag.
+        assert!(mesh.mask[..before].iter().all(|&m| m == 255) && mesh.mask[before..].iter().all(|&m| m == 0));
+        let (lo, hi) = mesh.positions[before..].iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+        let mid = (lo + hi) * 0.5;
+        assert!((mid - Vec3::new(0.0, 0.0, 1.0)).length() < 0.05, "{mid}");
+        let world = (app.view().unproject_at(app.canvas_cursor(), mid) - mid).length();
+        assert!(((hi.x - lo.x) * 0.5 / world - 1.0).abs() < 0.1, "{} vs {world}", (hi.x - lo.x) * 0.5);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Insert Cube"));
+        // One undo takes the cube and the mask away; redo puts both back.
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().vertex_count(), before);
+        assert!(app.doc.mesh().mask.iter().all(|&m| m == 0));
+        app.history_jump(1);
+        assert_eq!(app.doc.mesh().vertex_count(), n);
+        assert_eq!(app.doc.mesh().mask[0], 255);
+        // With subdivision levels it refuses.
+        app.history_jump(-1);
+        assert!(app.doc.divide());
+        let levels = app.doc.mesh().vertex_count();
+        press(&mut app, c + Vec2::new(60.0, 0.0));
+        assert_eq!(app.doc.mesh().vertex_count(), levels);
+    }
 
     fn worst(a: &[Vec3], b: &[Vec3]) -> f32 {
         assert_eq!(a.len(), b.len());
@@ -7190,6 +7512,34 @@ mod transpose_tests {
     }
 
     #[test]
+    fn scale_middle_circle_squashes_along_the_line() {
+        let mut app = App::new(24, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        let start = app.doc.mesh().positions.clone();
+        app.on_key(KeyCode::KeyE);
+        // A vertical line down the front of the sphere, then its middle circle dragged left.
+        let top = app.project(Vec3::new(0.0, 0.5, 0.9));
+        drag(&mut app, top, top + Vec2::new(0.0, 200.0));
+        let line = app.action_line.expect("a line");
+        // Extent along the line and across it.
+        let axis = (line.end - line.start).normalize();
+        let across = axis.cross(app.camera.forward()).normalize();
+        let extent = |app: &App, d: Vec3| {
+            let ts = app.doc.mesh().positions.iter().map(|p| p.dot(d));
+            let (lo, hi) = ts.fold((f32::MAX, f32::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+            hi - lo
+        };
+        let (along0, across0) = (extent(&app, axis), extent(&app, across));
+        let mid = app.project(line.mid());
+        drag(&mut app, mid, mid - Vec2::new(150.0, 0.0));
+        assert!((extent(&app, axis) / along0 - 0.5).abs() < 0.01, "{} vs {along0}", extent(&app, axis));
+        assert!((extent(&app, across) / across0 - 1.0).abs() < 1e-3);
+        app.history_jump(-1);
+        assert!(worst(&app.doc.mesh().positions, &start) < 1e-4);
+    }
+
+
+    #[test]
     fn transpose_moves_scales_rotates_and_undoes() {
         let mut app = App::new(24, false, usize::MAX);
         app.camera.aspect = 1.6;
@@ -7609,6 +7959,16 @@ mod pressure_tests {
         let curved = app.at_pressure(brush);
         assert!(curved.radius < linear.radius, "Soft: a half press gives less than half the size");
         assert!(curved.strength > linear.strength, "Firm: a half press gives more than half the intensity");
+        // Smooth with Tablet Pressure of its own: no size pressure, linear intensity; Draw
+        // keeps the global curves.
+        let smooth = Brush { kind: BrushKind::Smooth, ..brush };
+        app.workspace.brush_pressure.insert(
+            BrushKind::Smooth,
+            workspace::TabletPressure { size: false, intensity: true, size_curve: pressure::PressureCurve::linear(), intensity_curve: pressure::PressureCurve::linear() },
+        );
+        let own = app.at_pressure(smooth);
+        assert!(own.radius == 0.4 && (own.strength - 0.4).abs() < 1e-5, "{own:?}");
+        assert_eq!(app.at_pressure(brush).radius, curved.radius);
         app.pressure = None;
         assert_eq!(app.at_pressure(brush).radius, 0.4, "a mouse ignores the curves");
     }
@@ -8192,7 +8552,8 @@ mod stroke_modifier_tests {
         let origin = app.canvas_origin();
         let view = app.view();
         let centre = app.gizmo_centre();
-        let tip = gizmo::arrow_tip(&view, centre, 0) + origin;
+        let g = app.gizmo_place();
+        let tip = gizmo::arrow_tip(&view, &g, 0) + origin;
         let c = view.project(centre) + origin;
         // X arrow: the whole subtool moves along X, nothing else.
         drag(&mut app, c + (tip - c) * 0.8, c + (tip - c) * 1.3);
@@ -8203,8 +8564,8 @@ mod stroke_modifier_tests {
         assert!(same(&app));
         // Y ring: turns about Y through the centre.
         let view = app.view();
-        let ring = gizmo::ring(&view, centre, Some(1), gizmo::RING);
-        let at = ring.iter().copied().find(|&p| gizmo::hit(&view, centre, p) == Some(gizmo::Handle::Rotate(1))).unwrap() + origin;
+        let ring = gizmo::ring(&view, &g, Some(1), gizmo::RING);
+        let at = ring.iter().copied().find(|&p| gizmo::hit(&view, &g, p) == Some(gizmo::Handle::Rotate(1))).unwrap() + origin;
         drag(&mut app, at, at + Vec2::new(40.0, 0.0));
         let ys: Vec<f32> = app.doc.mesh().positions.iter().map(|p| p.y).collect();
         assert!(ys.iter().zip(&before).all(|(y, q)| (y - q.y).abs() < 1e-4), "Y stays");
@@ -8215,6 +8576,35 @@ mod stroke_modifier_tests {
         drag(&mut app, c + Vec2::new(400.0, 300.0), c + Vec2::new(450.0, 320.0));
         assert_eq!(app.doc.mesh().positions, undone);
         assert!(same(&app));
+        // The Y box dragged in squashes along Y only: a flattened sphere. (The press away
+        // from the handles turned the view.)
+        let view = app.view();
+        let g = app.gizmo_place();
+        let c = view.project(centre) + origin;
+        let tip = gizmo::arrow_tip(&view, &g, 0) + origin;
+        let b = gizmo::axis_box(&view, &g, 1) + origin;
+        let size0 = app.doc.bounds().max - app.doc.bounds().min;
+        drag(&mut app, b, b + (c - b).normalize() * 100.0);
+        let size1 = app.doc.bounds().max - app.doc.bounds().min;
+        assert!((size1.y / size0.y - 0.5).abs() < 0.02 && (size1.x / size0.x - 1.0).abs() < 1e-3, "{size1} vs {size0}");
+        app.history_jump(-1);
+        assert!(same(&app));
+        // Alt + drag the X arrow: the gizmo moves, the model stays.
+        app.modifiers = ModifiersState::ALT;
+        drag(&mut app, c + (tip - c) * 0.8, c + (tip - c) * 1.3);
+        assert!(same(&app));
+        assert!(app.gizmo_centre().x > centre.x + 0.05, "{:?}", app.gizmo_centre());
+        // Alt + click on the model: the gizmo goes there, its Y along the surface normal.
+        let on = app.project(Vec3::new(0.0, 0.0, 1.0)) ;
+        app.cursor_moved(on, false);
+        app.left_press(false, false);
+        app.left_release();
+        app.modifiers = ModifiersState::empty();
+        let place = app.gizmo_place();
+        assert!(place.centre.z > 0.9 && place.axis(1).z > 0.95, "{place:?}");
+        assert!(same(&app));
+        app.gizmo_pivot(false);
+        assert_eq!(app.gizmo_centre(), centre);
     }
 
     #[test]

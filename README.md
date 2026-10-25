@@ -29,6 +29,7 @@ cargo run --release -- --divide 2 --selftest-pressure                # tablet co
 cargo run --release -- --divide 2 --selftest-curve                   # Zipper along a curve vs freehand with a shaky hand, bend, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 400 --selftest-clip                # three crossing Clip Line cuts (a pie slice), checks no cut pushes an earlier one out, log, exit (--hold keeps it open, turned)
 cargo run --release -- --segments 400 --selftest-tube                # CurveTube: nine tubes, a bend, GPU readback, undo/redo, log, exit (--hold keeps the window open)
+cargo run --release -- --segments 400 --selftest-insert              # Insert Mesh: one of each shape, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
@@ -173,7 +174,7 @@ bar sliders. Long label/value rows wrap inside narrow trays.
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The 47 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
+The 48 brushes and tools, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X / Y / Z and
 radial symmetry, Auto Masking, LazyMouse and Spacing, Transpose, Curve strokes and live
@@ -208,7 +209,7 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 ### ZBrush tools added in 0.12
 
 - **Gizmo 3D** (`Y`, or Transform › Gizmo 3D): in Move / Scale / Rotate mode a manipulator at
-  the subtool's centre replaces the action line. Arrows move along X / Y / Z, rings turn
+  the subtool's centre (or where you put it, 0.15) replaces the action line. Arrows move along X / Y / Z, rings turn
   about them, the outer ring turns about the view axis, the white circle moves freely and the
   yellow square scales evenly (drag up-right to grow). Live preview, one undo step on
   release, masks respected, like Transpose.
@@ -250,6 +251,28 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 - Nine new detail alphas, painted by Klay as tileable 512 px images: **Pores, Wrinkles,
   Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers**. As alphas they fade softly at the
   stamp's edge; as textures (Texture palette) they repeat seamlessly for texture painting.
+
+### ZBrush tools added in 0.15
+
+- **Squash and stretch along one axis** (flatten a sphere): in **Scale** mode (`E`) drag the
+  action line's **middle circle** left to squash the subtool along the line, right to
+  stretch it (about the middle circle; masks hold). **Gizmo 3D** has a small box on each
+  axis that does the same along that axis (drag in to squash, out to stretch), and
+  **Deformation › Size** has ZBrush's **X Y Z** toggles: with one axis lit it flattens or
+  stretches along it, with two it scales those two.
+- **Gizmo 3D pivot**: **Alt + click** the model to put the gizmo there, its Y along the
+  surface normal; **Alt + drag** a handle moves or turns the gizmo alone; it stays on the
+  model as you move or turn it (and through undo). Transform › **Unmasked Center** puts it at
+  the centre of what is unmasked and shown, **Reset** back to the subtool's centre and world
+  axes.
+- **Tablet Pressure per brush**: Brush › Tablet pressure switches between **Global** and the
+  brush's own settings (Size and Z Intensity toggles and both curves), so Smooth can ignore
+  pressure while Clay Buildup follows a soft curve. Brushes without their own use Global.
+- **IMM Primitives** (Insert Mesh, B catalog › Insert): drag on the model to insert a
+  **Sphere, Cube, Cylinder** or **Ring** (Brush › Insert Mesh) standing on the surface; the
+  drag sets its size and it is about as dense as the model. It becomes a **new polygroup**
+  and the rest of the subtool is **masked**, ready for Transpose or the Gizmo. Symmetry
+  inserts mirror copies. One undo step; needs a subtool without subdivision levels.
 
 ### Canvas and Document
 

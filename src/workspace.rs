@@ -570,6 +570,18 @@ pub struct Actions {
     pub del_hidden: bool,
     pub close_holes: bool,
     pub mirror_weld: bool,
+    /// Gizmo 3D: to the unmasked centre, or back to the subtool centre and world axes.
+    pub gizmo_center: bool,
+    pub gizmo_reset: bool,
+}
+
+/// Brush › Tablet Pressure: what pen pressure scales and through which curves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabletPressure {
+    pub size: bool,
+    pub intensity: bool,
+    pub size_curve: crate::pressure::PressureCurve,
+    pub intensity_curve: crate::pressure::PressureCurve,
 }
 
 /// Materials: Klay's procedural clays, then the MatCaps from `matcap::FIRST` on (in
@@ -721,6 +733,11 @@ pub struct Workspace {
     pub intensity_curve: crate::pressure::PressureCurve,
     /// The curve point being dragged: (which curve, point index).
     curve_drag: Option<(bool, usize)>,
+    /// Brushes with Tablet Pressure of their own (ZBrush: per brush); the others use the
+    /// settings above.
+    pub brush_pressure: HashMap<BrushKind, TabletPressure>,
+    /// The mesh IMM Primitives inserts.
+    pub insert_shape: crate::primitive::Primitive,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -741,6 +758,8 @@ pub struct Workspace {
     pub(super) draw_settings: HashMap<BrushKind, brush_ui::DrawSettings>,
     /// Deformation slider being dragged, and its value.
     deform_drag: Option<(Deform, f32)>,
+    /// Deformation › Size's X, Y and Z toggles: the axes it scales along (ZBrush).
+    pub size_axes: [bool; 3],
     pub mode: Mode,
     /// Open hotkey popup and the logical position it was opened at.
     pub popup: Option<(QuickPopup, Pos2)>,
@@ -767,6 +786,28 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Tablet Pressure for strokes with `kind`: its own, else the global settings.
+    pub fn tablet(&self, kind: BrushKind) -> TabletPressure {
+        self.brush_pressure.get(&kind).cloned().unwrap_or_else(|| TabletPressure {
+            size: self.pressure_size,
+            intensity: self.pressure_intensity,
+            size_curve: self.size_curve.clone(),
+            intensity_curve: self.intensity_curve.clone(),
+        })
+    }
+
+    /// Store `t` where [`tablet`](Self::tablet) reads it for `kind`.
+    fn set_tablet(&mut self, kind: BrushKind, t: TabletPressure) {
+        if let Some(own) = self.brush_pressure.get_mut(&kind) {
+            *own = t;
+        } else {
+            self.pressure_size = t.size;
+            self.pressure_intensity = t.intensity;
+            self.size_curve = t.size_curve;
+            self.intensity_curve = t.intensity_curve;
+        }
+    }
+
     pub fn new() -> Self {
         let root = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -827,6 +868,8 @@ impl Workspace {
             size_curve: crate::pressure::PressureCurve::linear(),
             intensity_curve: crate::pressure::PressureCurve::linear(),
             curve_drag: None,
+            brush_pressure: HashMap::new(),
+            insert_shape: crate::primitive::Primitive::Sphere,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -836,6 +879,7 @@ impl Workspace {
             held_brush: None,
             draw_settings: HashMap::new(),
             deform_drag: None,
+            size_axes: [true; 3],
             mode: Mode::Draw,
             popup: None,
             quick_menu: None,
@@ -1334,7 +1378,7 @@ impl Workspace {
                     for (glyph, label, mode, hint) in [
                         ("sculpt", "Sculpt", Mode::Draw, "Draw · Q"),
                         ("move", "Move", Mode::Move, "Move · W · drag the model for an action line, its middle circle moves"),
-                        ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle"),
+                        ("scale", "Scale", Mode::Scale, "Scale · E · drag the action line's end circle; its middle circle squashes along the line"),
                         ("rotate", "Rotate", Mode::Rotate, "Rotate · R · drag the action line's end circle"),
                     ] {
                         if big_button(ui, glyph, label, vec2(46.0, 46.0), self.mode == mode, true)
@@ -2040,6 +2084,17 @@ impl Workspace {
                         zslider(ui,"Focal Shift",&mut m.brush.focal_shift,-100.0..=100.0,false,false,0);
                     },
                 );
+                if m.brush.kind.is_imm() {
+                    self.sec(ui, h, id, "imm", "Insert Mesh", None, true, true, &mut |ws, ui| {
+                        let shapes = crate::insert_mesh::SHAPES;
+                        let names: Vec<&str> = shapes.iter().map(|p| p.short()).collect();
+                        let at = shapes.iter().position(|p| *p == ws.insert_shape).unwrap_or(0);
+                        if let Some(i) = seg(ui, &names, at, false) {
+                            ws.insert_shape = shapes[i];
+                        }
+                        note(ui, "Drag on the model: the mesh stands on the surface, the drag sets its size · new polygroup, the rest masked · Shift smooths");
+                    });
+                }
                 self.sec(
                     ui,
                     h,
@@ -2050,11 +2105,24 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
+                        // ZBrush keeps Tablet Pressure per brush; Global is shared by every
+                        // brush without its own.
+                        let kind = ws.held_brush.unwrap_or(m.brush.kind);
+                        let own = ws.brush_pressure.contains_key(&kind);
+                        if let Some(i) = seg(ui, &["Global", kind.name()], own as usize, false) {
+                            if i == 1 && !own {
+                                let t = ws.tablet(kind);
+                                ws.brush_pressure.insert(kind, t);
+                            } else if i == 0 {
+                                ws.brush_pressure.remove(&kind);
+                            }
+                        }
+                        let mut t = ws.tablet(kind);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 16.0;
-                            ui.checkbox(&mut ws.pressure_size, "Size")
+                            ui.checkbox(&mut t.size, "Size")
                                 .on_hover_text("Pen pressure scales Draw Size");
-                            ui.checkbox(&mut ws.pressure_intensity, "Z Intensity")
+                            ui.checkbox(&mut t.intensity, "Z Intensity")
                                 .on_hover_text("Pen pressure scales Z Intensity (strength)");
                         });
                         let reading = match (m.tablet_on, m.pressure) {
@@ -2071,7 +2139,7 @@ impl Workspace {
                         for size in [true, false] {
                             ui.label(RichText::new(if size { "Size curve" } else { "Intensity curve" }).size(12.0).color(FG2));
                             let mut drag = ws.curve_drag.filter(|d| d.0 == size).map(|d| d.1);
-                            let curve = if size { &mut ws.size_curve } else { &mut ws.intensity_curve };
+                            let curve = if size { &mut t.size_curve } else { &mut t.intensity_curve };
                             pressure_curve_editor(ui, curve, &mut drag, live);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -2090,6 +2158,7 @@ impl Workspace {
                                 ws.curve_drag = None;
                             }
                         }
+                        ws.set_tablet(kind, t);
                         note(ui, "Drag a point · click to add one · double-click to remove it · Grab keeps its size");
                     },
                 );
@@ -2615,7 +2684,29 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         for kind in Deform::ALL {
-                            if let Some(v) = spring_slider(ui, kind, &mut ws.deform_drag) {
+                            let released = if kind == Deform::Size {
+                                // ZBrush's x y z toggles: Size scales along the lit axes only.
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    let w = ui.available_width() - 3.0 * 20.0;
+                                    let v = ui.allocate_ui(vec2(w, 22.0), |ui| spring_slider(ui, kind, &mut ws.deform_drag)).inner;
+                                    for (i, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                        let on = ws.size_axes[i];
+                                        if ui
+                                            .add(egui::Button::new(RichText::new(name).size(11.0)).selected(on).min_size(vec2(18.0, 22.0)))
+                                            .on_hover_text(format!("Size scales along {name}"))
+                                            .clicked()
+                                        {
+                                            ws.size_axes[i] = !on;
+                                        }
+                                    }
+                                    v
+                                })
+                                .inner
+                            } else {
+                                spring_slider(ui, kind, &mut ws.deform_drag)
+                            };
+                            if let Some(v) = released {
                                 a.deform = Some((kind, v));
                             }
                         }
@@ -2626,7 +2717,7 @@ impl Workspace {
                         {
                             a.mirror_weld = true;
                         }
-                        note(ui, "Drag and release · Offset and Size move every level; the others reshape the shown level (masks hold, one undo step) · Twist and Taper about Y");
+                        note(ui, "Drag and release · Offset and Size move every level; the others reshape the shown level (masks hold, one undo step) · Size's X Y Z pick its axes: one axis flattens or stretches · Twist and Taper about Y");
                     },
                 );
                 self.sec(
@@ -3215,7 +3306,7 @@ impl Workspace {
                             ("Q W E R", "draw / move / scale / rotate"),
                             ("Y", "Gizmo 3D / action line"),
                             ("W E R + drag model", "action line · Shift: 45°"),
-                            ("Drag circle", "middle: move · end: scale / rotate"),
+                            ("Drag circle", "middle: move, Scale squashes · end: scale / rotate"),
                             ("Drag ring / line", "move the action line"),
                             ("X", "symmetry"),
                             ("L", "LazyMouse"),
@@ -3353,8 +3444,20 @@ impl Workspace {
                         }
                         ui.checkbox(&mut ws.gizmo, "Gizmo 3D")
                             .on_hover_text("A manipulator instead of the action line in Move / Scale / Rotate · Y");
+                        if ws.gizmo {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                let w = (ui.available_width() - 3.0) / 2.0;
+                                if ui.add_sized([w, 20.0], egui::Button::new("Unmasked Center")).on_hover_text("Put the gizmo at the centre of what is unmasked and shown").clicked() {
+                                    a.gizmo_center = true;
+                                }
+                                if ui.add_sized([w, 20.0], egui::Button::new("Reset")).on_hover_text("Gizmo back to the subtool centre, turned to the world axes").clicked() {
+                                    a.gizmo_reset = true;
+                                }
+                            });
+                        }
                         note(ui, if ws.gizmo {
-                            "Arrows move along X / Y / Z, rings turn about them, the outer ring turns in the view, the circle moves freely, the square scales"
+                            "Arrows move along X / Y / Z, boxes squash or stretch along them, rings turn about them, the outer ring turns in the view, the circle moves freely, the square scales · Alt + click the model: gizmo there, on the surface · Alt + drag a handle: move or turn the gizmo alone"
                         } else {
                             "Drag on the model to draw the action line · Y for Gizmo 3D"
                         });

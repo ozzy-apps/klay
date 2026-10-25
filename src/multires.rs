@@ -2062,7 +2062,7 @@ impl Multires {
                     .par_iter_mut()
                     .for_each(|o| o.iter_mut().for_each(|d| *d = m.apply_vector(*d)));
             }
-            if m.rotation == glam::Quat::IDENTITY && m.scale > 0.0 {
+            if m.keeps_boxes() {
                 lvl.mesh.finish_monotone_edit(|p| m.apply(p));
             } else {
                 let all: Vec<u32> = (0..lvl.mesh.chunks.len() as u32).collect();
@@ -2383,7 +2383,10 @@ mod tests {
                 rotation: glam::Quat::from_axis_angle(Vec3::new(0.3, 1.0, -0.2).normalize(), 1.1),
                 scale: 0.6,
                 translate: Vec3::new(0.4, 0.0, -1.5),
+                ..Affine::IDENTITY
             },
+            Affine::stretching(Vec3::new(0.1, 0.0, 0.2), Vec3::new(1.0, 0.5, 0.2), 0.3),
+            Affine::stretching(Vec3::ZERO, Vec3::Y, 2.5),
         ];
         for m in maps {
             // Level 2 is stale (edits at levels 0 and 1 are not synced up yet): the map has

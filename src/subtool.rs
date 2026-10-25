@@ -90,8 +90,8 @@ impl Deform {
 
 /// The map for a deformation slider released at `value` (-100..100) on a subtool with
 /// these bounds. Offsets move by up to the subtool's largest extent; Size scales by
-/// 2^(value / 100) about the bounds centre.
-pub fn deform_map(kind: Deform, value: f32, bounds: Aabb) -> Affine {
+/// 2^(value / 100) about the bounds centre, along the axes `axes` picks.
+pub fn deform_map(kind: Deform, value: f32, bounds: Aabb, axes: [bool; 3]) -> Affine {
     use glam::Vec3;
     let center = (bounds.min + bounds.max) * 0.5;
     let extent = (bounds.max - bounds.min).max_element().max(1e-6);
@@ -100,7 +100,11 @@ pub fn deform_map(kind: Deform, value: f32, bounds: Aabb) -> Affine {
         Deform::OffsetX => Affine::translation(Vec3::X * step),
         Deform::OffsetY => Affine::translation(Vec3::Y * step),
         Deform::OffsetZ => Affine::translation(Vec3::Z * step),
-        Deform::Size => Affine::scaling(center, (value / 100.0).exp2()),
+        Deform::Size => {
+            let k = (value / 100.0).exp2();
+            let f = Vec3::from_array(axes.map(|on| if on { k } else { 1.0 }));
+            Affine::axis_scaling(center, f)
+        }
         _ => Affine::IDENTITY,
     }
 }
@@ -124,13 +128,18 @@ mod tests {
             min: Vec3::new(-1.0, -0.5, 0.0),
             max: Vec3::new(1.0, 0.5, 1.0),
         };
-        let m = deform_map(Deform::OffsetY, 50.0, b);
+        const ALL: [bool; 3] = [true; 3];
+        let m = deform_map(Deform::OffsetY, 50.0, b, ALL);
         assert!(m.is_translation());
         assert_eq!(m.translate, Vec3::Y * 1.0);
-        let m = deform_map(Deform::Size, -100.0, b);
+        let m = deform_map(Deform::Size, -100.0, b, ALL);
         assert_eq!(m.center, Vec3::new(0.0, 0.0, 0.5));
         assert_eq!(m.scale, 0.5);
         assert_eq!(m.translate, Vec3::ZERO);
-        assert_eq!(deform_map(Deform::Size, 100.0, b).scale, 2.0);
+        assert_eq!(deform_map(Deform::Size, 100.0, b, ALL).scale, 2.0);
+        // Y only: flattens to half height, width and depth kept.
+        let m = deform_map(Deform::Size, -100.0, b, [false, true, false]);
+        assert!((m.apply(Vec3::new(1.0, 0.5, 0.5)) - Vec3::new(1.0, 0.25, 0.5)).length() < 1e-6);
+        assert!(deform_map(Deform::Size, 60.0, b, [false; 3]).is_identity());
     }
 }

@@ -17,7 +17,7 @@ use rayon::prelude::*;
 /// the drag brushes (they pull what they picked up) nor shape tools and masks.
 /// Insert brushes (CurveTube) are left out: they always draw a curve (see [`always`]).
 pub fn capable(kind: crate::sculpt::BrushKind) -> bool {
-    !kind.is_drag() && !kind.is_shape() && !kind.is_mask() && !kind.is_insert()
+    !kind.is_drag() && !kind.is_shape() && !kind.is_mask() && !kind.is_insert() && !kind.is_imm()
 }
 
 /// Brushes that only work along a curve (ZBrush's curve insert brushes, such as CurveTube).
