@@ -25,10 +25,15 @@ pub enum Look {
     FormRead,
     Chrome,
     ToyPlastic,
+    StudioGray,
+    CavityWhite,
+    Slate,
+    RimDark,
+    Normal,
 }
 
 impl Look {
-    pub const ALL: [Look; 7] = [
+    pub const ALL: [Look; 12] = [
         Look::RedWax,
         Look::SkinShade,
         Look::GrayClay,
@@ -36,6 +41,11 @@ impl Look {
         Look::FormRead,
         Look::Chrome,
         Look::ToyPlastic,
+        Look::StudioGray,
+        Look::CavityWhite,
+        Look::Slate,
+        Look::RimDark,
+        Look::Normal,
     ];
 
     /// Its name in the Material palette (`workspace::MATERIALS`, which must match).
@@ -49,6 +59,11 @@ impl Look {
             Look::FormRead => "MatCap Form",
             Look::Chrome => "MatCap Chrome",
             Look::ToyPlastic => "MatCap Toy Plastic",
+            Look::StudioGray => "MatCap Studio Gray",
+            Look::CavityWhite => "MatCap Cavity White",
+            Look::Slate => "MatCap Slate",
+            Look::RimDark => "MatCap Rim Dark",
+            Look::Normal => "MatCap Normal",
         }
     }
 
@@ -62,6 +77,11 @@ impl Look {
             Look::FormRead => Vec3::new(0.66, 0.64, 0.62),
             Look::Chrome => Vec3::new(0.92, 0.93, 0.95),
             Look::ToyPlastic => Vec3::new(0.06, 0.24, 0.78),
+            Look::StudioGray => Vec3::new(0.56, 0.56, 0.57),
+            Look::CavityWhite => Vec3::new(0.86, 0.85, 0.83),
+            Look::Slate => Vec3::new(0.30, 0.36, 0.44),
+            Look::RimDark => Vec3::new(0.13, 0.13, 0.14),
+            Look::Normal => Vec3::ONE,
         }
     }
 
@@ -130,6 +150,34 @@ impl Look {
                 let boxes = softbox(r, Vec3::new(-0.55, 0.55, 0.63), 0.22, 0.10)
                     + softbox(r, Vec3::new(0.75, 0.20, 0.63), 0.10, 0.25) * 0.6;
                 (diffuse, Vec3::splat(boxes))
+            }
+            Look::StudioGray => {
+                // ZBrush's BasicMaterial look: warm key, cool fill, firm contrast.
+                let diffuse = Vec3::new(1.0, 0.97, 0.92) * (0.04 + 0.92 * lambert(key).powf(1.1))
+                    + Vec3::new(0.80, 0.88, 1.0) * (0.20 * lambert(fill) + 0.05 * sky);
+                (diffuse, Vec3::splat(0.12 * blinn(key, 40.0) + 0.04 * fresnel(3)))
+            }
+            Look::CavityWhite => {
+                // Darkens hard wherever the surface turns away from you: creases, pores and
+                // edges read at once.
+                let diffuse = Vec3::splat((0.32 + 0.68 * wrap(key, 0.3)) * (1.0 - 0.7 * fresnel(1).powf(1.6)));
+                (diffuse, Vec3::splat(0.05 * blinn(key, 24.0)))
+            }
+            Look::Slate => {
+                let diffuse = Vec3::splat(0.05 + 0.82 * lambert(key) + 0.12 * lambert(fill) + 0.04 * sky);
+                let spec = Vec3::splat(0.55 * blinn(key, 90.0)) + Vec3::new(0.18, 0.22, 0.28) * fresnel(4);
+                (diffuse, spec)
+            }
+            Look::RimDark => {
+                // Silhouettes: a dark body, a bright rim and a small highlight.
+                let diffuse = Vec3::splat(0.05 + 0.25 * lambert(key));
+                let spec = Vec3::new(0.80, 0.86, 0.95) * fresnel(2).powf(1.2) + Vec3::splat(0.3 * blinn(key, 60.0));
+                (diffuse, spec)
+            }
+            Look::Normal => {
+                // The normal as colour (x red, y green, z blue), to check surface flow.
+                let c = (n * 0.5 + Vec3::splat(0.5)).clamp(Vec3::ZERO, Vec3::ONE);
+                (Vec3::new(c.x.powf(2.2), c.y.powf(2.2), c.z.powf(2.2)), Vec3::ZERO)
             }
             Look::ToyPlastic => {
                 let diffuse = Vec3::splat(0.10 + 0.84 * lambert(key) + 0.16 * lambert(fill) + 0.06 * sky);
@@ -280,8 +328,11 @@ mod tests {
             assert_eq!(m.diffuse.len(), SIZE * SIZE);
             assert!(m.diffuse.iter().chain(&m.specular).all(|c| c.is_finite() && c.min_element() >= 0.0));
             let luma = |n: Vec3| shade(look, look.base(), n.normalize()).dot(Vec3::splat(1.0 / 3.0));
-            // The key light is upper left (Chrome reflects a bright sky above instead).
-            assert!(luma(Vec3::new(-0.5, 0.5, 0.7)) > luma(Vec3::new(0.5, -0.5, 0.7)), "{:?}", look);
+            // The key light is upper left (Chrome reflects a bright sky above instead); Normal
+            // shows directions, not light.
+            if look != Look::Normal {
+                assert!(luma(Vec3::new(-0.5, 0.5, 0.7)) > luma(Vec3::new(0.5, -0.5, 0.7)), "{:?}", look);
+            }
             let probe: Vec<Vec3> = [Vec3::Z, Vec3::new(0.6, 0.3, 0.74), Vec3::new(-0.2, -0.8, 0.56)]
                 .iter()
                 .map(|&n| shade(look, Vec3::ONE, n.normalize()))
@@ -335,5 +386,12 @@ mod material_table_tests {
                 assert!((c as i32 - encode(l) as i32).abs() <= 1, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn the_normal_matcap_shows_directions_as_colour() {
+        let right = shade(Look::Normal, Look::Normal.base(), Vec3::X);
+        let up = shade(Look::Normal, Look::Normal.base(), Vec3::Y);
+        assert!(right.x > 0.9 && right.y < 0.3 && up.y > 0.9 && up.x < 0.3, "{right:?} {up:?}");
     }
 }

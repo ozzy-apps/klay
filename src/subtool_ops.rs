@@ -125,6 +125,173 @@ pub fn extracted(mesh: &SculptMesh, thickness: f32) -> Option<SculptMesh> {
     Some(SculptMesh::from_raw_painted(positions, indices, groups, Vec::new()))
 }
 
+/// Geometry › Close Holes: every open border loop gets a cap, a fan of triangles around a
+/// vertex at the loop's middle, in a new polygroup of its own. `None` when there is no hole.
+pub fn holes_closed(mesh: &SculptMesh) -> Option<SculptMesh> {
+    use std::collections::HashMap;
+    let mut count: HashMap<(u32, u32), u32> = HashMap::new();
+    for t in mesh.indices.chunks(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    // Border edges in their triangle's direction: a → b.
+    let mut next: HashMap<u32, Vec<u32>> = HashMap::new();
+    for t in mesh.indices.chunks(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if count[&(a.min(b), a.max(b))] == 1 {
+                next.entry(a).or_default().push(b);
+            }
+        }
+    }
+    if next.is_empty() {
+        return None;
+    }
+    let mut positions = mesh.positions.clone();
+    let mut colors = mesh.colors.clone();
+    let mut indices = mesh.indices.clone();
+    let mut groups: Vec<u16> = (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect();
+    let mut group = groups.iter().copied().max().unwrap_or(0);
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
+    for start in starts {
+        while let Some(first) = next.get_mut(&start).and_then(|v| v.pop()) {
+            // Follow the border round to where it began.
+            let mut lp = vec![start];
+            let mut at = first;
+            while at != start {
+                lp.push(at);
+                let Some(n) = next.get_mut(&at).and_then(|v| v.pop()) else { break };
+                at = n;
+                if lp.len() > mesh.vertex_count() {
+                    break;
+                }
+            }
+            if at != start || lp.len() < 3 {
+                continue;
+            }
+            let centre = positions.len() as u32;
+            positions.push(lp.iter().map(|&v| mesh.positions[v as usize]).sum::<Vec3>() / lp.len() as f32);
+            if !colors.is_empty() {
+                let sum = lp.iter().fold([0u32; 4], |acc, &v| {
+                    let c = mesh.colors[v as usize];
+                    [acc[0] + c[0] as u32, acc[1] + c[1] as u32, acc[2] + c[2] as u32, acc[3] + c[3] as u32]
+                });
+                colors.push(sum.map(|x| (x / lp.len() as u32) as u8));
+            }
+            group = group.saturating_add(1);
+            for k in 0..lp.len() {
+                let (a, b) = (lp[k], lp[(k + 1) % lp.len()]);
+                // The border runs a → b in its triangle; the cap meets it as b → a.
+                indices.extend_from_slice(&[b, a, centre]);
+                groups.push(group);
+            }
+        }
+    }
+    (indices.len() > mesh.indices.len()).then(|| SculptMesh::from_raw_painted(positions, indices, groups, colors))
+}
+
+/// Deformation › Mirror And Weld: the +X half (cut cleanly at X = 0) mirrored onto −X and
+/// welded along the plane, so the mesh becomes exactly symmetric. `None` when nothing is on
+/// the +X side.
+pub fn mirrored_and_welded(mesh: &SculptMesh) -> Option<SculptMesh> {
+    use std::collections::HashMap;
+    let eps = 1e-6;
+    let side = |p: Vec3| p.x > eps;
+    let on = |p: Vec3| p.x.abs() <= eps;
+    let painted = !mesh.colors.is_empty();
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut colors: Vec<[u8; 4]> = Vec::new();
+    let mut kept: HashMap<u32, u32> = HashMap::new();
+    let mut cuts: HashMap<(u32, u32), u32> = HashMap::new();
+    let (mut indices, mut groups) = (Vec::new(), Vec::new());
+    let mut keep = |v: u32, positions: &mut Vec<Vec3>, colors: &mut Vec<[u8; 4]>| -> u32 {
+        *kept.entry(v).or_insert_with(|| {
+            let mut p = mesh.positions[v as usize];
+            if on(p) {
+                p.x = 0.0;
+            }
+            positions.push(p);
+            if painted {
+                colors.push(mesh.colors[v as usize]);
+            }
+            positions.len() as u32 - 1
+        })
+    };
+    for t in 0..mesh.triangle_count() as u32 {
+        let tri: Vec<u32> = mesh.indices[3 * t as usize..3 * t as usize + 3].to_vec();
+        let inside = |v: u32| side(mesh.positions[v as usize]) || on(mesh.positions[v as usize]);
+        if !tri.iter().any(|&v| side(mesh.positions[v as usize])) {
+            continue;
+        }
+        // Clip the triangle to x >= 0 (Sutherland–Hodgman), sharing cut points per edge.
+        let mut poly: Vec<u32> = Vec::with_capacity(4);
+        for k in 0..3 {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+            if inside(a) {
+                poly.push(keep(a, &mut positions, &mut colors));
+            }
+            if (pa.x > eps && pb.x < -eps) || (pa.x < -eps && pb.x > eps) {
+                let key = (a.min(b), a.max(b));
+                let cut = *cuts.entry(key).or_insert_with(|| {
+                    let (lo, hi) = (mesh.positions[key.0 as usize], mesh.positions[key.1 as usize]);
+                    let f = lo.x / (lo.x - hi.x);
+                    let mut p = lo.lerp(hi, f);
+                    p.x = 0.0;
+                    positions.push(p);
+                    if painted {
+                        let (c0, c1) = (mesh.colors[key.0 as usize], mesh.colors[key.1 as usize]);
+                        colors.push(std::array::from_fn(|i| (c0[i] as f32 + (c1[i] as f32 - c0[i] as f32) * f).round() as u8));
+                    }
+                    positions.len() as u32 - 1
+                });
+                poly.push(cut);
+            }
+        }
+        for k in 1..poly.len().saturating_sub(1) {
+            indices.extend_from_slice(&[poly[0], poly[k], poly[k + 1]]);
+            groups.push(mesh.group(t));
+        }
+    }
+    if indices.is_empty() {
+        return None;
+    }
+    // The mirror image: vertices off the plane copied to −X, triangles turned round.
+    let half = positions.len();
+    let mut mirror = vec![0u32; half];
+    for (v, slot) in mirror.iter_mut().enumerate() {
+        let p = positions[v];
+        *slot = if p.x == 0.0 {
+            v as u32
+        } else {
+            positions.push(Vec3::new(-p.x, p.y, p.z));
+            if painted {
+                colors.push(colors[v]);
+            }
+            positions.len() as u32 - 1
+        };
+    }
+    let n = indices.len();
+    for k in (0..n).step_by(3) {
+        let (a, b, c) = (indices[k], indices[k + 1], indices[k + 2]);
+        indices.extend_from_slice(&[mirror[a as usize], mirror[c as usize], mirror[b as usize]]);
+        groups.push(groups[k / 3]);
+    }
+    // Triangles lying in the plane would face both ways once mirrored: drop the degenerate.
+    let mut out_i = Vec::with_capacity(indices.len());
+    let mut out_g = Vec::with_capacity(groups.len());
+    for (k, t) in indices.chunks(3).enumerate() {
+        if t[0] != t[1] && t[1] != t[2] && t[0] != t[2] {
+            out_i.extend_from_slice(t);
+            out_g.push(groups[k]);
+        }
+    }
+    Some(SculptMesh::from_raw_painted(positions, out_i, out_g, colors))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +342,51 @@ mod tests {
         let v = volume(&shell);
         let area = 2.0 * std::f32::consts::PI * (1.0 - 0.5); // a spherical cap above z = 0.5
         assert!(v > 0.0 && (v - area * 0.05).abs() < area * 0.05 * 0.35, "{v} vs {}", area * 0.05);
+    }
+
+    fn edge_counts(m: &SculptMesh) -> std::collections::HashMap<(u32, u32), u32> {
+        let mut edges = std::collections::HashMap::new();
+        for t in m.indices.chunks(3) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *edges.entry((a.min(b), a.max(b))).or_insert(0u32) += 1;
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn close_holes_caps_every_border_loop_outward() {
+        let m = sphere();
+        assert!(holes_closed(&m).is_none(), "a sphere has no holes");
+        // Cut two caps off the sphere: two holes.
+        let open = part(&m, |t| {
+            let i = 3 * t as usize;
+            let z = m.indices[i..i + 3].iter().map(|&v| m.positions[v as usize].z).sum::<f32>() / 3.0;
+            z.abs() < 0.7
+        }).unwrap();
+        let closed = holes_closed(&open).unwrap();
+        assert!(edge_counts(&closed).values().all(|&c| c == 2), "closed");
+        assert!(volume(&closed) > 0.0);
+        assert_eq!(closed.group_count(), 3, "the band and one group per cap");
+    }
+
+    #[test]
+    fn mirror_and_weld_makes_a_closed_symmetric_mesh() {
+        // A sphere pushed out on +X only.
+        let (p, i) = crate::mesh::cube_sphere(10, 1.0);
+        let p: Vec<Vec3> = p.into_iter().map(|q| if q.x > 0.0 { q + Vec3::new(q.x * 0.4, 0.0, 0.0) } else { q }).collect();
+        let m = SculptMesh::from_raw(p, i);
+        let w = mirrored_and_welded(&m).unwrap();
+        assert!(edge_counts(&w).values().all(|&c| c == 2), "welded shut");
+        assert!(volume(&w) > 0.0);
+        // Every vertex has its mirror image.
+        for q in &w.positions {
+            let mirror = Vec3::new(-q.x, q.y, q.z);
+            assert!(w.positions.iter().any(|r| r.distance(mirror) < 1e-5), "{q:?}");
+        }
+        // The +X side kept its shape: the widest point is the pushed one.
+        let max_x = w.positions.iter().map(|q| q.x).fold(f32::MIN, f32::max);
+        assert!(max_x > 1.3);
     }
 }

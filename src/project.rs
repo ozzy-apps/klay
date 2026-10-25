@@ -9,6 +9,9 @@
 //!              · (version 2 on) the shown level's mask, inside the packed stack
 //!              · (version 3 on) polygroups and hidden triangles of every level
 //!              · (version 4 on) premultiplied vertex paint of every level
+//!              · (version 5 on) sculpt layers (count; name · intensity · visible ·
+//!                offsets of the highest level each) and the Morph Target (0, or 1 · level
+//!                · positions)
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -28,14 +31,26 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 4: vertex paint; 3: polygroups and hidden triangles; 2: mask. Versions 1–3 still open.
-pub const VERSION: u32 = 4;
+/// 5: layers and Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2:
+/// mask. Versions 1–4 still open.
+pub const VERSION: u32 = 5;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
     pub name: String,
     pub visible: bool,
     pub packed: Packed,
+    /// Its sculpt layers (not recording) and Morph Target (level, positions); empty before
+    /// version 5.
+    pub layers: crate::layers::Layers,
+    pub morph: Option<(usize, Vec<glam::Vec3>)>,
+}
+
+/// What a subtool has besides its stack (version 5): layers and a Morph Target.
+#[derive(Clone, Copy, Default)]
+pub struct Extras<'a> {
+    pub layers: Option<&'a crate::layers::Layers>,
+    pub morph: Option<(usize, &'a [glam::Vec3])>,
 }
 
 pub struct Project {
@@ -159,19 +174,30 @@ impl<R: Read> In<R> {
     }
 }
 
-/// Serialise a project into `w`.
+/// Serialise a project into `w` (no layers or Morph Targets).
+#[cfg(test)]
 pub fn write_to<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize) -> io::Result<W> {
     write_version(w, tools, active, VERSION)
 }
 
-/// Serialise in the layout of `version` (1 to 3; tests write older files with it).
+/// Serialise with each subtool's layers and Morph Target (`extras`, one per tool or none).
+pub fn write_with<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize) -> io::Result<W> {
+    write_full(w, tools, extras, active, VERSION)
+}
+
+/// Serialise in the layout of `version` (1 to 5; tests write older files with it).
+#[cfg(test)]
 pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize, version: u32) -> io::Result<W> {
+    write_full(w, tools, &[], active, version)
+}
+
+fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize, version: u32) -> io::Result<W> {
     let mut out = Out::new(w);
     out.bytes(MAGIC)?;
     out.u32(version)?;
     out.u32(tools.len() as u32)?;
     out.u32(active as u32)?;
-    for (name, visible, packed) in tools {
+    for (k, (name, visible, packed)) in tools.iter().enumerate() {
         out.slice(name.as_bytes())?;
         out.u8(*visible as u8)?;
         packed.write_to(&mut out, version)?;
@@ -179,6 +205,25 @@ pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: us
             packed.write_marks(&mut out)?;
         }
         if version >= 4 {packed.write_colors(&mut out)?;}
+        if version >= 5 {
+            let extra = extras.get(k).copied().unwrap_or_default();
+            let layers = extra.layers.map_or(&[][..], |l| &l.list[..]);
+            out.u32(layers.len() as u32)?;
+            for l in layers {
+                out.slice(l.name.as_bytes())?;
+                out.u32(l.intensity.to_bits())?;
+                out.u8(l.visible as u8)?;
+                out.slice(&l.delta)?;
+            }
+            match extra.morph {
+                Some((level, positions)) => {
+                    out.u8(1)?;
+                    out.u32(level as u32)?;
+                    out.slice(positions)?;
+                }
+                None => out.u8(0)?,
+            }
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -186,10 +231,16 @@ pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: us
 
 /// Write a project file next to `path` and move it into place, so a failed save never
 /// leaves a half-written file where the previous one was. Returns the size in bytes.
+#[cfg(test)]
 pub fn save(path: &Path, tools: &[(&str, bool, &Packed)], active: usize) -> io::Result<u64> {
+    save_with(path, tools, &[], active)
+}
+
+/// [`save`] with each subtool's layers and Morph Target.
+pub fn save_with(path: &Path, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize) -> io::Result<u64> {
     let tmp = path.with_extension("klay-saving");
     let file = std::fs::File::create(&tmp)?;
-    let w = write_to(io::BufWriter::with_capacity(8 << 20, file), tools, active)?;
+    let w = write_with(io::BufWriter::with_capacity(8 << 20, file), tools, extras, active)?;
     let file = w.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     drop(file);
@@ -221,10 +272,31 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
             packed.read_marks(&mut input)?;
         }
         if version >= 4 {packed.read_colors(&mut input)?;}
+        let (mut layers, mut morph) = (crate::layers::Layers::default(), None);
+        if version >= 5 {
+            let count = input.u32()?;
+            for _ in 0..count {
+                let name: Vec<u8> = input.vec()?;
+                let name = String::from_utf8(name).map_err(|_| "a layer name is not valid text")?;
+                let intensity = f32::from_bits(input.u32()?);
+                let visible = input.u8()? != 0;
+                let delta: Vec<glam::Vec3> = input.vec()?;
+                if !intensity.is_finite() {
+                    return Err("a layer's intensity is not a number".into());
+                }
+                layers.list.push(crate::layers::SculptLayer { name, delta, intensity, visible });
+            }
+            if input.u8()? != 0 {
+                let level = input.u32()? as usize;
+                morph = Some((level, input.vec()?));
+            }
+        }
         tools.push(SavedTool {
             name,
             visible,
             packed,
+            layers,
+            morph,
         });
     }
     input.exact(END, "end of project marker")?;

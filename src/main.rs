@@ -1,6 +1,7 @@
 mod branding;
 mod brush_asset;
 mod asset_library;
+mod alpha_library;
 mod brush_preview;
 mod paint;
 mod camera;
@@ -258,6 +259,10 @@ enum GeoOp {
     Wedge,
     DelHigher,
     DelLower,
+    /// Geometry › Del Hidden, Close Holes; Deformation › Mirror And Weld.
+    DelHidden,
+    CloseHoles,
+    MirrorWeld,
 }
 
 /// SubTool operations queued by the interface.
@@ -860,6 +865,35 @@ impl App {
         true
     }
 
+    /// A change of topology on a subtool without levels, as one undo step (the old stack is
+    /// kept packed, as for Remesh). `f` gives the new mesh, or `None` when there is nothing
+    /// to do.
+    fn topology_op(&mut self, what: &str, f: impl FnOnce(&SculptMesh) -> Option<SculptMesh>) {
+        if self.busy() || !self.without_levels(what) {
+            return;
+        }
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify(format!("{what}: bake or delete the layers first · Mesh › Layers"));
+            return;
+        }
+        let Some(mesh) = f(self.doc.mesh()) else {
+            self.workspace.notify(format!("{what}: nothing to do on this subtool"));
+            return;
+        };
+        let (before, after) = (self.doc.mesh().triangle_count(), mesh.triangle_count());
+        let budget = self.doc.budget;
+        let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
+        self.history.push(UndoStep::Replace(Box::new(old.pack())));
+        self.history.name_last(what);
+        self.morph_targets.remove(&self.subtools[self.active_tool].id);
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.workspace.notify(format!("{what}: {} → {} triangles", fmt_count(before), fmt_count(after)));
+    }
+
     /// The active subtool becomes `mesh` (a new topology: undo history and its Morph Target
     /// go).
     fn replace_active_mesh(&mut self, mesh: SculptMesh) {
@@ -1407,8 +1441,19 @@ impl App {
 
     /// Every subtool as `(name, visible, packed)` for a project file, with the active one
     /// packed as a copy so it is not disturbed.
-    fn with_project_tools<T>(&self, f: impl FnOnce(&[(&str, bool, &multires::Packed)]) -> T) -> T {
+    fn with_project_tools<T>(&self, f: impl FnOnce(&[(&str, bool, &multires::Packed)], &[project::Extras]) -> T) -> T {
         let active = self.doc.pack_copy();
+        let extras: Vec<project::Extras> = self
+            .subtools
+            .iter()
+            .map(|t| project::Extras {
+                layers: Some(match &t.parked {
+                    Some(p) => &p.layers,
+                    None => &self.doc.layers,
+                }),
+                morph: self.morph_targets.get(&t.id).map(|(level, pts)| (*level, pts.as_slice())),
+            })
+            .collect();
         let tools: Vec<(&str, bool, &multires::Packed)> = self
             .subtools
             .iter()
@@ -1421,12 +1466,25 @@ impl App {
                 (t.name.as_str(), t.visible || i == self.active_tool, packed)
             })
             .collect();
-        f(&tools)
+        f(&tools, &extras)
+    }
+
+    /// Put a loaded subtool's layers and Morph Target on `doc` when they fit its levels
+    /// (layers: the highest level's vertex count; target: its level's). Returns the target.
+    fn attach_saved(doc: &mut Multires, layers: layers::Layers, morph: Option<(usize, Vec<Vec3>)>) -> Option<(usize, std::sync::Arc<Vec<Vec3>>)> {
+        let counts = doc.vertex_counts();
+        let top = counts.last().copied().unwrap_or(0);
+        if layers.list.iter().all(|l| l.delta.len() == top) {
+            doc.layers = layers;
+        } else {
+            log::warn!("layers left out: they do not fit the highest level");
+        }
+        morph.filter(|(level, pts)| counts.get(*level) == Some(&pts.len())).map(|(l, p)| (l, std::sync::Arc::new(p)))
     }
 
     /// The whole model as project bytes, in memory (tests and the self-test).
     fn project_bytes(&self) -> Vec<u8> {
-        self.with_project_tools(|tools| project::write_to(Vec::new(), tools, self.active_tool))
+        self.with_project_tools(|tools, extras| project::write_with(Vec::new(), tools, extras, self.active_tool))
             .expect("writing to memory")
     }
 
@@ -1437,7 +1495,8 @@ impl App {
         }
         let t = Instant::now();
         let path = self.project_path.clone();
-        let result = self.with_project_tools(|tools| project::save(Path::new(&path), tools, self.active_tool));
+        self.doc.freeze_layers();
+        let result = self.with_project_tools(|tools, extras| project::save_with(Path::new(&path), tools, extras, self.active_tool));
         self.status = match result {
             Ok(bytes) => format!(
                 "Saved {path}: {} subtools, {:.1} MB in {:.2} s",
@@ -1517,12 +1576,13 @@ impl App {
             return;
         }
         let t = Instant::now();
+        self.doc.freeze_layers();
         let result = std::fs::create_dir_all(dir).and_then(|()| {
             let path = (1..=5)
                 .map(|n| dir.join(format!("QuickSave_{n}.klay")))
                 .min_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
                 .unwrap();
-            self.with_project_tools(|tools| project::save(&path, tools, self.active_tool)).map(|_| path)
+            self.with_project_tools(|tools, extras| project::save_with(&path, tools, extras, self.active_tool)).map(|_| path)
         });
         self.last_quicksave = Instant::now();
         self.quicksaved_at = (self.subtools[self.active_tool].id, self.history.edits());
@@ -1555,7 +1615,12 @@ impl App {
         let path = self.subtool_path.clone();
         let name = self.subtools[self.active_tool].name.clone();
         let packed = self.doc.pack_copy();
-        self.status = match project::save(Path::new(&path), &[(name.as_str(), true, &packed)], 0) {
+        self.doc.freeze_layers();
+        let extras = [project::Extras {
+            layers: Some(&self.doc.layers),
+            morph: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, p)| (*l, p.as_slice())),
+        }];
+        self.status = match project::save_with(Path::new(&path), &[(name.as_str(), true, &packed)], &extras, 0) {
             Ok(bytes) => format!(
                 "Saved subtool {name} to {path}: {} levels, {:.1} MB in {:.2} s",
                 self.doc.count(),
@@ -1578,22 +1643,27 @@ impl App {
         }
         let t = Instant::now();
         let path = self.subtool_path.clone();
-        let result = (|| -> Result<Vec<(String, bool, Multires)>, String> {
+        #[allow(clippy::type_complexity)]
+        let result = (|| -> Result<Vec<(String, bool, Multires, Option<(usize, std::sync::Arc<Vec<Vec3>>)>)>, String> {
             let project = project::open(Path::new(&path))?;
             project
                 .tools
                 .into_iter()
                 .map(|saved| {
-                    let doc = saved.packed.try_unpack().map_err(|e| format!("subtool {:?}: {e}", saved.name))?;
-                    Ok((saved.name, saved.visible, doc))
+                    let mut doc = saved.packed.try_unpack().map_err(|e| format!("subtool {:?}: {e}", saved.name))?;
+                    let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
+                    Ok((saved.name, saved.visible, doc, morph))
                 })
                 .collect()
         })();
         self.status = match result {
             Ok(docs) => {
                 let count = docs.len();
-                for (name, visible, doc) in docs {
+                for (name, visible, doc, morph) in docs {
                     let tool = self.parked_subtool(name, visible, doc);
+                    if let Some(m) = morph {
+                        self.morph_targets.insert(tool.id, m);
+                    }
                     self.subtools.push(tool);
                 }
                 format!("Loaded {count} subtool{} from {path} in {:.2} s", if count == 1 { "" } else { "s" }, t.elapsed().as_secs_f32())
@@ -1621,10 +1691,10 @@ impl App {
             bounds: stand_in.bounds,
             wedge: false,
             parked: Some(Box::new(Parked {
+                layers: std::mem::take(&mut doc.layers),
                 packed: doc.pack(),
                 history: History::new(32),
                 stand_in_vertices,
-                layers: Default::default(),
             })),
         }
     }
@@ -1848,14 +1918,16 @@ impl App {
         let mut staged: Vec<SubTool> = Vec::with_capacity(project.tools.len());
         let mut active_doc = None;
         let mut failure = None;
+        let mut morphs = Vec::new();
         for (i, saved) in project.tools.into_iter().enumerate() {
-            let doc = match saved.packed.try_unpack() {
+            let mut doc = match saved.packed.try_unpack() {
                 Ok(doc) => doc,
                 Err(e) => {
                     failure = Some(format!("subtool {:?}: {e}", saved.name));
                     break;
                 }
             };
+            let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
             if i == active {
                 let id = self.new_tool_id();
                 staged.push(SubTool {
@@ -1870,6 +1942,9 @@ impl App {
             } else {
                 let tool = self.parked_subtool(saved.name, saved.visible, doc);
                 staged.push(tool);
+            }
+            if let Some(m) = morph {
+                morphs.push((staged.last().unwrap().id, m));
             }
         }
         let (Some(doc), None) = (active_doc, &failure) else {
@@ -1887,6 +1962,7 @@ impl App {
             gfx.clear_levels();
         }
         self.subtools = staged;
+        self.morph_targets = morphs.into_iter().collect();
         self.active_tool = active;
         self.doc = doc;
         self.history = History::new(32);
@@ -2217,6 +2293,11 @@ impl App {
             Some(GeoOp::Wedge) => {
                 self.wedge_now();
             }
+            Some(GeoOp::DelHidden) => self.topology_op("Del Hidden", |m| {
+                if m.hidden.is_empty() { None } else { subtool_ops::part(m, |t| m.visible(t)) }
+            }),
+            Some(GeoOp::CloseHoles) => self.topology_op("Close Holes", subtool_ops::holes_closed),
+            Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
             Some(GeoOp::DelHigher) => self.delete_levels(true),
             Some(GeoOp::DelLower) => self.delete_levels(false),
             None => {}
@@ -5256,6 +5337,11 @@ impl App {
         if actions.group_visible {
             self.pending_vis = Some(VisOp::GroupVisible);
         }
+        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld)] {
+            if on {
+                self.pending_geo = Some(op);
+            }
+        }
         if actions.wedge_toggle {
             self.pending_geo = Some(GeoOp::WedgeToggle);
         }
@@ -5607,16 +5693,17 @@ impl App {
         };
         let px = self.camera.pixel_size_at(brush_pos, vp.y);
         let eye = self.camera.eye();
-        let light = (self.camera.right() * 0.6 + self.camera.up() * 0.8
-            - self.camera.forward() * 0.9)
-            .normalize();
+        // Light palette: placed on the front of a sphere facing the camera.
+        let place = self.workspace.light;
+        let toward = (1.0 - place.length_squared()).max(0.0).sqrt();
+        let light = (self.camera.right() * place.x + self.camera.up() * place.y - self.camera.forward() * toward).normalize_or(-self.camera.forward());
         let preview = self.preview_map();
         let (preview_axis, preview_angle) = preview.rotation.to_axis_angle();
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
             inv_view_proj: self.camera.view_proj().inverse().to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
-            light_dir: [light.x, light.y, light.z, 0.0],
+            light_dir: [light.x, light.y, light.z, self.workspace.light_intensity],
             brush: [brush_pos.x, brush_pos.y, brush_pos.z, radius],
             params: [
                 if show_brush { 1.0 } else { 0.0 },
@@ -5640,7 +5727,7 @@ impl App {
             xf_rotation: preview_axis.extend(preview_angle).to_array(),
             xf_move: preview.translate.extend(preview.scale).to_array(),
             material: self.material_uniform(),
-            cam_up: self.camera.up().extend(0.0).to_array(),
+            cam_up: self.camera.up().extend(self.workspace.ambient).to_array(),
             back: {
                 let d = &self.workspace.layout.document;
                 let c = d.back.map(|c| c as f32 / 255.0);
@@ -6653,6 +6740,35 @@ mod subtool_tests {
         assert!(app.doc.divide());
         app.groups_split();
         assert_eq!(app.subtools.len(), 9);
+    }
+
+    #[test]
+    fn del_hidden_close_holes_and_mirror_weld_are_one_undo_step_each() {
+        let mut app = App::new(12, false, usize::MAX);
+        let tris = app.doc.mesh().triangle_count();
+        // Del Hidden: hide the top half, delete it, undo.
+        let mesh = app.doc.mesh();
+        let hidden: Vec<u8> = (0..mesh.triangle_count()).map(|t| {
+            let i = 3 * t;
+            (mesh.indices[i..i + 3].iter().map(|&v| mesh.positions[v as usize].y).sum::<f32>() > 0.0) as u8
+        }).collect();
+        app.doc.set_hidden(0, hidden);
+        app.topology_op("Del Hidden", |m| subtool_ops::part(m, |t| m.visible(t)));
+        let open = app.doc.mesh().triangle_count();
+        assert!(open < tris && app.doc.mesh().hidden.is_empty());
+        // Close Holes caps the cut; the history has both steps.
+        app.topology_op("Close Holes", subtool_ops::holes_closed);
+        assert!(app.doc.mesh().triangle_count() > open);
+        assert_eq!(app.history.names().0, ["Del Hidden", "Close Holes"]);
+        app.history_jump(-2);
+        assert_eq!(app.doc.mesh().triangle_count(), tris);
+        // Mirror And Weld keeps a closed sphere closed; refused with subdivision levels.
+        app.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded);
+        assert!(app.doc.mesh().triangle_count() >= tris);
+        assert!(app.doc.divide());
+        let n = app.history.names().0.len();
+        app.topology_op("Close Holes", subtool_ops::holes_closed);
+        assert_eq!(app.history.names().0.len(), n);
     }
 
     #[test]
@@ -8162,6 +8278,37 @@ mod stroke_modifier_tests {
         assert!(near(&app.doc.mesh().positions, &both));
         // Edit › History names the steps.
         assert!(app.history.names().0.iter().any(|n| n == "New layer"));
+    }
+
+    #[test]
+    fn projects_keep_layers_and_morph_targets() {
+        let mut app = app();
+        let c = app.project(Vec3::ZERO);
+        app.store_morph_target();
+        app.layer_op(LayerOp::New);
+        app.workspace.select_brush(&mut app.brush, BrushKind::Inflate);
+        app.brush.radius = 0.3;
+        app.brush.strength = 1.0;
+        stroke(&mut app, c, &[c + Vec2::new(40.0, 0.0)]);
+        app.layer_op(LayerOp::Intensity(0, 0.7));
+        let shaped = app.doc.mesh().positions.clone();
+        // Save while still recording: what was sculpted is folded in first.
+        let bytes = { app.doc.freeze_layers(); app.project_bytes() };
+        let dir = std::env::temp_dir().join(format!("klay-v5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v5.klay");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut other = App::new(10, false, usize::MAX);
+        other.open_project(path.to_str().unwrap());
+        assert_eq!(other.doc.mesh().positions, shaped);
+        assert_eq!(other.doc.layers.list.len(), 1);
+        assert!(other.doc.layers.rec.is_none(), "recording is not saved");
+        assert!((other.doc.layers.list[0].intensity - 0.7).abs() < 1e-6);
+        assert!(other.morph_target().is_some());
+        // The loaded layer still works: hiding it takes its part out.
+        other.layer_op(LayerOp::Eye(0));
+        assert_ne!(other.doc.mesh().positions, shaped);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

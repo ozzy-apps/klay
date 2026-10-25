@@ -91,6 +91,8 @@ pub enum Pattern {
     Grain,
     Cracks,
     Marble,
+    /// One of Klay's painted detail images (`alpha_library`).
+    Library(crate::alpha_library::Baked),
     Image(Arc<BrushImage>),
 }
 
@@ -112,6 +114,9 @@ impl Pattern {
             Self::Grain,
             Self::Cracks,
         ]
+        .into_iter()
+        .chain(crate::alpha_library::Baked::ALL.map(Self::Library))
+        .collect()
     }
     pub fn textures() -> Vec<Self> {
         vec![
@@ -122,6 +127,9 @@ impl Pattern {
             Self::Stripes,
             Self::Dots,
         ]
+        .into_iter()
+        .chain(crate::alpha_library::Baked::ALL.map(Self::Library))
+        .collect()
     }
     pub fn name(&self) -> &str {
         match self {
@@ -134,6 +142,7 @@ impl Pattern {
             Self::Grain => "Grain",
             Self::Cracks => "Cracks",
             Self::Marble => "Marble",
+            Self::Library(b) => b.name(),
             Self::Image(i) => &i.name,
         }
     }
@@ -149,6 +158,7 @@ impl Pattern {
             Self::Grain => 6,
             Self::Cracks => 7,
             Self::Marble => 8,
+            Self::Library(b) => 20 + b.index() as u64,
         }
     }
     /// UV in [0,1] for alpha stamps; textures repeat using their tiling setting.
@@ -159,6 +169,15 @@ impl Pattern {
         }
         if let Self::Image(i) = self {
             return i.sample(uv);
+        }
+        if let Self::Library(b) = self {
+            // As an alpha it fades out toward the stamp's edge; as a texture it repeats.
+            let fade = if repeat { 1.0 } else {
+                let r = (uv * 2.0 - Vec2::ONE).length();
+                let t = ((1.0 - r) / 0.3).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+            return Vec3::splat(crate::alpha_library::sample(*b, uv) * fade).extend(1.0);
         }
         let p = uv * 2.0 - Vec2::ONE;
         let r = p.length();
@@ -193,7 +212,7 @@ impl Pattern {
                 ((n - 0.55).abs() * 9.0).clamp(0.0, 1.0)
             }
             Self::Marble => 0.5 + 0.5 * ((uv.x + uv.y) * 18.0 + noise(uv * 5.0) * 9.0).sin(),
-            Self::Image(_) => unreachable!(),
+            Self::Library(_) | Self::Image(_) => unreachable!(),
         };
         let color = if matches!(self, Self::Marble) {
             Vec3::new(0.25, 0.30, 0.34).lerp(Vec3::new(0.92, 0.88, 0.80), h)

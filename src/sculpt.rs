@@ -594,6 +594,8 @@ pub struct Stroke {
     /// DragRect: the direction the stamp's alpha is turned to (its "up" in the surface),
     /// in the brush's own frame; `None` for the surface's own frame.
     stamp_axis: Option<Vec3>,
+    /// The current dab's alpha turn (Stroke › Alpha rotation), radians.
+    dab_angle: f32,
 }
 
 /// Default Stroke › Spacing: a dab every 0.15 radius.
@@ -607,10 +609,55 @@ pub struct StampSettings {
     pub texture_scale: f32,
     /// Brush › Auto Masking.
     pub auto: AutoMask,
+    /// Stroke › Alpha rotation and its angle (degrees).
+    pub turn: AlphaTurn,
+    pub angle: f32,
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,auto:AutoMask::default()}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0}}
+}
+
+/// How the alpha (and texture) of each dab is turned (ZBrush: Stroke › Roll for Follow,
+/// spray-style strokes for Random).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaTurn {
+    /// At the set angle.
+    #[default]
+    Fixed,
+    /// Along the stroke, plus the angle.
+    Follow,
+    /// A new random turn every dab.
+    Random,
+}
+
+impl AlphaTurn {
+    pub const ALL: [Self; 3] = [Self::Fixed, Self::Follow, Self::Random];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fixed => "Fixed",
+            Self::Follow => "Follow",
+            Self::Random => "Random",
+        }
+    }
+}
+
+/// A random-looking angle (radians) for dab `n` at `p`, the same each time for the same dab.
+pub fn dab_turn(n: u32, p: Vec3) -> f32 {
+    let mut h = n.wrapping_mul(0x9e37_79b9) ^ p.x.to_bits().wrapping_mul(0x85eb_ca6b) ^ p.y.to_bits().rotate_left(13) ^ p.z.to_bits().rotate_left(7);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    (h as f32 / u32::MAX as f32) * std::f32::consts::TAU
+}
+
+/// `frame` (across, along) turned by `angle` radians about `normal`.
+pub fn turned((u, v): (Vec3, Vec3), angle: f32) -> (Vec3, Vec3) {
+    if angle == 0.0 {
+        return (u, v);
+    }
+    let (s, c) = angle.sin_cos();
+    (u * c + v * s, v * c - u * s)
 }
 
 /// Brush › Auto Masking (ZBrush): surface the stroke leaves alone without a mask.
@@ -677,11 +724,17 @@ impl Stroke {
             spacing: SPACING,
             morph: None,
             stamp_axis: None,
+            dab_angle: 0.0,
         }
     }
 
-    /// The stamp frame (across, along) at `normal`: turned to `stamp_axis` when set.
+    /// The stamp frame (across, along) at `normal`: turned to `stamp_axis` when set, then
+    /// by the dab's alpha turn.
     fn frame(&self, normal: Vec3) -> (Vec3, Vec3) {
+        turned(self.base_frame(normal), self.dab_angle)
+    }
+
+    fn base_frame(&self, normal: Vec3) -> (Vec3, Vec3) {
         match self.stamp_axis {
             Some(a) => {
                 let n = normal.normalize_or(Vec3::Z);
@@ -885,6 +938,17 @@ impl Stroke {
         let moved = previous_hit.map_or(Vec3::ZERO, |p| hit - p);
         let along = (moved - hit_normal * moved.dot(hit_normal)).normalize_or(fallback - hit_normal * fallback.dot(hit_normal)).normalize_or(tangent(hit_normal).0);
         self.direction = Some(along);
+        // Stroke › Alpha rotation for this dab.
+        let fixed = self.assets.angle.to_radians();
+        self.dab_angle = match self.assets.turn {
+            AlphaTurn::Fixed => fixed,
+            AlphaTurn::Follow => {
+                // The stroke's direction measured in the stamp's own frame.
+                let (u, v) = self.base_frame(hit_normal);
+                fixed + along.dot(u).atan2(along.dot(v))
+            }
+            AlphaTurn::Random => fixed + dab_turn(self.dabs, hit),
+        };
         // With symmetry every copy of the brush makes a whole dab of its own, one after
         // another, as in ZBrush: where copies overlap (a big brush, a stroke on a symmetry
         // plane) both apply, and the surface stays whole.
@@ -2323,6 +2387,65 @@ mod symmetry_group_tests {
         s.dab(&mut m, &b, hit);
         for q in sym.images().of(hit) {
             assert!(m.mask[nearest(&m, q)] > 200, "masked at {q:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod alpha_turn_tests {
+    use super::*;
+    use crate::primitive::Primitive;
+
+    fn plane() -> SculptMesh {
+        let (p, i) = Primitive::Plane.build(120, 1.0);
+        SculptMesh::from_raw(p, i)
+    }
+
+    /// Positions after one stroke of `n` dabs along `dir` with the Stripes alpha.
+    fn stamped(turn: AlphaTurn, angle: f32, dir: Vec3, n: usize) -> Vec<Vec3> {
+        let mut m = plane();
+        let assets = StampSettings { alpha: Pattern::Stripes, turn, angle, ..StampSettings::default() };
+        let b = Brush { kind: BrushKind::Draw, radius: 0.3, strength: 1.0, ..Brush::default() };
+        let mut s = Stroke::begin(false, false, false).with_assets(assets);
+        for k in 0..n {
+            let hit = dir * (0.12 * k as f32);
+            s.dab(&mut m, &b, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z * 4.0, -Vec3::Z));
+        }
+        m.positions
+    }
+
+    #[test]
+    fn frames_turn_and_angles_change_the_stamp() {
+        let (u, v) = turned((Vec3::X, Vec3::Y), std::f32::consts::FRAC_PI_2);
+        assert!(u.distance(Vec3::Y) < 1e-6 && v.distance(-Vec3::X) < 1e-6);
+        assert_ne!(stamped(AlphaTurn::Fixed, 0.0, Vec3::X, 1), stamped(AlphaTurn::Fixed, 90.0, Vec3::X, 1));
+        // Random: a different turn every dab, the same for the same dab.
+        let turns: Vec<f32> = (0..8).map(|n| dab_turn(n, Vec3::new(0.1, 0.2, 0.0))).collect();
+        assert!(turns.windows(2).all(|w| (w[0] - w[1]).abs() > 1e-3));
+        assert_eq!(dab_turn(3, Vec3::X), dab_turn(3, Vec3::X));
+        assert_ne!(stamped(AlphaTurn::Random, 0.0, Vec3::X, 3), stamped(AlphaTurn::Fixed, 0.0, Vec3::X, 3));
+    }
+
+    #[test]
+    fn follow_turns_the_alpha_with_the_stroke() {
+        // Along Y with Follow, the stamp is the X stroke's stamp turned a quarter: compare one
+        // dab's footprint height at mirrored places.
+        // Only the second dab's change: the first has no direction yet.
+        let second = |dir: Vec3| -> Vec<Vec3> {
+            let (one, two) = (stamped(AlphaTurn::Follow, 0.0, dir, 1), stamped(AlphaTurn::Follow, 0.0, dir, 2));
+            two.iter().zip(&one).map(|(a, b)| Vec3::new(0.0, 0.0, a.z - b.z)).collect()
+        };
+        let (x, y) = (second(Vec3::X), second(Vec3::Y));
+        let fixed_y = stamped(AlphaTurn::Fixed, 0.0, Vec3::Y, 2);
+        assert_ne!(y, fixed_y, "Follow turns the alpha");
+        let m = plane();
+        let height = |pos: &[Vec3], at: Vec3| pos[(0..m.vertex_count()).min_by(|&a, &b| m.positions[a].distance(at).total_cmp(&m.positions[b].distance(at))).unwrap()].z;
+        // The second dab (at 0.12 along the stroke): its stripes run the same way relative to
+        // the stroke whichever way the stroke goes.
+        for k in [-0.1f32, -0.05, 0.03, 0.08] {
+            let a = height(&x, Vec3::new(0.12, k, 0.0));
+            let b = height(&y, Vec3::new(-k, 0.12, 0.0));
+            assert!((a - b).abs() < 2e-3, "{k}: {a} vs {b}");
         }
     }
 }

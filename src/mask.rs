@@ -259,6 +259,8 @@ pub struct MaskStroke {
     snapshots: MaskChunks,
     snapshotted: HashSet<u32>,
     last_dab: Option<Vec3>,
+    /// Direction from the dab before to this one (Alpha rotation: Follow).
+    heading: Option<Vec3>,
     pub dabs: u32,
     kind: BrushKind,
     assets: StampSettings,
@@ -272,6 +274,7 @@ impl MaskStroke {
             snapshots: Vec::new(),
             snapshotted: HashSet::new(),
             last_dab: None,
+            heading: None,
             dabs: 0,
             kind: BrushKind::MaskPen,
             assets: StampSettings::default(),
@@ -295,6 +298,7 @@ impl MaskStroke {
                 return;
             }
         }
+        self.heading = self.last_dab.map(|last| (hit - last).normalize_or_zero()).filter(|d| *d != Vec3::ZERO).or(self.heading);
         self.last_dab = Some(hit);
         // Every symmetry copy masks a whole dab of its own, in turn (as in ZBrush), so
         // overlapping copies both apply.
@@ -326,7 +330,15 @@ impl MaskStroke {
         let step = brush.strength * 255.0 * if self.erase { -1.0 } else { 1.0 }
             * if self.kind==BrushKind::MaskSoft {0.4}else{1.0};
         let r = brush.radius;
-        let (u,tangent_v)=tangent(normal);
+        // Stroke › Alpha rotation (Follow uses the last dab's direction).
+        let base = tangent(normal);
+        let fixed = self.assets.angle.to_radians();
+        let angle = match self.assets.turn {
+            crate::sculpt::AlphaTurn::Fixed => fixed,
+            crate::sculpt::AlphaTurn::Follow => self.heading.map_or(fixed, |d| fixed + d.dot(base.0).atan2(d.dot(base.1))),
+            crate::sculpt::AlphaTurn::Random => fixed + crate::sculpt::dab_turn(self.dabs, hit),
+        };
+        let (u,tangent_v)=crate::sculpt::turned(base, angle);
         let values = sel.par_map(|i, v| {
             // The alpha is placed in the brush's own frame, so every copy shows it alike.
             let p=self.images.unmap(k,mesh.positions[v as usize]);

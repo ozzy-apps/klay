@@ -114,6 +114,7 @@ pub enum PaletteId {
     Brush,
     Document,
     Edit,
+    Light,
     Masking,
     Material,
     Mesh,
@@ -129,11 +130,12 @@ pub enum PaletteId {
 
 impl PaletteId {
     /// Alphabetical, which is also the menu bar order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Alpha,
         Self::Brush,
         Self::Document,
         Self::Edit,
+        Self::Light,
         Self::Masking,
         Self::Material,
         Self::Mesh,
@@ -152,6 +154,7 @@ impl PaletteId {
             Self::Brush => "Brush",
             Self::Document => "Document",
             Self::Edit => "Edit",
+            Self::Light => "Light",
             Self::Masking => "Masking",
             Self::Material => "Material",
             Self::Mesh => "Mesh",
@@ -563,11 +566,15 @@ pub struct Actions {
     /// Geometry: Del Higher / Del Lower.
     pub del_higher: bool,
     pub del_lower: bool,
+    /// Geometry › Del Hidden, Close Holes; Deformation › Mirror And Weld.
+    pub del_hidden: bool,
+    pub close_holes: bool,
+    pub mirror_weld: bool,
 }
 
 /// Materials: Klay's procedural clays, then the MatCaps from `matcap::FIRST` on (in
 /// `matcap::Look::ALL` order; the colour is each one's unpainted colour, sRGB).
-pub const MATERIALS: [(Color32, &str); 11] = [
+pub const MATERIALS: [(Color32, &str); 16] = [
     (Color32::from_rgb(199, 158, 128), "Warm clay"),
     (Color32::from_rgb(156, 163, 171), "Cool clay"),
     (Color32::from_rgb(182, 112, 90), "Terracotta"),
@@ -579,6 +586,11 @@ pub const MATERIALS: [(Color32, &str); 11] = [
     (Color32::from_rgb(211, 208, 205), "MatCap Form"),
     (Color32::from_rgb(246, 247, 249), "MatCap Chrome"),
     (Color32::from_rgb(71, 133, 228), "MatCap Toy Plastic"),
+    (Color32::from_rgb(196, 196, 198), "MatCap Studio Gray"),
+    (Color32::from_rgb(238, 237, 234), "MatCap Cavity White"),
+    (Color32::from_rgb(148, 160, 176), "MatCap Slate"),
+    (Color32::from_rgb(101, 101, 104), "MatCap Rim Dark"),
+    (Color32::from_rgb(255, 255, 255), "MatCap Normal"),
 ];
 
 /// Top-shelf edit mode (ZBrush: Q / W / E / R). Draw sculpts; Move, Scale and Rotate drive the
@@ -674,6 +686,11 @@ pub struct Workspace {
     pub extract_thick: f32,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
+    /// Light palette: where the key light is, as a point on the front of a sphere seen from
+    /// the camera (x right, y up), its intensity and the ambient light.
+    pub light: glam::Vec2,
+    pub light_intensity: f32,
+    pub ambient: f32,
     /// Mesh › Layers: the selected layer, and the Intensity slider's value while dragged
     /// with the value it started from.
     pub layer_selected: usize,
@@ -791,6 +808,9 @@ impl Workspace {
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
+            light: LIGHT_DEFAULT,
+            light_intensity: 1.0,
+            ambient: 1.0,
             layer_selected: 0,
             layer_drag: None,
             cavity_sensitivity: 50.0,
@@ -2319,6 +2339,29 @@ impl Workspace {
                     },
                 );
             }
+            PaletteId::Light => {
+                self.sec(
+                    ui,
+                    h,
+                    id,
+                    "light",
+                    "Light",
+                    None,
+                    true,
+                    true,
+                    &mut |ws, ui| {
+                        light_placer(ui, &mut ws.light);
+                        zslider(ui, "Intensity", &mut ws.light_intensity, 0.0..=2.0, false, false, 2);
+                        zslider(ui, "Ambient", &mut ws.ambient, 0.0..=2.0, false, false, 2);
+                        if ui.add_sized([ui.available_width(), 20.0], egui::Button::new("Reset")).clicked() {
+                            ws.light = LIGHT_DEFAULT;
+                            ws.light_intensity = 1.0;
+                            ws.ambient = 1.0;
+                        }
+                        note(ui, "Drag on the sphere to place the light; it turns with the view · lights the clays, MatCaps carry their own light");
+                    },
+                );
+            }
             PaletteId::Masking => {
                 self.sec(
                     ui,
@@ -2576,6 +2619,13 @@ impl Workspace {
                                 a.deform = Some((kind, v));
                             }
                         }
+                        if ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Mirror And Weld"))
+                            .on_hover_text("Make the subtool symmetric: the +X half mirrored onto −X and welded (no subdivision levels)")
+                            .clicked()
+                        {
+                            a.mirror_weld = true;
+                        }
                         note(ui, "Drag and release · Offset and Size move every level; the others reshape the shown level (masks hold, one undo step) · Twist and Taper about Y");
                     },
                 );
@@ -2767,6 +2817,28 @@ impl Workspace {
                             });
                         });
                         note(ui, "D / Shift + D: higher / lower level");
+                        // ZBrush: Geometry › Modify Topology.
+                        ui.add_enabled_ui(top == 0, |ui| {
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 4.0) * 0.5;
+                                if ui
+                                    .add_enabled(m.hidden > 0, egui::Button::new("Del Hidden").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Delete the hidden polygons")
+                                    .clicked()
+                                {
+                                    a.del_hidden = true;
+                                }
+                                if ui
+                                    .add(egui::Button::new("Close Holes").min_size(vec2(w, 20.0)))
+                                    .on_hover_text("Cap every open border, each cap a new polygroup")
+                                    .clicked()
+                                {
+                                    a.close_holes = true;
+                                }
+                            });
+                        })
+                        .response
+                        .on_disabled_hover_text("Needs a subtool without subdivision levels");
                     },
                 );
                 self.sec(
@@ -3208,6 +3280,15 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         zslider(ui, "Spacing", &mut ws.spacing, 0.03..=1.0, false, false, 2);
+                        // How each dab's alpha and texture are turned (ZBrush: Roll, spray strokes).
+                        ui.label(RichText::new("Alpha rotation").size(12.0).color(FG2));
+                        let turns = crate::sculpt::AlphaTurn::ALL;
+                        let names: Vec<&str> = turns.iter().map(|t| t.name()).collect();
+                        let at = turns.iter().position(|t| *t == ws.assets.turn).unwrap_or(0);
+                        if let Some(i) = seg(ui, &names, at, false) {
+                            ws.assets.turn = turns[i];
+                        }
+                        zslider(ui, "Angle", &mut ws.assets.angle, -180.0..=180.0, false, false, 0);
                         ui.checkbox(&mut ws.lazy_mouse, "LazyMouse")
                             .on_hover_text("The brush trails the cursor on a string, for steady lines · L");
                         ui.add_enabled_ui(ws.lazy_mouse, |ui| {
@@ -3821,6 +3902,41 @@ pub fn sphere_image(kind: Option<BrushKind>, material: usize, sub: bool) -> Colo
 }
 
 // ---------------------------------------------------------------- widgets
+/// Where the key light starts (Light › Reset): upper left, in front.
+pub const LIGHT_DEFAULT: glam::Vec2 = glam::Vec2::new(0.44, 0.59);
+
+/// Light placement (ZBrush: the Light palette's sphere): a lit sphere; drag on it to put the
+/// light there.
+fn light_placer(ui: &mut Ui, light: &mut glam::Vec2) {
+    let size = 96.0;
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), size + 6.0), Sense::click_and_drag());
+    let c = r.center();
+    let radius = size * 0.5;
+    if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+        let mut v = glam::Vec2::new((p.x - c.x) / radius, (c.y - p.y) / radius);
+        if v.length() > 0.98 {
+            v = v.normalize() * 0.98;
+        }
+        *light = v;
+    }
+    let p = ui.painter();
+    // A few rings shaded by how much each faces the light.
+    let l = glam::Vec3::new(light.x, light.y, (1.0 - light.length_squared()).max(0.0).sqrt());
+    for k in (1..=24).rev() {
+        let f = k as f32 / 24.0;
+        let rr = radius * f;
+        // Shade the disc toward the light: an offset gradient approximates a lit sphere.
+        let centre = c + vec2(light.x, -light.y) * radius * (1.0 - f) * 0.55;
+        let lit = (0.25 + 0.75 * (1.0 - f).powf(0.7) * l.z.max(0.2)).clamp(0.0, 1.0);
+        let g = (40.0 + lit * 190.0) as u8;
+        p.circle_filled(centre, rr, Color32::from_rgb(g, g, g));
+    }
+    p.circle_stroke(c, radius, Stroke::new(1.0, LINE));
+    let at = c + vec2(light.x, -light.y) * radius;
+    p.circle_filled(at, 4.0, Color32::from_rgb(255, 214, 120));
+    p.circle_stroke(at, 6.0, Stroke::new(1.0, Color32::from_rgb(255, 214, 120)));
+}
+
 /// A Tablet Pressure curve: pressure across, output up. Drag a point, click empty space to
 /// add one, double-click a point to remove it. `live` marks the pen's pressure now.
 fn pressure_curve_editor(ui: &mut Ui, curve: &mut crate::pressure::PressureCurve, drag: &mut Option<usize>, live: Option<f32>) {

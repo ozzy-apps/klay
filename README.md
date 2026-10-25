@@ -1,4 +1,4 @@
-# Klay 0.12.0
+# Klay 0.14.0
 
 A sculpting prototype in Rust + wgpu, exploring how far a chunked triangle mesh can go
 before polygon count becomes the bottleneck.
@@ -228,6 +228,29 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
   `~/.local/share/klay/quicksave` (`$XDG_DATA_HOME`); **QuickSave now** saves at once. Open
   one with Document › Open. Self-tests and scripted runs never QuickSave.
 
+### ZBrush tools added in 0.13
+
+- **Mesh › Geometry › Del Hidden** deletes the hidden polygons; **Close Holes** caps every
+  open border with a fan (each cap a new polygroup). **Deformation › Mirror And Weld** cuts
+  the subtool at X = 0, mirrors the +X half onto −X and welds the seam, so it becomes exactly
+  symmetric. All three need a subtool without subdivision levels and without layers, and are
+  one undo step each.
+- **Light** palette: drag on the sphere to place the key light (it turns with the view, as in
+  ZBrush), **Intensity** and **Ambient**. It lights the four clays; MatCaps carry their own
+  light.
+- **Projects** (format version 5) keep each subtool's **Layers** (names, intensity, shown or
+  hidden; a recording layer is saved as not recording) and its **Morph Target**. Versions
+  1–4 still open.
+
+### Alphas in 0.14
+
+- **Stroke › Modifiers › Alpha rotation**: **Fixed** (at **Angle**), **Follow** (the alpha
+  rolls with the stroke direction, ZBrush's Roll) or **Random** (a new turn every dab, as
+  ZBrush's spray-style texture painting does), for sculpting, painting and the mask pen.
+- Nine new detail alphas, painted by Klay as tileable 512 px images: **Pores, Wrinkles,
+  Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers**. As alphas they fade softly at the
+  stamp's edge; as textures (Texture palette) they repeat seamlessly for texture painting.
+
 ### Canvas and Document
 
 The document frame is drawn inside the canvas, and the margin around it (the border) is
@@ -341,9 +364,13 @@ current material, including the brush's subtract variant where applicable.
 ### Materials and MatCaps
 
 Click the material thumbnail on the left shelf, or open the Material palette. Klay's four
-procedural clays (Warm clay, Cool clay, Terracotta, Polished bronze) are joined by seven
+procedural clays (Warm clay, Cool clay, Terracotta, Polished bronze) are joined by twelve
 MatCaps: **Red Wax**, **Skin**, **Gray**, **White**, **Form** (hard key, dark shadow side and a
-cool rim, for reading planes), **Chrome** and **Toy Plastic**. A MatCap is a picture of a lit
+cool rim, for reading planes), **Chrome**, **Toy Plastic**, and for reading detail **Studio
+Gray** (warm key, cool fill, like ZBrush's BasicMaterial), **Cavity White** (darkens hard
+wherever the surface turns away: creases and pores read at once), **Slate** (cool, with a crisp
+highlight that catches small forms), **Rim Dark** (dark body, bright rim: silhouettes) and
+**Normal** (normal directions as colour, to check surface flow). A MatCap is a picture of a lit
 sphere looked up by the view-space normal, as in ZBrush, so the lighting stays fixed to the
 view while the model turns. Each one is two 256 px images painted by Klay at start-up
 (`src/matcap.rs`, no borrowed artwork): a diffuse layer that the surface colour multiplies,

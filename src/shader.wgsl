@@ -172,12 +172,13 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
     let l = normalize(u.light_dir.xyz);
 
     // Clay-like shading: key light, soft fill from the opposite side, rim and a small highlight.
-    let diff = max(dot(n, l), 0.0);
+    // Light palette: light_dir.w is the key light's intensity, cam_up.w the ambient.
+    let diff = max(dot(n, l), 0.0) * u.light_dir.w;
     let fill = max(dot(n, -l), 0.0) * 0.25;
-    let ambient = 0.22 + 0.10 * (n.y * 0.5 + 0.5);
+    let ambient = (0.22 + 0.10 * (n.y * 0.5 + 0.5)) * u.cam_up.w;
     let h = normalize(l + v);
     let polish = select(0.18, 0.75, u.params.w > 2.5);
-    let spec = pow(max(dot(n, h), 0.0), 40.0) * polish;
+    let spec = pow(max(dot(n, h), 0.0), 40.0) * polish * u.light_dir.w;
     let rim = pow(1.0 - max(dot(n, v), 0.0), 3.0) * 0.12;
     var color = base * (ambient + diff * 0.75 + fill) + vec3<f32>(spec + rim);
     if (u.material.w >= 0.0) {

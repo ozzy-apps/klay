@@ -497,3 +497,17 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Verification: 222 tests; all 16 native self-tests.
 - Not done in this batch: per-brush pressure curves, gizmo pivot/orientation and per-axis scale, saving layers / Morph Targets / settings in projects, layer duplicate / rename / reorder.
 
+## Step 54: 0.13.0 — ZBrush parity, batch 3 (2026-10-24, Claude Code)
+- Topology (`subtool_ops.rs`): `holes_closed` (border edges by undirected count, loops followed via `next`, fan cap per loop, new group each), `mirrored_and_welded` (Sutherland–Hodgman clip at x ≥ 0 with shared cut points per edge, on-plane vertices snapped to x = 0 and shared with the mirror, mirrored triangles reversed, degenerate dropped). `App::topology_op(what, f)`: needs no levels and no layers; `UndoStep::Replace(old.pack())`, named in History. `GeoOp::{DelHidden, CloseHoles, MirrorWeld}`; buttons in Geometry (base level only) and Deformation.
+- Light: `PaletteId::Light` (16 palettes), `Workspace::{light, light_intensity, ambient}`, `light_placer` widget; the uniform's `light_dir.w` is intensity and `cam_up.w` ambient (`shade()` in shader.wgsl).
+- Project version 5 (`project.rs`): per subtool after paint, layers (count; name, intensity bits, visible, delta slice) and Morph Target (flag, level, positions). `Extras`, `write_with`, `save_with`; `SavedTool::{layers, morph}`; `App::with_project_tools` passes extras; saves fold the recording layer first (`freeze_layers`); `App::attach_saved` checks sizes on load; `parked_subtool` now moves the doc's layers into `Parked`.
+- Self-tests: all pass (selftest-pressure failed once while the user was active, passed twice on re-run). Screenshot `ui-light-geometry.png`.
+- Then the user asked (mid-batch): alphas that rotate per dab (configurable), more high-quality alphas, more matcaps for reading sculpting detail — next.
+
+## Step 55: 0.14.0 — alpha rotation, detail alphas, detail MatCaps (2026-10-24, Claude Code)
+- User (mid batch 3): alphas should rotate per step when texture painting (configurable), more high-quality alphas, more MatCaps for sculpting and seeing detail.
+- Alpha rotation: `StampSettings::{turn: AlphaTurn (Fixed/Follow/Random), angle}`; `Stroke::dab_angle` set per dab in `dab` (Follow: the stroke direction measured in the stamp frame; Random: `dab_turn(dabs, hit)`), applied by `Stroke::frame` (= `turned(base_frame, dab_angle)`) in stamps and paint; `MaskStroke` does the same with `heading`. UI in Stroke › Modifiers. Session only.
+- Alphas (`alpha_library.rs`): `Baked` × 9, each a 512² tileable image from periodic value noise / ridged fbm / periodic Worley, painted lazily (OnceLock) and range-normalised; `Pattern::Library(Baked)` (keys 20+) in both alpha and texture lists, soft circular fade as an alpha. Ignored test `export_sheet` writes a contact sheet (KLAY_EXPORT_ALPHAS).
+- MatCaps: `Look::{StudioGray, CavityWhite, Slate, RimDark, Normal}`; `MATERIALS` 16.
+- Screenshot `ui-alphas-matcaps.png`. 230 tests, all 16 self-tests pass.
+

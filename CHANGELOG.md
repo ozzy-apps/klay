@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0 — 2026-10-24
+
+- Stroke › Alpha rotation: Fixed (Angle), Follow (rolls with the stroke) or Random (per dab), for sculpt, paint and mask stamps.
+- Nine detail alphas and textures: Pores, Wrinkles, Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers (tileable, soft-edged as alphas).
+- Five MatCaps for reading detail: Studio Gray, Cavity White, Slate, Rim Dark, Normal (16 materials).
+- Verification: 230 release tests (new: alpha frames turn, fixed/random/follow stamps; library images fill the range, tile and differ; the normal MatCap); every native self-test passes on the GPU (MatCaps within 1–3/255 of their images).
+
+## 0.13.0 — 2026-10-24
+
+- Geometry: Del Hidden and Close Holes; Deformation: Mirror And Weld. Each one undo step (the old stack kept packed, as for Remesh); base level only, layers baked first.
+- Light palette: key light placement on a sphere (view-relative), Intensity, Ambient.
+- Projects save each subtool's layers and Morph Target (format version 5; 1–4 still open).
+- Verification: 226 release tests (new: closed outward caps, welded symmetric mirror, the three topology ops with undo and refusals, version 5 round trip with layers and Morph Target); every native self-test passes on the GPU.
+
 ## 0.12.0 — 2026-10-24
 
 - Gizmo 3D (Y): axis arrows, axis rings, view ring, free move and even scale, with live preview, one undo step, masks respected.
