@@ -28,8 +28,8 @@ impl BrushGroup {
             Self::Mask => k.is_mask(),
             Self::Detail => k.is_detail(),
             Self::Clip => k == BrushKind::ClipLine,
-            Self::Curve => k.is_insert() || k.is_imm(),
-            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && !k.is_imm() && k != BrushKind::ClipLine,
+            Self::Curve => k.is_insert() || k.is_imm() || k.is_zmodeler(),
+            Self::Sculpt => !k.is_mask() && !k.is_detail() && !k.is_insert() && !k.is_imm() && !k.is_zmodeler() && k != BrushKind::ClipLine,
         }
     }
 }

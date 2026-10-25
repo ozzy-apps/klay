@@ -32,6 +32,7 @@ cargo run --release -- --segments 400 --selftest-tube                # CurveTube
 cargo run --release -- --segments 400 --selftest-insert              # Insert Mesh: one of each shape, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 12 --selftest-sculptris            # Sculptris Pro: three strokes, timing, closed surface, GPU readback, undo/redo, log, exit
 cargo run --release -- --segments 100 --selftest-boolean             # Live Boolean: a subtracted ball, frame readback vs Make Boolean Mesh, log, exit
+cargo run --release -- --selftest-zmodeler                           # ZModeler: QMesh, Inset, Insert, Polygroup, Move on a cube, GPU readback, undo, log, exit
 cargo run --release -- --segments 100 --divide 1 --selftest-surface    # mask tools + Clip Line, GPU readback and undo/redo
 cargo run --release -- --segments 100 --divide 1 --selftest-brushes    # new brushes, GPU readback and undo/redo
 cargo run --release -- --selftest-materials                            # every material drawn and read back, MatCaps against their images, polypaint under a MatCap
@@ -176,7 +177,7 @@ bar sliders. Long label/value rows wrap inside narrow trays.
   `$XDG_CONFIG_HOME/klay/workspace.layout`, falling back to `~/.config/klay/workspace.layout`.
   Older `v1` layout files are ignored and replaced.
 
-The 48 brushes and tools, Sculptris Pro, alphas and textures, RGB painting, focal shift, pen pressure,
+The 49 brushes and tools, Sculptris Pro, alphas and textures, RGB painting, focal shift, pen pressure,
 radius/strength, Add/Subtract, materials, floor grid, detail shading, view presets, primitives,
 Remesh, polygroups, visibility, masking, subdivision, undo/redo, OBJ export, X / Y / Z and
 radial symmetry, Auto Masking, LazyMouse and Spacing, Transpose, Curve strokes and live
@@ -328,6 +329,27 @@ quads in under a second, to 30k in about two.
 The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and a quad
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
+
+### ZModeler (0.19)
+
+The **ZModeler** brush (B catalog › Insert) models with polygons instead of sculpting.
+Hover the model: the point, edge or polygon under the cursor lights up (a point within a
+few pixels, then an edge, else the polygon), and a click or drag acts on it. Brush ›
+ZModeler picks the actions, as ZBrush's Space menu does:
+
+- **Polygon**: **QMesh** / **Extrude** (drag to pull out or push in along the normal),
+  **Inset** (drag to size the inner copy), **Delete**, **Polygroup** (click). Targets: **A
+  Single Poly**, **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest
+  the cursor).
+- **Edge**: **Insert** an edge loop round the ring of quads through the edge (click where it
+  goes, drag to slide it; a triangle at the end becomes a quad) or **Delete** the edge or
+  its whole **EdgeLoop**.
+- **Point**: **Move** in the view plane.
+
+Klay keeps triangles, so ZModeler pairs them into quads the way PolyF shows them and then
+remembers the pairing from one action to the next. Each action is one undo step; it needs
+a subtool without subdivision levels. Not yet: symmetry, Bevel, Bridge, Crease, Spin and
+the other actions of ZBrush's long list.
 
 ### Canvas and Document
 

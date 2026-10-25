@@ -41,6 +41,7 @@ pub fn orthographic_rh(half_w: f32, half_h: f32, near: f32, far: f32) -> Mat4 {
 pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2;
 
 /// Orbit camera around a target point.
+#[derive(Clone)]
 pub struct Camera {
     pub target: Vec3,
     pub yaw: f32,

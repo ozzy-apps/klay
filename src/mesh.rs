@@ -292,6 +292,34 @@ impl SculptMesh {
         Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new())
     }
 
+    /// [`from_raw_painted`](Self::from_raw_painted), also returning where each input vertex
+    /// went (its new number) and which input triangle each triangle of the mesh is.
+    pub fn from_raw_tracked(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> (Self, Vec<u32>, Vec<u32>) {
+        let groups = partition_vertices(&positions);
+        let mut remap = vec![0u32; positions.len()];
+        let mut k = 0u32;
+        for g in &groups {
+            for &old in g {
+                remap[old as usize] = k;
+                k += 1;
+            }
+        }
+        let old_tris: Vec<[u32; 3]> = indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]].map(|v| remap[v as usize])).collect();
+        let mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new());
+        // Triangles keep their corners in order, rotated at most: key by the sorted corners.
+        let key = |t: [u32; 3]| {
+            let mut k = t;
+            k.sort_unstable();
+            k
+        };
+        let mut at: crate::fx::FxHashMap<[u32; 3], u32> = crate::fx::FxHashMap::default();
+        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+            at.insert(key([tri[0], tri[1], tri[2]]), t as u32);
+        }
+        let tri_of_old: Vec<u32> = old_tris.iter().map(|&t| at.get(&key(t)).copied().unwrap_or(u32::MAX)).collect();
+        (mesh, remap, tri_of_old)
+    }
+
     /// [`from_raw_painted`](Self::from_raw_painted) with a tag per triangle (which
     /// operand of a boolean it came from), returned in the mesh's triangle order.
     pub fn from_raw_tagged(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>, tags: Vec<u8>) -> (Self, Vec<u8>) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0 — 2026-10-25
+
+- ZModeler brush (catalog: 49 tools): hover a point, edge or polygon (lit up) and click or drag. Polygons: QMesh, Extrude, Inset, Delete, Polygroup, on A Single Poly, Polygroup All or Polyloop; edges: Insert an edge loop (click to place, drag to slide), Delete the edge or its loop; points: Move. One undo step each; subtools without subdivision levels.
+- Klay's triangles are paired into quads as PolyF shows them, and the pairing is kept through ZModeler actions (`SculptMesh::from_raw_tracked`).
+- New --selftest-zmodeler.
+- Verification: 251 release tests (new: quads pair back exactly; extrude, inset, delete, regroup and an edge loop round a cube keep it closed with the right counts and volume; the loop dissolves back; QMesh and Insert through the input path with undo); every native self-test passes on the GPU.
+
 ## 0.18.0 — 2026-10-25
 
 - ZRemesher (Geometry › ZRemesher): automatic retopology into all-quad meshes whose edge loops follow the form (Instant Meshes: four-way direction field and quad lattice on a multi-level graph of surface samples, lattice points extracted as quads, stray diagonals merged away, holes closed, every face split through its middle). Target Polygons Count with Half / Same / Double; KeepGroups holds loops along polygroup borders and puts border vertices and corners exactly on the old ones. One undo step.

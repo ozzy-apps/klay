@@ -755,6 +755,12 @@ pub struct Workspace {
     pub boolean_resolution: f32,
     /// Geometry › ZRemesher settings.
     pub zremesh: crate::zremesh::Settings,
+    /// Brush › ZModeler: the polygon action and target, the edge action and whether it
+    /// takes the whole edge loop.
+    pub zm_poly: crate::zmodeler::PolyAction,
+    pub zm_target: crate::zmodeler::PolyTarget,
+    pub zm_edge: crate::zmodeler::EdgeAction,
+    pub zm_edge_loop: bool,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -892,6 +898,10 @@ impl Workspace {
             live_boolean: false,
             boolean_resolution: 400.0,
             zremesh: crate::zremesh::Settings::default(),
+            zm_poly: Default::default(),
+            zm_target: Default::default(),
+            zm_edge: Default::default(),
+            zm_edge_loop: true,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -2132,6 +2142,35 @@ impl Workspace {
                     });
                     note(ui, "Triangles follow Draw Size: a smaller brush makes smaller ones · Smooth (Shift) coarsens to its own size · masked surface stays as it is");
                 });
+                if m.brush.kind.is_zmodeler() {
+                    self.sec(ui, h, id, "zmodeler", "ZModeler", None, true, true, &mut |ws, ui| {
+                        use crate::zmodeler::{EdgeAction, PolyAction, PolyTarget};
+                        ui.label(RichText::new("Polygon").size(12.0).color(FG2));
+                        let names: Vec<&str> = PolyAction::ALL.iter().map(|x| x.name()).collect();
+                        let at = PolyAction::ALL.iter().position(|x| *x == ws.zm_poly).unwrap_or(0);
+                        if let Some(i) = seg(ui, &names[..3], at.min(2), false) {
+                            ws.zm_poly = PolyAction::ALL[i];
+                        }
+                        if let Some(i) = seg(ui, &names[3..], at.saturating_sub(3).min(1), false) {
+                            ws.zm_poly = PolyAction::ALL[3 + i];
+                        }
+                        let targets: Vec<&str> = PolyTarget::ALL.iter().map(|x| x.name()).collect();
+                        let at = PolyTarget::ALL.iter().position(|x| *x == ws.zm_target).unwrap_or(0);
+                        if let Some(i) = seg(ui, &targets, at, false) {
+                            ws.zm_target = PolyTarget::ALL[i];
+                        }
+                        ui.label(RichText::new("Edge").size(12.0).color(FG2));
+                        let names: Vec<&str> = EdgeAction::ALL.iter().map(|x| x.name()).collect();
+                        let at = EdgeAction::ALL.iter().position(|x| *x == ws.zm_edge).unwrap_or(0);
+                        if let Some(i) = seg(ui, &names, at, false) {
+                            ws.zm_edge = EdgeAction::ALL[i];
+                        }
+                        if ws.zm_edge == EdgeAction::Delete {
+                            ui.checkbox(&mut ws.zm_edge_loop, "EdgeLoop").on_hover_text("Delete the whole loop, not just the edge");
+                        }
+                        note(ui, "Hover a polygon, edge or point · QMesh and Extrude: drag out · Inset: drag in · Insert: click where the loop goes, drag to slide it · points: drag to move");
+                    });
+                }
                 if m.brush.kind.is_imm() {
                     self.sec(ui, h, id, "imm", "Insert Mesh", None, true, true, &mut |ws, ui| {
                         let shapes = crate::insert_mesh::SHAPES;

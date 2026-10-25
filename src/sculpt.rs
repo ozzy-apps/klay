@@ -62,10 +62,12 @@ pub enum BrushKind {
     Morph,
     /// IMM Primitives (ZBrush): drag to insert a mesh (see `insert_mesh.rs`).
     InsertMesh,
+    /// ZModeler (ZBrush): polygon modelling on points, edges and polygons (`zmodeler.rs`).
+    ZModeler,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 48] = [
+    pub const ALL: [BrushKind; 49] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -92,7 +94,7 @@ impl BrushKind {
         Self::Stitch, Self::Rake, Self::CurveTube,
         Self::ClayTubes, Self::HPolish, Self::TrimAdaptive, Self::Planar, Self::TrimSmoothBorder,
         Self::MoveTopological, Self::InflateBalloon, Self::Magnify, Self::OrbCracks,
-        Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks, Self::Morph, Self::InsertMesh,
+        Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks, Self::Morph, Self::InsertMesh, Self::ZModeler,
     ];
 
     pub fn name(self) -> &'static str {
@@ -132,6 +134,7 @@ impl BrushKind {
             Self::SmoothValleys => "SmoothValleys", Self::SmoothPeaks => "SmoothPeaks",
             Self::Morph => "Morph",
             Self::InsertMesh => "IMM Primitives",
+            Self::ZModeler => "ZModeler",
         }
     }
 
@@ -153,6 +156,7 @@ impl BrushKind {
             Self::SmoothValleys|Self::SmoothPeaks=>"Smooth",
             Self::Morph=>"Morph",
             Self::InsertMesh=>"InsertMesh",
+            Self::ZModeler=>"ZModeler",
         }
     }
 
@@ -168,9 +172,11 @@ impl BrushKind {
     pub fn is_insert(self) -> bool { matches!(self,Self::CurveTube) }
     /// Inserts a whole mesh where you drag (ZBrush: IMM brushes).
     pub fn is_imm(self) -> bool { self == Self::InsertMesh }
+    /// Polygon modelling instead of sculpting (ZBrush: ZModeler).
+    pub fn is_zmodeler(self) -> bool { self == Self::ZModeler }
     /// Strokes as one stamp you size and turn (DragRect) or slide (DragDot): the dab brushes.
     pub fn stamps(self) -> bool {
-        !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_imm() && !self.is_mask() && self != Self::ClipLine
+        !self.is_drag() && !self.is_detail() && !self.is_insert() && !self.is_imm() && !self.is_zmodeler() && !self.is_mask() && self != Self::ClipLine
     }
 
     pub fn description(self) -> &'static str {
@@ -215,6 +221,7 @@ impl BrushKind {
             Self::SmoothValleys=>"Smooth only recessed areas; ridges stay sharp.",
             Self::SmoothPeaks=>"Smooth only raised areas; grooves stay sharp.",
             Self::Morph=>"Brush the surface back to the stored Morph Target (Mesh › Morph Target › StoreMT).",
+            Self::ZModeler=>"Polygon modelling: hover a point, edge or polygon and click or drag. Polygons: QMesh, Extrude, Inset, Delete, Polygroup; edges: Insert an edge loop, Delete; points: Move. Pick actions and targets in Brush › ZModeler. Needs a subtool without subdivision levels.",
             Self::InsertMesh=>"Drag on the model to insert a mesh standing on the surface; the drag sets its size. Pick Sphere, Cube, Cylinder or Ring in Brush › Insert Mesh. It becomes a new polygroup and the rest is masked, ready for Transpose. Needs a subtool without subdivision levels.",
         }
     }

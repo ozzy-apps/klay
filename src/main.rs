@@ -19,6 +19,7 @@ mod sculptris;
 mod fx;
 mod boolean;
 mod zremesh;
+mod zmodeler;
 mod layers;
 mod obj;
 mod pressure;
@@ -385,6 +386,31 @@ struct InsertDrag {
     mask: Vec<u8>,
 }
 
+/// The polygon view of the active subtool ZModeler works on, kept while the subtool's
+/// topology is the one it made (`generation`): its polygons, the polygon of each mesh
+/// triangle and the mesh vertex of each polygon vertex.
+struct ZModel {
+    poly: zmodeler::PolyMesh,
+    face_of: Vec<u32>,
+    vmap: Vec<u32>,
+    generation: u64,
+}
+
+/// A ZModeler click or drag: what it started on, the polygons before it and the subtool
+/// before it (the undo step).
+struct ZDrag {
+    hover: zmodeler::Hover,
+    base: zmodeler::PolyMesh,
+    press: Vec2,
+    before: Box<multires::Packed>,
+    /// The polygons a polygon action takes, and where the drag is measured from.
+    faces: Vec<u32>,
+    anchor: Vec3,
+    normal: Vec3,
+    label: String,
+    changed: bool,
+}
+
 /// A left drag in Move / Scale / Rotate mode (ZBrush Transpose, see `transform.rs`).
 #[derive(Clone, Copy, Debug)]
 enum TransposeDrag {
@@ -500,6 +526,8 @@ struct App {
     selftest_tube: Option<(u8, u32)>,
     /// `--selftest-insert`: likewise, for Insert Mesh.
     selftest_insert: Option<(u8, u32)>,
+    /// `--selftest-zmodeler`: likewise, for ZModeler.
+    selftest_zmodeler: Option<(u8, u32)>,
     /// `--selftest-sculptris`: likewise, for Sculptris Pro.
     selftest_sculptris: Option<(u8, u32)>,
     /// `--hold`: a self-test leaves the window open when it is done.
@@ -527,6 +555,9 @@ struct App {
     action_line: Option<ActionLine>,
     transpose: Option<TransposeDrag>,
     insert: Option<InsertDrag>,
+    zmodel: Option<ZModel>,
+    zm_hover: Option<zmodeler::Hover>,
+    zm_drag: Option<ZDrag>,
     /// Sculptris Pro during a stroke: the subtool as it was before (the stroke's undo step
     /// once the mesh changed), whether it changed, and where the last pass was.
     sculptris_before: Option<Box<multires::Packed>>,
@@ -671,6 +702,7 @@ impl App {
             selftest_tube: None,
             selftest_insert: None,
             selftest_sculptris: None,
+            selftest_zmodeler: None,
             selftest_hold: false,
             selftest_clip: None,
             cursor: Vec2::ZERO,
@@ -686,6 +718,9 @@ impl App {
             action_line: None,
             transpose: None,
             insert: None,
+            zmodel: None,
+            zm_hover: None,
+            zm_drag: None,
             sculptris_before: None,
             sculptris_changed: false,
             sculptris_at: Vec::new(),
@@ -750,6 +785,7 @@ impl App {
             || self.curve_draw.is_some()
             || self.curve.as_ref().is_some_and(|c| c.bend.is_some())
             || self.insert.is_some()
+            || self.zm_drag.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -1537,6 +1573,73 @@ impl App {
         self.transpose = Some(TransposeDrag::Gizmo { handle, place, press, map: Affine::IDENTITY, alone });
         self.hover = None;
         true
+    }
+
+    /// ZModeler: what the press would act on, outlined (ZBrush lights the target the
+    /// same way): the polygons, the edge (and the loop Insert would cut or Delete would
+    /// take), or the point.
+    fn paint_zmodel(&self, ctx: &egui::Context) {
+        if !self.brush.kind.is_zmodeler() || self.zm_drag.is_some() || self.workspace.mode != Mode::Draw {
+            return;
+        }
+        let (Some(hover), Some(z)) = (self.zm_hover, self.zmodel.as_ref()) else { return };
+        let view = self.view();
+        let to_pos = |p: Vec3| {
+            let px = view.project(p) + self.canvas_origin();
+            egui::pos2(px.x / self.scale, px.y / self.scale)
+        };
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("zmodeler")))
+            .with_clip_rect(self.workspace.canvas);
+        let lit = egui::Color32::from_rgb(255, 214, 92);
+        let stroke = egui::Stroke::new(2.0, lit);
+        let pm = &z.poly;
+        let outline = |f: u32| {
+            let fv = &pm.faces[f as usize];
+            let mut pts: Vec<egui::Pos2> = fv.iter().map(|&v| to_pos(pm.pos[v as usize])).collect();
+            pts.push(pts[0]);
+            painter.add(egui::Shape::line(pts, stroke));
+        };
+        match hover {
+            zmodeler::Hover::Poly(f) => {
+                let at = self.canvas_cursor();
+                let face = &pm.faces[f as usize];
+                let n = face.len();
+                let k = (0..n)
+                    .min_by(|&a, &b| {
+                        let mid = |k: usize| view.project((pm.pos[face[k] as usize] + pm.pos[face[(k + 1) % n] as usize]) * 0.5);
+                        mid(a).distance(at).total_cmp(&mid(b).distance(at))
+                    })
+                    .unwrap_or(0);
+                let faces = pm.target(f, self.workspace.zm_target, Some((face[(k + 1) % n], face[(k + 2) % n])));
+                for g in faces.into_iter().take(4000) {
+                    outline(g);
+                }
+            }
+            zmodeler::Hover::Edge(a, b) => {
+                let wide = egui::Stroke::new(3.0, lit);
+                match self.workspace.zm_edge {
+                    zmodeler::EdgeAction::Insert => {
+                        // The loop to be cut: across the ring's quads, through the middles.
+                        for (f, k) in pm.ring(a, b) {
+                            let fv = &pm.faces[f as usize];
+                            let p = |i: usize| pm.pos[fv[(k + i) % 4] as usize];
+                            painter.line_segment([to_pos((p(0) + p(1)) * 0.5), to_pos((p(2) + p(3)) * 0.5)], stroke);
+                        }
+                    }
+                    zmodeler::EdgeAction::Delete => {
+                        let edges = if self.workspace.zm_edge_loop { pm.edge_loop(a, b) } else { vec![(a, b)] };
+                        for (x, y) in edges {
+                            painter.line_segment([to_pos(pm.pos[x as usize]), to_pos(pm.pos[y as usize])], wide);
+                        }
+                    }
+                }
+                painter.line_segment([to_pos(pm.pos[a as usize]), to_pos(pm.pos[b as usize])], wide);
+            }
+            zmodeler::Hover::Point(v) => {
+                painter.circle_stroke(to_pos(pm.pos[v as usize]), 6.0, stroke);
+            }
+        }
     }
 
     /// Draw Gizmo 3D: X red, Y green, Z blue; the handle under the cursor (or being dragged)
@@ -3819,6 +3922,109 @@ impl App {
         }
     }
 
+    /// `--selftest-zmodeler`: on a cube of 2 x 2 quads a side, through the real input
+    /// handlers: QMesh, Inset, Insert, Delete edge loop, Polygroup and point Move, each
+    /// checked on the polygons and against the GPU copy; then every step undone.
+    fn selftest_zmodeler_phase(&mut self, phase: u8) -> Option<u8> {
+        use zmodeler::{EdgeAction, PolyAction};
+        let check = |app: &mut Self, what: &str, pass: bool| {
+            app.selftest_curve_state.ok &= pass;
+            log::info!("selftest-zmodeler: {what} ({})", if pass { "ok" } else { "FAIL" });
+        };
+        let drag = |app: &mut Self, from: Vec2, to: Vec2| {
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=6 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 6.0), false);
+            }
+            app.left_release();
+        };
+        let faces = |app: &Self| app.zmodel.as_ref().map_or(0, |z| z.poly.faces.len());
+        let gpu_ok = |app: &Self| {
+            app.gfx.as_ref().and_then(Gfx::read_positions).is_none_or(|g| {
+                let m = app.doc.mesh();
+                g.len() >= m.vertex_count() && g.iter().zip(&m.positions).all(|(a, b)| a.distance(*b) < 1e-6)
+            })
+        };
+        let at = |app: &Self, p: Vec3| app.project(p);
+        match phase {
+            0 => {
+                self.selftest_curve_state = CurveTest { ok: true, ..CurveTest::default() };
+                let (p, i) = Primitive::Cube.build(2, 1.0);
+                self.replace_active_mesh(SculptMesh::from_raw(p, i));
+                self.frame_camera();
+                // Seen from the front, a little from the right and above: +Z, +X and +Y show.
+                self.camera.yaw = 0.6;
+                self.camera.pitch = 0.45;
+                if self.camera.forward().z > 0.0 {
+                    self.camera.yaw = std::f32::consts::PI - self.camera.yaw;
+                }
+                if self.camera.forward().x > 0.0 {
+                    self.camera.yaw = -self.camera.yaw;
+                }
+                if self.camera.forward().y > 0.0 {
+                    self.camera.pitch = -self.camera.pitch;
+                }
+                self.workspace.select_brush(&mut self.brush, BrushKind::ZModeler);
+                self.selftest_curve_state.original = self.doc.mesh().positions.clone();
+                Some(1)
+            }
+            1 => {
+                self.workspace.zm_poly = PolyAction::QMesh;
+                let c = at(self, Vec3::new(0.5, 0.5, 1.0));
+                let up = at(self, Vec3::new(0.5, 0.5, 1.6));
+                drag(self, c, up);
+                check(self, &format!("QMesh pulls a quad out: {} polygons, front now at z {:.2}", faces(self), self.doc.bounds().max.z), faces(self) == 28 && self.doc.bounds().max.z > 1.3);
+                check(self, "GPU copy matches", gpu_ok(self));
+                Some(2)
+            }
+            2 => {
+                self.workspace.zm_poly = PolyAction::Inset;
+                let c = at(self, Vec3::new(-0.5, 0.5, 1.0));
+                drag(self, c, c + Vec2::new(40.0, 0.0));
+                check(self, &format!("Inset: {} polygons", faces(self)), faces(self) == 32);
+                Some(3)
+            }
+            3 => {
+                self.workspace.zm_edge = EdgeAction::Insert;
+                let e = at(self, Vec3::new(0.0, -0.5, 1.0));
+                drag(self, e, e + Vec2::new(4.0, 0.0));
+                let quads = self.zmodel.as_ref().is_some_and(|z| z.poly.faces.iter().all(|f| f.len() == 4));
+                check(self, &format!("Insert cuts a loop: {} polygons, all quads {quads}", faces(self)), faces(self) > 32 && quads);
+                check(self, "GPU copy matches", gpu_ok(self));
+                Some(4)
+            }
+            4 => {
+                self.workspace.zm_poly = PolyAction::Polygroup;
+                let groups = self.doc.mesh().group_count();
+                let c = at(self, Vec3::new(-0.5, -0.5, 1.0));
+                drag(self, c, c);
+                check(self, &format!("Polygroup makes a new group ({groups} → {})", self.doc.mesh().group_count()), self.doc.mesh().group_count() == groups + 1);
+                Some(5)
+            }
+            5 => {
+                // Move the middle point of the top.
+                let p = Vec3::new(0.0, 1.0, 0.0);
+                let c = at(self, p);
+                let before = self.doc.mesh().positions.iter().map(|q| q.distance(p)).fold(f32::MAX, f32::min);
+                drag(self, c, c + Vec2::new(30.0, -30.0));
+                let moved = !self.doc.mesh().positions.iter().any(|q| q.distance(p) < 1e-4);
+                check(self, "a point moves", before < 1e-4 && moved);
+                check(self, "GPU copy matches", gpu_ok(self));
+                Some(6)
+            }
+            _ => {
+                let steps = self.history.names().0.iter().filter(|n| n.starts_with("ZModeler")).count();
+                self.history_jump(-(steps as i64));
+                let back = self.doc.mesh().positions.len() == self.selftest_curve_state.original.len();
+                check(self, &format!("{steps} undo steps put the cube back"), steps == 5 && back && self.doc.mesh().triangle_count() == 48);
+                let ok = self.selftest_curve_state.ok;
+                log::info!("selftest-zmodeler: {}", if ok { "all passed" } else { "FAILED" });
+                None
+            }
+        }
+    }
+
     /// One frame of `--selftest-mask` (see [`MaskTest`]). Returns true when it is over.
     fn selftest_mask_frame(&mut self, t: &mut MaskTest, dt: f32) -> bool {
         let vp = self.viewport();
@@ -4754,6 +4960,214 @@ impl App {
         self.update_hover();
     }
 
+    /// The polygon view of the active subtool, made afresh when its topology changed since
+    /// ZModeler last made it, and with the mesh's positions (sculpting may have moved them).
+    fn zmodel_view(&mut self) -> &ZModel {
+        let mesh = self.doc.mesh();
+        let fresh = self.zmodel.as_ref().is_some_and(|z| z.generation == self.doc.generation && z.face_of.len() == mesh.triangle_count());
+        if !fresh {
+            let (poly, face_of) = zmodeler::PolyMesh::from_mesh(mesh);
+            let vmap = (0..mesh.vertex_count() as u32).collect();
+            self.zmodel = Some(ZModel { poly, face_of, vmap, generation: self.doc.generation });
+        }
+        let z = self.zmodel.as_mut().unwrap();
+        for (i, &v) in z.vmap.iter().enumerate() {
+            if v != u32::MAX {
+                z.poly.pos[i] = mesh.positions[v as usize];
+            }
+        }
+        self.zmodel.as_ref().unwrap()
+    }
+
+    /// What ZModeler would act on under the cursor: a point within 9 pixels, else an edge
+    /// within 7, else the polygon.
+    fn zmodel_hover(&mut self) -> Option<zmodeler::Hover> {
+        if self.doc.count() > 1 {
+            return None;
+        }
+        let (o, d) = self.cursor_ray();
+        let hit = self.doc.mesh().raycast(o, d)?;
+        let at = self.canvas_cursor();
+        let view_size = self.viewport();
+        let camera = self.camera.clone();
+        let z = self.zmodel_view();
+        let f = *z.face_of.get(hit.tri as usize)?;
+        if f == u32::MAX {
+            return None;
+        }
+        let view = View { camera: &camera, size: view_size };
+        let face = &z.poly.faces[f as usize];
+        let px: Vec<Vec2> = face.iter().map(|&v| view.project(z.poly.pos[v as usize])).collect();
+        let near = (0..face.len()).map(|k| (px[k].distance(at), k)).min_by(|a, b| a.0.total_cmp(&b.0))?;
+        if near.0 < 9.0 {
+            return Some(zmodeler::Hover::Point(face[near.1]));
+        }
+        let seg = |a: Vec2, b: Vec2| {
+            let ab = b - a;
+            let t = ((at - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            at.distance(a + ab * t)
+        };
+        let n = face.len();
+        let edge = (0..n).map(|k| (seg(px[k], px[(k + 1) % n]), k)).min_by(|a, b| a.0.total_cmp(&b.0))?;
+        if edge.0 < 7.0 {
+            return Some(zmodeler::Hover::Edge(face[edge.1], face[(edge.1 + 1) % n]));
+        }
+        Some(zmodeler::Hover::Poly(f))
+    }
+
+    /// ZModeler press: start the action of what is under the cursor.
+    fn begin_zmodel(&mut self) {
+        if self.doc.count() > 1 {
+            self.workspace.notify("ZModeler works on a subtool without subdivision levels · Del Lower first".to_string());
+            return;
+        }
+        let Some(hover) = self.zmodel_hover() else { return };
+        let before = Box::new(self.doc.pack_copy());
+        let at = self.canvas_cursor();
+        let view_size = self.viewport();
+        let camera = self.camera.clone();
+        let ws = (self.workspace.zm_poly, self.workspace.zm_target, self.workspace.zm_edge, self.workspace.zm_edge_loop);
+        let base = self.zmodel_view().poly.clone();
+        let (faces, anchor, normal, label) = match hover {
+            zmodeler::Hover::Poly(f) => {
+                // A loop runs across the polygon's edge nearest the cursor.
+                let view = View { camera: &camera, size: view_size };
+                let face = &base.faces[f as usize];
+                let n = face.len();
+                let k = (0..n)
+                    .min_by(|&a, &b| {
+                        let mid = |k: usize| view.project((base.pos[face[k] as usize] + base.pos[face[(k + 1) % n] as usize]) * 0.5);
+                        mid(a).distance(at).total_cmp(&mid(b).distance(at))
+                    })
+                    .unwrap_or(0);
+                // Across that edge means through the edge next to it.
+                let across = (face[(k + 1) % n], face[(k + 2) % n]);
+                let faces = base.target(f, ws.1, Some(across));
+                let normal = faces.iter().map(|&g| base.normal(g)).sum::<Vec3>().normalize_or(Vec3::Z);
+                (faces, base.centre(f), normal, format!("ZModeler {} {}", ws.0.name(), ws.1.name()))
+            }
+            zmodeler::Hover::Edge(a, b) => (Vec::new(), (base.pos[a as usize] + base.pos[b as usize]) * 0.5, Vec3::Z, format!("ZModeler {} Edge{}", ws.2.name(), if ws.2 == zmodeler::EdgeAction::Delete && ws.3 { "Loop" } else { "" })),
+            zmodeler::Hover::Point(v) => (Vec::new(), base.pos[v as usize], Vec3::Z, "ZModeler Move Point".to_string()),
+        };
+        self.zm_drag = Some(ZDrag { hover, base, press: self.cursor, before, faces, anchor, normal, label, changed: false });
+        self.hover = None;
+        // Insert puts the loop where the press is at once.
+        if matches!(hover, zmodeler::Hover::Edge(..)) && ws.2 == zmodeler::EdgeAction::Insert {
+            self.zmodel_move();
+        }
+    }
+
+    /// Show the polygons `poly` as the active subtool (during a ZModeler drag).
+    fn show_zmodel(&mut self, poly: zmodeler::PolyMesh) {
+        let (mesh, face_of, vmap) = poly.to_mesh();
+        let budget = self.doc.budget;
+        self.doc = Multires::new(mesh, budget);
+        self.zmodel = Some(ZModel { poly, face_of, vmap, generation: self.doc.generation });
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+    }
+
+    /// The action at the drag's current amount.
+    fn zmodel_result(&self, d: &ZDrag) -> Option<zmodeler::PolyMesh> {
+        use zmodeler::{EdgeAction, Hover, PolyAction};
+        let view = self.view();
+        let delta = self.cursor - d.press;
+        let ws = &self.workspace;
+        Some(match d.hover {
+            Hover::Poly(_) => match ws.zm_poly {
+                PolyAction::QMesh | PolyAction::Extrude => {
+                    // Along the normal's screen direction, at its screen speed.
+                    let len = self.camera.pixel_size_at(d.anchor, self.viewport().y) * 100.0;
+                    let s = (view.project(d.anchor + d.normal * len) - view.project(d.anchor)) / len;
+                    // Seen nearly head on the normal barely moves on screen: up pulls out.
+                    let px = self.camera.pixel_size_at(d.anchor, self.viewport().y);
+                    let dist = if s.length() * px < 0.35 { -delta.y * px } else { delta.dot(s) / s.length_squared() };
+                    if delta.length() < 2.0 {
+                        return None;
+                    }
+                    d.base.extrude(&d.faces, dist)
+                }
+                PolyAction::Inset => {
+                    if delta.length() < 2.0 {
+                        return None;
+                    }
+                    d.base.inset(&d.faces, (delta.length() / 150.0).min(0.9))
+                }
+                PolyAction::Delete => d.base.delete(&d.faces),
+                PolyAction::Polygroup => d.base.regroup(&d.faces),
+            },
+            Hover::Edge(a, b) => match ws.zm_edge {
+                EdgeAction::Insert => {
+                    let (pa, pb) = (view.project(d.base.pos[a as usize]), view.project(d.base.pos[b as usize]));
+                    let at = self.canvas_cursor();
+                    let ab = pb - pa;
+                    let t = ((at - pa).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.05, 0.95);
+                    d.base.insert_loop(a, b, t)
+                }
+                EdgeAction::Delete => {
+                    let edges = if ws.zm_edge_loop { d.base.edge_loop(a, b) } else { vec![(a, b)] };
+                    d.base.dissolve(&edges)
+                }
+            },
+            Hover::Point(v) => {
+                if delta.length() < 1.0 {
+                    return None;
+                }
+                let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
+                d.base.moved(&[v], m.translate)
+            }
+        })
+    }
+
+    /// Follow the cursor during a ZModeler drag.
+    fn zmodel_move(&mut self) {
+        let Some(d) = self.zm_drag.as_ref() else { return };
+        let click = matches!(
+            (d.hover, self.workspace.zm_poly, self.workspace.zm_edge),
+            (zmodeler::Hover::Poly(_), zmodeler::PolyAction::Delete | zmodeler::PolyAction::Polygroup, _) | (zmodeler::Hover::Edge(..), _, zmodeler::EdgeAction::Delete)
+        );
+        if click {
+            return;
+        }
+        if let Some(poly) = self.zmodel_result(d) {
+            self.show_zmodel(poly);
+            self.zm_drag.as_mut().unwrap().changed = true;
+        }
+    }
+
+    /// ZModeler release: click actions happen now; the action is one undo step.
+    fn end_zmodel(&mut self) {
+        let Some(d) = self.zm_drag.take() else { return };
+        let mut changed = d.changed;
+        let click = matches!(
+            (d.hover, self.workspace.zm_poly, self.workspace.zm_edge),
+            (zmodeler::Hover::Poly(_), zmodeler::PolyAction::Delete | zmodeler::PolyAction::Polygroup, _) | (zmodeler::Hover::Edge(..), _, zmodeler::EdgeAction::Delete)
+        );
+        if click {
+            if let Some(poly) = self.zmodel_result(&d) {
+                self.show_zmodel(poly);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.history.push(UndoStep::Replace(d.before));
+        self.history.name_last(&d.label);
+        self.morph_targets.remove(&self.subtools[self.active_tool].id);
+        self.status = format!("{}: {} polygons", d.label, fmt_count(self.zmodel.as_ref().map_or(0, |z| z.poly.faces.len())));
+        self.update_zmodel_hover();
+    }
+
+    /// Keep what ZModeler would act on under the cursor up to date.
+    fn update_zmodel_hover(&mut self) {
+        let on = self.brush.kind.is_zmodeler() && self.workspace.mode == Mode::Draw && !self.busy() && !self.in_canvas_border();
+        self.zm_hover = if on { self.zmodel_hover() } else { None };
+    }
+
     /// Insert Mesh press on the model: the mesh goes in there at Draw Size. With
     /// subdivision levels it says why it cannot.
     fn begin_insert(&mut self) {
@@ -5506,6 +5920,8 @@ impl App {
             self.transpose_move();
         } else if self.insert.is_some() {
             self.insert_move();
+        } else if self.zm_drag.is_some() {
+            self.zmodel_move();
         } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
             self.mask_move();
         } else if self.curve_draw.is_some() {
@@ -5525,8 +5941,12 @@ impl App {
             }
         } else if !over_ui && !self.in_canvas_border() {
             self.update_hover();
+            if self.brush.kind.is_zmodeler() {
+                self.update_zmodel_hover();
+            }
         } else {
             self.hover = None;
+            self.zm_hover = None;
         }
     }
 
@@ -5605,6 +6025,8 @@ impl App {
                 self.begin_nav(MouseButton::Left);
             } else if self.effective_brush().kind.is_imm() {
                 self.begin_insert();
+            } else if self.effective_brush().kind.is_zmodeler() {
+                self.begin_zmodel();
             } else if self.curve_mode(self.effective_brush().kind) {
                 self.begin_curve();
             } else {
@@ -5636,6 +6058,7 @@ impl App {
         self.end_stroke();
         self.end_transpose();
         self.end_insert();
+        self.end_zmodel();
         self.end_nav(MouseButton::Left);
     }
 
@@ -5761,7 +6184,7 @@ impl App {
         // canvas and its border it shows, so navigating stays visible.
         // Shape gestures (mask shapes, Clip Line) keep the pointer: it marks their corners.
         let sculpting = self.stroke.is_some() || self.mask_stroke.is_some() || self.curve_draw.is_some();
-        let ring = self.hover.is_some() && self.workspace.mode == Mode::Draw && !self.in_canvas_border() && self.gesture.is_none() && !self.brush.kind.is_shape();
+        let ring = self.hover.is_some() && self.workspace.mode == Mode::Draw && !self.in_canvas_border() && self.gesture.is_none() && !self.brush.kind.is_shape() && !self.brush.kind.is_zmodeler();
         if (sculpting || ring) && !ui.ctx().is_pointer_over_egui() && !self.workspace.modal_open() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
@@ -6019,6 +6442,7 @@ impl App {
             self.camera.yaw = yaw;
             self.camera.pitch = pitch;
         }
+        self.paint_zmodel(ui.ctx());
         if self.workspace.gizmo {
             self.paint_gizmo(ui.ctx());
         } else {
@@ -6174,6 +6598,16 @@ impl App {
                 }
             } else {
                 self.selftest_tube = Some((phase, left - 1));
+            }
+        }
+        if let Some((phase, left)) = self.selftest_zmodeler {
+            if left == 0 {
+                self.selftest_zmodeler = self.selftest_zmodeler_phase(phase).map(|next| (next, 6));
+                if self.selftest_zmodeler.is_none() && !self.selftest_hold {
+                    self.quit = true;
+                }
+            } else {
+                self.selftest_zmodeler = Some((phase, left - 1));
             }
         }
         if let Some((phase, left)) = self.selftest_sculptris {
@@ -6332,7 +6766,8 @@ impl App {
         let brush_pos = self.hover.unwrap_or(Vec3::ZERO);
         let show_brush = self.hover.is_some()
             && !ctx.is_pointer_over_egui()
-            && self.workspace.mode == Mode::Draw;
+            && self.workspace.mode == Mode::Draw
+            && !self.brush.kind.is_zmodeler();
         let radius = if self.stroke.is_some() {
             self.stroke_brush.radius
         } else {
@@ -7088,6 +7523,9 @@ fn main() {
     if args.iter().any(|a| a == "--selftest-tube") {
         app.selftest_tube = Some((0, 20));
     }
+    if args.iter().any(|a| a == "--selftest-zmodeler") {
+        app.selftest_zmodeler = Some((0, 20));
+    }
     if args.iter().any(|a| a == "--selftest-sculptris") {
         app.selftest_sculptris = Some((0, 20));
     }
@@ -7271,6 +7709,48 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    #[test]
+    fn zmodeler_extrudes_a_polygon_and_inserts_an_edge_loop_through_the_input_path() {
+        let mut app = App::new(4, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let (p, i) = Primitive::Cube.build(2, 1.0);
+        app.replace_active_mesh(SculptMesh::from_raw(p, i));
+        app.workspace.select_brush(&mut app.brush, BrushKind::ZModeler);
+        let drag = |app: &mut App, from: Vec2, to: Vec2| {
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=5 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 5.0), false);
+            }
+            app.left_release();
+        };
+        // QMesh on the front quad at (0.5, 0.5): pulled toward the viewer.
+        let c = app.project(Vec3::new(0.5, 0.5, 1.0));
+        app.cursor_moved(c, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Poly(_))), "{:?}", app.zm_hover);
+        let size0 = app.doc.bounds().max.z;
+        drag(&mut app, c, c - Vec2::new(0.0, 60.0));
+        let pm = &app.zmodel.as_ref().unwrap().poly;
+        assert_eq!(pm.faces.len(), 28, "the quad and four walls");
+        // The quad left its plane (along its normal: in or out, by the drag's sense).
+        let off = app.doc.mesh().positions.iter().map(|p| (p.z - size0).abs()).filter(|d| *d < 0.9).fold(0.0f32, f32::max);
+        assert!(off > 0.05, "moved off the front by {off}");
+        assert!(app.history.names().0.last().unwrap().starts_with("ZModeler QMesh"));
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().triangle_count(), 48);
+        // Insert on the edge from (0, 0, 1) to (1, 0, 1): a loop round the cube.
+        let e = app.project(Vec3::new(0.5, 0.0, 1.0));
+        app.cursor_moved(e, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Edge(..))), "{:?}", app.zm_hover);
+        drag(&mut app, e, e + Vec2::new(10.0, 0.0));
+        assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 32);
+        assert!(app.zmodel.as_ref().unwrap().poly.faces.iter().all(|f| f.len() == 4));
+        // The pairing is kept: the triangle mesh pairs back into the same 32 quads.
+        let (again, _) = zmodeler::PolyMesh::from_mesh(app.doc.mesh());
+        assert_eq!(again.faces.len(), 32);
+    }
 
     #[test]
     fn zremesher_rebuilds_the_subtool_in_quads_as_one_undo_step() {
