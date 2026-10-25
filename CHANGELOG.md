@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.0 — 2026-10-25
+
+- ZModeler: Bevel (an edge loop chamfered into a flat strip, drag for width), Spin (an edge turned round its two polygons), Bridge (two clicks join two polygons by a tube of quads); every action follows symmetry (mirror and radial), mirrored.
+- ZRemesher: AdaptiveSize (0–100, default 50): smaller quads where the surface curves more, larger where it is flat (half to twice the even size), the total kept near the target.
+- Sculptris Pro: a stroke's undo holds only the triangles it changed (by position) instead of a copy of the subtool: 1–4 MB instead of ~35 MB a stroke at two million triangles.
+- Verification: 253 release tests (new: bevel of a rim and of a closed loop, spin both ways, bridge through a cube; symmetric QMesh, Spin and two-click Bridge through the input path; adaptive density on a big and a small ball; Sculptris undo by region restoring the same surface); every native self-test passes on the GPU.
+
 ## 0.19.0 — 2026-10-25
 
 - ZModeler brush (catalog: 49 tools): hover a point, edge or polygon (lit up) and click or drag. Polygons: QMesh, Extrude, Inset, Delete, Polygroup, on A Single Poly, Polygroup All or Polyloop; edges: Insert an edge loop (click to place, drag to slide), Delete the edge or its loop; points: Move. One undo step each; subtools without subdivision levels.

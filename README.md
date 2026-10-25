@@ -294,8 +294,9 @@ without dividing or remeshing.
   Rake), drag brushes (Grab, Snake Hook, Elastic, Move Topological) and DragRect /
   DragDot strokes, which sculpt as usual. It needs a subtool without subdivision levels
   and without layers (a stroke then sculpts as usual and says why).
-- A stroke is one undo step (it keeps a copy of the subtool from before it). Fluid up to a
-  few hundred thousand triangles; at around two million each pointer move takes ~30 ms.
+- A stroke is one undo step, holding only the triangles it changed (at two million
+  triangles about 1–4 MB a stroke instead of a 35 MB copy). Fluid up to a few hundred
+  thousand triangles; at around two million each pointer move takes ~20–30 ms.
 
 ### Live Boolean (0.17)
 
@@ -319,7 +320,9 @@ overlap with the result of the ones above it.
 
 Geometry › **ZRemesher** rebuilds the active subtool as clean quads whose edge loops follow
 its form, at about **Target Polygons Count** thousand quads (**Half / Same / Double** set it
-from the subtool's polygons now). With **KeepGroups** edge loops run along the polygroup
+from the subtool's polygons now). **AdaptiveSize** (0–100, default 50) makes quads smaller
+where the surface curves more and larger where it is flat, by up to half and twice the
+even size, keeping about the target count. With **KeepGroups** edge loops run along the polygroup
 borders, and vertices on a border are put exactly on it, so a polygrouped hard-surface
 part keeps crisp edges and corners. Holes in a closed surface are closed; the result is
 all quads (a few three- and five-sided poles where the surface needs them). One undo
@@ -338,18 +341,23 @@ few pixels, then an edge, else the polygon), and a click or drag acts on it. Bru
 ZModeler picks the actions, as ZBrush's Space menu does:
 
 - **Polygon**: **QMesh** / **Extrude** (drag to pull out or push in along the normal),
-  **Inset** (drag to size the inner copy), **Delete**, **Polygroup** (click). Targets: **A
+  **Inset** (drag to size the inner copy), **Delete**, **Polygroup** (click), **Bridge**
+  (click one polygon, then another with as many sides: a tube joins them). Targets: **A
   Single Poly**, **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest
   the cursor).
 - **Edge**: **Insert** an edge loop round the ring of quads through the edge (click where it
-  goes, drag to slide it; a triangle at the end becomes a quad) or **Delete** the edge or
-  its whole **EdgeLoop**.
+  goes, drag to slide it; a triangle at the end becomes a quad), **Delete** the edge or
+  its whole **EdgeLoop**, **Bevel** the edge loop into a flat strip (drag for its width),
+  or **Spin** the edge one step round its two polygons (click).
 - **Point**: **Move** in the view plane.
+
+With symmetry on (X, Y, Z or radial), every action also happens on the mirror images of
+its target, mirrored (a spin turns the other way in a mirror).
 
 Klay keeps triangles, so ZModeler pairs them into quads the way PolyF shows them and then
 remembers the pairing from one action to the next. Each action is one undo step; it needs
-a subtool without subdivision levels. Not yet: symmetry, Bevel, Bridge, Crease, Spin and
-the other actions of ZBrush's long list.
+a subtool without subdivision levels. Not yet: Crease, Slide, Spin Poly and the rest of
+ZBrush's long list.
 
 ### Canvas and Document
 

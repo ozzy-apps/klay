@@ -310,6 +310,9 @@ pub enum UndoStep {
     Groups(Vec<crate::polygroup::GroupRuns>),
     /// The whole stack before it was replaced (Wedge), packed.
     Replace(Box<crate::multires::Packed>),
+    /// A Sculptris Pro stroke: the triangles to take out and put back (see
+    /// [`crate::sculptris::RegionDiff`]: `added` comes out, `removed` goes back in).
+    Region(Box<crate::sculptris::RegionDiff>),
     /// What followed `keep` in the base mesh before a part was added or changed there
     /// (CurveTube): `None` for nothing. Only the part is kept, not the whole model.
     Part { keep: crate::mesh::Extent, part: Option<Box<SculptMesh>> },
@@ -377,6 +380,12 @@ impl History {
             Some(UndoStep::Transform(map)) => Some(*map),
             _ => None,
         }
+    }
+
+    /// Bytes the last undo step holds.
+    #[cfg(test)]
+    pub fn bytes_last(&self) -> usize {
+        self.undo.last().map_or(0, step_bytes)
     }
 
     pub fn push(&mut self, step: UndoStep) {
@@ -455,6 +464,7 @@ fn step_name(s: &UndoStep) -> &'static str {
         UndoStep::Visibility(_) => "Visibility",
         UndoStep::Groups(_) => "Polygroups",
         UndoStep::Replace(_) => "Remesh",
+        UndoStep::Region(_) => "Sculptris Pro",
         UndoStep::Part { .. } => "CurveTube",
         UndoStep::Mask { .. } => "Mask",
         UndoStep::Paint(_) => "Paint",
@@ -475,6 +485,7 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Visibility(runs) => runs.iter().map(|r| r.len() * 4).sum(),
         UndoStep::Groups(runs) => runs.iter().map(|r| r.bytes()).sum(),
         UndoStep::Replace(packed) => packed.bytes(),
+        UndoStep::Region(d) => d.bytes(),
         UndoStep::Part { part, .. } => part.as_ref().map_or(0, |m| m.vertex_count() * 40 + m.triangle_count() * 14),
         UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
         UndoStep::Layers { state, .. } => state.bytes(),
@@ -513,6 +524,19 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
         UndoStep::Paint(data) => UndoStep::Paint(doc.restore_paint(data)),
         UndoStep::Visibility(runs) => UndoStep::Visibility(doc.restore_visibility(runs)),
         UndoStep::Groups(runs) => UndoStep::Groups(doc.restore_groups(runs)),
+        UndoStep::Region(d) => {
+            let budget = doc.budget;
+            match crate::sculptris::swapped(doc.mesh(), &d.added, &d.removed) {
+                Some(mesh) => {
+                    *doc = Multires::new(mesh, budget);
+                    UndoStep::Region(Box::new(crate::sculptris::RegionDiff { removed: d.added, added: d.removed }))
+                }
+                None => {
+                    log::warn!("a Sculptris Pro step no longer fits the mesh; left as it is");
+                    UndoStep::Region(d)
+                }
+            }
+        }
         UndoStep::Replace(packed) => {
             let budget = doc.budget;
             let now = std::mem::replace(doc, packed.unpack());

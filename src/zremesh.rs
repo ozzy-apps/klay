@@ -35,11 +35,14 @@ pub struct Settings {
     pub target_k: f32,
     /// Hold edge loops along polygroup borders (ZBrush: KeepGroups).
     pub keep_groups: bool,
+    /// 0..=100: how much smaller quads get where the surface curves more (ZBrush:
+    /// AdaptiveSize); 0 keeps them all one size.
+    pub adaptive: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0 }
     }
 }
 
@@ -258,16 +261,16 @@ fn round4(o: Vec3, q: Vec3, n: Vec3, p: Vec3, scale: f32) -> Vec3 {
 /// The pair of lattice points of two samples (lattices through `o0` and `o1`) that are
 /// nearest each other, near the point between them.
 #[allow(clippy::too_many_arguments)]
-fn compat_position(p0: Vec3, n0: Vec3, q0: Vec3, o0: Vec3, p1: Vec3, n1: Vec3, q1: Vec3, o1: Vec3, scale: f32) -> (Vec3, Vec3) {
+fn compat_position(p0: Vec3, n0: Vec3, q0: Vec3, o0: Vec3, p1: Vec3, n1: Vec3, q1: Vec3, o1: Vec3, s0: f32, s1: f32) -> (Vec3, Vec3) {
     let (t0, t1) = (n0.cross(q0), n1.cross(q1));
     let mid = middle_point(p0, n0, p1, n1);
-    let a = floor4(o0, q0, n0, mid, scale);
-    let b = floor4(o1, q1, n1, mid, scale);
+    let a = floor4(o0, q0, n0, mid, s0);
+    let b = floor4(o1, q1, n1, mid, s1);
     let (mut best, mut bi, mut bj) = (f32::INFINITY, 0, 0);
     for i in 0..4 {
-        let x = a + (q0 * (i & 1) as f32 + t0 * ((i >> 1) & 1) as f32) * scale;
+        let x = a + (q0 * (i & 1) as f32 + t0 * ((i >> 1) & 1) as f32) * s0;
         for j in 0..4 {
-            let y = b + (q1 * (j & 1) as f32 + t1 * ((j >> 1) & 1) as f32) * scale;
+            let y = b + (q1 * (j & 1) as f32 + t1 * ((j >> 1) & 1) as f32) * s1;
             let c = x.distance_squared(y);
             if c < best {
                 best = c;
@@ -277,8 +280,8 @@ fn compat_position(p0: Vec3, n0: Vec3, q0: Vec3, o0: Vec3, p1: Vec3, n1: Vec3, q
         }
     }
     (
-        a + (q0 * (bi & 1) as f32 + t0 * ((bi >> 1) & 1) as f32) * scale,
-        b + (q1 * (bj & 1) as f32 + t1 * ((bj >> 1) & 1) as f32) * scale,
+        a + (q0 * (bi & 1) as f32 + t0 * ((bi >> 1) & 1) as f32) * s0,
+        b + (q1 * (bj & 1) as f32 + t1 * ((bj >> 1) & 1) as f32) * s1,
     )
 }
 
@@ -313,8 +316,9 @@ fn smooth_directions(g: &Graph, q: &mut [Vec3], colours: &[Vec<u32>], sweeps: us
     }
 }
 
-/// Smooth the lattice points `o` of `g` (directions `q`, step `scale`), `sweeps` times.
-fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize, scale: f32) {
+/// Smooth the lattice points `o` of `g` (directions `q`, each sample's step in `scale`),
+/// `sweeps` times.
+fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize, scale: &[f32]) {
     for _ in 0..sweeps {
         for set in colours {
             let new: Vec<(u32, Vec3)> = set
@@ -327,12 +331,12 @@ fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>],
                     for &j in g.neighbours(i) {
                         let j = j as usize;
                         let (qi, qj) = compat_orientation(q[i], n, q[j], g.n[j]);
-                        let (a, b) = compat_position(p, n, qi, sum, g.p[j], g.n[j], qj, o[j], scale);
+                        let (a, b) = compat_position(p, n, qi, sum, g.p[j], g.n[j], qj, o[j], scale[i], scale[j]);
                         sum = (a * w + b) / (w + 1.0);
                         w += 1.0;
                         sum -= n * n.dot(sum - p);
                     }
-                    (i as u32, round4(sum, q[i], n, p, scale))
+                    (i as u32, round4(sum, q[i], n, p, scale[i]))
                 })
                 .collect();
             for (i, v) in new {
@@ -340,6 +344,49 @@ fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>],
             }
         }
     }
+}
+
+/// AdaptiveSize: each sample's lattice step, `scale` scaled down where the surface curves
+/// more than usual and up where it is flatter (by up to two), by an amount that grows with
+/// `adaptive` (0..=100), smoothed so it changes gently, and normalised so the surface still
+/// gets about as many quads as at one step everywhere.
+fn adaptive_scale(g: &Graph, scale: f32, adaptive: f32) -> Vec<f32> {
+    let m = g.len();
+    let strength = (adaptive / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 || m == 0 {
+        return vec![scale; m];
+    }
+    // Curvature: how fast the normal turns toward the neighbours.
+    let curv: Vec<f32> = (0..m)
+        .into_par_iter()
+        .map(|i| {
+            let nb = g.neighbours(i);
+            if nb.is_empty() {
+                return 0.0;
+            }
+            nb.iter().map(|&j| (g.n[i] - g.n[j as usize]).length() / g.p[i].distance(g.p[j as usize]).max(1e-9)).sum::<f32>() / nb.len() as f32
+        })
+        .collect();
+    let mut sorted = curv.clone();
+    sorted.sort_by(f32::total_cmp);
+    let typical = sorted[m / 2].max(1e-6 / scale);
+    // In log steps: bends twice the typical halve the step at full strength (bounded).
+    let mut ln: Vec<f32> = curv.iter().map(|&k| (-(k / typical).max(1e-3).ln() * 0.5 * strength).clamp(-0.69, 0.69)).collect();
+    for _ in 0..8 {
+        ln = (0..m)
+            .map(|i| {
+                let nb = g.neighbours(i);
+                if nb.is_empty() {
+                    return ln[i];
+                }
+                0.5 * ln[i] + 0.5 * nb.iter().map(|&j| ln[j as usize]).sum::<f32>() / nb.len() as f32
+            })
+            .collect();
+    }
+    // Quads per sample go as 1 / step²: keep their mean.
+    let mean: f32 = ln.iter().map(|&x| (-2.0 * x).exp()).sum::<f32>() / m as f32;
+    let fix = mean.sqrt();
+    ln.iter().map(|&x| scale * x.exp() * fix).collect()
 }
 
 /// Union-find.
@@ -433,6 +480,18 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
         levels.push((coarse, Vec::new()));
     }
     stats.levels = levels.len();
+    // The lattice step of every sample: smaller where the surface curves more
+    // (AdaptiveSize), keeping the quad count about the same.
+    let mut scales: Vec<Vec<f32>> = vec![adaptive_scale(&levels[0].0, scale, s.adaptive)];
+    for l in 1..levels.len() {
+        let mut sum = vec![0.0f32; levels[l].0.len()];
+        let mut cnt = vec![0.0f32; levels[l].0.len()];
+        for (i, &pa) in levels[l - 1].1.iter().enumerate() {
+            sum[pa as usize] += scales[l - 1][i];
+            cnt[pa as usize] += 1.0;
+        }
+        scales.push(sum.iter().zip(&cnt).map(|(s, c)| s / c.max(1.0)).collect());
+    }
     let colours: Vec<Vec<Vec<u32>>> = levels.iter().map(|(g, _)| g.colours()).collect();
 
     // Smoothing passes per level (more on the finest, which the quads come from).
@@ -486,7 +545,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                 })
                 .collect();
         }
-        smooth_positions(g, &qs[l], &mut o, &colours[l], sweeps(l), scale);
+        smooth_positions(g, &qs[l], &mut o, &colours[l], sweeps(l), &scales[l]);
     }
     let g = &levels[0].0;
     let q = &qs[0];
@@ -502,7 +561,9 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                 continue;
             }
             let (qi, qj) = compat_orientation(q[i], g.n[i], q[j], g.n[j]);
-            let (a, b) = compat_position(g.p[i], g.n[i], qi, o[i], g.p[j], g.n[j], qj, o[j], scale);
+            let (si, sj) = (scales[0][i], scales[0][j]);
+            let (a, b) = compat_position(g.p[i], g.n[i], qi, o[i], g.p[j], g.n[j], qj, o[j], si, sj);
+            let scale = (si + sj) * 0.5;
             let d = b - a;
             let ti = g.n[i].cross(qi);
             let (x, y) = ((qi.dot(d) / scale).round() as i32, (ti.dot(d) / scale).round() as i32);
@@ -528,6 +589,8 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
     let mut vn: Vec<Vec3> = Vec::new();
     let mut vq: Vec<Vec3> = Vec::new();
     let mut cnt: Vec<f32> = Vec::new();
+    // Each vertex's lattice step (the mean of its samples').
+    let mut vs: Vec<f32> = Vec::new();
     for i in 0..m {
         let r = find(&mut uf, i as u32) as usize;
         if vid[r] == u32::MAX {
@@ -536,22 +599,26 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
             vn.push(Vec3::ZERO);
             vq.push(q[r]);
             cnt.push(0.0);
+            vs.push(0.0);
         }
         let k = vid[r] as usize;
         vid[i] = vid[r];
         vp[k] += o[i];
         vn[k] += g.n[i];
+        vs[k] += scales[0][i];
         cnt[k] += 1.0;
     }
     for k in 0..vp.len() {
         vp[k] /= cnt[k];
+        vs[k] /= cnt[k];
         vn[k] = vn[k].normalize_or(Vec3::Z);
     }
+    let biggest = scales[0].iter().copied().fold(scale, f32::max);
     // One lattice point split into nearby vertices is joined again.
     {
         let k = vp.len();
         let mut uf2: Vec<u32> = (0..k as u32).collect();
-        let inv = 1.0 / (scale * 0.4);
+        let inv = 1.0 / (biggest * 0.4);
         let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
         for v in 0..k {
             let c = (vp[v] * inv).floor();
@@ -564,7 +631,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                     for dz in -1..=1 {
                         if let Some(list) = grid.get(&(c.x as i32 + dx, c.y as i32 + dy, c.z as i32 + dz)) {
                             for &w in list {
-                                if (w as usize) > v && vp[v].distance(vp[w as usize]) < scale * 0.4 && vn[v].dot(vn[w as usize]) > 0.5 {
+                                if (w as usize) > v && vp[v].distance(vp[w as usize]) < vs[v].min(vs[w as usize]) * 0.4 && vn[v].dot(vn[w as usize]) > 0.5 {
                                     let (ra, rb) = (find(&mut uf2, v as u32), find(&mut uf2, w));
                                     if ra != rb {
                                         uf2[ra as usize] = rb;
@@ -577,7 +644,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
             }
         }
         let mut remap = vec![u32::MAX; k];
-        let (mut np, mut nn, mut nq, mut nc): (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<f32>) = Default::default();
+        let (mut np, mut nn, mut nq, mut nc, mut ns): (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<f32>, Vec<f32>) = Default::default();
         for v in 0..k {
             let r = find(&mut uf2, v as u32) as usize;
             if remap[r] == u32::MAX {
@@ -586,27 +653,30 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                 nn.push(Vec3::ZERO);
                 nq.push(vq[r]);
                 nc.push(0.0);
+                ns.push(0.0);
             }
             let t = remap[r] as usize;
             remap[v] = remap[r];
             np[t] += vp[v] * cnt[v];
             nn[t] += vn[v] * cnt[v];
+            ns[t] += vs[v] * cnt[v];
             nc[t] += cnt[v];
         }
         for t in 0..np.len() {
             np[t] /= nc[t];
+            ns[t] /= nc[t];
             nn[t] = nn[t].normalize_or(Vec3::Z);
         }
         for x in vid.iter_mut() {
             *x = remap[*x as usize];
         }
-        (vp, vn, vq) = (np, nn, nq);
+        (vp, vn, vq, vs) = (np, nn, nq, ns);
     }
     let mut nb: Vec<Vec<u32>> = vec![Vec::new(); vp.len()];
     for &(i, j) in &steps {
         let (a, b) = (vid[i as usize], vid[j as usize]);
         // A step is one lattice edge long; far longer ones are strays.
-        if a != b && !nb[a as usize].contains(&b) && vp[a as usize].distance(vp[b as usize]) < scale * 2.0 {
+        if a != b && !nb[a as usize].contains(&b) && vp[a as usize].distance(vp[b as usize]) < (vs[a as usize] + vs[b as usize]) {
             nb[a as usize].push(b);
             nb[b as usize].push(a);
         }
@@ -776,7 +846,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
     stats.quads = quads.len();
 
     // Onto the old surface, then even spacing along it.
-    let reach = scale * 1.5;
+    let reach = biggest * 1.5;
     let mut vnorm = vec![Vec3::ZERO; out_p.len()];
     let normals = |p: &[Vec3], out: &mut Vec<Vec3>| {
         out.iter_mut().for_each(|n| *n = Vec3::ZERO);
@@ -961,7 +1031,7 @@ mod tests {
     fn a_sphere_becomes_even_quads_near_the_target() {
         // A dense, uneven sphere: squash its vertices toward the poles first.
         let m = sphere(40);
-        let (out, stats) = zremesh(&m, &Settings { target_k: 1.0, keep_groups: false }).unwrap();
+        let (out, stats) = zremesh(&m, &Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0 }).unwrap();
         eprintln!("{stats:?}");
         // About the target count (split quads: twice the triangles).
         let quads = out.triangle_count() / 2;
@@ -997,11 +1067,34 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_size_puts_more_quads_where_the_surface_curves() {
+        // A big ball and a small one: the small one curves five times as much.
+        let (p1, i1) = crate::mesh::cube_sphere(30, 1.0);
+        let (p2, i2) = crate::mesh::cube_sphere(30, 0.2);
+        let n = p1.len() as u32;
+        let mut pos = p1;
+        pos.extend(p2.into_iter().map(|p| p + Vec3::new(2.0, 0.0, 0.0)));
+        let mut idx = i1;
+        idx.extend(i2.into_iter().map(|i| i + n));
+        let m = SculptMesh::from_raw(pos, idx);
+        let small = |s: f32| {
+            let (out, _) = zremesh(&m, &Settings { target_k: 2.0, keep_groups: false, adaptive: s }).unwrap();
+            let quads = out.triangle_count() / 2;
+            let on_small = out.indices.chunks_exact(6).filter(|q| out.positions[q[0] as usize].x > 1.5).count();
+            (on_small, quads)
+        };
+        let (even, total_even) = small(0.0);
+        let (adapt, total_adapt) = small(100.0);
+        assert!(adapt as f32 > even as f32 * 1.8, "small ball: {even} quads even, {adapt} adaptive");
+        assert!((total_adapt as f32 / total_even as f32 - 1.0).abs() < 0.35, "total {total_even} vs {total_adapt}");
+    }
+
+    #[test]
     #[ignore]
     fn debug_sphere() {
         for k in [1.0f32, 4.0, 16.0] {
             let m = sphere(60);
-            let r = zremesh(&m, &Settings { target_k: k, keep_groups: false });
+            let r = zremesh(&m, &Settings { target_k: k, keep_groups: false, adaptive: 0.0 });
             eprintln!("{k}: {:?}", r.map(|x| x.1));
         }
     }
@@ -1011,7 +1104,7 @@ mod tests {
     fn debug_plane() {
         let (p, i) = crate::primitive::Primitive::Plane.build(60, 1.0);
         let m = SculptMesh::from_raw(p, i);
-        let r = zremesh(&m, &Settings { target_k: 0.4, keep_groups: false });
+        let r = zremesh(&m, &Settings { target_k: 0.4, keep_groups: false, adaptive: 0.0 });
         eprintln!("{:?}", r.map(|x| x.1));
     }
 }

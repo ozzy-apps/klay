@@ -2151,7 +2151,7 @@ impl Workspace {
                         if let Some(i) = seg(ui, &names[..3], at.min(2), false) {
                             ws.zm_poly = PolyAction::ALL[i];
                         }
-                        if let Some(i) = seg(ui, &names[3..], at.saturating_sub(3).min(1), false) {
+                        if let Some(i) = seg(ui, &names[3..], at.saturating_sub(3).min(2), false) {
                             ws.zm_poly = PolyAction::ALL[3 + i];
                         }
                         let targets: Vec<&str> = PolyTarget::ALL.iter().map(|x| x.name()).collect();
@@ -3120,6 +3120,7 @@ impl Workspace {
                             }
                         }
                     });
+                    zslider(ui, "AdaptiveSize", &mut ws.zremesh.adaptive, 0.0..=100.0, false, false, 0);
                     ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
                         .on_hover_text("Edge loops run along polygroup borders");
                     note(ui, "Target in thousands of quads · all quads, loops following the form · needs a subtool without subdivision levels");

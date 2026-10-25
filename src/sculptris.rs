@@ -548,6 +548,169 @@ fn rebuilt(mesh: &SculptMesh, l: &Local, region: &[u32]) -> SculptMesh {
     mesh.patched(&patch)
 }
 
+/// A Sculptris Pro stroke's undo: the triangles it took out and those it put in, each
+/// as its corners' positions and attributes, so it holds only the region the stroke
+/// touched (vertex numbers change with every pass, positions do not).
+#[derive(Clone, Debug, Default)]
+pub struct RegionDiff {
+    pub removed: Vec<TriRec>,
+    pub added: Vec<TriRec>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TriRec {
+    pub pos: [Vec3; 3],
+    pub group: u16,
+    pub mask: [u8; 3],
+    pub color: [[u8; 4]; 3],
+}
+
+impl RegionDiff {
+    pub fn bytes(&self) -> usize {
+        (self.removed.len() + self.added.len()) * std::mem::size_of::<TriRec>()
+    }
+}
+
+/// The arrays of a mesh a diff is taken against (kept from the start of a stroke).
+pub struct Before {
+    pub pos: Vec<Vec3>,
+    pub idx: Vec<u32>,
+    pub groups: Vec<u16>,
+    pub mask: Vec<u8>,
+    pub colors: Vec<[u8; 4]>,
+}
+
+impl Before {
+    pub fn of(mesh: &SculptMesh) -> Self {
+        Self {
+            pos: mesh.positions.clone(),
+            idx: mesh.indices.clone(),
+            groups: (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect(),
+            mask: mesh.mask.clone(),
+            colors: mesh.colors.clone(),
+        }
+    }
+}
+
+/// A triangle's key: its corners' position bits, turned so the least comes first (the
+/// orientation stays).
+fn tri_key(p: [Vec3; 3]) -> [[u32; 3]; 3] {
+    let b = p.map(|v| v.to_array().map(f32::to_bits));
+    let k = (0..3).min_by_key(|&k| b[k]).unwrap();
+    [b[k], b[(k + 1) % 3], b[(k + 2) % 3]]
+}
+
+fn rec(pos: &[Vec3], idx: &[u32], groups: &[u16], mask: &[u8], colors: &[[u8; 4]], t: usize) -> TriRec {
+    let v = [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]];
+    TriRec {
+        pos: v.map(|i| pos[i as usize]),
+        group: groups.get(t).copied().unwrap_or(0),
+        mask: v.map(|i| mask.get(i as usize).copied().unwrap_or(0)),
+        color: v.map(|i| colors.get(i as usize).copied().unwrap_or([0; 4])),
+    }
+}
+
+/// What changed from `before` to `after`: the triangles only one of them has.
+pub fn diff(before: &Before, after: &SculptMesh) -> RegionDiff {
+    use rayon::prelude::*;
+    let keys = |pos: &[Vec3], idx: &[u32]| -> Vec<([[u32; 3]; 3], u32)> {
+        let mut k: Vec<([[u32; 3]; 3], u32)> = (0..idx.len() / 3)
+            .into_par_iter()
+            .map(|t| (tri_key([pos[idx[3 * t] as usize], pos[idx[3 * t + 1] as usize], pos[idx[3 * t + 2] as usize]]), t as u32))
+            .collect();
+        k.par_sort_unstable();
+        k
+    };
+    let (a, b) = (keys(&before.pos, &before.idx), keys(&after.positions, &after.indices));
+    let after_groups: Vec<u16> = (0..after.triangle_count() as u32).map(|t| after.group(t)).collect();
+    let (mut i, mut j) = (0, 0);
+    let mut d = RegionDiff::default();
+    while i < a.len() || j < b.len() {
+        match (a.get(i), b.get(j)) {
+            (Some(x), Some(y)) if x.0 == y.0 => {
+                i += 1;
+                j += 1;
+            }
+            (Some(x), Some(y)) if x.0 < y.0 => {
+                d.removed.push(rec(&before.pos, &before.idx, &before.groups, &before.mask, &before.colors, x.1 as usize));
+                i += 1;
+            }
+            (Some(x), None) => {
+                d.removed.push(rec(&before.pos, &before.idx, &before.groups, &before.mask, &before.colors, x.1 as usize));
+                i += 1;
+            }
+            (_, Some(y)) => {
+                d.added.push(rec(&after.positions, &after.indices, &after_groups, &after.mask, &after.colors, y.1 as usize));
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    d
+}
+
+/// `mesh` with the triangles `take_out` replaced by `put_in` (an undo or redo of a
+/// [`RegionDiff`]); `None` when `take_out` is not all there.
+pub fn swapped(mesh: &SculptMesh, take_out: &[TriRec], put_in: &[TriRec]) -> Option<SculptMesh> {
+    use crate::mesh::{NewVertex, Patch, VRef};
+    let bits = |p: Vec3| p.to_array().map(f32::to_bits);
+    let mut at: HashMap<[u32; 3], u32> = HashMap::default();
+    for (v, p) in mesh.positions.iter().enumerate() {
+        at.insert(bits(*p), v as u32);
+    }
+    let mut patch = Patch::default();
+    let mut removed: HashSet<u32> = HashSet::default();
+    for r in take_out {
+        let v = r.pos.map(|p| at.get(&bits(p)).copied());
+        let [Some(a), Some(b), Some(c)] = v else { return None };
+        let t = mesh.incident(a).iter().copied().find(|&t| {
+            let tri = &mesh.indices[3 * t as usize..3 * t as usize + 3];
+            tri.contains(&b) && tri.contains(&c)
+        })?;
+        if removed.insert(t) {
+            patch.removed_tris.push(t);
+        }
+    }
+    // Vertices of the removed triangles that nothing else uses.
+    let mut candidates: HashSet<u32> = HashSet::default();
+    for &t in &patch.removed_tris {
+        for &v in &mesh.indices[3 * t as usize..3 * t as usize + 3] {
+            candidates.insert(v);
+        }
+    }
+    let mut new_at: HashMap<[u32; 3], u32> = HashMap::default();
+    let mut used_old: HashSet<u32> = HashSet::default();
+    let fallback_chunk = patch.removed_tris.first().map_or(0, |&t| mesh.vert_chunk[mesh.indices[3 * t as usize] as usize]);
+    for r in put_in {
+        let mut tri = [VRef::Old(0); 3];
+        let old: Vec<u32> = r.pos.iter().filter_map(|&p| at.get(&bits(p)).copied()).collect();
+        let chunk = old.first().map_or(fallback_chunk, |&v| mesh.vert_chunk[v as usize]);
+        for k in 0..3 {
+            let key = bits(r.pos[k]);
+            tri[k] = if let Some(&v) = at.get(&key) {
+                used_old.insert(v);
+                VRef::Old(v)
+            } else {
+                let n = *new_at.entry(key).or_insert_with(|| {
+                    patch.new_verts.push(NewVertex { pos: r.pos[k], chunk, mask: r.mask[k], color: r.color[k] });
+                    (patch.new_verts.len() - 1) as u32
+                });
+                VRef::New(n)
+            };
+        }
+        patch.new_tris.push((tri, r.group));
+    }
+    for v in candidates {
+        if used_old.contains(&v) {
+            continue;
+        }
+        if mesh.incident(v).iter().all(|t| removed.contains(t)) {
+            patch.dead.push(v);
+        }
+    }
+    Some(mesh.patched(&patch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

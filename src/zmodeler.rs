@@ -55,10 +55,12 @@ pub enum PolyAction {
     Inset,
     Delete,
     Polygroup,
+    /// Join this polygon to a second one clicked next by a tube of quads.
+    Bridge,
 }
 
 impl PolyAction {
-    pub const ALL: [Self; 5] = [Self::QMesh, Self::Extrude, Self::Inset, Self::Delete, Self::Polygroup];
+    pub const ALL: [Self; 6] = [Self::QMesh, Self::Extrude, Self::Inset, Self::Delete, Self::Polygroup, Self::Bridge];
     pub fn name(self) -> &'static str {
         match self {
             Self::QMesh => "QMesh",
@@ -66,6 +68,7 @@ impl PolyAction {
             Self::Inset => "Inset",
             Self::Delete => "Delete",
             Self::Polygroup => "Polygroup",
+            Self::Bridge => "Bridge",
         }
     }
 }
@@ -75,14 +78,20 @@ pub enum EdgeAction {
     #[default]
     Insert,
     Delete,
+    /// Chamfer the edge loop into a flat strip.
+    Bevel,
+    /// Turn the edge one step round its two polygons.
+    Spin,
 }
 
 impl EdgeAction {
-    pub const ALL: [Self; 2] = [Self::Insert, Self::Delete];
+    pub const ALL: [Self; 4] = [Self::Insert, Self::Delete, Self::Bevel, Self::Spin];
     pub fn name(self) -> &'static str {
         match self {
             Self::Insert => "Insert",
             Self::Delete => "Delete",
+            Self::Bevel => "Bevel",
+            Self::Spin => "Spin",
         }
     }
 }
@@ -563,6 +572,118 @@ impl PolyMesh {
         out
     }
 
+    /// The polygons on edge (a, b) and where the edge starts in each.
+    fn faces_on(&self, a: u32, b: u32) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (f, fv) in self.faces.iter().enumerate() {
+            let n = fv.len();
+            for k in 0..n {
+                if key(fv[k], fv[(k + 1) % n]) == key(a, b) {
+                    out.push((f, k));
+                }
+            }
+        }
+        out
+    }
+
+    /// The polygon with exactly these vertices (in any turn), if any.
+    pub fn face_with(&self, verts: &[u32]) -> Option<u32> {
+        let mut want = verts.to_vec();
+        want.sort_unstable();
+        self.faces.iter().position(|f| {
+            let mut v = f.clone();
+            v.sort_unstable();
+            v == want
+        }).map(|f| f as u32)
+    }
+
+    /// Bevel: the edge loop through (a, b) chamfered: a loop is cut on each side of it,
+    /// `t` of the way along the edges that leave it, and the loop itself dissolved, so a
+    /// flat strip of quads replaces the edge.
+    pub fn bevel(&self, a: u32, b: u32, t: f32) -> PolyMesh {
+        let t = t.clamp(0.02, 0.45);
+        let lp = self.edge_loop(a, b);
+        let mut out = self.clone();
+        for (f, k) in self.faces_on(a, b) {
+            let fv = &self.faces[f];
+            if fv.len() != 4 {
+                return self.clone();
+            }
+            // The edge leaving the loop at the end of (a, b) that is `a` in this polygon.
+            let n = fv.len();
+            let (x, y) = (fv[k], fv[(k + 1) % n]);
+            let (from, to) = if x == a { (x, fv[(k + n - 1) % n]) } else { (y, fv[(k + 2) % n]) };
+            let _ = y;
+            out = out.insert_loop(from, to, t);
+        }
+        out.dissolve(&lp)
+    }
+
+    /// Spin: the edge (a, b) turned one step round the two polygons on it (`forward`:
+    /// with their order; else against it, which is how a mirror image of a forward spin
+    /// turns).
+    pub fn spin(&self, a: u32, b: u32, forward: bool) -> PolyMesh {
+        let on = self.faces_on(a, b);
+        if on.len() != 2 {
+            return self.clone();
+        }
+        let ((f, k), (g, _)) = (on[0], on[1]);
+        let fv = &self.faces[f];
+        let (n, u, v) = (fv.len(), fv[k], fv[(k + 1) % fv.len()]);
+        let f_rot: Vec<u32> = (0..n).map(|i| fv[(k + 1 + i) % n]).collect(); // v .. u
+        let gv = &self.faces[g];
+        let m = gv.len();
+        let Some(j) = gv.iter().position(|&x| x == u) else { return self.clone() };
+        let g_rot: Vec<u32> = (0..m).map(|i| gv[(j + i) % m]).collect(); // u .. v
+        if g_rot.last() != Some(&v) || n < 3 || m < 3 {
+            return self.clone();
+        }
+        // The polygon round both: v, x1 .. u, y1 .. ; the edge v–u (slots 0 and n - 1)
+        // moves one slot on at both ends.
+        let mut ring = f_rot.clone();
+        ring.extend_from_slice(&g_rot[1..m - 1]);
+        let len = ring.len();
+        let (x1, y1) = if forward { (1usize, n) } else { (len - 1, n - 2) };
+        let walk = |from: usize, to: usize| -> Vec<u32> {
+            let mut out = vec![ring[from]];
+            let mut i = from;
+            while i != to {
+                i = (i + 1) % len;
+                out.push(ring[i]);
+            }
+            out
+        };
+        let first = walk(x1, y1);
+        let second = walk(y1, x1);
+        if first.len() < 3 || second.len() < 3 {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.faces[f] = first;
+        out.faces[g] = second;
+        out
+    }
+
+    /// Bridge: polygons `f` and `g` (with as many sides) taken out and their borders joined
+    /// by a tube of quads in a new polygroup, turned for the shortest joins.
+    pub fn bridge(&self, f: u32, g: u32) -> Option<PolyMesh> {
+        let (a, b) = (self.faces[f as usize].clone(), self.faces[g as usize].clone());
+        let n = a.len();
+        if f == g || b.len() != n || a.iter().any(|v| b.contains(v)) {
+            return None;
+        }
+        let cost = |r: usize| -> f32 { (0..n).map(|k| self.pos[a[k] as usize].distance(self.pos[b[(r + n - k) % n] as usize])).sum() };
+        let r = (0..n).min_by(|&x, &y| cost(x).total_cmp(&cost(y)))?;
+        let mut out = self.delete(&[f, g]);
+        let wall = out.next_group();
+        for k in 0..n {
+            let (b0, b1) = (b[(r + n - k) % n], b[(r + 2 * n - k - 1) % n]);
+            out.faces.push(vec![a[k], a[(k + 1) % n], b1, b0]);
+            out.groups.push(wall);
+        }
+        Some(out)
+    }
+
     /// Move points by `delta`.
     pub fn moved(&self, points: &[u32], delta: Vec3) -> PolyMesh {
         let mut out = self.clone();
@@ -638,6 +759,47 @@ mod tests {
         assert!(top.iter().all(|&f| g.groups[f as usize] == g.groups[top[0] as usize]));
         assert_ne!(g.groups[top[0] as usize], g.groups[(0..24u32).find(|f| !top.contains(f)).unwrap() as usize]);
         assert_eq!(pm.target(top[0], PolyTarget::Polygroup, None).len(), 24, "one polygroup on a plain cube");
+    }
+
+    #[test]
+    fn bevel_spin_and_bridge() {
+        let pm = cube();
+        // A cube edge loop (round the top's rim, one side) bevelled: a strip of quads.
+        let top = (0..pm.faces.len() as u32).find(|&f| pm.normal(f).y > 0.9).unwrap();
+        let fv = pm.faces[top as usize].clone();
+        let rim = (0..4)
+            .map(|k| (fv[k], fv[(k + 1) % 4]))
+            .find(|&(x, y)| pm.pos[x as usize].y > 0.99 && pm.pos[y as usize].y > 0.99 && (pm.pos[x as usize].x.abs() > 0.99 && pm.pos[y as usize].x.abs() > 0.99 && (pm.pos[x as usize].x - pm.pos[y as usize].x).abs() < 1e-4))
+            .unwrap();
+        let bev = pm.bevel(rim.0, rim.1, 0.2);
+        assert!(closed(&bev), "closed after the bevel");
+        assert!(volume(&bev) < volume(&pm) - 0.01, "the edge was cut off: {} vs {}", volume(&bev), volume(&pm));
+        // A closed loop (round the cube's middle) bevels into quads only.
+        let eq = (0..pm.faces.len())
+            .flat_map(|f| {
+                let fv = pm.faces[f].clone();
+                (0..4).map(move |k| (fv[k], fv[(k + 1) % 4]))
+            })
+            .find(|&(x, y)| pm.pos[x as usize].y.abs() < 1e-4 && pm.pos[y as usize].y.abs() < 1e-4)
+            .unwrap();
+        assert_eq!(pm.edge_loop(eq.0, eq.1).len(), 8);
+        let band = pm.bevel(eq.0, eq.1, 0.3);
+        assert!(closed(&band));
+        assert!(band.faces.iter().all(|f| f.len() == 4), "{:?}", band.faces.iter().map(|f| f.len()).collect::<Vec<_>>());
+        assert_eq!(band.faces.len(), 32);
+        // Spin an edge between two quads: still closed, the same count.
+        let (a, b) = (fv[0], fv[1]);
+        let sp = pm.spin(a, b, true);
+        assert!(closed(&pm.spin(a, b, false)));
+        assert!(closed(&sp));
+        assert_eq!(sp.faces.len(), pm.faces.len());
+        assert_ne!(sp.faces, pm.faces);
+        // Bridge two opposite quads of the cube: a tunnel, still closed.
+        let bottom = (0..pm.faces.len() as u32).find(|&f| pm.normal(f).y < -0.9 && (pm.centre(f) - pm.centre(top) * Vec3::new(1.0, -1.0, 1.0)).length() < 1e-4).unwrap();
+        let tunnel = pm.bridge(top, bottom).unwrap();
+        assert!(closed(&tunnel));
+        assert_eq!(tunnel.faces.len(), pm.faces.len() - 2 + 4);
+        assert!(volume(&tunnel) < volume(&pm), "the tunnel goes through");
     }
 
     #[test]
