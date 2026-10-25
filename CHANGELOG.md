@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.1 — 2026-10-25
+
+- Pen drag scrolls the brush catalog (B), the Alpha and Texture shelf pop-ups and the History list, like the trays; a drag that started on a brush tile scrolls instead of picking it.
+- Verification: 257 release tests (new: a pen-style drag over the catalog grid scrolls it, picks nothing and leaves it open).
+
 ## 0.22.0 — 2026-10-25
 
 - ZBrush brush keys: B, then a brush's two letters picks it (B D S Dam Standard, B C B Clay Buildup, B M V Move, B S T Standard, B H P hPolish, B T D Trim Dynamic…). All 49 brushes have a code, ZBrush's own where ZBrush has the brush; the catalog shows each code on its tile, the first letter keeps only the brushes it starts, Backspace takes it back.

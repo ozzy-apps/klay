@@ -520,6 +520,7 @@ impl Workspace {
                 ui.set_width(280.0);
                 ScrollArea::vertical()
                     .id_salt(("shelf-assets", texture))
+                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .max_height((ui.ctx().content_rect().height() - 40.0).min(480.0))
                     .show(ui, |ui| self.asset_grid(ui, texture));
             });
@@ -731,6 +732,7 @@ impl Workspace {
                             ui.set_width(grid_width);
                             ScrollArea::vertical()
                                 .id_salt(("brush-catalog-scroll", self.brush_ui.group as u8))
+                                .scroll_source(egui::scroll_area::ScrollSource::ALL)
                                 .max_height(height - 76.0)
                                 .show(ui, |ui| {
                                     let group = self.brush_ui.group;
@@ -1287,6 +1289,39 @@ mod tests {
         for (code, k) in [("DS", BrushKind::DamStandard), ("CB", BrushKind::ClayBuildup), ("ST", BrushKind::Draw), ("MV", BrushKind::Grab), ("HP", BrushKind::HPolish), ("TD", BrushKind::TrimDynamic), ("MT", BrushKind::MoveTopological), ("ZM", BrushKind::ZModeler)] {
             assert_eq!(k.code(), code);
         }
+    }
+    #[test]
+    fn pen_drag_scrolls_the_brush_catalog_without_picking() {
+        let mut a = app("catalog-drag");
+        a.workspace.open_brush_catalog(pos2(320.0, 140.0));
+        frame(&mut a, vec![]);
+        let out = frame(&mut a, vec![]);
+        let at = text(&out, "Mask Line", |p| p.x > 300.0);
+        let before = a.brush.kind;
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut a, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut a, vec![press(true)]);
+        let mut p = at;
+        for _ in 0..12 {
+            p.y -= 15.0;
+            frame(&mut a, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(&mut a, vec![egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let out = frame(&mut a, vec![]);
+        let after = text(&out, "Mask Line", |p| p.x > 300.0);
+        assert!(after.y < at.y - 100.0, "{at:?} -> {after:?}");
+        assert_eq!(a.brush.kind, before);
+        assert!(a.workspace.brush_catalog_open());
     }
     #[test]
     fn b_then_two_letters_picks_the_brush_like_zbrush() {

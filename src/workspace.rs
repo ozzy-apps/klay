@@ -2507,7 +2507,7 @@ impl Workspace {
                             note(ui, "No steps yet.");
                             return;
                         }
-                        egui::ScrollArea::vertical().max_height(240.0).stick_to_bottom(true).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(240.0).stick_to_bottom(true).scroll_source(egui::scroll_area::ScrollSource::ALL).show(ui, |ui| {
                             let rows = std::iter::once("Start".to_string())
                                 .chain(m.undo_names.iter().cloned())
                                 .chain(m.redo_names.iter().cloned());

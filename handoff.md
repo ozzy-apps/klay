@@ -582,3 +582,6 @@ The requested UI mockup is complete. Further product work can proceed independen
 - Catalog (`brush_catalog_ui`): `BrushUi::{code, code_fresh}`; letter key events (no modifiers, not while a text field has focus) set the first letter if some code starts with it, the second picks `from_code` → `choose_brush` and closes; Backspace clears; the opening frame's B is skipped (`code_fresh`). With a letter typed the grid shows only matching codes across all groups and hides Quick Pick; the header hint says what to type. `brush_tile(.., code: (&str, Option<char>), ..)` draws the code chip (accent when its first letter is typed) and the hover text names "B D S".
 - `--brush-catalog` opens the catalog at start (snapshots).
 - Codes I was unsure of in ZBrush (SnakeHook SH, Layer LA, Magnify MG, CurveTube CU, IMM IP) can be changed in one table.
+
+## Step 64: 0.22.1 — pen drag in the brush catalog (2026-10-25, Claude Code)
+- User: the brush menu has no pen scroll like the other menus. The catalog grid, the shelf's Alpha / Texture pop-ups and the History list were the only `ScrollArea`s without `.scroll_source(ScrollSource::ALL)`; added. Test `pen_drag_scrolls_the_brush_catalog_without_picking` (fails without the fix).
