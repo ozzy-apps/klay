@@ -14,6 +14,7 @@ mod curve;
 mod curve_tube;
 mod cut;
 mod deform;
+mod file_dialog;
 mod gizmo;
 mod insert_mesh;
 mod sculptris;
@@ -212,7 +213,7 @@ enum DocOp {
     Open,
     Save,
     /// SubTool: save the active subtool on its own, add the subtools of a file, export the
-    /// active subtool as OBJ (all at `App::subtool_path`).
+    /// active subtool as OBJ (all at `App::subtool_path`, set by the file dialog).
     SaveSubtool,
     LoadSubtools,
     ExportSubtool,
@@ -495,6 +496,12 @@ struct App {
     subtool_path: String,
     /// Document › Import: OBJ file to import.
     import_path: String,
+    /// The desktop's Open / Save dialog while it is open, the folder of the last file picked
+    /// in one, and whether `project_path` is a file this project was opened from or saved to
+    /// (Save asks for a file until it is).
+    file_dialog: Option<file_dialog::Pending>,
+    last_dir: Option<std::path::PathBuf>,
+    project_has_file: bool,
     /// QuickSave: when the last input came, when the model was last QuickSaved, and the
     /// (subtool id, edit count) it was saved at, so an unchanged model is not saved again.
     last_input: Instant,
@@ -690,6 +697,9 @@ impl App {
             project_path: "untitled.klay".to_string(),
             subtool_path: "subtool.klay".to_string(),
             import_path: "model.obj".to_string(),
+            file_dialog: None,
+            last_dir: None,
+            project_has_file: false,
             morph_targets: std::collections::HashMap::new(),
             last_input: Instant::now(),
             last_quicksave: Instant::now(),
@@ -1890,6 +1900,105 @@ impl App {
             .expect("writing to memory")
     }
 
+    /// Save (Ctrl + S): to the project's file, or ask for one when it has none yet.
+    fn save_or_ask(&mut self) {
+        if self.project_has_file {
+            self.pending_doc = Some(DocOp::Save);
+        } else {
+            self.ask_file(file_dialog::Ask::SaveProject);
+        }
+    }
+
+    /// Open the desktop's file dialog for `ask`, starting in the folder of the file it is
+    /// about; [`answer_file_dialog`](Self::answer_file_dialog) acts on the file picked.
+    /// Scripted runs and tests have no dialogs and use the stored paths.
+    fn ask_file(&mut self, ask: file_dialog::Ask) {
+        use file_dialog::Ask;
+        if self.automated || self.window.is_none() {
+            self.pending_doc = Some(match ask {
+                Ask::OpenProject => DocOp::Open,
+                Ask::SaveProject => DocOp::Save,
+                Ask::SaveSubtool => DocOp::SaveSubtool,
+                Ask::LoadSubtools => DocOp::LoadSubtools,
+                Ask::ExportSubtoolObj => DocOp::ExportSubtool,
+                Ask::ImportObj => DocOp::ImportObj,
+                Ask::ExportObj => {
+                    self.pending_export = true;
+                    return;
+                }
+            });
+            return;
+        }
+        if self.file_dialog.is_some() {
+            self.workspace.notify("A file dialog is already open");
+            return;
+        }
+        let file_of = |path: &str| Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned());
+        let project_stem = Path::new(&self.project_path).file_stem().map_or_else(|| "untitled".into(), |s| s.to_string_lossy().into_owned());
+        let tool = self.subtools[self.active_tool].name.clone();
+        let (near, name) = match ask {
+            Ask::OpenProject => (&self.project_path, String::new()),
+            Ask::SaveProject => (&self.project_path, file_of(&self.project_path).unwrap_or_else(|| "untitled.klay".into())),
+            Ask::SaveSubtool | Ask::LoadSubtools => (&self.subtool_path, file_dialog::file_name(&tool, "klay")),
+            Ask::ExportSubtoolObj => (&self.subtool_path, file_dialog::file_name(&tool, "obj")),
+            Ask::ExportObj if self.project_has_file => (&self.export_path, file_dialog::file_name(&project_stem, "obj")),
+            Ask::ExportObj => (&self.export_path, file_of(&self.export_path).unwrap_or_else(|| "export.obj".into())),
+            Ask::ImportObj => (&self.import_path, String::new()),
+        };
+        // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
+        let dir = file_dialog::start_dir(near, self.last_dir.as_deref());
+        self.file_dialog = Some(file_dialog::open(ask, &dir, &name, self.window.as_deref()));
+    }
+
+    /// Act on the file picked in the open dialog once it closes (nothing when it was
+    /// cancelled). Waits while a stroke or gesture is under way.
+    fn answer_file_dialog(&mut self) {
+        use file_dialog::Ask;
+        if self.busy() {
+            return;
+        }
+        let Some(paths) = self.file_dialog.as_ref().and_then(file_dialog::Pending::answer) else {
+            return;
+        };
+        let ask = self.file_dialog.take().expect("an open dialog").ask;
+        let Some(first) = paths.first() else {
+            return;
+        };
+        self.last_dir = first.parent().map(Path::to_path_buf);
+        let text = |p: &std::path::PathBuf| p.to_string_lossy().into_owned();
+        match ask {
+            Ask::OpenProject => self.open_project(&text(first)),
+            Ask::SaveProject => {
+                self.project_path = text(first);
+                self.save_project();
+            }
+            Ask::SaveSubtool => {
+                self.subtool_path = text(first);
+                self.save_subtool();
+            }
+            Ask::LoadSubtools => {
+                for path in &paths {
+                    self.subtool_path = text(path);
+                    self.load_subtools();
+                }
+            }
+            Ask::ExportSubtoolObj => {
+                self.subtool_path = text(first);
+                self.export_subtool_obj();
+            }
+            Ask::ExportObj => {
+                self.export_path = text(first);
+                self.export_obj_all();
+            }
+            Ask::ImportObj => {
+                for path in &paths {
+                    self.import_path = text(path);
+                    self.import_obj(&text(path));
+                }
+            }
+        }
+    }
+
     /// Write every subtool to `self.project_path` (ZBrush: Save; Ctrl + S).
     fn save_project(&mut self) {
         if self.busy() {
@@ -1899,6 +2008,7 @@ impl App {
         let path = self.project_path.clone();
         self.doc.freeze_layers();
         let result = self.with_project_tools(|tools, extras| project::save_with(Path::new(&path), tools, extras, self.active_tool));
+        self.project_has_file |= result.is_ok();
         self.status = match result {
             Ok(bytes) => format!(
                 "Saved {path}: {} subtools, {:.1} MB in {:.2} s",
@@ -2308,6 +2418,7 @@ impl App {
         match self.load_project(path) {
             Ok(()) => {
                 self.project_path = path.to_string();
+                self.project_has_file = true;
                 self.status = format!(
                     "Opened {path}: {} subtools in {:.2} s",
                     self.subtools.len(),
@@ -2408,6 +2519,7 @@ impl App {
         }];
         self.active_tool = 0;
         self.project_path = "untitled.klay".to_string();
+        self.project_has_file = false;
         self.show_active_level();
         self.home_camera();
         self.status = "New project".to_string();
@@ -6460,8 +6572,8 @@ impl App {
                 self.curve = None;
                 self.workspace.curve_preview = None;
             }
-            KeyCode::KeyS if ctrl => self.pending_doc = Some(DocOp::Save),
-            KeyCode::KeyO if ctrl => self.pending_doc = Some(DocOp::Open),
+            KeyCode::KeyS if ctrl => self.save_or_ask(),
+            KeyCode::KeyO if ctrl => self.ask_file(file_dialog::Ask::OpenProject),
             // ZBrush masking: Ctrl + I invert, Ctrl + A mask all, Ctrl + Shift + A clear,
             // Ctrl + H view mask.
             KeyCode::KeyI if ctrl => self.pending_mask = Some(MaskOp::Invert),
@@ -6587,7 +6699,6 @@ impl App {
             &mut workspace::Model {
                 brush: &mut self.brush,
                 primitive: &mut self.primitive,
-                export_path: &mut self.export_path,
                 status: &self.status,
                 can_undo: self.history.can_undo(),
                 can_redo: self.history.can_redo(),
@@ -6619,8 +6730,6 @@ impl App {
                 parked_bytes,
                 stand_in_bytes,
                 project_path: &mut self.project_path,
-                subtool_path: &mut self.subtool_path,
-                import_path: &mut self.import_path,
                 morph_level: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, _)| *l),
                 layers: self.doc.layers.list.iter().enumerate().map(|(i, l)| (l.name.clone(), l.visible, self.doc.layers.rec.as_ref().is_some_and(|(r, _)| *r == i), l.intensity)).collect(),
                 undo_names: self.history.names().0,
@@ -6641,14 +6750,13 @@ impl App {
             self.pending_doc = Some(DocOp::New);
         }
         if actions.open {
-            self.pending_doc = Some(DocOp::Open);
+            self.ask_file(file_dialog::Ask::OpenProject);
         }
         if actions.save {
-            self.pending_doc = Some(DocOp::Save);
+            self.save_or_ask();
         }
-        if let Some(path) = actions.save_as {
-            self.project_path = path;
-            self.pending_doc = Some(DocOp::Save);
+        if actions.save_as {
+            self.ask_file(file_dialog::Ask::SaveProject);
         }
         if actions.revert {
             self.pending_doc = Some(DocOp::Open);
@@ -6657,16 +6765,19 @@ impl App {
             self.request_snapshot();
         }
         if actions.save_subtool {
-            self.pending_doc = Some(DocOp::SaveSubtool);
+            self.ask_file(file_dialog::Ask::SaveSubtool);
         }
         if actions.load_subtools {
-            self.pending_doc = Some(DocOp::LoadSubtools);
+            self.ask_file(file_dialog::Ask::LoadSubtools);
         }
         if actions.export_subtool {
-            self.pending_doc = Some(DocOp::ExportSubtool);
+            self.ask_file(file_dialog::Ask::ExportSubtoolObj);
         }
         if actions.import_obj {
-            self.pending_doc = Some(DocOp::ImportObj);
+            self.ask_file(file_dialog::Ask::ImportObj);
+        }
+        if actions.export {
+            self.ask_file(file_dialog::Ask::ExportObj);
         }
         if let Some(by) = actions.history_jump {
             self.history_jump(by);
@@ -6773,7 +6884,6 @@ impl App {
             self.pending_subtool = Some(SubToolOp::Deform(kind, value));
         }
         self.pending_rebuild |= actions.rebuild;
-        self.pending_export |= actions.export;
         self.pending_undo |= actions.undo;
         self.pending_redo |= actions.redo;
         self.pending_divide |= actions.divide;
@@ -6862,6 +6972,7 @@ impl App {
         }
         self.run_pending_vis();
         self.run_pending_geo();
+        self.answer_file_dialog();
         match self.pending_doc.take() {
             Some(DocOp::New) => self.new_project(),
             Some(DocOp::Open) => {
@@ -7287,6 +7398,7 @@ impl ApplicationHandler for App {
                 let keep = self.project_path.clone();
                 self.open_project(&doc.to_string_lossy());
                 self.project_path = keep;
+                self.project_has_file = false;
             }
         }
         for _ in 0..std::mem::take(&mut self.initial_subtools) {

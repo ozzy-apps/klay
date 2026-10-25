@@ -18,6 +18,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "1.0"
 env_logger = "0.11"
 log = "0.4"
+rfd = "0.17.2"
 
 [profile.dev]
 opt-level = 1

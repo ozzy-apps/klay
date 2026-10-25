@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- File dialogs: Document › Open (Ctrl + O), Save As, SubTool › Save / Load / Export OBJ and Document › Import / Export OBJ open the desktop's own file dialog (the XDG portal, so GNOME's or KDE's; zenity where there is no portal) instead of reading a typed path. Save (Ctrl + S) saves straight to the project's file once it has one and asks the first time. Dialogs start in the folder of the file they are about, else where the last file was picked; SubTool › Save offers the subtool's name; Load and Import take several files at once; a saved name without `.klay` / `.obj` gets it. The canvas keeps drawing while a dialog is open. The Document palette shows the project's folder instead of a path field.
+- Verification: 284 release tests (new: file names from subtool names, extensions on saved files, where dialogs start).
+
 ## 0.25.0 — 2026-10-25
 
 - Every shelf item can go anywhere, as in ZBrush: the top, left, right and a new bottom shelf are lists of single items (the four mode buttons, Sculptris Pro, Live Boolean, Z+RGB / RGB / Z, RGB Intensity, Zadd / Zsub, Z Intensity, Focal Shift, Draw Size, Undo, Redo, the Brush / Stroke / Alpha / Texture / Material thumbnails, the colour picker, Alternate, the view buttons, separators and springs) plus any brush or palette command dragged on. In Customize mode drag an item to another place or shelf, or onto the canvas to take it off; taken-off built-in items wait under Preferences › Interface to be dragged back. Items draw to fit (half-height pairs on the top and bottom shelves, full width on the side shelves; sliders on a narrow shelf show their value, the name on hover). My shelf's buttons move onto the top shelf; workspaces from 0.23–0.24 open with their shelves converted.

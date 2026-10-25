@@ -457,8 +457,6 @@ impl DocumentLook {
 /// Document dialogs (see `Workspace::doc_dialog`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum DocDialog {
-    /// Save As, with the path being typed.
-    SaveAs(String),
     Revert,
 }
 
@@ -718,7 +716,6 @@ pub struct Model<'a> {
     pub brush: &'a mut Brush,
     /// Primitive and resolution used by New, Append and Rebuild.
     pub primitive: &'a mut crate::primitive::Settings,
-    pub export_path: &'a mut String,
     pub status: &'a str,
     pub can_undo: bool,
     pub can_redo: bool,
@@ -753,12 +750,9 @@ pub struct Model<'a> {
     pub parked_bytes: usize,
     /// GPU memory held by the stand-ins of parked subtools.
     pub stand_in_bytes: u64,
-    /// Project file used by Save and Open.
+    /// The project's file, used by Save and Revert (Open, Save As and the subtool and OBJ
+    /// files are picked in the desktop's file dialog).
     pub project_path: &'a mut String,
-    /// File for SubTool › Save / Load (and Export OBJ, as `.obj`).
-    pub subtool_path: &'a mut String,
-    /// Document › Import: OBJ path.
-    pub import_path: &'a mut String,
     /// Mesh › Morph Target: the level (0-based) of the active subtool's stored target.
     pub morph_level: Option<usize>,
     /// Mesh › Layers of the active subtool: name, visible, recording, intensity.
@@ -843,8 +837,9 @@ pub struct Actions {
     pub new_project: bool,
     pub open: bool,
     pub save: bool,
-    /// Document › Save As (to this path, which becomes the project's), Revert, Snapshot.
-    pub save_as: Option<String>,
+    /// Document › Save As (to a file picked in a dialog, which becomes the project's),
+    /// Revert, Snapshot.
+    pub save_as: bool,
     pub revert: bool,
     pub snapshot: bool,
     /// SubTool: save the active subtool alone, add the subtools of a file, export the
@@ -1845,21 +1840,6 @@ impl Workspace {
                 ui.set_width(360.0);
                 ui.spacing_mut().item_spacing.y = 8.0;
                 match dialog {
-                    DocDialog::SaveAs(path) => {
-                        ui.label(RichText::new("Save As").size(14.0).strong());
-                        let field = ui.add(
-                            egui::TextEdit::singleline(path).desired_width(f32::INFINITY).font(FontId::monospace(12.0)),
-                        );
-                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(!path.trim().is_empty(), egui::Button::new("Save")).clicked() || (enter && !path.trim().is_empty()) {
-                                a.save_as = Some(path.trim().to_string());
-                                close = true;
-                            }
-                            close |= ui.button("Cancel").clicked();
-                        });
-                        note(ui, "Saves every subtool there; later saves go to the new file.");
-                    }
                     DocDialog::Revert => {
                         ui.label(RichText::new("Revert").size(14.0).strong());
                         ui.label(format!("Open {} again as it was last saved? Changes since then are lost.", m.project_path));
@@ -2654,21 +2634,22 @@ impl Workspace {
                             .map_or_else(String::new, |n| n.to_string_lossy().to_string());
                         kv(ui, "Name", &name);
                         kv(ui, "Subtools", &m.subtools.len().to_string());
-                        ui.add(
-                            egui::TextEdit::singleline(m.project_path)
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(12.0)),
-                        );
                         let saved = std::path::Path::new(m.project_path.as_str()).is_file();
+                        let folder = std::path::Path::new(m.project_path.as_str())
+                            .parent()
+                            .filter(|_| saved)
+                            .map_or_else(|| "Not saved yet".to_string(), |p| p.display().to_string());
+                        ui.add(egui::Label::new(RichText::new(&folder).monospace().size(11.0).color(FG2())).truncate())
+                            .on_hover_text(if saved { m.project_path.as_str() } else { "Save picks a file for it" });
                         let mut clicked = [false; 6];
                         for (row, cells) in [
                             [
                                 ("New", true, "Start over with one subtool from Mesh › Initialize"),
-                                ("Open", true, "Open the project at this path · Ctrl + O"),
-                                ("Save", true, "Save every subtool to this path · Ctrl + S"),
+                                ("Open", true, "Pick a project file to open · Ctrl + O"),
+                                ("Save", true, "Save every subtool to the project's file (the first time, pick one) · Ctrl + S"),
                             ],
                             [
-                                ("Save As", true, "Save every subtool to a new path and keep working there"),
+                                ("Save As", true, "Pick a new file, save every subtool there and keep working in it"),
                                 ("Revert", saved, "Open this project again as it was last saved"),
                                 ("Snapshot", true, "Save the canvas inside the document frame as a PNG next to the project"),
                             ],
@@ -2694,9 +2675,7 @@ impl Workspace {
                         a.new_project |= clicked[0];
                         a.open |= clicked[1];
                         a.save |= clicked[2];
-                        if clicked[3] {
-                            ws.doc_dialog = Some(DocDialog::SaveAs(m.project_path.clone()));
-                        }
+                        a.save_as |= clicked[3];
                         if clicked[4] {
                             ws.doc_dialog = Some(DocDialog::Revert);
                         }
@@ -2749,11 +2728,6 @@ impl Workspace {
                     true,
                     true,
                     &mut |_, ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(m.export_path)
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(12.0)),
-                        );
                         if ui
                             .add_sized(
                                 [ui.available_width(), 20.0],
@@ -2784,14 +2758,9 @@ impl Workspace {
                     false,
                     true,
                     &mut |ws, ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(m.import_path)
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(12.0)),
-                        );
                         if ui
                             .add_sized([ui.available_width(), 20.0], egui::Button::new("Import OBJ"))
-                            .on_hover_text("Add the OBJ at this path as a new subtool")
+                            .on_hover_text("Pick OBJ files and add each as a new subtool")
                             .clicked()
                         {
                             a.import_obj = true;
@@ -3074,19 +3043,15 @@ impl Workspace {
                             }
                             zslider(ui, "Thick %", &mut ws.extract_thick, 0.2..=20.0, true, false, 1);
                         });
-                        // Single subtools to and from files (ZBrush: Tool › Export, Append).
+                        // Single subtools to and from files (ZBrush: Tool › Export, Append),
+                        // picked in the desktop's file dialog.
                         ui.add_space(2.0);
-                        ui.add(
-                            egui::TextEdit::singleline(m.subtool_path)
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::monospace(12.0)),
-                        );
                         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
                         let w = (r.width() - 6.0) / 3.0;
                         for (col, (label, hint)) in [
-                            ("Save", "Save the active subtool alone, with its levels, to this path"),
-                            ("Load", "Add the subtools saved at this path to the list"),
-                            ("Export OBJ", "The active subtool at its shown level, as an OBJ next to this path"),
+                            ("Save", "Save the active subtool alone, with its levels, to a file you pick"),
+                            ("Load", "Pick saved subtool or project files and add their subtools to the list"),
+                            ("Export OBJ", "The active subtool at its shown level, as an OBJ file you pick"),
                         ]
                         .into_iter()
                         .enumerate()
@@ -5858,7 +5823,6 @@ mod tests {
         let mut brush = Brush::default();
         let mut actions = Actions::default();
         let mut budget = 20_000_000usize;
-        let mut path = String::from("test.obj");
         let out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
@@ -5872,7 +5836,6 @@ mod tests {
                     &mut Model {
                         brush: &mut brush,
                         primitive,
-                        export_path: &mut path,
                         status: "",
                         can_undo: false,
                         can_redo: false,
@@ -5897,8 +5860,6 @@ mod tests {
                         parked_bytes: 0,
                         stand_in_bytes: 0,
                         project_path: &mut String::from("untitled.klay"),
-                        subtool_path: &mut String::from("subtool.klay"),
-                        import_path: &mut String::from("model.obj"),
                         morph_level: None,
                         layers: Vec::new(),
                         undo_names: &[],

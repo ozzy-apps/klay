@@ -416,8 +416,10 @@ always empty canvas: models are drawn only inside the frame, as in ZBrush, so ho
 zoom in there is always somewhere to click and drag to rotate, move and zoom. The border is
 40 points wide; **Document › Back › Border width** sets it from 8 to 120.
 
-**Document** palette: **New / Open / Save** use the path field; **Save As** saves to a new
-path and keeps working there; **Revert** opens the project again as it was last saved (it
+**Document** palette: **Open** (Ctrl + O) picks a project in the desktop's file dialog;
+**Save** (Ctrl + S) saves to the project's file, and asks where the first time; **Save As**
+picks a new file and keeps working there (each dialog starts in the project's folder, or
+where the last file was picked); **Revert** opens the project again as it was last saved (it
 asks first); **Snapshot** saves the canvas inside the frame, without the interface, as
 `<project> snapshot.png` next to the project. **Back**: the **Back** colour of the canvas
 with a vertical gradient (**Range**: how strong, **Center**: where it crosses the Back
@@ -752,11 +754,11 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   subdivisions from those labels, so vertex order and chunks come back identical and its
   undo list stays valid. Alt + click picks a subtool with a one-pixel GPU id pass. The
   SubTool section of the Mesh palette lists them with eye toggles and has Append, Duplicate,
-  Delete and reordering. Under the list, a path field with **Save** (the active subtool
-  alone, with all its levels, as a one-subtool `.klay` that Document › Open also reads),
-  **Load** (adds every subtool of a `.klay` file to the end of the list, parked, without
-  changing the active one; a bad file adds nothing) and **Export OBJ** (the active subtool
-  at its shown level, written next to the path as `.obj`); Deformation moves and sizes the active subtool exactly at every
+  Delete and reordering. Under the list, **Save** (the active subtool alone, with all its
+  levels, as a one-subtool `.klay` that Document › Open also reads; the file dialog offers
+  the subtool's name), **Load** (pick one or more `.klay` files; every subtool in them is
+  added to the end of the list, parked, without changing the active one; a bad file adds
+  nothing) and **Export OBJ** (the active subtool at its shown level, to an `.obj` you pick); Deformation moves and sizes the active subtool exactly at every
   level, undoably.
 - `transform.rs`: moving, scaling and rotating a whole subtool, ZBrush Transpose style.
   The map is `p -> c + s R (p - c) + t` (rotation, uniform scale, translation). Loop weights
