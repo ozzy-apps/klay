@@ -578,6 +578,8 @@ pub struct Actions {
     /// SubTool › Boolean: the active subtool's operation; Make Boolean Mesh.
     pub boolean_op: Option<crate::boolean::BoolOp>,
     pub make_boolean: bool,
+    /// Geometry › ZRemesher.
+    pub zremesh: bool,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -751,6 +753,8 @@ pub struct Workspace {
     /// Boolean Mesh builds it at this resolution (Remesh voxels across two units).
     pub live_boolean: bool,
     pub boolean_resolution: f32,
+    /// Geometry › ZRemesher settings.
+    pub zremesh: crate::zremesh::Settings,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -887,6 +891,7 @@ impl Workspace {
             sculptris_detail: 50.0,
             live_boolean: false,
             boolean_resolution: 400.0,
+            zremesh: crate::zremesh::Settings::default(),
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -3050,6 +3055,36 @@ impl Workspace {
                         }
                     },
                 );
+                self.sec(ui, h, id, "zremesher", "ZRemesher", None, false, true, &mut |ws, ui| {
+                    let can = m.wedge_refusal.is_none() || m.wedge_on;
+                    ui.add_enabled_ui(can, |ui| {
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("ZRemesher"))
+                            .on_hover_text("Rebuild the subtool as clean quads whose edge loops follow its form · one undo step");
+                        let r = match m.wedge_refusal {
+                            Some(why) => r.on_disabled_hover_text(why),
+                            None => r,
+                        };
+                        if r.clicked() {
+                            a.zremesh = true;
+                        }
+                    });
+                    zslider(ui, "Target Polygons Count", &mut ws.zremesh.target_k, 0.1..=100.0, true, false, 1);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let w = (ui.available_width() - 6.0) / 3.0;
+                        // ZBrush: half, the same or double the subtool's polygons now.
+                        let now = m.triangles as f32 / 2000.0;
+                        for (label, k) in [("Half", 0.5), ("Same", 1.0), ("Double", 2.0)] {
+                            if ui.add(egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(w, 20.0))).on_hover_text(format!("Target {label}: of the quads the subtool has now")).clicked() {
+                                ws.zremesh.target_k = (now * k).clamp(0.1, 100.0);
+                            }
+                        }
+                    });
+                    ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
+                        .on_hover_text("Edge loops run along polygroup borders");
+                    note(ui, "Target in thousands of quads · all quads, loops following the form · needs a subtool without subdivision levels");
+                });
                 self.sec(
                     ui,
                     h,

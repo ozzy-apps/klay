@@ -314,6 +314,21 @@ overlap with the result of the ones above it.
   are hidden and Live Boolean goes off. Not undoable: delete the new subtool to go back.
 - Projects (format version 6) save each subtool's operation; versions 1–5 still open.
 
+### ZRemesher (0.18)
+
+Geometry › **ZRemesher** rebuilds the active subtool as clean quads whose edge loops follow
+its form, at about **Target Polygons Count** thousand quads (**Half / Same / Double** set it
+from the subtool's polygons now). With **KeepGroups** edge loops run along the polygroup
+borders, and vertices on a border are put exactly on it, so a polygrouped hard-surface
+part keeps crisp edges and corners. Holes in a closed surface are closed; the result is
+all quads (a few three- and five-sided poles where the surface needs them). One undo
+step; it needs a subtool without subdivision levels. A million-vertex sculpt goes to 5k
+quads in under a second, to 30k in about two.
+
+The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and a quad
+lattice are smoothed over a graph of surface samples, the lattice points become vertices,
+and every face is split through its middle so the result is all quads.
+
 ### Canvas and Document
 
 The document frame is drawn inside the canvas, and the margin around it (the border) is

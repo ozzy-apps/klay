@@ -18,6 +18,7 @@ mod insert_mesh;
 mod sculptris;
 mod fx;
 mod boolean;
+mod zremesh;
 mod layers;
 mod obj;
 mod pressure;
@@ -267,6 +268,8 @@ enum GeoOp {
     DelHidden,
     CloseHoles,
     MirrorWeld,
+    /// Geometry › ZRemesher.
+    ZRemesh,
 }
 
 /// SubTool operations queued by the interface.
@@ -950,6 +953,30 @@ impl App {
         }
         self.show_active_level();
         self.workspace.notify(format!("{what}: {} → {} triangles", fmt_count(before), fmt_count(after)));
+    }
+
+    /// Geometry › ZRemesher: the active subtool rebuilt as quads (one undo step).
+    fn zremesh_now(&mut self) {
+        if self.busy() || !self.without_levels("ZRemesher") {
+            return;
+        }
+        let settings = self.workspace.zremesh;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zremesh::zremesh(self.doc.mesh(), &settings)));
+        let (mesh, stats) = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.workspace.notify(format!("ZRemesher: {e}"));
+                return;
+            }
+            Err(_) => {
+                self.workspace.notify("ZRemesher failed".to_string());
+                return;
+            }
+        };
+        let mut mesh = Some(mesh);
+        self.topology_op("ZRemesher", |_| mesh.take());
+        self.status = format!("ZRemesher: {} quads in {:.0} ms", fmt_count(stats.quads), stats.ms);
+        log::info!("{} ({stats:?})", self.status);
     }
 
     /// The active subtool becomes `mesh` (a new topology: undo history and its Morph Target
@@ -2553,6 +2580,7 @@ impl App {
             }),
             Some(GeoOp::CloseHoles) => self.topology_op("Close Holes", subtool_ops::holes_closed),
             Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
+            Some(GeoOp::ZRemesh) => self.zremesh_now(),
             Some(GeoOp::DelHigher) => self.delete_levels(true),
             Some(GeoOp::DelLower) => self.delete_levels(false),
             None => {}
@@ -5932,7 +5960,7 @@ impl App {
         if actions.gizmo_center || actions.gizmo_reset {
             self.gizmo_pivot(actions.gizmo_center);
         }
-        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld)] {
+        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.zremesh, GeoOp::ZRemesh)] {
             if on {
                 self.pending_geo = Some(op);
             }
@@ -7106,6 +7134,11 @@ fn main() {
     }
     // `--polyf`: start with polygroup colours and the polygon frame shown (Shift + F).
     app.workspace.polyframe = args.iter().any(|a| a == "--polyf");
+    // `--zremesh K`: ZRemesher to K thousand quads at startup.
+    if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
+        app.workspace.zremesh.target_k = k;
+        app.pending_geo = Some(GeoOp::ZRemesh);
+    }
     // `--material <name or number>`: start in that material (e.g. "MatCap Red Wax").
     if let Some(m) = flag("--material") {
         let names = workspace::MATERIALS.iter().map(|(_, n)| n.to_lowercase()).collect::<Vec<_>>();
@@ -7238,6 +7271,24 @@ mod nav_tests {
 #[cfg(test)]
 mod subtool_tests {
     use super::*;
+
+    #[test]
+    fn zremesher_rebuilds_the_subtool_in_quads_as_one_undo_step() {
+        let mut app = App::new(40, false, usize::MAX);
+        let before = app.doc.mesh().positions.clone();
+        app.workspace.zremesh.target_k = 0.5;
+        app.zremesh_now();
+        let quads = app.doc.mesh().triangle_count() / 2;
+        assert!((250..800).contains(&quads), "{quads} quads");
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("ZRemesher"));
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().positions, before);
+        // With subdivision levels it refuses.
+        assert!(app.doc.divide());
+        let n = app.doc.mesh().vertex_count();
+        app.zremesh_now();
+        assert_eq!(app.doc.mesh().vertex_count(), n);
+    }
 
     #[test]
     fn make_boolean_mesh_carves_the_subtract_subtool_out() {

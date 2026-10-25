@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.0 — 2026-10-25
+
+- ZRemesher (Geometry › ZRemesher): automatic retopology into all-quad meshes whose edge loops follow the form (Instant Meshes: four-way direction field and quad lattice on a multi-level graph of surface samples, lattice points extracted as quads, stray diagonals merged away, holes closed, every face split through its middle). Target Polygons Count with Half / Same / Double; KeepGroups holds loops along polygroup borders and puts border vertices and corners exactly on the old ones. One undo step.
+- New --zremesh K flag (ZRemesher to K thousand quads at startup).
+- Speed: a 960k-vertex sphere to 5k quads in 0.7 s, to 30k quads in 2.0 s.
+- Verification: 247 release tests (new: a sphere to even, closed, mostly regular quads near the target count on the sphere; ZRemesher as one undo step through the app and its refusal with levels); every native self-test passes on the GPU.
+
 ## 0.17.0 — 2026-10-25
 
 - Booleans between subtools: Add / Subtract / Intersect per subtool (Mesh › Boolean, marked in the SubTool list), combining the visible subtools top to bottom.
