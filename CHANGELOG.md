@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.27.0 — 2026-10-26
 
 - STL: **Document › Import** reads binary and ASCII STL as well as OBJ (the dialog lists both) and welds corners at the same position into one connected, closed mesh (flat and repeated triangles are left out); Fit applies as for OBJ. **Export STL** (Document › Export and the new 3D Print palette) writes every visible subtool at its shown level as one binary STL through the desktop's file dialog.
 - **3D Print** palette (ZBrush: 3D Print Hub): the print's width, depth and height in mm, cm or inches, scaled evenly by typing any one of them (the model is not changed, files are written in mm), Z Up so the model stands on the bed as on screen; Export STL; Send to a slicer found on the computer (PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio, UltiMaker Cura, Creality Print and others, from their menu entries, including Flatpaks and AppImages) or a custom command; Check Mesh counts holes, open, non-manifold and flipped edges, shells and triangles per visible subtool, with Close Holes and Remesh at hand. Unit, size, Z Up and slicer are kept with the workspace. Export STL, Send to Slicer and Check Mesh can go on a shelf.

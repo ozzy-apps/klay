@@ -268,7 +268,7 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 - Nine new detail alphas, painted by Klay as tileable images: **Pores, Wrinkles,
   Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers**. As alphas they fade softly at the
   stamp's edge; as textures (Texture palette) they repeat seamlessly for texture painting.
-- Seven more followed (Unreleased): **Skin, Creases, Cracked Earth, Panels, Wood Grain, Cobbles,
+- Seven more in 0.27: **Skin, Creases, Cracked Earth, Panels, Wood Grain, Cobbles,
   Hammered**, and all 16 are painted at 2048 × 2048 in 16 bits and read back with a smooth
   cubic filter (imported images too), so even a large Draw Size over a dense mesh gives
   smooth edges, not stair steps. Each image is built the first time it is used (8 MB, about
