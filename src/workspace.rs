@@ -883,6 +883,8 @@ pub struct Actions {
     /// Export STL (Document, 3D Print); 3D Print › Send to the slicer, Check.
     pub export_stl: bool,
     pub send_slicer: bool,
+    pub send_strata:bool,
+    pub update_strata:bool,
     pub print_check: bool,
     /// Mesh › Morph Target: StoreMT, DelMT, Switch.
     pub morph: Option<crate::MorphOp>,
@@ -1044,6 +1046,9 @@ pub struct Workspace {
     /// 3D Print › Slicer: the slicers found on this computer (looked for when the palette
     /// is first drawn, and again on Rescan).
     pub slicers: Option<Vec<crate::print::Slicer>>,
+    pub strata_visible:bool,
+    pub strata_can_update:bool,
+    pub strata_pending:bool,
     /// SubTool › Extract thickness, % of the subtool's size.
     pub extract_thick: f32,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
@@ -1246,6 +1251,7 @@ impl Workspace {
             fov: 45.0,
             import_fit: true,
             slicers: None,
+            strata_visible:false,strata_can_update:false,strata_pending:false,
             extract_thick: 2.0,
             quicksave: true,
             quicksave_minutes: 10.0,
@@ -2486,6 +2492,15 @@ impl Workspace {
     fn print_palette(&mut self, ui: &mut Ui, h: bool, m: &mut Model<'_>, a: &mut Actions) {
         use crate::print::{CUSTOM, Unit};
         let id = PaletteId::Print;
+        // Strata first: the top choice for printing.
+        self.sec(ui,h,id,"strata","Strata",None,true,true,&mut |ws,ui|{
+            ui.add_enabled_ui(!ws.strata_pending,|ui|{
+                a.send_strata|=ui.add_sized([ui.available_width(),CONTROL_H],egui::Button::new("Send to Strata").truncate()).on_hover_text("Open Strata and transfer CPU geometry at the print size set under Size. Existing source links keep their original scale.").clicked();
+                a.update_strata|=ui.add_enabled(ws.strata_can_update,egui::Button::new("Update in Strata").min_size(vec2(ui.available_width(),CONTROL_H))).on_hover_text("Replace linked source geometry, keeping Strata placement and print settings.").on_disabled_hover_text("Send these subtools to Strata first.").clicked();
+            });
+            ui.checkbox(&mut ws.strata_visible,"Visible subtools").on_hover_text("Off: active subtool. On: every visible subtool. Exact shown subdivision levels; all faces.");
+            if ws.strata_pending{note(ui,"Sending to Strata");}
+        });
         self.sec(ui, h, id, "size", "Size", None, true, true, &mut |ws, ui| {
             let ps = &mut ws.layout.print;
             let at = Unit::ALL.iter().position(|u| *u == ps.unit).unwrap_or(0);
@@ -6087,7 +6102,7 @@ mod tests {
         let mut brush = Brush::default();
         let mut actions = Actions::default();
         let mut budget = 20_000_000usize;
-        let out = ctx.run_ui(
+        let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                 events,
@@ -6147,6 +6162,7 @@ mod tests {
                 );
             },
         );
+        out.textures_delta.clear(); // Headless tests inspect shapes, without a GPU compositor.
         (out, actions)
     }
 
@@ -6214,7 +6230,15 @@ mod tests {
         // (The number and the unit are drawn apart.)
         assert_eq!(text_count(&out, "50.0"), 3, "width, depth and height");
         assert_eq!(text_count(&out, "25.0"), 1, "1 unit");
+        // Send to Strata is the top choice: above every other section and button.
+        let strata = text_position(&out, "Send to Strata");
+        for other in ["Update in Strata", "Visible subtools", "Width", "Export STL", "Send to TestSlicer", "Check Mesh"] {
+            assert!(text_position(&out, other).y > strata.y, "Send to Strata against {other}");
+        }
         assert!(press(&mut workspace, "Send to TestSlicer").1.send_slicer);
+        assert!(press(&mut workspace,"Send to Strata").1.send_strata);
+        workspace.strata_can_update=true;
+        assert!(press(&mut workspace,"Update in Strata").1.update_strata);
         assert!(press(&mut workspace, "Check Mesh").1.print_check);
         press(&mut workspace, "cm");
         assert_eq!(workspace.layout.print.unit, crate::print::Unit::Cm);

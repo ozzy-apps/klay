@@ -1229,7 +1229,7 @@ mod tests {
     }
     fn frame(app: &mut crate::App, events: Vec<egui::Event>) -> egui::FullOutput {
         let ctx = app.egui_ctx.clone();
-        ctx.run_ui(
+        let mut out=ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
                 events,
@@ -1237,7 +1237,9 @@ mod tests {
                 ..Default::default()
             },
             |ui| app.ui(ui),
-        )
+        );
+        out.textures_delta.clear();
+        out
     }
     fn text(out: &egui::FullOutput, label: &str, predicate: impl Fn(Pos2) -> bool) -> Pos2 {
         out.shapes
@@ -1446,6 +1448,7 @@ mod tests {
                 },
                 |ui| a.ui(ui),
             );
+            output.textures_delta.clear();
         }
         assert!(
             output.shapes.iter().any(|s| match &s.shape {

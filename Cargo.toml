@@ -19,6 +19,7 @@ pollster = "1.0"
 env_logger = "0.11"
 log = "0.4"
 rfd = "0.17.2"
+strata-bridge = { path = "../Strata/crates/strata-bridge" }
 
 [profile.dev]
 opt-level = 1

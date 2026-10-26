@@ -440,8 +440,17 @@ colours are kept with the workspace layout (Workspace › Reset leaves them alon
 
 ### 3D printing
 
-**3D Print** palette (ZBrush: 3D Print Hub), for sending a sculpt to a slicer:
+**3D Print** palette (ZBrush: 3D Print Hub), for sending a sculpt to Strata or a slicer:
 
+- **Strata** (at the top): **Send to Strata** sends the active subtool at its shown level to
+  Strata, the print preparation app, and opens Strata if it is not running; tick **Visible
+  subtools** to send every visible one. After more sculpting, **Update in Strata** replaces
+  that geometry and keeps where it sits on Strata's plate and its print settings. The first
+  send uses the size set under **Size**; later updates keep it. Links last while the project
+  is open (after reopening, send again). Up to 500,000 vertices per subtool, so show a lower
+  level for a denser sculpt, and bake Live Boolean Subtract / Intersect first. Klay looks
+  for Strata in the folder next to its own source, then `strata-studio` on `PATH`;
+  `STRATA_STUDIO_BIN` names another build.
 - **Size**: the print's **Width**, **Depth** and **Height** in **mm**, **cm** or **in**.
   Drag or type any one and the print scales evenly; **1 unit** is how many of them a Klay
   unit becomes. The model itself does not change, only what is written. **Z Up** turns
@@ -463,7 +472,7 @@ colours are kept with the workspace layout (Workspace › Reset leaves them alon
   subtools are written as they are, so Make Boolean Mesh carves them first. The result says
   when the model changed since.
 
-Export STL, Send to Slicer and Check Mesh can go on a shelf.
+Export STL, Send to Slicer and Check Mesh can go on a shelf (Send to Strata cannot yet).
 
 ### Sculpting helpers
 

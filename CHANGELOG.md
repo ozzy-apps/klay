@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Send to Strata**, the top choice in the 3D Print palette: sends the active subtool (or, with **Visible subtools**, every visible one) at its shown level to Strata, the print preparation app, opening it if needed. **Update in Strata** replaces that geometry after more sculpting and keeps Strata's placement and print settings. The first send uses the print size set under Size. Links last for the session; after reopening a project, send again. Up to 500,000 vertices per subtool (show a lower level for denser sculpts). Strata is found next to Klay's source folder, on `PATH` as `strata-studio`, or through `STRATA_STUDIO_BIN`.
+- Verification: 305 release tests (new: CPU snapshots of active and parked subtools at their shown levels without changing sculpt history, the link's scale fixed after the first send, Send / Update through the palette, Send to Strata above every other 3D Print control).
+
 ## 0.27.0 — 2026-10-26
 
 - STL: **Document › Import** reads binary and ASCII STL as well as OBJ (the dialog lists both) and welds corners at the same position into one connected, closed mesh (flat and repeated triangles are left out); Fit applies as for OBJ. **Export STL** (Document › Export and the new 3D Print palette) writes every visible subtool at its shown level as one binary STL through the desktop's file dialog.
