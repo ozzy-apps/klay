@@ -19,7 +19,13 @@ pollster = "1.0"
 env_logger = "0.11"
 log = "0.4"
 rfd = "0.17.2"
-strata-bridge = { path = "../Strata/crates/strata-bridge" }
+# Send to Strata (3D Print): only with `--features strata`.
+strata-bridge = { path = "crates/strata-bridge", optional = true }
+
+[features]
+# The direct Klay -> Strata bridge (3D Print > Strata). Off by default: release packages
+# and plain clones build without it.
+strata = ["dep:strata-bridge"]
 
 [profile.dev]
 opt-level = 1

@@ -15,6 +15,7 @@ mod curve_tube;
 mod cut;
 mod deform;
 mod file_dialog;
+#[cfg(feature = "strata")]
 mod strata_bridge;
 mod gizmo;
 mod insert_mesh;
@@ -453,6 +454,7 @@ enum TransposeDrag {
 }
 
 struct App {
+    #[cfg(feature = "strata")]
     strata:strata_bridge::State,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
@@ -687,6 +689,7 @@ impl App {
         let mesh = SculptMesh::from_raw_with_groups(p, i, g);
         let build_ms = t.elapsed().as_secs_f32() * 1000.0;
         Self {
+            #[cfg(feature = "strata")]
             strata:Default::default(),
             window: None,
             gfx: None,
@@ -2545,7 +2548,8 @@ impl App {
             }
             gfx.clear_levels();
         }
-        self.strata=Default::default();
+        #[cfg(feature = "strata")]
+        {self.strata=Default::default();}
         self.subtools = staged;
         self.morph_targets = morphs.into_iter().collect();
         self.active_tool = active;
@@ -2567,7 +2571,8 @@ impl App {
             }
             gfx.clear_levels();
         }
-        self.strata=Default::default();
+        #[cfg(feature = "strata")]
+        {self.strata=Default::default();}
         let budget = self.doc.budget;
         let (p, i, g) = self.primitive.build(1.0);
         self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
@@ -6852,6 +6857,7 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "strata")]
         self.strata_ui_state();
         // ZBrush: over the model the brush is the cursor. The system pointer hides while the
         // brush ring is drawn there or a stroke is under way; over the interface, the empty
@@ -7006,8 +7012,11 @@ impl App {
         if actions.export_stl {
             self.ask_file(file_dialog::Ask::ExportStl);
         }
-        if actions.send_strata {self.request_strata(false);}
-        if actions.update_strata {self.request_strata(true);}
+        #[cfg(feature = "strata")]
+        {
+            if actions.send_strata {self.request_strata(false);}
+            if actions.update_strata {self.request_strata(true);}
+        }
         if actions.send_slicer {
             self.send_to_slicer();
         }
@@ -7240,6 +7249,7 @@ impl App {
             Some(SubToolOp::Extract) => self.extract(),
             None => {}
         }
+        #[cfg(feature = "strata")]
         self.run_strata();
         if self.pending_export {
             self.pending_export = false;
@@ -8179,6 +8189,7 @@ const DEFAULT_BUDGET: usize = 64_000_000;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "strata")]
     if args.iter().any(|a|a=="--selftest-strata"){strata_bridge::self_test();return;}
     if args.iter().any(|a|a=="--version"||a=="-V") {
         println!("Klay {}",branding::VERSION);return;

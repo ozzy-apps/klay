@@ -450,7 +450,10 @@ colours are kept with the workspace layout (Workspace › Reset leaves them alon
   is open (after reopening, send again). Up to 500,000 vertices per subtool, so show a lower
   level for a denser sculpt, and bake Live Boolean Subtract / Intersect first. Klay looks
   for Strata in the folder next to its own source, then `strata-studio` on `PATH`;
-  `STRATA_STUDIO_BIN` names another build.
+  `STRATA_STUDIO_BIN` names another build. The Strata section is only in builds made with
+  `cargo build --release --features strata` (Strata's `run-klay.sh` does this); default
+  builds and the release packages leave it out. The bridge's shared code is
+  `crates/strata-bridge` in Klay's repository, which Strata uses from there.
 - **Size**: the print's **Width**, **Depth** and **Height** in **mm**, **cm** or **in**.
   Drag or type any one and the print scales evenly; **1 unit** is how many of them a Klay
   unit becomes. The model itself does not change, only what is written. **Z Up** turns
