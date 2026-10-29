@@ -94,8 +94,8 @@ polygroup. The groups are carried through Divide and Remesh like any others.
 
 ### Pen pressure
 
-With a drawing tablet on X11 (XP-Pen, Wacom, Huion: any pen whose driver reports an "Abs
-Pressure" axis, as the libinput and wacom drivers do), pen pressure scales each dab like
+With a drawing tablet (XP-Pen, Wacom, Huion), on Wayland or on X11 (any pen whose driver
+reports an "Abs Pressure" axis, as the libinput and wacom drivers do), pen pressure scales each dab like
 ZBrush's Brush › Tablet Pressure with its default linear curves: **Draw Size** and **Z
 Intensity** both follow the pen, and either can be turned off in Brush › Tablet pressure.
 The lightest touch still leaves a dab 5 % of Draw Size wide, with no strength. Sculpting
@@ -105,10 +105,12 @@ with, and Zipper, Stitch and Rake keep their size so the teeth stay even. Curve 
 applied at full Draw Size and Z Intensity. A mouse, or any device without pressure, sculpts
 at full Draw Size and Z Intensity, so switching between pen and mouse needs no setting.
 
-Brush › Tablet pressure shows the live pressure and the pen found. The libinput driver adds
-the pen's device the first time the pen comes near the screen, so it shows "none yet" until
-then. Pressure is not read on Wayland yet (winit, the window library, does not report it):
-run an X11 session.
+Brush › Tablet pressure shows the live pressure and the pen found. Tablets add the pen
+the first time it comes near the screen, so it shows "none yet" until then. On Wayland the
+pen's side buttons act as the middle (lower button) and right (upper button) mouse buttons,
+and the pen can use the title bar: its buttons, a drag to move the window, a double tap to
+maximize and the upper side button for the window menu. To resize the window with the pen,
+hold Super and drag with the middle button.
 
 ### Curve strokes
 
@@ -748,8 +750,23 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   writes only the tube's slice (`Gfx::swap_tail`). Undo keeps only the tube
   (`UndoStep::Part`). A bend re-raycasts pulled points against the model without the tube
   (`raycast_in`).
-- `tablet.rs`: pen pressure on X11. winit does not report it on Linux, so Klay opens a
-  second connection to the X server that only listens: XInput2 raw events (motion and
+- `tablet.rs`: pen pressure. winit does not report it on Linux. On Wayland Klay binds the
+  tablet protocol (`zwp_tablet_manager_v2`, version 1) on winit's own `wl_display`
+  (`Backend::from_foreign_display`), since the compositor only sends tablet events to the
+  client that owns the surface; the objects live on an event queue of their own, dispatched
+  by a thread (libwayland lets it and winit both read the socket). Once a client binds the
+  tablet seat the compositor stops emulating a pointer for the pen, so each tool `frame`
+  becomes `PenEvent`s (enter, move with pressure, tip and stylus buttons, leave) that
+  `about_to_wait` replays through `window_event` as `CursorMoved` / `MouseInput`, setting
+  the pressure before each one. winit's title bar (sctk-adwaita subsurfaces) only listens
+  to the pointer, so a pen there is recognised as on the title bar once it has been where
+  only the title bar takes input, and its taps are hit-tested against sctk-adwaita's button
+  layout (`TitleBar`, GNOME's `button-layout`): close, maximize and minimize work, a double
+  tap toggles maximize. A press elsewhere on the bar sends `xdg_toplevel.move` on winit's
+  toplevel (`WindowExtWayland::xdg_toplevel`) with the pen's own down serial and seat (winit's
+  `drag_window` uses the pointer's serial, which the compositor refuses for a pen), and the
+  upper side button opens the window menu the same way; resizing by the borders is not done.
+  On X11 Klay opens a second connection to the X server that only listens: XInput2 raw events (motion and
   buttons, from every device) and device changes, selected on the root window. Devices with
   an axis labelled "Abs Pressure" (or, unlabelled, valuator 2 of a device named like a pen)
   are pens; the device of the latest raw event decides whether the next dab has a pressure

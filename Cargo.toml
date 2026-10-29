@@ -37,7 +37,11 @@ opt-level = 3
 opt-level = 3
 debug = 1
 
-# Pen pressure on X11 through XInput2, which winit does not report (winit already builds it);
-# XTest only for `--selftest-pressure`.
+# Pen pressure, which winit does not report: on X11 through XInput2 (XTest only for
+# `--selftest-pressure`), on Wayland through the tablet protocol on winit's own connection
+# (winit already builds all of these; `client_system` is what lets us share its wl_display).
 [target.'cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))'.dependencies]
 x11rb = { version = "0.13", features = ["xinput", "xtest"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client"] }

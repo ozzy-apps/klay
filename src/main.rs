@@ -537,7 +537,7 @@ struct App {
     history: History,
     stroke: Option<Stroke>,
     stroke_brush: Brush,
-    /// Pen pressure from the tablet (X11), read on every pointer event.
+    /// Pen pressure from the tablet (X11 or Wayland), read on every pointer event.
     tablet: Option<tablet::Tablet>,
     /// Pressure of the pen moving the pointer, 0..=1; `None` for a mouse (full strength).
     pressure: Option<f32>,
@@ -3624,12 +3624,12 @@ impl App {
             log::info!("selftest-pressure: {what} ({})", if pass { "ok" } else { "FAIL" });
         };
         match (&self.tablet, &self.tablet_error) {
-            (Some(t), _) => check(&format!("XInput2 connection open; pens: {}", t.describe()), true),
+            (Some(t), _) => check(&format!("{} connection open; pens: {}", t.kind(), t.describe()), true),
             (None, e) => check(&format!("no tablet connection: {}", e.as_deref().unwrap_or("?")), false),
         }
         // Real raw events reach the listener: an XTest move comes from a device without
-        // pressure, so it reads as a mouse.
-        if let Some(t) = &self.tablet {
+        // pressure, so it reads as a mouse (X11 only: Wayland has no XTest).
+        if let Some(t) = self.tablet.as_ref().filter(|t| t.kind() == "XInput2") {
             let before = t.state().events;
             let sent = tablet::fake_motion(300, 300);
             let t0 = Instant::now();
@@ -5139,9 +5139,49 @@ impl App {
             Ok(()) => self.pressure = t.pressure(),
             Err(e) => {
                 log::warn!("tablet: {e}; pen pressure is off");
-                self.tablet_error = Some(format!("lost the X connection: {e}"));
+                self.tablet_error = Some(format!("lost the tablet connection: {e}"));
                 self.tablet = None;
                 self.pressure = None;
+            }
+        }
+    }
+
+    /// Wayland: replay what the pen did as cursor and button events (the compositor sends
+    /// the pen only through the tablet protocol once Klay has bound it), each move at its
+    /// own pressure.
+    fn replay_pen(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else { return };
+        let Some(events) = self.tablet.as_ref().map(|t| t.take_events()) else { return };
+        let scale = window.scale_factor();
+        for e in events {
+            let Some(t) = self.tablet.as_mut() else { return };
+            if let tablet::PenEvent::TitleMenu { x, y, serial, .. } = e {
+                if let Err(err) = t.window_menu(&window, serial, x, y) {
+                    log::info!("tablet: no window menu: {err}");
+                }
+                continue;
+            }
+            if let tablet::PenEvent::Title { serial, .. } = e {
+                let width = window.inner_size().width as f64 / scale;
+                match t.title_action(&e, width, window.is_maximized()) {
+                    Some(tablet::TitleAction::Close) => self.window_event(event_loop, window.id(), WindowEvent::CloseRequested),
+                    Some(tablet::TitleAction::ToggleMaximize) => window.set_maximized(!window.is_maximized()),
+                    Some(tablet::TitleAction::Minimize) => window.set_minimized(true),
+                    // With the pen's own serial: winit's drag_window uses the pointer's,
+                    // which the compositor refuses for a pen.
+                    Some(tablet::TitleAction::Move) => {
+                        if let Err(err) = t.move_window(&window, serial) {
+                            log::info!("tablet: cannot move the window with the pen: {err}");
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            t.apply(&e);
+            self.pressure = t.pressure();
+            if let Some(event) = tablet::window_event(&e, scale) {
+                self.window_event(event_loop, window.id(), event);
             }
         }
     }
@@ -7638,7 +7678,7 @@ impl ApplicationHandler for App {
         self.gfx = Some(gfx);
         match tablet::Tablet::for_window(&window) {
             Ok(t) => {
-                log::info!("tablet: listening for pen pressure; {}", t.describe());
+                log::info!("tablet: listening for pen pressure ({}); {}", t.kind(), t.describe());
                 self.tablet = Some(t);
             }
             Err(e) => {
@@ -7831,6 +7871,7 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        self.replay_pen(event_loop);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
