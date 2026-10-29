@@ -7866,6 +7866,16 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // winit disconnects its Wayland display once the loop ends, but some of what we keep
+        // runs a thread on that display: egui-winit's Wayland clipboard and the tablet
+        // listener. Dropping them afterwards read freed memory and segfaulted on every quit
+        // under Wayland. Let them go now, the GPU surface with them.
+        self.tablet = None;
+        self.egui_state = None;
+        self.gfx = None;
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.quit {
             event_loop.exit();

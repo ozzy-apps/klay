@@ -494,10 +494,11 @@ mod wayland {
     //! thread; libwayland lets that thread and winit both read the socket.
     use super::{Frame, Pen, PenEvent, Pressure, tool_button};
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     use wayland_backend::client::{Backend, ObjectId};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
-    use wayland_client::protocol::{wl_registry, wl_seat};
+    use wayland_client::protocol::{wl_callback, wl_registry, wl_seat};
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, event_created_child};
     use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
     use wayland_protocols::wp::tablet::zv2::client::{
@@ -579,6 +580,28 @@ mod wayland {
         /// pen's own serial on the seat it came from.
         conn: Connection,
         seat: wl_seat::WlSeat,
+        /// Stopping the thread: the flag, and the queue a `wl_display.sync` wakes it on.
+        qh: QueueHandle<State>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// The thread blocks on winit's display, so it must be gone before winit disconnects
+    /// it (`App::exiting`), or it reads freed memory as Klay quits.
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let Some(thread) = self.thread.take() else { return };
+            self.stop.store(true, Ordering::Release);
+            // The compositor's answer wakes the thread, which then sees the flag.
+            // (A dead connection has already ended the thread with an error.)
+            self.conn.display().sync(&self.qh, ());
+            let _ = self.conn.flush();
+            let _ = thread.join();
+        }
+    }
+
+    impl Dispatch<wl_callback::WlCallback, ()> for State {
+        fn event(_: &mut Self, _: &wl_callback::WlCallback, _: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
 
     fn err(e: impl std::fmt::Display) -> String {
@@ -606,19 +629,30 @@ mod wayland {
             // The tablets and tools already plugged in.
             queue.roundtrip(&mut state).map_err(err)?;
             state.publish_pens();
-            std::thread::Builder::new()
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let thread = std::thread::Builder::new()
                 .name("klay-tablet".into())
                 .spawn(move || {
-                    let _keep = (manager, seat);
-                    loop {
+                    while !stopping.load(Ordering::Acquire) {
                         if let Err(e) = queue.blocking_dispatch(&mut state) {
                             state.shared().error = Some(e.to_string());
                             break;
                         }
                     }
+                    // Everything on the queue goes before winit closes the display.
+                    drop((state, manager, seat, queue));
                 })
                 .map_err(err)?;
-            let listener = Self { shared, state: Mutex::new(Pressure::default()), conn: conn2, seat: seat2 };
+            let listener = Self {
+                shared,
+                state: Mutex::new(Pressure::default()),
+                conn: conn2,
+                seat: seat2,
+                qh,
+                stop,
+                thread: Some(thread),
+            };
             drop(listener.state());
             Ok(listener)
         }
