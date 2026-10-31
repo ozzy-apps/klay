@@ -83,6 +83,8 @@ pub enum BrushKind {
     TrimLasso,
     SliceCurve,
     KnifeCurve,
+    /// ZRemesherGuide (ZBrush): curves on the surface that ZRemesher runs edge loops along.
+    ZRemesherGuide,
 }
 
 /// The outline a screen gesture draws.
@@ -95,7 +97,7 @@ pub enum Shape {
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 66] = [
+    pub const ALL: [BrushKind; 67] = [
         BrushKind::Draw,
         BrushKind::Smooth,
         BrushKind::Grab,
@@ -125,7 +127,7 @@ impl BrushKind {
         Self::MalletFast, Self::SmoothValleys, Self::SmoothPeaks, Self::Morph, Self::InsertMesh, Self::ZModeler,
         Self::SmoothStronger, Self::Slash, Self::PenA, Self::PenS, Self::Noise, Self::Gravity, Self::Spiral,
         Self::SelectRect, Self::SelectLasso, Self::ClipRect, Self::ClipCircle, Self::TrimCurve, Self::TrimRect,
-        Self::TrimCircle, Self::TrimLasso, Self::SliceCurve, Self::KnifeCurve,
+        Self::TrimCircle, Self::TrimLasso, Self::SliceCurve, Self::KnifeCurve, Self::ZRemesherGuide,
     ];
 
     pub fn name(self) -> &'static str {
@@ -174,6 +176,7 @@ impl BrushKind {
             Self::TrimCurve => "Trim Curve", Self::TrimRect => "Trim Rect",
             Self::TrimCircle => "Trim Circle", Self::TrimLasso => "Trim Lasso",
             Self::SliceCurve => "Slice Curve", Self::KnifeCurve => "Knife Curve",
+            Self::ZRemesherGuide => "ZRemesherGuide",
         }
     }
 
@@ -203,6 +206,7 @@ impl BrushKind {
             Self::ClipRect|Self::ClipCircle=>"Clip",
             Self::TrimCurve|Self::TrimRect|Self::TrimCircle|Self::TrimLasso=>"Trim",
             Self::SliceCurve=>"Slice",Self::KnifeCurve=>"Knife",
+            Self::ZRemesherGuide=>"Curve",
         }
     }
 
@@ -232,6 +236,8 @@ impl BrushKind {
     pub fn is_detail(self) -> bool { matches!(self,Self::Zipper|Self::Stitch|Self::Rake) }
     /// Adds geometry along a curve instead of moving the surface (ZBrush: curve insert brushes).
     pub fn is_insert(self) -> bool { matches!(self,Self::CurveTube) }
+    /// Draws ZRemesher guide curves instead of changing the model (ZBrush: ZRemesherGuide).
+    pub fn is_guide(self) -> bool { self == Self::ZRemesherGuide }
     /// Inserts a whole mesh where you drag (ZBrush: IMM brushes).
     pub fn is_imm(self) -> bool { self == Self::InsertMesh }
     /// Polygon modelling instead of sculpting (ZBrush: ZModeler).
@@ -312,6 +318,7 @@ impl BrushKind {
             Self::TrimLasso => "TL",
             Self::SliceCurve => "SC",
             Self::KnifeCurve => "KC",
+            Self::ZRemesherGuide => "ZG",
         }
     }
 
@@ -382,6 +389,7 @@ impl BrushKind {
             Self::TrimLasso=>"Draw a lasso: only what is inside is kept, rebuilt as a closed remeshed surface. Alt cuts the inside away. Needs a subtool without subdivision levels.",
             Self::SliceCurve=>"Drag a line: polygons are cut along it and the arrow's side becomes a new polygroup. Needs a subtool without subdivision levels.",
             Self::KnifeCurve=>"Drag a line: the model is cut through along it into two closed pieces with polygroups of their own (Groups Split separates them). Needs a subtool without subdivision levels.",
+            Self::ZRemesherGuide=>"Draw curves that ZRemesher runs edge loops along. Curves Strength sets how closely they are followed. Alt + click a curve to delete it; Delete guides clears them all.",
         }
     }
 }

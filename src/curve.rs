@@ -17,12 +17,13 @@ use rayon::prelude::*;
 /// the drag brushes (they pull what they picked up) nor shape tools and masks.
 /// Insert brushes (CurveTube) are left out: they always draw a curve (see [`always`]).
 pub fn capable(kind: crate::sculpt::BrushKind) -> bool {
-    !kind.is_drag() && !kind.is_shape() && !kind.is_mask() && !kind.is_insert() && !kind.is_imm() && !kind.is_zmodeler()
+    !kind.is_drag() && !kind.is_shape() && !kind.is_mask() && !kind.is_insert() && !kind.is_guide() && !kind.is_imm() && !kind.is_zmodeler()
 }
 
-/// Brushes that only work along a curve (ZBrush's curve insert brushes, such as CurveTube).
+/// Brushes that only work along a curve (ZBrush's curve insert brushes, such as CurveTube,
+/// and ZRemesherGuide).
 pub fn always(kind: crate::sculpt::BrushKind) -> bool {
-    kind.is_insert()
+    kind.is_insert() || kind.is_guide()
 }
 
 /// Brushes that start in Curve mode, as ZBrush's zipper and stitch brushes do.
@@ -255,6 +256,16 @@ impl Curve {
     /// Segments `(i, i + 1)` within pieces.
     fn segments(&self) -> impl Iterator<Item = usize> + '_ {
         self.pieces.iter().flat_map(|p| p.start..p.end.saturating_sub(1))
+    }
+
+    /// Add `other`'s pieces after this curve's.
+    pub fn append(&mut self, other: &Curve) {
+        let base = self.points.len();
+        self.points.extend_from_slice(&other.points);
+        self.normals.extend_from_slice(&other.normals);
+        self.tangents.extend_from_slice(&other.tangents);
+        self.along.extend_from_slice(&other.along);
+        self.pieces.extend(other.pieces.iter().map(|p| p.start + base..p.end + base));
     }
 
     /// The curve under an orthogonal map through the origin (a symmetry image).

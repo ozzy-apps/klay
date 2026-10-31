@@ -235,7 +235,8 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                 | BrushKind::TrimRect
                 | BrushKind::TrimCircle
                 | BrushKind::TrimLasso
-                | BrushKind::SliceCurve,
+                | BrushKind::SliceCurve
+                | BrushKind::ZRemesherGuide,
             ) => 0.0,
             Some(
                 BrushKind::ClipLine
@@ -293,6 +294,14 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
                     if p.x + p.y * 0.45 > 0.0 {
                         color = color.lerp(Vec3::new(0.35, 0.62, 0.85), 0.7);
                     }
+                }
+                // Quad edge loops bending along a guide curve drawn over them.
+                Some(BrushKind::ZRemesherGuide) => {
+                    let along = p.y - 0.22 * ((p.x + 0.48) / 0.96 * PI * 1.8).sin() + 0.12;
+                    let line = |v: f32| (-((v - (v / 0.16).round() * 0.16) / 0.008).powi(2)).exp();
+                    color *= 1.0 - 0.45 * line(along).max(line(p.x));
+                    let d = distance(p, &curve);
+                    color = color.lerp(Vec3::new(0.95, 0.62, 0.25), (-(d / 0.022).powi(2)).exp());
                 }
                 _ => {}
             }

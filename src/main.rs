@@ -207,6 +207,11 @@ struct SelectDrag {
     hit: Option<u32>,
 }
 
+/// ZRemesher guides as polylines, one per piece of each guide.
+fn guide_lines(guides: &[curve::Curve]) -> Vec<Vec<Vec3>> {
+    guides.iter().flat_map(|g| g.pieces.iter().map(|p| g.points[p.clone()].to_vec())).collect()
+}
+
 /// A press that moves less than this (physical pixels) before release is a click.
 const CLICK_SLOP: f32 = 4.0;
 
@@ -695,7 +700,7 @@ impl App {
             gfx: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            subtools: vec![SubTool {
+            subtools: vec![SubTool { guides: Default::default(),
             boolean: Default::default(),
                 id: 1,
                 name: format!("{} 1", settings.kind.short()),
@@ -956,7 +961,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
-        self.subtools.push(SubTool {
+        self.subtools.push(SubTool { guides: Default::default(),
             boolean: Default::default(),
             id,
             name: name.clone(),
@@ -995,7 +1000,7 @@ impl App {
         let wedge = self.subtools[self.active_tool].wedge;
         self.subtools.insert(
             self.active_tool + 1,
-            SubTool {
+            SubTool { guides: Default::default(),
             boolean: Default::default(),
                 id,
                 name: name.clone(),
@@ -1058,7 +1063,8 @@ impl App {
             return;
         }
         let settings = self.workspace.zremesh;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zremesh::zremesh(self.doc.mesh(), &settings)));
+        let guides = guide_lines(&self.subtools[self.active_tool].guides);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zremesh::zremesh(self.doc.mesh(), &settings, &guides)));
         let (mesh, stats) = match result {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -1356,6 +1362,12 @@ impl App {
             return ms;
         }
         self.transform_doc(&map, |app| app.doc.transform(&map));
+        // Guides ride along with the whole subtool.
+        for g in &mut self.subtools[self.active_tool].guides {
+            g.points.iter_mut().for_each(|p| *p = map.apply(*p));
+            g.normals.iter_mut().for_each(|n| *n = map.apply_vector(*n).normalize_or(*n));
+            g.tangents.iter_mut().for_each(|t| *t = map.apply_vector(*t).normalize_or(*t));
+        }
         // History entries hold what undoes them: the inverse map.
         self.history.push(UndoStep::Transform(map.inverse()));
         let ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -2248,7 +2260,7 @@ impl App {
                 stand_in_vertices = 0;
             }
         }
-        SubTool {
+        SubTool { guides: Default::default(),
             boolean: Default::default(),
             id,
             name,
@@ -2423,7 +2435,7 @@ impl App {
         self.doc = Multires::new(mesh, budget);
         let id = self.new_tool_id();
         let name = Path::new(path).file_stem().map_or_else(|| format!("Import {id}"), |s| s.to_string_lossy().to_string());
-        self.subtools.push(SubTool { boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { guides: Default::default(), boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -2515,7 +2527,7 @@ impl App {
             let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
             if i == active {
                 let id = self.new_tool_id();
-                staged.push(SubTool {
+                staged.push(SubTool { guides: Default::default(),
                     boolean: saved.boolean,
                     id,
                     name: saved.name,
@@ -2578,7 +2590,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
-        self.subtools = vec![SubTool {
+        self.subtools = vec![SubTool { guides: Default::default(),
             boolean: Default::default(),
             id,
             name: format!("{} {id}", self.primitive.kind.short()),
@@ -5448,6 +5460,10 @@ impl App {
     /// previous one keeps its result and can no longer be bent).
     fn begin_curve(&mut self) {
         let brush = self.effective_brush();
+        if brush.kind.is_guide() && self.modifiers.alt_key() {
+            self.delete_guide_at_cursor();
+            return;
+        }
         if brush.kind.is_insert() {
             if let Some(why) = self.tube_refusal() {
                 self.workspace.notify(why);
@@ -5480,6 +5496,10 @@ impl App {
             self.add_tube(curve, d, t);
             return;
         }
+        if d.brush.kind.is_guide() {
+            self.add_guide(curve);
+            return;
+        }
         let (symmetry, assets) = (self.workspace.sym(), self.workspace.assets.clone());
         let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone()).with_morph(self.morph_target());
         let (fwd, step) = (self.camera.forward(), d.brush.radius * self.workspace.curve_step);
@@ -5506,6 +5526,82 @@ impl App {
         });
         self.stroke_ms = t.elapsed().as_secs_f32() * 1000.0;
         self.update_hover();
+    }
+
+    /// ZRemesherGuide release: the curve, with its symmetry images as pieces of the same
+    /// guide, kept on the active subtool for ZRemesher to run edge loops along.
+    fn add_guide(&mut self, curve: curve::Curve) {
+        let images = self.workspace.sym().images();
+        let mut guide = curve.clone();
+        for k in 1..images.len() {
+            guide.append(&curve.transformed(&images.0[k]));
+        }
+        let guides = &mut self.subtools[self.active_tool].guides;
+        guides.push(guide);
+        self.status = format!("ZRemesherGuide: {} guide curves · ZRemesher runs edge loops along them", guides.len());
+    }
+
+    /// The guide of the active subtool nearest the cursor on screen, within reach of a grab.
+    fn guide_under_cursor(&self) -> Option<usize> {
+        let eye = self.camera.eye();
+        let mut best: Option<(f32, usize)> = None;
+        for (k, g) in self.subtools[self.active_tool].guides.iter().enumerate() {
+            for (i, &p) in g.points.iter().enumerate() {
+                if g.normals[i].dot(eye - p) <= 0.0 {
+                    continue;
+                }
+                if let Some(q) = self.project_front(p) {
+                    let d = q.distance(self.cursor);
+                    if d <= CURVE_GRAB_PX * 1.5 && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, k));
+                    }
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// Alt + click with ZRemesherGuide: delete the guide under the cursor.
+    fn delete_guide_at_cursor(&mut self) {
+        if let Some(k) = self.guide_under_cursor() {
+            let guides = &mut self.subtools[self.active_tool].guides;
+            guides.remove(k);
+            self.status = format!("ZRemesherGuide: deleted a guide · {} left", guides.len());
+        }
+    }
+
+    /// The active subtool's guides on the canvas (logical pixels), in runs facing the
+    /// camera, while ZRemesherGuide is the brush.
+    fn guides_preview(&self) -> Vec<(Vec<egui::Pos2>, bool)> {
+        if !self.brush.kind.is_guide() || self.workspace.mode != Mode::Draw {
+            return Vec::new();
+        }
+        let scale = self.scale;
+        let hot = if self.modifiers.alt_key() { self.guide_under_cursor() } else { None };
+        let eye = self.camera.eye();
+        let mut out = Vec::new();
+        for (k, g) in self.subtools[self.active_tool].guides.iter().enumerate() {
+            for piece in &g.pieces {
+                let mut run = Vec::new();
+                for i in piece.clone() {
+                    let p = g.points[i];
+                    let q = (g.normals[i].dot(eye - p) > 0.0).then(|| self.project_front(p)).flatten();
+                    match q {
+                        Some(q) => run.push(egui::pos2(q.x / scale, q.y / scale)),
+                        None => {
+                            if run.len() > 1 {
+                                out.push((std::mem::take(&mut run), hot == Some(k)));
+                            }
+                            run.clear();
+                        }
+                    }
+                }
+                if run.len() > 1 {
+                    out.push((run, hot == Some(k)));
+                }
+            }
+        }
+        out
     }
 
     /// The polygon view of the active subtool, made afresh when its topology changed since
@@ -6959,6 +7055,8 @@ impl App {
             (None, None) => String::new(),
         };
         self.workspace.curve_preview = self.curve_preview();
+        self.workspace.guides_preview = self.guides_preview();
+        self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
         self.workspace.held_brush = self.held_brush();
         let print_extent = self.print_extent();
         let print_stale = self.print_report.as_ref().is_some_and(|r| r.stamp != self.print_stamp());
@@ -7131,6 +7229,10 @@ impl App {
         }
         if actions.gizmo_center || actions.gizmo_reset {
             self.gizmo_pivot(actions.gizmo_center);
+        }
+        if actions.delete_guides {
+            let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
+            self.status = format!("ZRemesher: deleted {n} guide curves");
         }
         for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.zremesh, GeoOp::ZRemesh)] {
             if on {
@@ -8444,6 +8546,28 @@ fn main() {
     }
     // `--polyf`: start with polygroup colours and the polygon frame shown (Shift + F).
     app.workspace.polyframe = args.iter().any(|a| a == "--polyf");
+    // `--guide-ring`: a ZRemesher guide around the model, diagonal across the view, with
+    // ZRemesherGuide picked so it shows (for `--zremesh` with `--snapshot-ui`).
+    if args.iter().any(|a| a == "--guide-ring") {
+        let mesh = app.doc.mesh();
+        let b = mesh.bounds();
+        let (centre, reach) = ((b.min + b.max) * 0.5, (b.max - b.min).length());
+        // Across the front of the default view, diagonally.
+        let f = app.camera.forward();
+        let diagonal = (f.cross(Vec3::Y).normalize_or(Vec3::X) + Vec3::Y).normalize();
+        let axis = f.cross(diagonal).normalize_or(Vec3::new(1.0, 2.0, 3.0).normalize());
+        let (u, v) = (axis.any_orthonormal_vector(), axis.cross(axis.any_orthonormal_vector()));
+        let hits: Vec<_> = (0..=720)
+            .map(|k| {
+                let a = k as f32 / 720.0 * std::f32::consts::TAU;
+                let d = u * a.cos() + v * a.sin();
+                mesh.raycast(centre + d * reach, -d).map(|h| (h.point, h.normal))
+            })
+            .collect();
+        let ring = curve::Curve::from_hits(&hits, reach * 0.004);
+        app.subtools[app.active_tool].guides.push(ring);
+        app.workspace.select_brush(&mut app.brush, BrushKind::ZRemesherGuide);
+    }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         app.workspace.zremesh.target_k = k;
@@ -10391,6 +10515,49 @@ mod curve_input_tests {
         a.workspace.select_brush(&mut a.brush, BrushKind::CurveTube);
         a.brush.radius = 0.05;
         a
+    }
+
+    #[test]
+    fn zremesher_guides_are_drawn_deleted_and_followed() {
+        let mut a = app();
+        a.workspace.select_brush(&mut a.brush, BrushKind::ZRemesherGuide);
+        a.brush.radius = 0.05;
+        assert!(a.curve_mode(BrushKind::ZRemesherGuide), "ZRemesherGuide always draws a curve");
+        let (positions, edits) = (a.mesh().positions.clone(), a.history.edits());
+        let c = a.project(Vec3::ZERO) - Vec2::new(150.0, 0.0);
+        drag(&mut a, c, 300.0, true);
+        // A guide on the front of the unit sphere; the model and its history are untouched.
+        assert_eq!(a.mesh().positions, positions);
+        assert_eq!(a.history.edits(), edits);
+        let guides = &a.subtools[a.active_tool].guides;
+        assert_eq!(guides.len(), 1);
+        assert!(guides[0].points.len() > 20 && guides[0].points.iter().all(|p| (p.length() - 1.0).abs() < 0.03 && p.z > 0.0));
+        assert!(!a.guides_preview().is_empty(), "drawn while the brush is ZRemesherGuide");
+        // Alt + click on it deletes it.
+        let mid = { let g = &a.subtools[a.active_tool].guides[0]; g.points[g.points.len() / 2] };
+        a.modifiers = ModifiersState::ALT;
+        a.cursor_moved(a.project(mid), false);
+        a.left_press(false, false);
+        a.left_release();
+        a.modifiers = ModifiersState::empty();
+        assert!(a.subtools[a.active_tool].guides.is_empty());
+        assert_eq!(a.mesh().positions, positions);
+        // Draw it again: ZRemesher puts a loop on it and keeps it.
+        drag(&mut a, c, 300.0, true);
+        let line = super::guide_lines(&a.subtools[a.active_tool].guides);
+        a.workspace.zremesh.target_k = 1.0;
+        a.workspace.zremesh.curves_strength = 100.0;
+        a.zremesh_now();
+        let near = |p: Vec3| {
+            line.iter().flat_map(|l| l.windows(2)).map(|w| {
+                let ab = w[1] - w[0];
+                let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-12)).clamp(0.0, 1.0);
+                p.distance(w[0] + ab * t)
+            }).fold(f32::INFINITY, f32::min)
+        };
+        let on = a.mesh().positions.iter().filter(|&&p| near(p) < 1e-4).count();
+        assert!(on >= 6, "{on} vertices on the guide");
+        assert_eq!(a.subtools[a.active_tool].guides.len(), 1, "guides stay after ZRemesher");
     }
 
     #[test]

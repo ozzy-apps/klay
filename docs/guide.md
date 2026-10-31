@@ -350,6 +350,17 @@ all quads (a few three- and five-sided poles where the surface needs them). One 
 step; it needs a subtool without subdivision levels. A million-vertex sculpt goes to 5k
 quads in under a second, to 30k in about two.
 
+**Guide curves** steer the edge loops (ZBrush: the ZRemesherGuide brush, **B Z G**). Draw
+curves on the model with ZRemesherGuide: each stays on the subtool as an orange line (shown
+while the brush is picked), and the next ZRemesher runs an edge loop along it and turns the
+loops around it to follow. **Curves Strength** (0–100, default 50) sets how closely: at 100
+the direction along a curve is held exactly and the loop's vertices are put on it; lower
+values let the form have more say. Draw a ring around an arm, a line down a seam or loops
+around the eyes and mouth. With symmetry on, a curve is mirrored and the copies are one
+guide. **Alt + click** a curve to delete it; **Delete guides** under ZRemesher clears them
+all. Guides stay after ZRemesher (draw once, remesh at several counts), move with the
+subtool when all of it is moved (Transpose, Deformation), and are not part of undo or saved in projects.
+
 The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and a quad
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.

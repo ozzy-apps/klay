@@ -21,6 +21,11 @@
 //!    every face is split into quads through its middle (the lattice is laid at twice the
 //!    quad size for this), so the result is all quads. Vertices are moved onto the old
 //!    surface and spaced evenly along it; faces take the polygroup under them.
+//!
+//! **Guide curves** (ZBrush: the ZRemesherGuide brush) steer the loops: samples along a
+//! curve turn toward its direction and shift their lattice so a lattice line runs on it, both
+//! by Curves Strength, and the smoothing carries that into the rest of the field. Vertices of
+//! the loop that comes out on a curve are put on it.
 
 use crate::mesh::SculptMesh;
 use crate::fx::FxHashMap as HashMap;
@@ -38,12 +43,119 @@ pub struct Settings {
     /// 0..=100: how much smaller quads get where the surface curves more (ZBrush:
     /// AdaptiveSize); 0 keeps them all one size.
     pub adaptive: f32,
+    /// 0..=100: how strongly guide curves steer the loops (ZBrush: Curves Strength); 100
+    /// holds the direction along a curve exactly.
+    pub curves_strength: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0 }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0 }
     }
+}
+
+/// Guide curves as segments, by grid cell, for the nearest point on any of them.
+struct Guides {
+    segs: Vec<(Vec3, Vec3)>,
+    cell: f32,
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl Guides {
+    fn new(curves: &[Vec<Vec3>], cell: f32) -> Self {
+        let cell = cell.max(1e-6);
+        let mut segs = Vec::new();
+        let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
+        for c in curves {
+            for w in c.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if a.distance_squared(b) <= 0.0 {
+                    continue;
+                }
+                let k = segs.len() as u32;
+                segs.push((a, b));
+                // Every cell the segment passes through (sampled at half a cell).
+                let n = (a.distance(b) / (cell * 0.5)).ceil().max(1.0) as usize;
+                let mut last = None;
+                for i in 0..=n {
+                    let c = (a.lerp(b, i as f32 / n as f32) / cell).floor();
+                    let key = (c.x as i32, c.y as i32, c.z as i32);
+                    if last != Some(key) {
+                        let list = grid.entry(key).or_default();
+                        if list.last() != Some(&k) {
+                            list.push(k);
+                        }
+                        last = Some(key);
+                    }
+                }
+            }
+        }
+        Self { segs, cell, grid }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+
+    /// The nearest point on a guide within `reach` of `p`: its distance, the point and the
+    /// guide's direction there.
+    fn nearest(&self, p: Vec3, reach: f32) -> Option<(f32, Vec3, Vec3)> {
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        let mut try_seg = |&(a, b): &(Vec3, Vec3)| {
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+            let q = a + ab * t;
+            let d = q.distance(p);
+            if d <= reach && best.is_none_or(|x| d < x.0) {
+                best = Some((d, q, ab.normalize()));
+            }
+        };
+        let k = (reach / self.cell).ceil() as i32;
+        if k > 3 {
+            self.segs.iter().for_each(&mut try_seg);
+        } else {
+            let c = (p / self.cell).floor();
+            for dx in -k..=k {
+                for dy in -k..=k {
+                    for dz in -k..=k {
+                        for &s in self.grid.get(&(c.x as i32 + dx, c.y as i32 + dy, c.z as i32 + dz)).into_iter().flatten() {
+                            try_seg(&self.segs[s as usize]);
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Where a sample is pulled by a guide: the guide's direction in its tangent plane, the
+/// nearest point on the guide, and how strongly (0 for not at all).
+#[derive(Clone, Copy, Default)]
+struct Pull {
+    dir: Vec3,
+    at: Vec3,
+    w: f32,
+}
+
+/// The pull of `guides` on every sample of `g` within `reach` of one, with weight `w`.
+fn pulls(g: &Graph, guides: &Guides, reach: f32, w: f32) -> Vec<Pull> {
+    if guides.is_empty() || w <= 0.0 {
+        return vec![Pull::default(); g.len()];
+    }
+    (0..g.len())
+        .into_par_iter()
+        .map(|i| {
+            let n = g.n[i];
+            guides
+                .nearest(g.p[i], reach)
+                .and_then(|(_, at, d)| {
+                    let d = d - n * d.dot(n);
+                    (d.length() > 0.3).then(|| Pull { dir: d.normalize(), at, w })
+                })
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +166,8 @@ pub struct Stats {
     /// Faces other than quads before the split, and holes closed.
     pub odd_faces: usize,
     pub holes: usize,
+    /// Vertices put on a guide curve.
+    pub on_guides: usize,
     pub ms: f32,
 }
 
@@ -286,7 +400,7 @@ fn compat_position(p0: Vec3, n0: Vec3, q0: Vec3, o0: Vec3, p1: Vec3, n1: Vec3, q
 }
 
 /// Smooth the direction field `q` of `g`, `sweeps` times.
-fn smooth_directions(g: &Graph, q: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize) {
+fn smooth_directions(g: &Graph, q: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize, pull: &[Pull]) {
     for _ in 0..sweeps {
         for set in colours {
             let new: Vec<(u32, Vec3)> = set
@@ -306,6 +420,13 @@ fn smooth_directions(g: &Graph, q: &mut [Vec3], colours: &[Vec<u32>], sweeps: us
                         sum -= n * n.dot(sum);
                         sum = sum.normalize_or(q[i]);
                     }
+                    // Along a guide: turned toward it.
+                    let pl = pull[i];
+                    if pl.w > 0.0 {
+                        let (a, b) = compat_orientation(sum, n, pl.dir, n);
+                        let v = a * (1.0 - pl.w) + b * pl.w;
+                        sum = (v - n * n.dot(v)).normalize_or(b);
+                    }
                     (i as u32, sum)
                 })
                 .collect();
@@ -318,7 +439,7 @@ fn smooth_directions(g: &Graph, q: &mut [Vec3], colours: &[Vec<u32>], sweeps: us
 
 /// Smooth the lattice points `o` of `g` (directions `q`, each sample's step in `scale`),
 /// `sweeps` times.
-fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize, scale: &[f32]) {
+fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>], sweeps: usize, scale: &[f32], pull: &[Pull]) {
     for _ in 0..sweeps {
         for set in colours {
             let new: Vec<(u32, Vec3)> = set
@@ -335,6 +456,15 @@ fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>],
                         sum = (a * w + b) / (w + 1.0);
                         w += 1.0;
                         sum -= n * n.dot(sum - p);
+                    }
+                    // Along a guide: the lattice line across it is shifted onto it.
+                    let pl = pull[i];
+                    if pl.w > 0.0 {
+                        let t = n.cross(q[i]);
+                        let axis = if q[i].dot(pl.dir).abs() >= t.dot(pl.dir).abs() { t } else { q[i] };
+                        let off = axis.dot(sum - pl.at);
+                        let r = off - (off / scale[i]).round() * scale[i];
+                        sum -= axis * r * pl.w;
                     }
                     (i as u32, round4(sum, q[i], n, p, scale[i]))
                 })
@@ -435,8 +565,9 @@ fn project(mesh: &SculptMesh, p: Vec3, n: Vec3, reach: f32) -> Option<(Vec3, u32
     best.map(|b| (b.1, b.2))
 }
 
-/// ZRemesh `mesh` into about `s.target_k` thousand quads.
-pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), String> {
+/// ZRemesh `mesh` into about `s.target_k` thousand quads, with edge loops steered along
+/// `guides` (curves on the surface, ZBrush: ZRemesherGuide) by `s.curves_strength`.
+pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
     let mut stats = Stats::default();
     let target = (s.target_k * 1000.0).max(50.0);
@@ -469,9 +600,12 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
     drop(fine);
     stats.samples = g0.len();
     let mut levels: Vec<(Graph, Vec<u32>)> = vec![(g0, Vec::new())];
+    // Each level's cell size, for how far a guide reaches there.
+    let mut cells = vec![cell];
     let mut c = cell;
     while levels.last().unwrap().0.len() > 400 && levels.len() < 14 {
         c *= 2.0;
+        cells.push(c);
         let (coarse, parent) = coarsen(&levels.last().unwrap().0, c);
         if coarse.len() as f32 > levels.last().unwrap().0.len() as f32 * 0.8 {
             break;
@@ -479,7 +613,12 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
         levels.last_mut().unwrap().1 = parent;
         levels.push((coarse, Vec::new()));
     }
+    cells.truncate(levels.len());
     stats.levels = levels.len();
+    // Guide curves pull the samples within about a cell of them, at every level.
+    let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
+    let guides = Guides::new(guides, quad);
+    let pull: Vec<Vec<Pull>> = levels.iter().zip(&cells).map(|((g, _), &c)| pulls(g, &guides, c * 0.75, strength)).collect();
     // The lattice step of every sample: smaller where the surface curves more
     // (AdaptiveSize), keeping the quad count about the same.
     let mut scales: Vec<Vec<f32>> = vec![adaptive_scale(&levels[0].0, scale, s.adaptive)];
@@ -510,7 +649,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                 })
                 .collect();
         }
-        smooth_directions(g, &mut q, &colours[l], sweeps(l));
+        smooth_directions(g, &mut q, &colours[l], sweeps(l), &pull[l]);
     }
     // Directions at every level, for the lattice pass.
     let mut qs: Vec<Vec<Vec3>> = vec![q];
@@ -545,7 +684,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
                 })
                 .collect();
         }
-        smooth_positions(g, &qs[l], &mut o, &colours[l], sweeps(l), &scales[l]);
+        smooth_positions(g, &qs[l], &mut o, &colours[l], sweeps(l), &scales[l], &pull[l]);
     }
     let g = &levels[0].0;
     let q = &qs[0];
@@ -893,6 +1032,17 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings) -> Result<(SculptMesh, Stats), S
             }
         }
     }
+    // The loop that came out on a guide goes onto it.
+    if !guides.is_empty() && strength > 0.0 {
+        let snapped: Vec<(usize, Vec3)> = (0..out_p.len())
+            .into_par_iter()
+            .filter_map(|v| guides.nearest(out_p[v], quad * 0.3).map(|(_, q, _)| (v, out_p[v].lerp(q, strength))))
+            .collect();
+        stats.on_guides = snapped.len();
+        for (v, q) in snapped {
+            out_p[v] = q;
+        }
+    }
 
     // Polygroups: each quad takes the one under its middle. Vertices between quads of
     // different groups go onto the old group border, so the borders stay crisp.
@@ -1031,7 +1181,7 @@ mod tests {
     fn a_sphere_becomes_even_quads_near_the_target() {
         // A dense, uneven sphere: squash its vertices toward the poles first.
         let m = sphere(40);
-        let (out, stats) = zremesh(&m, &Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0 }).unwrap();
+        let (out, stats) = zremesh(&m, &Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, ..Settings::default() }, &[]).unwrap();
         eprintln!("{stats:?}");
         // About the target count (split quads: twice the triangles).
         let quads = out.triangle_count() / 2;
@@ -1078,7 +1228,7 @@ mod tests {
         idx.extend(i2.into_iter().map(|i| i + n));
         let m = SculptMesh::from_raw(pos, idx);
         let small = |s: f32| {
-            let (out, _) = zremesh(&m, &Settings { target_k: 2.0, keep_groups: false, adaptive: s }).unwrap();
+            let (out, _) = zremesh(&m, &Settings { target_k: 2.0, keep_groups: false, adaptive: s, ..Settings::default() }, &[]).unwrap();
             let quads = out.triangle_count() / 2;
             let on_small = out.indices.chunks_exact(6).filter(|q| out.positions[q[0] as usize].x > 1.5).count();
             (on_small, quads)
@@ -1089,12 +1239,64 @@ mod tests {
         assert!((total_adapt as f32 / total_even as f32 - 1.0).abs() < 0.35, "total {total_even} vs {total_adapt}");
     }
 
+    /// Quad edges (each quad's two triangles less their shared diagonal).
+    fn quad_edges(m: &SculptMesh) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for t in m.indices.chunks_exact(6) {
+            let e = |a: u32, b: u32| (a.min(b), a.max(b));
+            let first: Vec<_> = (0..3).map(|k| e(t[k], t[(k + 1) % 3])).collect();
+            let second: Vec<_> = (0..3).map(|k| e(t[3 + k], t[3 + (k + 1) % 3])).collect();
+            out.extend(first.iter().filter(|x| !second.contains(x)));
+            out.extend(second.iter().filter(|x| !first.contains(x)));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn a_guide_curve_puts_an_edge_loop_on_it() {
+        // A great circle tilted away from every axis, so the sphere's own field would not
+        // follow it.
+        let m = sphere(40);
+        let axis = Vec3::new(1.0, 2.0, 3.0).normalize();
+        let u = axis.any_orthonormal_vector();
+        let v = axis.cross(u);
+        let circle: Vec<Vec3> = (0..=256).map(|k| {
+            let a = k as f32 / 256.0 * std::f32::consts::TAU;
+            u * a.cos() + v * a.sin()
+        }).collect();
+        let along = |guides: &[Vec<Vec3>], strength: f32| {
+            let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, curves_strength: strength };
+            let (out, stats) = zremesh(&m, &s, guides).unwrap();
+            let quad = (4.0 * std::f32::consts::PI / 1000.0).sqrt();
+            // Distance from the circle, for points on the unit sphere.
+            let off = |p: Vec3| p.dot(axis).abs();
+            let on: usize = quad_edges(&out)
+                .iter()
+                .filter(|&&(a, b)| {
+                    let (pa, pb) = (out.positions[a as usize], out.positions[b as usize]);
+                    off(pa) < quad * 0.15 && off(pb) < quad * 0.15 && pa.distance(pb) > quad * 0.5
+                })
+                .count();
+            (on, quad, stats)
+        };
+        let (free, quad, _) = along(&[], 50.0);
+        let (guided, _, stats) = along(&[circle.clone()], 100.0);
+        let (half, _, _) = along(&[circle], 50.0);
+        let expected = (std::f32::consts::TAU / quad) as usize;
+        eprintln!("edges on the circle: free {free}, strength 50 {half}, strength 100 {guided} of about {expected} · {stats:?}");
+        assert!(guided as f32 > expected as f32 * 0.8, "{guided} of {expected} edges on the guide");
+        assert!(half as f32 > expected as f32 * 0.6, "{half} of {expected} edges on the guide at strength 50");
+        assert!((free as f32) < guided as f32 * 0.5, "the sphere had {free} edges along the circle unguided");
+    }
+
     #[test]
     #[ignore]
     fn debug_sphere() {
         for k in [1.0f32, 4.0, 16.0] {
             let m = sphere(60);
-            let r = zremesh(&m, &Settings { target_k: k, keep_groups: false, adaptive: 0.0 });
+            let r = zremesh(&m, &Settings { target_k: k, keep_groups: false, adaptive: 0.0, ..Settings::default() }, &[]);
             eprintln!("{k}: {:?}", r.map(|x| x.1));
         }
     }
@@ -1104,7 +1306,7 @@ mod tests {
     fn debug_plane() {
         let (p, i) = crate::primitive::Primitive::Plane.build(60, 1.0);
         let m = SculptMesh::from_raw(p, i);
-        let r = zremesh(&m, &Settings { target_k: 0.4, keep_groups: false, adaptive: 0.0 });
+        let r = zremesh(&m, &Settings { target_k: 0.4, keep_groups: false, adaptive: 0.0, ..Settings::default() }, &[]);
         eprintln!("{:?}", r.map(|x| x.1));
     }
 }

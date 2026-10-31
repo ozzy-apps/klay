@@ -34,6 +34,9 @@ pub struct SubTool {
     pub wedge: bool,
     /// How it joins the visible subtools above it (ZBrush: SubTool › Boolean).
     pub boolean: crate::boolean::BoolOp,
+    /// ZRemesher guide curves drawn on it (ZBrush: ZRemesherGuide brush), on its surface,
+    /// each with its symmetry images as further pieces. Not saved in projects.
+    pub guides: Vec<crate::curve::Curve>,
 }
 
 pub struct Parked {

@@ -922,6 +922,8 @@ pub struct Actions {
     pub make_boolean: bool,
     /// Geometry › ZRemesher.
     pub zremesh: bool,
+    /// Geometry › ZRemesher › Delete guides.
+    pub delete_guides: bool,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -1080,6 +1082,11 @@ pub struct Workspace {
     pub tube_sides: u32,
     /// The curve being drawn or the one that can be bent, in logical pixels, per piece.
     pub curve_preview: Option<CurvePreview>,
+    /// ZRemesher guide curves of the active subtool, in logical pixels, per visible run, and
+    /// whether Alt + click would delete that one (shown while ZRemesherGuide is the brush).
+    pub guides_preview: Vec<(Vec<Pos2>, bool)>,
+    /// How many guide curves the active subtool has.
+    pub guide_count: usize,
     /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
     pub pressure_size: bool,
     pub pressure_intensity: bool,
@@ -1270,6 +1277,8 @@ impl Workspace {
             tube_taper: 0.0,
             tube_sides: 12,
             curve_preview: None,
+            guides_preview: Vec::new(),
+            guide_count: 0,
             pressure_size: true,
             pressure_intensity: true,
             size_curve: crate::pressure::PressureCurve::linear(),
@@ -3700,6 +3709,21 @@ impl Workspace {
                     zslider(ui, "AdaptiveSize", &mut ws.zremesh.adaptive, 0.0..=100.0, false, false, 0);
                     ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
                         .on_hover_text("Edge loops run along polygroup borders");
+                    zslider(ui, "Curves Strength", &mut ws.zremesh.curves_strength, 0.0..=100.0, false, false, 0);
+                    let label = match ws.guide_count {
+                        0 => "No guides · draw them with ZRemesherGuide (B Z G)".to_string(),
+                        1 => "1 guide curve".to_string(),
+                        n => format!("{n} guide curves"),
+                    };
+                    note(ui, &label);
+                    if ws.guide_count > 0
+                        && ui
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Delete guides").size(12.0)))
+                            .on_hover_text("Delete every ZRemesher guide curve of this subtool")
+                            .clicked()
+                    {
+                        a.delete_guides = true;
+                    }
                     note(ui, "Target in thousands of quads · all quads, loops following the form · needs a subtool without subdivision levels");
                 });
                 self.sec(
@@ -4599,6 +4623,15 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if !self.guides_preview.is_empty() {
+            // ZRemesher guides: solid lines, the one Alt + click would delete in red. They
+            // stay on screen, so they go under menus and popups.
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("guides"))).with_clip_rect(self.canvas);
+            for (run, hot) in &self.guides_preview {
+                let color = if *hot { Color32::from_rgb(235, 95, 75) } else { Color32::from_rgb(242, 160, 64) };
+                p.add(egui::Shape::line(run.clone(), Stroke::new(if *hot { 2.5 } else { 1.8 }, color)));
+            }
+        }
         if let Some(c) = &self.curve_preview {
             // ZBrush draws a curve as a dotted line on the surface; it lights up under the
             // cursor, where a drag bends it.
@@ -5210,13 +5243,12 @@ fn seg(ui: &mut Ui, labels: &[&str], selected: usize, tall: bool) -> Option<usiz
         } else if resp.hovered() {
             p.rect_filled(cell, round, BG4());
         }
-        p.text(
-            cell.center(),
-            Align2::CENTER_CENTER,
-            *label,
-            font(13.0, if on { Weight::SemiBold } else { Weight::Medium }),
-            if on && enabled { ACC_FG() } else if on { FG() } else { FG2() },
-        );
+        // A label wider than its cell gets a smaller font, and never spills into the next.
+        let weight = if on { Weight::SemiBold } else { Weight::Medium };
+        let color = if on && enabled { ACC_FG() } else if on { FG() } else { FG2() };
+        let wide = p.layout_no_wrap(label.to_string(), font(13.0, weight), color).size().x;
+        let size = if wide > w - 6.0 { (13.0 * (w - 6.0) / wide).max(9.0) } else { 13.0 };
+        p.with_clip_rect(cell.shrink(1.0)).text(cell.center(), Align2::CENTER_CENTER, *label, font(size, weight), color);
         if resp.clicked() {
             clicked = Some(i);
         }
