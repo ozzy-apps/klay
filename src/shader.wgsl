@@ -444,20 +444,44 @@ fn fs_splat(@builtin(position) at: vec4<f32>) -> SplatOut {
     let y = i32(at.y);
     var key = splat_key(x, y);
     if (key.y == 0u) {
-        var filled = 0u;
+        // A pixel no point landed in, inside the surface: take the nearest neighbour's
+        // point. Inside means three of the four sides are covered, two opposite ones (a
+        // one-pixel line through the surface where the vertex grid beats against the pixel
+        // grid; a pixel just past the silhouette never has both), or a neighbour faces the
+        // camera (below).
         var best = vec2<u32>(0u);
-        for (var k = 0; k < 4; k++) {
-            let d = select(select(vec2<i32>(0, 1), vec2<i32>(0, -1), k == 2), select(vec2<i32>(1, 0), vec2<i32>(-1, 0), k == 1), k < 2);
-            let n = splat_key(x + d.x, y + d.y);
-            if (n.y != 0u) {
-                filled += 1u;
+        var filled = 0u;
+        var hit: array<bool, 8>;
+        let offsets = array<vec2<i32>, 8>(
+            vec2<i32>(1, 0), vec2<i32>(-1, 0), vec2<i32>(0, 1), vec2<i32>(0, -1),
+            vec2<i32>(1, 1), vec2<i32>(-1, -1), vec2<i32>(1, -1), vec2<i32>(-1, 1),
+        );
+        for (var k = 0; k < 8; k++) {
+            let n = splat_key(x + offsets[k].x, y + offsets[k].y);
+            hit[k] = n.y != 0u;
+            if (hit[k]) {
+                if (k < 4) {
+                    filled += 1u;
+                }
                 if (n.y > best.y) {
                     best = n;
                 }
             }
         }
-        if (filled < 3u) {
+        let across = (hit[0] && hit[1]) || (hit[2] && hit[3]) || (hit[4] && hit[5]) || (hit[6] && hit[7]);
+        if (best.y == 0u) {
             discard;
+        }
+        if (filled < 3u && !across) {
+            // Next to a chunk drawn as triangles, whose pixels this pass cannot see: fill
+            // from a point that faces the camera. At the silhouette the points graze, so
+            // the outline does not grow.
+            let b = best.x;
+            let p = vec3<f32>(splat_positions[3u * b], splat_positions[3u * b + 1u], splat_positions[3u * b + 2u]);
+            let n = unpack4x8snorm(splat_normals[b]).xyz;
+            if (dot(n, normalize(u.cam_pos.xyz - p)) < 0.35) {
+                discard;
+            }
         }
         key = best;
     }

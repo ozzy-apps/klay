@@ -330,7 +330,7 @@ impl BrushKind {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Draw=>"Build a rounded stroke. Alt carves.",Self::Smooth=>"Relax surface detail.",
+            Self::Draw=>"Build a rounded stroke. Alt carves.",Self::Smooth=>"Relax surface detail: two relax passes per dab. Hold Shift with any brush.",
             Self::Grab=>"Pull the surface with the cursor.",Self::Flatten=>"Level the surface to a fitted plane.",
             Self::Inflate=>"Expand along surface normals. Alt deflates.",Self::DamStandard=>"Cut a narrow groove. Alt raises a seam.",
             Self::Pinch=>"Contract the surface. Alt spreads.",Self::Clay=>"Deposit a broad clay stroke.",
@@ -1393,8 +1393,16 @@ impl Stroke {
                 sel.par_map_into(new, |i, v| mesh.positions[v as usize] - Vec3::Y * (amount * w[i]));
             }
             BrushKind::Smooth | BrushKind::SmoothValleys | BrushKind::SmoothPeaks => {
-                let k = brush.strength * 0.5;
+                // Up to all the way to the neighbours' mean per pass; Smooth relaxes twice
+                // per dab (Smooth Stronger four times).
+                let k = brush.strength.min(1.0);
                 let kind = brush.kind;
+                let passes = if kind == BrushKind::Smooth { 2 } else { 1 };
+                for pass in 0..passes {
+                if pass > 0 {
+                    mesh.scatter_positions(&sel, new);
+                }
+                let mesh = &*mesh;
                 sel.par_map_into(new, |i, v| {
                     let nb = mesh.neighbors(v);
                     let p = mesh.positions[v as usize];
@@ -1419,6 +1427,7 @@ impl Stroke {
                     };
                     p.lerp(avg, (k * w[i] * gate).min(1.0))
                 });
+                }
             }
             BrushKind::Flatten | BrushKind::TrimDynamic | BrushKind::Polish | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Fill | BrushKind::Scrape | BrushKind::FormHard
             | BrushKind::ClayTubes | BrushKind::HPolish | BrushKind::TrimAdaptive | BrushKind::Planar | BrushKind::TrimSmoothBorder | BrushKind::MalletFast => {
@@ -2262,6 +2271,7 @@ mod advanced_brush_tests {
         stroke(&mut soft, BrushKind::Smooth, false, false, false, start);
         stroke(&mut hard, BrushKind::SmoothStronger, false, false, false, start);
         let (r1, r2) = (roughness(&soft), roughness(&hard));
+        eprintln!("roughness {r0} → Smooth {r1}, Smooth Stronger {r2}");
         assert!(r2 < r1 && r1 < r0, "{r0} {r1} {r2}");
     }
 
