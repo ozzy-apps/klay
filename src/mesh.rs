@@ -1187,13 +1187,21 @@ impl SculptMesh {
         let file = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
         writeln!(w, "# Klay export: {} vertices, {} triangles", self.vertex_count(), self.triangle_count())?;
-        self.write_obj(&mut w, "Klay", 0)?;
+        self.write_obj_uv(&mut w, "Klay", 0, &[], 0)?;
         w.flush()
     }
 
     /// Append this mesh to an OBJ stream as object `name`, with normals. `first` is the
     /// number of vertices already written (OBJ indices are global and 1-based).
+    #[cfg(test)]
     pub fn write_obj<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize) -> std::io::Result<()> {
+        self.write_obj_uv(w, name, first, &[], 0).map(|_| ())
+    }
+
+    /// [`write_obj`](Self::write_obj) with UVs: `uvs` holds one triple per triangle (or is
+    /// empty for none), `first_uv` the number of `vt` lines already written. Equal UVs are
+    /// written once. Returns how many `vt` lines it wrote.
+    pub fn write_obj_uv<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize, uvs: &[[glam::Vec2; 3]], first_uv: usize) -> std::io::Result<usize> {
         writeln!(w, "o {name}")?;
         for p in &self.positions {
             writeln!(w, "v {} {} {}", p.x, p.y, p.z)?;
@@ -1202,6 +1210,22 @@ impl SculptMesh {
             let n = unpack_normal(n);
             writeln!(w, "vn {} {} {}", n.x, n.y, n.z)?;
         }
+        let with_uvs = !uvs.is_empty() && uvs.len() == self.triangle_count();
+        let mut uv_index: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
+        let mut corner_uv: Vec<[u64; 3]> = Vec::new();
+        if with_uvs {
+            corner_uv.reserve(uvs.len());
+            for tri in uvs {
+                corner_uv.push(tri.map(|q| {
+                    let next = uv_index.len() as u64;
+                    *uv_index.entry((q.x.to_bits(), q.y.to_bits())).or_insert_with(|| {
+                        let _ = writeln!(w, "vt {} {}", q.x, q.y);
+                        next
+                    })
+                }));
+            }
+        }
+        let first_uv = first_uv as u64 + 1;
         let first = first as u64 + 1;
         // Polygroups become OBJ groups, as ZBrush exports them.
         let mut group = None;
@@ -1211,9 +1235,14 @@ impl SculptMesh {
                 writeln!(w, "g {name}_{}", self.groups[t])?;
             }
             let [a, b, c] = [tri[0], tri[1], tri[2]].map(|v| v as u64 + first);
-            writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
+            if with_uvs {
+                let [ta, tb, tc] = corner_uv[t].map(|k| k + first_uv);
+                writeln!(w, "f {a}/{ta}/{a} {b}/{tb}/{b} {c}/{tc}/{c}")?;
+            } else {
+                writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
+            }
         }
-        Ok(())
+        Ok(uv_index.len())
     }
 }
 

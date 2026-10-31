@@ -375,6 +375,27 @@ The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
 
+### UV Map
+
+Geometry › **UV Map** (ZBrush: UV Master) lays the subtool out flat in UV space, for
+textures and maps. Press **Unwrap**: the lowest level is cut into islands that each lie
+flat with little stretch, scaled to the same texel density and packed into the unit square.
+The section shows the layout, the number of islands, the **Distortion** (how much angles
+are bent, 0 % for none) and the **Coverage** of the square. One undo step.
+
+- Seams fall where the surface turns: **Max angle** (20–90°, default 60) is how far it may
+  turn within one island; larger gives fewer islands and more stretch. Fine detail
+  (ridges, pores, noise) does not cut islands; they follow the large-scale form.
+- **Polygroups** makes the islands follow the polygroups instead (each connected part of a
+  group is one island, split further only where it could not lie flat): group the parts
+  you want as islands, then unwrap.
+- UVs live on the lowest level, as in ZBrush: Divide and sculpting keep them, Export OBJ
+  writes them (`vt`) while the lowest level is shown, and projects save them. Anything that
+  rebuilds the mesh (ZRemesher, Decimation, Remesh, Sculptris Pro, ZModeler, CurveTube) starts
+  without UVs; undo brings back the mesh and its UVs together. **Delete UVs** removes them.
+
+A 120k-triangle model unwraps in under a second.
+
 ### Decimation
 
 Geometry › **Decimation** (ZBrush: Decimation Master) cuts the triangle count a long way

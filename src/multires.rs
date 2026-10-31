@@ -769,6 +769,8 @@ pub struct Packed {
     colors: Vec<Vec<[u8;4]>>,
     /// Polygroups and hidden triangles of every level, base first, run-length coded.
     marks: Vec<Marks>,
+    /// UVs of the base level's triangle corners, in its triangle order (empty for none).
+    uvs: Vec<[glam::Vec2; 3]>,
 }
 
 /// Polygroups and hidden triangles of one level in run-length form (see `crate::polygroup`).
@@ -852,6 +854,24 @@ impl Packed {
     #[cfg(test)]
     pub fn set_marks_for_test(&mut self, marks: Vec<Marks>) {
         self.marks = marks;
+    }
+
+    /// Serialise the base level's UVs (project version 7; empty for none).
+    pub fn write_uvs<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        out.slice(&self.uvs)
+    }
+
+    /// Read what [`write_uvs`](Self::write_uvs) wrote.
+    pub fn read_uvs<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+        let uvs: Vec<[glam::Vec2; 3]> = input.vec()?;
+        if !uvs.is_empty() && uvs.len() * 3 != self.indices.len() {
+            return Err("UVs do not match the base level's triangles".into());
+        }
+        if uvs.iter().flatten().any(|q| !q.is_finite()) {
+            return Err("UVs are not finite numbers".into());
+        }
+        self.uvs = uvs;
+        Ok(())
     }
 
     /// Serialise the polygroups and hidden triangles of every level (project version 3).
@@ -992,6 +1012,7 @@ impl Packed {
             marks,
             mask,
             colors: Vec::new(),
+            uvs: Vec::new(),
         })
     }
 
@@ -1023,6 +1044,7 @@ impl Packed {
             levels: packed,
             active,
             budget,
+            uvs,
             marks,
             mask,
             colors,
@@ -1082,12 +1104,16 @@ impl Packed {
             level.mesh.colors=colors;
             for c in &mut level.mesh.chunks {c.dirty_color=true;}
         }
+        if !uvs.is_empty() && uvs.len() != levels[0].mesh.triangle_count() {
+            return Err("UVs do not match the base level's triangles".into());
+        }
         Ok(Multires {
             levels,
             active,
             budget,
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
+            uvs,
         })
     }
 }
@@ -1190,6 +1216,9 @@ pub struct Multires {
     /// Tool › Layers, on the highest level (not packed: a parked subtool keeps them with
     /// its undo history).
     pub layers: crate::layers::Layers,
+    /// UV Master: UVs of the base level's triangle corners, in its triangle order; empty
+    /// for none. Dropped whenever the base level's triangles change.
+    uvs: Vec<[glam::Vec2; 3]>,
 }
 
 fn next_generation() -> u64 {
@@ -1205,6 +1234,7 @@ impl Multires {
             budget,
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
+            uvs: Vec::new(),
         }
     }
 
@@ -1221,6 +1251,8 @@ impl Multires {
     /// (`Gfx::swap_tail`): the stack keeps its generation.
     pub fn swap_part_in_place(&mut self, keep: crate::mesh::Extent, part: Option<&SculptMesh>) -> Option<SculptMesh> {
         assert_eq!(self.levels.len(), 1, "parts are added to a stack without levels");
+        // The base's triangles change: its UVs no longer fit.
+        self.uvs.clear();
         let level = &mut self.levels[0];
         let old = level.mesh.swap_tail(keep, part);
         let n = level.mesh.chunks.len();
@@ -1239,6 +1271,30 @@ impl Multires {
         n
     }
 
+    /// UVs of the base level's triangle corners, in its triangle order (empty for none).
+    pub fn uvs(&self) -> &[[glam::Vec2; 3]] {
+        &self.uvs
+    }
+
+    /// Set the base level's UVs (one triple per base triangle) or clear them (empty).
+    #[cfg(test)]
+    pub fn set_uvs(&mut self, uvs: Vec<[glam::Vec2; 3]>) {
+        assert!(uvs.is_empty() || uvs.len() == self.levels[0].mesh.triangle_count(), "one UV triple per base triangle");
+        self.uvs = uvs;
+    }
+
+    /// Put `uvs` in and return the ones there before (undo). UVs that no longer fit the
+    /// base's triangles are left out.
+    pub fn swap_uvs(&mut self, uvs: Vec<[glam::Vec2; 3]>) -> Vec<[glam::Vec2; 3]> {
+        let fits = uvs.is_empty() || uvs.len() == self.levels[0].mesh.triangle_count();
+        std::mem::replace(&mut self.uvs, if fits { uvs } else { Vec::new() })
+    }
+
+    /// The base level (the one UVs belong to).
+    pub fn base_mesh(&self) -> &SculptMesh {
+        &self.levels[0].mesh
+    }
+
     /// Make the shown level the base, deleting the levels below it (ZBrush: Del Lower). Its
     /// sculpting is kept as plain positions. Returns how many went.
     pub fn delete_lower(&mut self) -> usize {
@@ -1254,6 +1310,7 @@ impl Multires {
         self.levels.insert(0, base);
         self.active = 0;
         self.generation = next_generation();
+        self.uvs.clear();
         n
     }
 
@@ -1719,6 +1776,7 @@ impl Multires {
             levels,
             active,
             budget,
+            uvs,
             ..
         } = self;
         let mut it = levels.into_iter();
@@ -1744,6 +1802,7 @@ impl Multires {
             marks,
             mask,
             colors,
+            uvs,
         }
     }
 
@@ -1767,6 +1826,7 @@ impl Multires {
             marks: self.marks(),
             mask: self.mesh().mask.clone(),
             colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
+            uvs: self.uvs.clone(),
         }
     }
 

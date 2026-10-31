@@ -25,6 +25,7 @@ mod boolean;
 mod zremesh;
 mod project_all;
 mod decimate;
+mod uv;
 mod zmodeler;
 mod layers;
 mod obj;
@@ -207,6 +208,12 @@ struct SelectDrag {
     start: Vec2,
     /// Triangle of the active subtool under the press; `None` on the background.
     hit: Option<u32>,
+}
+
+/// The UVs to export with the shown level: the base level's when it is the one shown
+/// (UVs live on the lowest level, as in ZBrush), else none.
+fn shown_uvs(doc: &Multires) -> &[[Vec2; 3]] {
+    if doc.active() == 0 { doc.uvs() } else { &[] }
 }
 
 /// ZRemesher guides as polylines, one per piece of each guide.
@@ -650,6 +657,8 @@ struct App {
     pending_geo: Option<GeoOp>,
     /// Decimation running in the background (Geometry › Decimation).
     decimation: Option<DecimateJob>,
+    /// The stats of the last unwrap, with the UV key they belong to.
+    uv_stats: Option<(u64, uv::Stats)>,
     /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
     selftest_wedge: Option<(u8, u32)>,
     /// SubTool list operation from the interface, run outside the egui pass.
@@ -824,6 +833,7 @@ impl App {
             pending_vis: None,
             pending_geo: None,
             decimation: None,
+            uv_stats: None,
             selftest_wedge: None,
             pending_subtool: None,
             measure: None,
@@ -1079,6 +1089,82 @@ impl App {
         }
         self.show_active_level();
         self.workspace.notify(format!("{what}: {} → {} triangles", fmt_count(before), fmt_count(after)));
+    }
+
+    /// Geometry › UV Map › Unwrap (ZBrush: UV Master): UVs for the base level of the active
+    /// subtool, as one undo step.
+    fn uv_unwrap_now(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let settings = self.workspace.uv;
+        let base = self.doc.base_mesh();
+        let groups: Vec<u16> = (0..base.triangle_count() as u32).map(|t| base.group(t)).collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uv::unwrap(&base.positions, &base.indices, &groups, &settings)));
+        let u = match result {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
+                self.workspace.notify(format!("UV Unwrap: {e}"));
+                return;
+            }
+            Err(_) => {
+                self.workspace.notify("UV Unwrap failed".to_string());
+                return;
+            }
+        };
+        let old = self.doc.swap_uvs(u.uvs);
+        self.history.push(UndoStep::Uvs(old));
+        self.history.name_last("UV Unwrap");
+        self.uv_stats = Some((self.uv_key(), u.stats.clone()));
+        let s = &u.stats;
+        self.status = format!("UV Unwrap: {} islands, {:.1} % distortion, {:.0} % coverage in {:.0} ms", s.charts, s.distortion * 100.0, s.coverage * 100.0, s.ms);
+        if self.doc.active() > 0 {
+            self.workspace.notify("UVs are on the lowest level · show it to export them with OBJ");
+        }
+    }
+
+    /// Geometry › UV Map › Delete UVs, as one undo step.
+    fn uv_delete_now(&mut self) {
+        if self.busy() || self.doc.uvs().is_empty() {
+            return;
+        }
+        let old = self.doc.swap_uvs(Vec::new());
+        self.history.push(UndoStep::Uvs(old));
+        self.history.name_last("Delete UVs");
+        self.status = "UVs deleted".to_string();
+    }
+
+    /// A fingerprint of the active subtool's UVs (0 for none), to notice when they change.
+    fn uv_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let uvs = self.doc.uvs();
+        if uvs.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.subtools[self.active_tool].id, self.doc.generation, uvs.len()).hash(&mut h);
+        for t in uvs.iter().step_by((uvs.len() / 512).max(1)) {
+            for q in t {
+                (q.x.to_bits(), q.y.to_bits()).hash(&mut h);
+            }
+        }
+        h.finish() | 1
+    }
+
+    /// The UV Map section's picture and numbers, made again when the UVs change.
+    fn update_uv_layout(&mut self) {
+        let key = self.uv_key();
+        if key == 0 {
+            self.workspace.uv_layout = None;
+            self.workspace.uv_info = None;
+            return;
+        }
+        if self.workspace.uv_layout.as_ref().is_none_or(|l| l.0 != key) {
+            const SIZE: usize = 256;
+            self.workspace.uv_layout = Some((key, SIZE, uv::layout_image(self.doc.uvs(), SIZE)));
+        }
+        let stats = self.uv_stats.as_ref().filter(|s| s.0 == key).map(|s| s.1.clone());
+        self.workspace.uv_info = Some((self.doc.uvs().len(), stats));
     }
 
     /// Geometry › Decimation: decimate the shown level of the active subtool on a thread of
@@ -2618,7 +2704,7 @@ impl App {
             let mut w = std::io::BufWriter::with_capacity(8 << 20, file);
             use std::io::Write;
             writeln!(w, "# Klay export: subtool {name}")?;
-            self.doc.mesh().write_obj(&mut w, &name, 0)?;
+            self.doc.mesh().write_obj_uv(&mut w, &name, 0, shown_uvs(&self.doc), 0)?;
             w.flush()
         })();
         self.status = match result {
@@ -2767,14 +2853,14 @@ impl App {
             let mut w = std::io::BufWriter::with_capacity(8 << 20, file);
             use std::io::Write;
             writeln!(w, "# Klay export: {} subtools", self.subtools.len())?;
-            let (mut verts, mut count) = (0usize, 0usize);
+            let (mut verts, mut count, mut uvs) = (0usize, 0usize, 0usize);
             for (i, tool) in self.subtools.iter().enumerate() {
                 if i == self.active_tool {
-                    self.doc.mesh().write_obj(&mut w, &tool.name, verts)?;
+                    uvs += self.doc.mesh().write_obj_uv(&mut w, &tool.name, verts, shown_uvs(&self.doc), uvs)?;
                     verts += self.doc.mesh().vertex_count();
                 } else if let (true, Some(p)) = (tool.visible, &tool.parked) {
                     let doc = p.packed.clone().unpack();
-                    doc.mesh().write_obj(&mut w, &tool.name, verts)?;
+                    uvs += doc.mesh().write_obj_uv(&mut w, &tool.name, verts, shown_uvs(&doc), uvs)?;
                     verts += doc.mesh().vertex_count();
                 } else {
                     continue;
@@ -7211,6 +7297,7 @@ impl App {
         };
         self.poll_decimation(false);
         self.workspace.curve_preview = self.curve_preview();
+        self.update_uv_layout();
         self.workspace.guides_preview = self.guides_preview();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
         self.workspace.held_brush = self.held_brush();
@@ -7388,6 +7475,12 @@ impl App {
         }
         if actions.decimate {
             self.start_decimation();
+        }
+        if actions.uv_unwrap {
+            self.uv_unwrap_now();
+        }
+        if actions.uv_delete {
+            self.uv_delete_now();
         }
         if actions.delete_guides {
             let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
@@ -8765,6 +8858,11 @@ fn main() {
         app.poll_decimation(true);
         log::info!("{}", app.status);
     }
+    // `--uv-unwrap`: UV Master's Unwrap at startup (after `--retopo-demo`, `--decimate`).
+    if args.iter().any(|a| a == "--uv-unwrap") {
+        app.uv_unwrap_now();
+        log::info!("{}", app.status);
+    }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         app.workspace.zremesh.target_k = k;
@@ -9067,6 +9165,60 @@ mod subtool_tests {
         drag(&mut app, p2, p2);
         assert!(app.zm_bridge.is_none());
         assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 24 - 2 + 4);
+    }
+
+    #[test]
+    fn uv_unwrap_undoes_survives_divide_exports_and_goes_with_new_topology() {
+        let mut app = App::new(24, false, usize::MAX);
+        let tris = app.doc.mesh().triangle_count();
+        app.uv_unwrap_now();
+        assert_eq!(app.doc.uvs().len(), tris);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("UV Unwrap"));
+        assert!(app.doc.uvs().iter().flatten().all(|q| (0.0..=1.0).contains(&q.x) && (0.0..=1.0).contains(&q.y)));
+        app.update_uv_layout();
+        let (mapped, stats) = app.workspace.uv_info.clone().expect("the section shows them");
+        assert_eq!(mapped, tris);
+        assert!(stats.is_some_and(|s| s.charts >= 1));
+        assert!(app.workspace.uv_layout.is_some());
+        let uvs = app.doc.uvs().to_vec();
+        // Undo, redo.
+        app.history_jump(-1);
+        assert!(app.doc.uvs().is_empty());
+        app.update_uv_layout();
+        assert!(app.workspace.uv_layout.is_none() && app.workspace.uv_info.is_none());
+        app.history_jump(1);
+        assert_eq!(app.doc.uvs(), &uvs[..]);
+        // Exported with the lowest level shown: vt lines and v/vt/vn faces.
+        let dir = std::env::temp_dir().join(format!("klay-uv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.subtool_path = dir.join("mapped.klay").to_string_lossy().into_owned();
+        app.export_subtool_obj();
+        let obj = std::fs::read_to_string(dir.join("mapped.obj")).unwrap();
+        let vt = obj.lines().filter(|l| l.starts_with("vt ")).count();
+        assert!(vt > app.doc.mesh().vertex_count(), "{vt} vt lines: seams split UVs");
+        let face = obj.lines().find(|l| l.starts_with("f ")).unwrap();
+        assert!(face.split(' ').skip(1).all(|c| c.split('/').count() == 3 && !c.contains("//")), "{face}");
+        // Divide keeps them on the base; a higher level exports without.
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        assert_eq!(app.doc.uvs(), &uvs[..]);
+        app.export_subtool_obj();
+        let obj = std::fs::read_to_string(dir.join("mapped.obj")).unwrap();
+        assert!(!obj.contains("\nvt "));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Delete UVs undoes too.
+        app.uv_delete_now();
+        assert!(app.doc.uvs().is_empty());
+        app.history_jump(-1);
+        assert_eq!(app.doc.uvs(), &uvs[..]);
+        // New topology has none.
+        let mut app = App::new(24, false, usize::MAX);
+        app.uv_unwrap_now();
+        app.workspace.zremesh.target_k = 0.3;
+        app.zremesh_now();
+        assert!(app.doc.uvs().is_empty());
+        app.history_jump(-1);
+        assert_eq!(app.doc.uvs().len(), app.doc.mesh().triangle_count(), "undo brings the old mesh and its UVs");
     }
 
     #[test]

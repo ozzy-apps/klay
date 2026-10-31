@@ -494,6 +494,8 @@ pub enum UndoStep {
     Layers { state: Box<crate::layers::Layers>, reshape: bool },
     /// A layer's intensity before it was changed.
     LayerIntensity { index: usize, intensity: f32 },
+    /// The base level's UVs before UV Master changed them (empty for none).
+    Uvs(Vec<[glam::Vec2; 3]>),
 }
 
 pub struct History {
@@ -638,6 +640,7 @@ fn step_name(s: &UndoStep) -> &'static str {
         UndoStep::Steps(_) => "Group masked",
         UndoStep::Layers { .. } => "Layers",
         UndoStep::LayerIntensity { .. } => "Layer intensity",
+        UndoStep::Uvs(_) => "UV Unwrap",
     }
 }
 
@@ -657,6 +660,7 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
         UndoStep::Layers { state, .. } => state.bytes(),
         UndoStep::LayerIntensity { .. } => 0,
+        UndoStep::Uvs(uvs) => uvs.len() * 24,
     }
 }
 
@@ -737,6 +741,7 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             index,
             intensity: doc.set_layer_intensity(index, intensity),
         },
+        UndoStep::Uvs(uvs) => UndoStep::Uvs(doc.swap_uvs(uvs)),
         UndoStep::Steps(steps) => {
             // Applied in order; their inverses run the other way.
             let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, s)).collect();

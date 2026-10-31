@@ -928,6 +928,9 @@ pub struct Actions {
     pub delete_guides: bool,
     /// Geometry › Decimation › Decimate.
     pub decimate: bool,
+    /// Geometry › UV Map › Unwrap, Delete UVs.
+    pub uv_unwrap: bool,
+    pub uv_delete: bool,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -1061,6 +1064,15 @@ pub struct Workspace {
     pub project: crate::project_all::Settings,
     /// Geometry › Decimation settings.
     pub decimation: crate::decimate::Settings,
+    /// Geometry › UV Map settings.
+    pub uv: crate::uv::Settings,
+    /// The active subtool's UV layout as a picture (a key that changes with the UVs, and
+    /// RGBA pixels), set by the app; `None` without UVs.
+    pub uv_layout: Option<(u64, usize, Vec<[u8; 4]>)>,
+    /// What the UV Map section shows about it: triangles mapped, and the stats of the
+    /// unwrap that made it when known.
+    pub uv_info: Option<(usize, Option<crate::uv::Stats>)>,
+    uv_texture: Option<(u64, egui::TextureHandle)>,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
     /// Light palette: where the key light is, as a point on the front of a sphere seen from
@@ -1270,6 +1282,10 @@ impl Workspace {
             extract_thick: 2.0,
             project: crate::project_all::Settings::default(),
             decimation: crate::decimate::Settings::default(),
+            uv: crate::uv::Settings::default(),
+            uv_layout: None,
+            uv_info: None,
+            uv_texture: None,
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
@@ -3776,6 +3792,51 @@ impl Workspace {
                         ui.checkbox(&mut ws.decimation.keep_paint, "Keep Polypaint").on_hover_text("Colours are carried over");
                     });
                     note(ui, "Decimates the shown level; subdivision levels are replaced by the result (undo brings them back)");
+                });
+                self.sec(ui, h, id, "uvmap", "UV Map", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Unwrap"))
+                        .on_hover_text("Lay the lowest level out flat in UV space, in islands with little stretch (ZBrush: UV Master) · one undo step");
+                    if r.shelf(ui, "cmd:uv-unwrap").clicked() {
+                        a.uv_unwrap = true;
+                    }
+                    ui.checkbox(&mut ws.uv.groups, "Polygroups").on_hover_text("Islands follow the polygroups");
+                    ui.add_enabled_ui(!ws.uv.groups, |ui| {
+                        zslider(ui, "Max angle", &mut ws.uv.max_angle, 20.0..=90.0, false, false, 0);
+                    });
+                    // The layout, uploaded again only when the UVs change.
+                    match &ws.uv_layout {
+                        Some((key, size, px)) => {
+                            if ws.uv_texture.as_ref().is_none_or(|t| t.0 != *key) {
+                                let image = egui::ColorImage::from_rgba_unmultiplied([*size, *size], bytemuck::cast_slice(px));
+                                ws.uv_texture = Some((*key, ui.ctx().load_texture("uv-layout", image, TextureOptions::LINEAR)));
+                            }
+                            let side = ui.available_width().min(260.0);
+                            if let Some((_, tex)) = &ws.uv_texture {
+                                ui.add(egui::Image::new((tex.id(), vec2(side, side))));
+                            }
+                        }
+                        None => ws.uv_texture = None,
+                    }
+                    match &ws.uv_info {
+                        Some((tris, stats)) => {
+                            kv(ui, "Mapped triangles", &crate::fmt_count(*tris));
+                            if let Some(s) = stats {
+                                kv(ui, "Islands", &s.charts.to_string());
+                                kv(ui, "Distortion", &format!("{:.1} %", s.distortion * 100.0));
+                                kv(ui, "Coverage", &format!("{:.0} %", s.coverage * 100.0));
+                            }
+                            if ui
+                                .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Delete UVs").size(12.0)))
+                                .on_hover_text("Remove this subtool's UVs · one undo step")
+                                .clicked()
+                            {
+                                a.uv_delete = true;
+                            }
+                            note(ui, "UVs live on the lowest level and go out with Export OBJ while it is shown");
+                        }
+                        None => note(ui, "No UVs yet · Unwrap lays out the lowest level"),
+                    }
                 });
                 self.sec(
                     ui,

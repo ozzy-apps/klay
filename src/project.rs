@@ -13,6 +13,8 @@
 //!                offsets of the highest level each) and the Morph Target (0, or 1 · level
 //!                · positions)
 //!              · (version 6 on) boolean operation u8 (0 Add, 1 Subtract, 2 Intersect)
+//!              · (version 7 on) UVs of the base level's triangle corners (u64 count of
+//!                triangles, 0 for none, then six f32 per triangle)
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -32,9 +34,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 5: layers and Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2:
-/// mask. Versions 1–4 still open.
-pub const VERSION: u32 = 6;
+/// 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
+/// polygroups and hidden triangles; 2: mask. Every older version still opens.
+pub const VERSION: u32 = 7;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -231,6 +233,9 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
         if version >= 6 {
             out.u8(extras.get(k).map_or(0, |e| e.boolean.code()))?;
         }
+        if version >= 7 {
+            packed.write_uvs(&mut out)?;
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -299,6 +304,9 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
             }
         }
         let boolean = if version >= 6 { crate::boolean::BoolOp::from_code(input.u8()?) } else { Default::default() };
+        if version >= 7 {
+            packed.read_uvs(&mut input)?;
+        }
         tools.push(SavedTool {
             name,
             visible,
@@ -480,5 +488,41 @@ mod tests {
         marks[1].hidden[0] += 1;
         bad.set_marks_for_test(marks);
         assert!(bad.try_unpack().is_err());
+    }
+
+    #[test]
+    fn uvs_round_trip_from_version_7_and_version_6_files_open_without() {
+        let mut a = Multires::new(sphere(8, 1.0), usize::MAX);
+        let n = a.base_mesh().triangle_count();
+        let uvs: Vec<[glam::Vec2; 3]> = (0..n).map(|t| {
+            let f = t as f32 / n as f32;
+            [glam::Vec2::new(f, 0.1), glam::Vec2::new(f, 0.5), glam::Vec2::new(f * 0.5, 0.9)]
+        }).collect();
+        a.set_uvs(uvs.clone());
+        assert!(a.divide(), "levels above keep the base's UVs");
+        let p = a.pack_copy();
+        let bytes = bytes_of(&[("Mapped", true, &p)], 0);
+        let project = read_from(&bytes[..], bytes.len() as u64).expect("reads back");
+        let again: Vec<(&str, bool, &Packed)> = project.tools.iter().map(|t| (t.name.as_str(), t.visible, &t.packed)).collect();
+        assert_eq!(bytes_of(&again, 0), bytes);
+        let back = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.uvs(), &uvs[..]);
+        // Version 6: no UVs stored, the rest opens.
+        let v6 = write_version(Vec::new(), &[("Old", true, &p)], 0, 6).unwrap();
+        let project = read_from(&v6[..], v6.len() as u64).expect("version 6 opens");
+        let old = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert!(old.uvs().is_empty());
+        assert_eq!(old.level_mesh(1).positions, a.level_mesh(1).positions);
+        // UVs for the wrong number of triangles are refused.
+        let mut wrong = Multires::new(sphere(6, 1.0), usize::MAX);
+        let m = wrong.base_mesh().triangle_count();
+        wrong.set_uvs(vec![[glam::Vec2::ZERO; 3]; m]);
+        let mut bytes = bytes_of(&[("Wrong", true, &wrong.pack_copy())], 0);
+        // The UV count is the u64 right before the UV data at the end of the subtool.
+        let at = bytes.len() - END.len() - m * 24 - 8;
+        assert_eq!(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()), m as u64);
+        bytes.drain(at + 8..at + 8 + 24);
+        bytes[at..at + 8].copy_from_slice(&((m - 1) as u64).to_le_bytes());
+        assert!(read_from(&bytes[..], bytes.len() as u64).is_err());
     }
 }
