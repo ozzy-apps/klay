@@ -361,6 +361,16 @@ guide. **Alt + click** a curve to delete it; **Delete guides** under ZRemesher c
 all. Guides stay after ZRemesher (draw once, remesh at several counts), move with the
 subtool when all of it is moved (Transpose, Deformation), and are not part of undo or saved in projects.
 
+**Use Polypaint** lets paint set the density (ZBrush: Use Polypaint): paint **red** where you
+want more quads and **blue** where you want fewer; unpainted, white and grey stay as they
+are. **ColorDensity** (1–4, default 2) is how many times more (red) or fewer (blue) quads
+pure colour asks for; the total stays about the target, so painting one area red also thins
+the rest a little. It adds to AdaptiveSize.
+
+With **X symmetry** on, ZRemesher makes symmetric topology: the +X half is remeshed with an
+edge loop held on X = 0, then mirrored and welded, so every vertex has its mirror image and
+the middle loop runs straight down the plane. Guides drawn on −X count for both sides.
+
 The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and a quad
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.

@@ -46,12 +46,42 @@ pub struct Settings {
     /// 0..=100: how strongly guide curves steer the loops (ZBrush: Curves Strength); 100
     /// holds the direction along a curve exactly.
     pub curves_strength: f32,
+    /// Polypaint sets the density (ZBrush: Use Polypaint): red for more quads, blue for
+    /// fewer, unpainted and white as they are.
+    pub use_polypaint: bool,
+    /// 1..=4: how many times more (red) or fewer (blue) quads polypaint asks for (ZBrush:
+    /// ColorDensity).
+    pub color_density: f32,
+    /// Symmetric across X (ZBrush: with X symmetry on): the +X half is remeshed and
+    /// mirrored, with an edge loop on X = 0.
+    pub symmetric: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0 }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false }
     }
+}
+
+/// The density polypaint asks for at each vertex, as the log of the factor on the quad count:
+/// red up to `ln(color_density)`, blue down to minus that, unpainted and grey nothing.
+fn paint_density(mesh: &SculptMesh, color_density: f32) -> Vec<f32> {
+    let k = color_density.clamp(1.0, 4.0).ln();
+    if mesh.colors.len() != mesh.vertex_count() || k <= 0.0 {
+        return Vec::new();
+    }
+    mesh.colors
+        .iter()
+        .map(|c| {
+            if c[3] == 0 {
+                return 0.0;
+            }
+            let [r, g, b] = [c[0], c[1], c[2]].map(|x| x as f32 / 255.0);
+            let red = (r - g.max(b)).max(0.0);
+            let blue = (b - r.max(g)).max(0.0);
+            k * (red - blue).clamp(-1.0, 1.0)
+        })
+        .collect()
 }
 
 /// Guide curves as segments, by grid cell, for the nearest point on any of them.
@@ -180,6 +210,8 @@ struct Graph {
     adj: Vec<u32>,
     /// A direction to hold (border tangent), or zero.
     held: Vec<Vec3>,
+    /// The log of how many times more quads are wanted here (polypaint density).
+    dens: Vec<f32>,
 }
 
 impl Graph {
@@ -229,6 +261,7 @@ fn coarsen(g: &Graph, cell: f32) -> (Graph, Vec<u32>) {
     let mut index: HashMap<(i32, i32, i32, u8), u32> = HashMap::default();
     let mut parent = Vec::with_capacity(g.len());
     let (mut p, mut n, mut held, mut count): (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<f32>) = Default::default();
+    let mut dens: Vec<f32> = Vec::new();
     for i in 0..g.len() {
         let key = cell_key(g.p[i], g.n[i], inv);
         let k = *index.entry(key).or_insert_with(|| {
@@ -236,10 +269,12 @@ fn coarsen(g: &Graph, cell: f32) -> (Graph, Vec<u32>) {
             n.push(Vec3::ZERO);
             held.push(Vec3::ZERO);
             count.push(0.0);
+            dens.push(0.0);
             (p.len() - 1) as u32
         });
         parent.push(k);
         let k = k as usize;
+        dens[k] += g.dens[i];
         p[k] += g.p[i];
         n[k] += g.n[i];
         count[k] += 1.0;
@@ -249,6 +284,7 @@ fn coarsen(g: &Graph, cell: f32) -> (Graph, Vec<u32>) {
     }
     for k in 0..p.len() {
         p[k] /= count[k];
+        dens[k] /= count[k];
         n[k] = n[k].normalize_or(Vec3::Z);
         if held[k] != Vec3::ZERO {
             held[k] = (held[k] - n[k] * held[k].dot(n[k])).normalize_or_zero();
@@ -263,11 +299,11 @@ fn coarsen(g: &Graph, cell: f32) -> (Graph, Vec<u32>) {
             }
         }
     }
-    let graph = graph_from(p, n, held, edges);
+    let graph = graph_from(p, n, held, dens, edges);
     (graph, parent)
 }
 
-fn graph_from(p: Vec<Vec3>, n: Vec<Vec3>, held: Vec<Vec3>, mut edges: Vec<(u32, u32)>) -> Graph {
+fn graph_from(p: Vec<Vec3>, n: Vec<Vec3>, held: Vec<Vec3>, dens: Vec<f32>, mut edges: Vec<(u32, u32)>) -> Graph {
     let m = p.len();
     edges.extend(edges.clone().into_iter().map(|(a, b)| (b, a)));
     edges.par_sort_unstable();
@@ -280,12 +316,12 @@ fn graph_from(p: Vec<Vec3>, n: Vec<Vec3>, held: Vec<Vec3>, mut edges: Vec<(u32, 
         off[i + 1] += off[i];
     }
     let adj = edges.into_iter().map(|e| e.1).collect();
-    Graph { p, n, off, adj, held }
+    Graph { p, n, off, adj, held, dens }
 }
 
 /// The sample graph of `mesh`'s vertices: one sample per vertex, neighbours along edges.
 /// Directions are held along open borders, and with `groups` along polygroup borders.
-fn vertex_graph(positions: &[Vec3], indices: &[u32], groups: &[u16]) -> Graph {
+fn vertex_graph(positions: &[Vec3], indices: &[u32], groups: &[u16], dens: &[f32]) -> Graph {
     let m = positions.len();
     let mut n = vec![Vec3::ZERO; m];
     for t in indices.chunks_exact(3) {
@@ -327,7 +363,8 @@ fn vertex_graph(positions: &[Vec3], indices: &[u32], groups: &[u16]) -> Graph {
             held[v] = (held[v] - n[v] * held[v].dot(n[v])).normalize_or_zero();
         }
     }
-    graph_from(positions.to_vec(), n, held, edges)
+    let dens = if dens.len() == m { dens.to_vec() } else { vec![0.0; m] };
+    graph_from(positions.to_vec(), n, held, dens, edges)
 }
 
 /// The pair of (one of four turns of `q0`, one of four turns of `q1`) that agree best.
@@ -476,32 +513,43 @@ fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>],
     }
 }
 
-/// AdaptiveSize: each sample's lattice step, `scale` scaled down where the surface curves
-/// more than usual and up where it is flatter (by up to two), by an amount that grows with
-/// `adaptive` (0..=100), smoothed so it changes gently, and normalised so the surface still
-/// gets about as many quads as at one step everywhere.
+/// AdaptiveSize and polypaint density: each sample's lattice step, `scale` scaled down where
+/// the surface curves more than usual and up where it is flatter (by up to two), by an amount
+/// that grows with `adaptive` (0..=100), and by the density painted there; smoothed so it
+/// changes gently, and normalised so the surface still gets about as many quads as at one
+/// step everywhere.
 fn adaptive_scale(g: &Graph, scale: f32, adaptive: f32) -> Vec<f32> {
     let m = g.len();
     let strength = (adaptive / 100.0).clamp(0.0, 1.0);
-    if strength <= 0.0 || m == 0 {
+    let painted = g.dens.iter().any(|&d| d != 0.0);
+    if (strength <= 0.0 && !painted) || m == 0 {
         return vec![scale; m];
     }
     // Curvature: how fast the normal turns toward the neighbours.
-    let curv: Vec<f32> = (0..m)
-        .into_par_iter()
-        .map(|i| {
-            let nb = g.neighbours(i);
-            if nb.is_empty() {
-                return 0.0;
-            }
-            nb.iter().map(|&j| (g.n[i] - g.n[j as usize]).length() / g.p[i].distance(g.p[j as usize]).max(1e-9)).sum::<f32>() / nb.len() as f32
-        })
-        .collect();
-    let mut sorted = curv.clone();
-    sorted.sort_by(f32::total_cmp);
-    let typical = sorted[m / 2].max(1e-6 / scale);
-    // In log steps: bends twice the typical halve the step at full strength (bounded).
-    let mut ln: Vec<f32> = curv.iter().map(|&k| (-(k / typical).max(1e-3).ln() * 0.5 * strength).clamp(-0.69, 0.69)).collect();
+    let mut ln: Vec<f32> = vec![0.0; m];
+    if strength > 0.0 {
+        let curv: Vec<f32> = (0..m)
+            .into_par_iter()
+            .map(|i| {
+                let nb = g.neighbours(i);
+                if nb.is_empty() {
+                    return 0.0;
+                }
+                nb.iter().map(|&j| (g.n[i] - g.n[j as usize]).length() / g.p[i].distance(g.p[j as usize]).max(1e-9)).sum::<f32>() / nb.len() as f32
+            })
+            .collect();
+        let mut sorted = curv.clone();
+        sorted.sort_by(f32::total_cmp);
+        let typical = sorted[m / 2].max(1e-6 / scale);
+        // In log steps: bends twice the typical halve the step at full strength (bounded).
+        for i in 0..m {
+            ln[i] = (-(curv[i] / typical).max(1e-3).ln() * 0.5 * strength).clamp(-0.69, 0.69);
+        }
+    }
+    // Density: k times the quads is a step 1 / sqrt(k) as long.
+    for i in 0..m {
+        ln[i] -= 0.5 * g.dens[i];
+    }
     for _ in 0..8 {
         ln = (0..m)
             .map(|i| {
@@ -529,8 +577,9 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 /// Midpoint subdivision, each triangle into four.
-fn subdivide(positions: &[Vec3], indices: &[u32], groups: &[u16]) -> (Vec<Vec3>, Vec<u32>, Vec<u16>) {
+fn subdivide(positions: &[Vec3], indices: &[u32], groups: &[u16], dens: &mut Vec<f32>) -> (Vec<Vec3>, Vec<u32>, Vec<u16>) {
     let mut p = positions.to_vec();
+    let carry = !dens.is_empty();
     let mut mid: HashMap<(u32, u32), u32> = HashMap::default();
     let mut out = Vec::with_capacity(indices.len() * 4);
     let mut g = Vec::with_capacity(groups.len() * 4);
@@ -540,6 +589,9 @@ fn subdivide(positions: &[Vec3], indices: &[u32], groups: &[u16]) -> (Vec<Vec3>,
             let (a, b) = (tri[k], tri[(k + 1) % 3]);
             m[k] = *mid.entry((a.min(b), a.max(b))).or_insert_with(|| {
                 p.push((positions[a as usize] + positions[b as usize]) * 0.5);
+                if carry {
+                    dens.push((dens[a as usize] + dens[b as usize]) * 0.5);
+                }
                 (p.len() - 1) as u32
             });
         }
@@ -568,6 +620,83 @@ fn project(mesh: &SculptMesh, p: Vec3, n: Vec3, reach: f32) -> Option<(Vec3, u32
 /// ZRemesh `mesh` into about `s.target_k` thousand quads, with edge loops steered along
 /// `guides` (curves on the surface, ZBrush: ZRemesherGuide) by `s.curves_strength`.
 pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
+    if s.symmetric {
+        symmetric(mesh, s, guides)
+    } else {
+        remesh(mesh, s, guides, &[])
+    }
+}
+
+/// Symmetric across X: the +X half remeshed to half the target, with its cut edge on X = 0
+/// held as a full-strength guide so an edge loop runs on the plane, then mirrored and welded.
+/// Guides on −X are folded over to +X.
+fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
+    let start = Instant::now();
+    let half = crate::subtool_ops::plus_x_half(mesh).ok_or("nothing on the +X side to mirror")?;
+    let folded: Vec<Vec<Vec3>> = guides.iter().map(|g| g.iter().map(|p| Vec3::new(p.x.abs(), p.y, p.z)).collect()).collect();
+    // The cut edge: open edges with both ends on the plane.
+    let mut count: HashMap<(u32, u32), u32> = HashMap::default();
+    for t in half.indices.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let seam: Vec<Vec<Vec3>> = count
+        .iter()
+        .filter(|&(&(a, b), &c)| c == 1 && half.positions[a as usize].x == 0.0 && half.positions[b as usize].x == 0.0)
+        .map(|(&(a, b), _)| vec![half.positions[a as usize], half.positions[b as usize]])
+        .collect();
+    let hs = Settings { target_k: s.target_k * 0.5, symmetric: false, ..*s };
+    let (out, mut stats) = remesh(&half, &hs, &folded, &seam)?;
+    // Its open border goes onto the plane; nothing else may reach it, or it would weld.
+    let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+    for t in out.indices.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut border = vec![false; out.vertex_count()];
+    for (&(a, b), &c) in &edges {
+        if c == 1 {
+            border[a as usize] = true;
+            border[b as usize] = true;
+        }
+    }
+    let (lo, hi) = out.positions.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), p| (a.min(*p), b.max(*p)));
+    let nudge = (hi - lo).length() * 1e-4;
+    let reach = stats_quad(&out);
+    let mut positions = out.positions.clone();
+    for (v, p) in positions.iter_mut().enumerate() {
+        if border[v] && p.x.abs() < reach {
+            p.x = 0.0;
+        } else if p.x <= 0.0 {
+            p.x = nudge;
+        }
+    }
+    let groups: Vec<u16> = (0..out.triangle_count() as u32).map(|t| out.group(t)).collect();
+    let grouped = out.group_count() > 1;
+    let snapped = SculptMesh::from_raw_with_groups(positions, out.indices.clone(), if grouped { groups } else { Vec::new() });
+    let full = crate::subtool_ops::mirrored(&snapped);
+    stats.quads = full.triangle_count() / 2;
+    stats.ms = start.elapsed().as_secs_f32() * 1000.0;
+    Ok((full, stats))
+}
+
+/// About the edge length of `m`'s quads.
+fn stats_quad(m: &SculptMesh) -> f32 {
+    let t = &m.indices;
+    if t.len() < 3 {
+        return 0.0;
+    }
+    let step = (t.len() / 3 / 512).max(1);
+    let (sum, n) = t.chunks_exact(3).step_by(step).fold((0.0f32, 0.0f32), |(s, n), c| (s + m.positions[c[0] as usize].distance(m.positions[c[1] as usize]), n + 1.0));
+    sum / n
+}
+
+/// ZRemesh `mesh`, with `seams` held as full-strength guides (the symmetry plane's cut).
+fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
     let mut stats = Stats::default();
     let target = (s.target_k * 1000.0).max(50.0);
@@ -586,6 +715,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     // 1. Samples: subdivide until edges are well under the cell size.
     let groups: Vec<u16> = if s.keep_groups { (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect() } else { Vec::new() };
     let (mut pos, mut idx, mut grp) = (mesh.positions.clone(), mesh.indices.clone(), groups);
+    let mut dens = if s.use_polypaint { paint_density(mesh, s.color_density) } else { Vec::new() };
     let cell = scale / 4.0;
     for _ in 0..5 {
         let edge: f32 = idx.chunks_exact(3).step_by((idx.len() / 3 / 4096).max(1)).map(|t| pos[t[0] as usize].distance(pos[t[1] as usize])).sum::<f32>()
@@ -593,9 +723,9 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         if edge <= cell || idx.len() / 3 > 4_000_000 {
             break;
         }
-        (pos, idx, grp) = subdivide(&pos, &idx, &grp);
+        (pos, idx, grp) = subdivide(&pos, &idx, &grp, &mut dens);
     }
-    let fine = vertex_graph(&pos, &idx, &grp);
+    let fine = vertex_graph(&pos, &idx, &grp, &dens);
     let (g0, _) = coarsen(&fine, cell);
     drop(fine);
     stats.samples = g0.len();
@@ -618,7 +748,21 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     // Guide curves pull the samples within about a cell of them, at every level.
     let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
     let guides = Guides::new(guides, quad);
-    let pull: Vec<Vec<Pull>> = levels.iter().zip(&cells).map(|((g, _), &c)| pulls(g, &guides, c * 0.75, strength)).collect();
+    let seams = Guides::new(seams, quad);
+    // A seam holds fully, ahead of any guide.
+    let pull: Vec<Vec<Pull>> = levels
+        .iter()
+        .zip(&cells)
+        .map(|((g, _), &c)| {
+            let mut p = pulls(g, &guides, c * 0.75, strength);
+            for (x, y) in p.iter_mut().zip(pulls(g, &seams, c * 0.75, 1.0)) {
+                if y.w > 0.0 {
+                    *x = y;
+                }
+            }
+            p
+        })
+        .collect();
     // The lattice step of every sample: smaller where the surface curves more
     // (AdaptiveSize), keeping the quad count about the same.
     let mut scales: Vec<Vec<f32>> = vec![adaptive_scale(&levels[0].0, scale, s.adaptive)];
@@ -1267,7 +1411,7 @@ mod tests {
             u * a.cos() + v * a.sin()
         }).collect();
         let along = |guides: &[Vec<Vec3>], strength: f32| {
-            let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, curves_strength: strength };
+            let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, curves_strength: strength, ..Settings::default() };
             let (out, stats) = zremesh(&m, &s, guides).unwrap();
             let quad = (4.0 * std::f32::consts::PI / 1000.0).sqrt();
             // Distance from the circle, for points on the unit sphere.
@@ -1289,6 +1433,59 @@ mod tests {
         assert!(guided as f32 > expected as f32 * 0.8, "{guided} of {expected} edges on the guide");
         assert!(half as f32 > expected as f32 * 0.6, "{half} of {expected} edges on the guide at strength 50");
         assert!((free as f32) < guided as f32 * 0.5, "the sphere had {free} edges along the circle unguided");
+    }
+
+    #[test]
+    fn red_polypaint_asks_for_more_quads_and_blue_for_fewer() {
+        let mut m = sphere(40);
+        m.colors = m.positions.iter().map(|p| if p.y > 0.0 { [230, 20, 20, 255] } else { [0; 4] }).collect();
+        let split = |out: &SculptMesh| {
+            let (mut up, mut down) = (0, 0);
+            for q in out.indices.chunks_exact(6) {
+                let c = (out.positions[q[0] as usize] + out.positions[q[1] as usize] + out.positions[q[2] as usize]) / 3.0;
+                if c.y > 0.2 { up += 1 } else if c.y < -0.2 { down += 1 }
+            }
+            up as f32 / down.max(1) as f32
+        };
+        let base = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, color_density: 4.0, ..Settings::default() };
+        let (plain, _) = zremesh(&m, &base, &[]).unwrap();
+        let (dense, _) = zremesh(&m, &Settings { use_polypaint: true, ..base }, &[]).unwrap();
+        let (r_plain, r_dense) = (split(&plain), split(&dense));
+        eprintln!("red half / other half: {r_plain} plain, {r_dense} with polypaint; {} vs {} quads", plain.triangle_count() / 2, dense.triangle_count() / 2);
+        assert!((r_plain - 1.0).abs() < 0.25, "{r_plain}");
+        assert!(r_dense > 2.2, "{r_dense}");
+        // Blue asks for fewer.
+        m.colors = m.positions.iter().map(|p| if p.y > 0.0 { [20, 20, 230, 255] } else { [0; 4] }).collect();
+        let (sparse, _) = zremesh(&m, &Settings { use_polypaint: true, ..base }, &[]).unwrap();
+        assert!(split(&sparse) < 0.6, "{}", split(&sparse));
+        // The total stays about the target.
+        let total = dense.triangle_count() / 2;
+        assert!((600..1700).contains(&total), "{total}");
+    }
+
+    #[test]
+    fn symmetric_remeshing_mirrors_with_a_loop_on_the_plane() {
+        // An egg off-centre in Y and Z, so the plane is the only symmetry.
+        let (p, i) = crate::mesh::cube_sphere(40, 1.0);
+        let p: Vec<Vec3> = p.into_iter().map(|q| Vec3::new(q.x, q.y * 1.3 + 0.2 * q.y * q.y, q.z + 0.1)).collect();
+        let m = SculptMesh::from_raw(p, i);
+        let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, symmetric: true, ..Settings::default() };
+        let (out, stats) = zremesh(&m, &s, &[]).unwrap();
+        eprintln!("{stats:?}");
+        let quads = out.triangle_count() / 2;
+        assert!((600..1700).contains(&quads), "{quads} quads");
+        // Every vertex has its mirror image.
+        let key = |p: Vec3| ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64, (p.z * 1e4).round() as i64);
+        let all: std::collections::HashSet<_> = out.positions.iter().map(|&p| key(p)).collect();
+        let lonely = out.positions.iter().filter(|p| !all.contains(&key(Vec3::new(-p.x, p.y, p.z)))).count();
+        assert_eq!(lonely, 0, "vertices without a mirror image");
+        // A loop on the plane, and the mesh closed across it.
+        let on = out.positions.iter().filter(|p| p.x == 0.0).count();
+        let quad = (4.0 * std::f32::consts::PI * 1.3 / 1000.0).sqrt();
+        assert!(on as f32 > 5.0 / quad, "{on} vertices on the plane");
+        let counts = edge_counts(&out);
+        let open = counts.values().filter(|&&k| k != 2).count();
+        assert_eq!(open, 0, "{open} edges not between two triangles");
     }
 
     #[test]

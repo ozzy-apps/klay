@@ -3731,6 +3731,14 @@ impl Workspace {
                     ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
                         .on_hover_text("Edge loops run along polygroup borders");
                     zslider(ui, "Curves Strength", &mut ws.zremesh.curves_strength, 0.0..=100.0, false, false, 0);
+                    ui.checkbox(&mut ws.zremesh.use_polypaint, "Use Polypaint")
+                        .on_hover_text("Paint red where you want more quads, blue where you want fewer");
+                    ui.add_enabled_ui(ws.zremesh.use_polypaint, |ui| {
+                        zslider(ui, "ColorDensity", &mut ws.zremesh.color_density, 1.0..=4.0, false, false, 1);
+                    });
+                    if ws.symmetry {
+                        note(ui, "X symmetry is on: the result mirrors across X, with a loop on the middle");
+                    }
                     let label = match ws.guide_count {
                         0 => "No guides · draw them with ZRemesherGuide (B Z G)".to_string(),
                         1 => "1 guide curve".to_string(),

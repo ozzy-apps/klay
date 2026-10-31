@@ -1126,7 +1126,7 @@ impl App {
         if self.busy() || !self.without_levels("ZRemesher") {
             return;
         }
-        let settings = self.workspace.zremesh;
+        let settings = zremesh::Settings { symmetric: self.workspace.symmetry, ..self.workspace.zremesh };
         let guides = guide_lines(&self.subtools[self.active_tool].guides);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zremesh::zremesh(self.doc.mesh(), &settings, &guides)));
         let (mesh, stats) = match result {
@@ -8966,6 +8966,31 @@ mod subtool_tests {
         drag(&mut app, p2, p2);
         assert!(app.zm_bridge.is_none());
         assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 24 - 2 + 4);
+    }
+
+    #[test]
+    fn zremesher_follows_x_symmetry_and_polypaint_density() {
+        let mut app = App::new(40, false, usize::MAX);
+        app.workspace.zremesh.target_k = 1.0;
+        app.workspace.zremesh.adaptive = 0.0;
+        // Paint the top red.
+        let mesh = app.doc.mesh_mut();
+        mesh.colors = mesh.positions.iter().map(|p| if p.y > 0.0 { [230, 20, 20, 255] } else { [0; 4] }).collect();
+        app.workspace.zremesh.use_polypaint = true;
+        app.workspace.zremesh.color_density = 4.0;
+        app.workspace.symmetry = true;
+        app.zremesh_now();
+        let m = app.doc.mesh();
+        // Mirror image of every vertex, and more quads on top.
+        let key = |p: Vec3| ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64, (p.z * 1e4).round() as i64);
+        let all: std::collections::HashSet<_> = m.positions.iter().map(|&p| key(p)).collect();
+        assert!(m.positions.iter().all(|p| all.contains(&key(Vec3::new(-p.x, p.y, p.z)))));
+        let (up, down) = m.indices.chunks_exact(3).fold((0, 0), |(u, d), t| {
+            let y = (m.positions[t[0] as usize].y + m.positions[t[1] as usize].y + m.positions[t[2] as usize].y) / 3.0;
+            (u + (y > 0.2) as usize, d + (y < -0.2) as usize)
+        });
+        assert!(up > down * 2, "{up} on top, {down} below");
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("ZRemesher"));
     }
 
     #[test]

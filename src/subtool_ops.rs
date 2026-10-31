@@ -197,6 +197,12 @@ pub fn holes_closed(mesh: &SculptMesh) -> Option<SculptMesh> {
 /// welded along the plane, so the mesh becomes exactly symmetric. `None` when nothing is on
 /// the +X side.
 pub fn mirrored_and_welded(mesh: &SculptMesh) -> Option<SculptMesh> {
+    plus_x_half(mesh).map(|half| mirrored(&half))
+}
+
+/// The part of `mesh` with X ≥ 0, cut cleanly at X = 0: vertices on the plane have X
+/// exactly 0. `None` when nothing is on the +X side.
+pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
     use std::collections::HashMap;
     let eps = 1e-6;
     let side = |p: Vec3| p.x > eps;
@@ -259,6 +265,16 @@ pub fn mirrored_and_welded(mesh: &SculptMesh) -> Option<SculptMesh> {
     if indices.is_empty() {
         return None;
     }
+    Some(SculptMesh::from_raw_painted(positions, indices, groups, colors))
+}
+
+/// `half` (X ≥ 0) and its mirror image on −X, welded where X is exactly 0.
+pub fn mirrored(half: &SculptMesh) -> SculptMesh {
+    let painted = !half.colors.is_empty();
+    let mut positions = half.positions.clone();
+    let mut colors = half.colors.clone();
+    let mut indices = half.indices.clone();
+    let mut groups: Vec<u16> = (0..half.triangle_count() as u32).map(|t| half.group(t)).collect();
     // The mirror image: vertices off the plane copied to −X, triangles turned round.
     let half = positions.len();
     let mut mirror = vec![0u32; half];
@@ -289,7 +305,7 @@ pub fn mirrored_and_welded(mesh: &SculptMesh) -> Option<SculptMesh> {
             out_g.push(groups[k]);
         }
     }
-    Some(SculptMesh::from_raw_painted(positions, out_i, out_g, colors))
+    SculptMesh::from_raw_painted(positions, out_i, out_g, colors)
 }
 
 #[cfg(test)]
