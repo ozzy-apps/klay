@@ -365,6 +365,26 @@ The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
 
+### ProjectAll
+
+SubTool › Project › **ProjectAll** moves the active subtool onto the other visible subtools,
+at its shown level, so a clean mesh takes on a sculpt's detail and polypaint (ZBrush:
+ProjectAll). The retopology workflow:
+
+1. **Duplicate** the sculpt and select the copy.
+2. Draw guides if you like, then **ZRemesher** the copy.
+3. **ProjectAll** (the sculpt stays visible), then **Divide** and **ProjectAll** again, level
+   by level, until the copy holds the detail you need. Hide or delete the sculpt after.
+
+Every vertex looks along its normal, outward and inward, for the nearest surface within
+**Dist %** (of the subtool's size, default 4) and moves onto it. Only surfaces facing the
+same way count, so a vertex does not jump to the far side of a thin part. **Outer** and
+**Inner** limit the search to one side; **Paint** takes the polypaint too; **PA Blur**
+(0–10 passes) smooths the moves where the result is noisy. Masked vertices stay (partly
+masked ones move part of the way) and hidden ones are left alone. One undo step. Vertices
+that find no surface stay where they are; raise Dist if many do. A 540k-vertex level takes
+under 0.1 s against a 1.9M-triangle sculpt, plus about 0.25 s to index the sculpt.
+
 ### ZModeler (0.19)
 
 The **ZModeler** brush (B catalog › Insert) models with polygons instead of sculpting.

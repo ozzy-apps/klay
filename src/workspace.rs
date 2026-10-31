@@ -858,6 +858,8 @@ pub struct Actions {
     pub split_hidden: bool,
     pub groups_split: bool,
     pub extract: bool,
+    /// SubTool › Project › ProjectAll.
+    pub project_all: bool,
     pub delete: bool,
     /// Move the active subtool up (-1) or down (+1) in the list.
     pub move_subtool: i32,
@@ -1053,6 +1055,8 @@ pub struct Workspace {
     pub strata_pending:bool,
     /// SubTool › Extract thickness, % of the subtool's size.
     pub extract_thick: f32,
+    /// SubTool › Project settings.
+    pub project: crate::project_all::Settings,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
     /// Light palette: where the key light is, as a point on the front of a sphere seen from
@@ -1260,6 +1264,7 @@ impl Workspace {
             slicers: None,
             strata_visible:false,strata_can_update:false,strata_pending:false,
             extract_thick: 2.0,
+            project: crate::project_all::Settings::default(),
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
@@ -3343,6 +3348,22 @@ impl Workspace {
                         note(ui, "Alt + click a subtool to select it");
                     },
                 );
+                self.sec(ui, h, id, "project", "Project", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("ProjectAll"))
+                        .on_hover_text("Move this subtool onto the other visible subtools at its shown level, taking their paint · one undo step");
+                    if r.shelf(ui, "cmd:project-all").clicked() {
+                        a.project_all = true;
+                    }
+                    zslider(ui, "Dist %", &mut ws.project.dist, 0.1..=20.0, true, false, 1);
+                    zslider(ui, "PA Blur", &mut ws.project.blur, 0.0..=10.0, false, false, 0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut ws.project.outer, "Outer").on_hover_text("Look outward along the normal");
+                        ui.checkbox(&mut ws.project.inner, "Inner").on_hover_text("Look inward along the normal");
+                        ui.checkbox(&mut ws.project.paint, "Paint").on_hover_text("Take the polypaint too");
+                    });
+                    note(ui, "Duplicate a sculpt, ZRemesh the copy, then Divide and ProjectAll at each level, with the sculpt visible");
+                });
                 self.sec(ui, h, id, "boolean", "Boolean", None, false, true, &mut |ws, ui| {
                     ui.checkbox(&mut ws.live_boolean, "Live Boolean")
                         .on_hover_text("The viewport shows the result of every visible subtool, top to bottom");

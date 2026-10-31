@@ -23,6 +23,7 @@ mod sculptris;
 mod fx;
 mod boolean;
 mod zremesh;
+mod project_all;
 mod zmodeler;
 mod layers;
 mod obj;
@@ -285,6 +286,8 @@ enum GeoOp {
     MirrorWeld,
     /// Geometry › ZRemesher.
     ZRemesh,
+    /// SubTool › Project › ProjectAll.
+    ProjectAll,
 }
 
 /// SubTool operations queued by the interface.
@@ -1055,6 +1058,67 @@ impl App {
         }
         self.show_active_level();
         self.workspace.notify(format!("{what}: {} → {} triangles", fmt_count(before), fmt_count(after)));
+    }
+
+    /// SubTool › Project › ProjectAll: the shown level of the active subtool moved onto
+    /// the other visible subtools (their shown levels), taking their paint, as one stroke.
+    fn project_all_now(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let mut docs = Vec::new();
+        for (i, tool) in self.subtools.iter().enumerate() {
+            if i == self.active_tool || !tool.visible {
+                continue;
+            }
+            if let Some(p) = &tool.parked {
+                match p.packed.clone().try_unpack() {
+                    Ok(doc) => docs.push(doc),
+                    Err(e) => {
+                        self.workspace.notify(format!("ProjectAll: {}: {e}", tool.name));
+                        return;
+                    }
+                }
+            }
+        }
+        if docs.is_empty() {
+            self.workspace.notify("ProjectAll: no other subtool is visible · show the one to project from");
+            return;
+        }
+        let meshes: Vec<&SculptMesh> = docs.iter().map(|d| d.mesh()).collect();
+        let sources = project_all::Sources::new(&meshes);
+        drop(meshes);
+        drop(docs);
+        let settings = self.workspace.project;
+        let r = project_all::project(self.doc.mesh(), &sources, &settings);
+        drop(sources);
+        if r.moved == 0 {
+            self.workspace.notify("ProjectAll: no surface within Dist · raise Dist, or check Inner and Outer");
+            return;
+        }
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+        if r.colors.is_some() {
+            paint::ensure(mesh);
+        }
+        let mut stroke = Stroke::begin(false, false, false);
+        stroke.snapshot_now(mesh, &all);
+        mesh.positions.copy_from_slice(&r.positions);
+        if let Some(c) = r.colors {
+            mesh.colors = c;
+            mesh.chunks.iter_mut().for_each(|ch| ch.dirty_color = true);
+        }
+        mesh.finish_edit(&all);
+        self.commit_stroke_named(stroke, level, "ProjectAll");
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.update_hover();
+        let n = r.moved + r.missed;
+        self.status = format!("ProjectAll: {} of {} vertices moved in {:.0} ms", fmt_count(r.moved), fmt_count(n), t.elapsed().as_secs_f32() * 1000.0);
+        if r.missed * 20 > n {
+            self.workspace.notify(format!("ProjectAll: {} vertices found no surface within Dist and stayed", fmt_count(r.missed)));
+        }
     }
 
     /// Geometry › ZRemesher: the active subtool rebuilt as quads (one undo step).
@@ -3130,6 +3194,7 @@ impl App {
             Some(GeoOp::CloseHoles) => self.topology_op("Close Holes", subtool_ops::holes_closed),
             Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
             Some(GeoOp::ZRemesh) => self.zremesh_now(),
+            Some(GeoOp::ProjectAll) => self.project_all_now(),
             Some(GeoOp::DelHigher) => self.delete_levels(true),
             Some(GeoOp::DelLower) => self.delete_levels(false),
             None => {}
@@ -7234,7 +7299,7 @@ impl App {
             let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
             self.status = format!("ZRemesher: deleted {n} guide curves");
         }
-        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.zremesh, GeoOp::ZRemesh)] {
+        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
             if on {
                 self.pending_geo = Some(op);
             }
@@ -8568,6 +8633,37 @@ fn main() {
         app.subtools[app.active_tool].guides.push(ring);
         app.workspace.select_brush(&mut app.brush, BrushKind::ZRemesherGuide);
     }
+    // `--retopo-demo N`: the retopology workflow at startup: a sculpt with ridges and
+    // bumps, duplicated, the copy ZRemeshed to 2k quads and divided twice, with ProjectAll at
+    // each level when N is 1 (0 skips it), and the sculpt hidden to show the copy alone
+    // (2: the copy hidden instead, to compare).
+    if let Some(n) = flag("--retopo-demo").and_then(|v| v.parse::<u32>().ok()) {
+        let shape = |d: Vec3| 1.0 + 0.05 * (d.x * 5.0).sin() * (d.y * 4.0).cos() + 0.012 * ((d.y * 40.0).sin() * (d.x * 3.0 + d.z * 31.0).cos()).abs();
+        let (p, i) = mesh::cube_sphere(300, 1.0);
+        let p = p.into_iter().map(|q| q.normalize() * shape(q.normalize())).collect();
+        app.replace_active_mesh(SculptMesh::from_raw(p, i));
+        app.duplicate_subtool();
+        app.select_subtool(app.active_tool + 1);
+        app.workspace.zremesh.target_k = 2.0;
+        app.zremesh_now();
+        if n > 0 {
+            app.project_all_now();
+        }
+        for _ in 0..2 {
+            app.divide();
+            if n > 0 {
+                app.project_all_now();
+            }
+        }
+        // 2: the sculpt shown instead of the copy, to compare.
+        let source = app.active_tool - 1;
+        if n == 2 {
+            app.select_subtool(source);
+            app.toggle_subtool(source + 1);
+        } else {
+            app.toggle_subtool(source);
+        }
+    }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         app.workspace.zremesh.target_k = k;
@@ -8888,6 +8984,42 @@ mod subtool_tests {
         let n = app.doc.mesh().vertex_count();
         app.zremesh_now();
         assert_eq!(app.doc.mesh().vertex_count(), n);
+    }
+
+    #[test]
+    fn project_all_brings_a_sculpt_back_onto_its_zremeshed_copy() {
+        let bump = |d: Vec3| 1.0 + 0.04 * (d.x * 6.0).sin() * (d.y * 5.0).cos() + 0.03 * (d.z * 7.0).sin();
+        let mut app = App::new(40, false, usize::MAX);
+        let (p, i) = cube_sphere(60, 1.0);
+        let p = p.into_iter().map(|q| q.normalize() * bump(q.normalize())).collect();
+        app.replace_active_mesh(SculptMesh::from_raw(p, i));
+        // Duplicate, select the copy, ZRemesh it.
+        app.duplicate_subtool();
+        app.select_subtool(app.active_tool + 1);
+        app.workspace.zremesh.target_k = 1.0;
+        app.zremesh_now();
+        let err = |app: &App| app.doc.mesh().positions.iter().map(|p| (p.length() - bump(p.normalize())).abs()).fold(0.0f32, f32::max);
+        // Divide twice, projecting at each level.
+        app.project_all_now();
+        for _ in 0..2 {
+            app.divide();
+            let smoothed = err(&app);
+            app.project_all_now();
+            let projected = err(&app);
+            assert!(projected < smoothed * 0.3 && projected < 0.006, "level {}: {smoothed} -> {projected}", app.doc.active());
+        }
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("ProjectAll"));
+        let after = app.doc.mesh().positions.clone();
+        app.history_jump(-1);
+        assert_ne!(app.doc.mesh().positions, after, "undoes");
+        app.history_jump(1);
+        assert_eq!(app.doc.mesh().positions, after, "redoes");
+        // With the sculpt hidden there is nothing to project from.
+        let src = app.active_tool - 1;
+        app.toggle_subtool(src);
+        let before = app.history.edits();
+        app.project_all_now();
+        assert_eq!(app.history.edits(), before);
     }
 
     #[test]
