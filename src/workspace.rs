@@ -926,6 +926,8 @@ pub struct Actions {
     pub zremesh: bool,
     /// Geometry › ZRemesher › Delete guides.
     pub delete_guides: bool,
+    /// Geometry › Decimation › Decimate.
+    pub decimate: bool,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -1057,6 +1059,8 @@ pub struct Workspace {
     pub extract_thick: f32,
     /// SubTool › Project settings.
     pub project: crate::project_all::Settings,
+    /// Geometry › Decimation settings.
+    pub decimation: crate::decimate::Settings,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
     /// Light palette: where the key light is, as a point on the front of a sphere seen from
@@ -1265,6 +1269,7 @@ impl Workspace {
             strata_visible:false,strata_can_update:false,strata_pending:false,
             extract_thick: 2.0,
             project: crate::project_all::Settings::default(),
+            decimation: crate::decimate::Settings::default(),
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
@@ -3754,6 +3759,23 @@ impl Workspace {
                         a.delete_guides = true;
                     }
                     note(ui, "Target in thousands of quads · all quads, loops following the form · needs a subtool without subdivision levels");
+                });
+                self.sec(ui, h, id, "decimation", "Decimation", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Decimate"))
+                        .on_hover_text("Far fewer triangles with the shape kept, for export and printing · runs in the background · one undo step");
+                    if r.shelf(ui, "cmd:decimate").clicked() {
+                        a.decimate = true;
+                    }
+                    zslider(ui, "% kept", &mut ws.decimation.keep_percent, 0.5..=100.0, true, false, 1);
+                    let after = (m.triangles as f32 * ws.decimation.keep_percent / 100.0).round() as usize;
+                    kv(ui, "Triangles after", &crate::fmt_count(after));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut ws.decimation.keep_borders, "Keep Borders").on_hover_text("Open borders stay where they are");
+                        ui.checkbox(&mut ws.decimation.keep_groups, "Keep Groups").on_hover_text("Polygroup borders stay where they are");
+                        ui.checkbox(&mut ws.decimation.keep_paint, "Keep Polypaint").on_hover_text("Colours are carried over");
+                    });
+                    note(ui, "Decimates the shown level; subdivision levels are replaced by the result (undo brings them back)");
                 });
                 self.sec(
                     ui,

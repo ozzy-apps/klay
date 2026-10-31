@@ -24,6 +24,7 @@ mod fx;
 mod boolean;
 mod zremesh;
 mod project_all;
+mod decimate;
 mod zmodeler;
 mod layers;
 mod obj;
@@ -288,6 +289,16 @@ enum GeoOp {
     ZRemesh,
     /// SubTool › Project › ProjectAll.
     ProjectAll,
+}
+
+/// A decimation running on its own thread, and what it was started on: its result is
+/// dropped if the subtool changed meanwhile.
+struct DecimateJob {
+    rx: std::sync::mpsc::Receiver<Option<decimate::Decimated>>,
+    tool: u64,
+    edits: u64,
+    level: usize,
+    started: Instant,
 }
 
 /// SubTool operations queued by the interface.
@@ -637,6 +648,8 @@ struct App {
     pending_vis: Option<VisOp>,
     /// Geometry operation (Wedge, Del Higher / Lower), run outside the egui pass.
     pending_geo: Option<GeoOp>,
+    /// Decimation running in the background (Geometry › Decimation).
+    decimation: Option<DecimateJob>,
     /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
     selftest_wedge: Option<(u8, u32)>,
     /// SubTool list operation from the interface, run outside the egui pass.
@@ -810,6 +823,7 @@ impl App {
             pending_level: None,
             pending_vis: None,
             pending_geo: None,
+            decimation: None,
             selftest_wedge: None,
             pending_subtool: None,
             measure: None,
@@ -855,6 +869,7 @@ impl App {
             || self.curve.as_ref().is_some_and(|c| c.bend.is_some())
             || self.insert.is_some()
             || self.zm_drag.is_some()
+            || self.decimation.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -1046,6 +1061,12 @@ impl App {
             self.workspace.notify(format!("{what}: nothing to do on this subtool"));
             return;
         };
+        self.replace_topology(what, mesh);
+    }
+
+    /// The active subtool's whole stack replaced by `mesh` (one level), as one undo step
+    /// that keeps the old stack packed.
+    fn replace_topology(&mut self, what: &str, mesh: SculptMesh) {
         let (before, after) = (self.doc.mesh().triangle_count(), mesh.triangle_count());
         let budget = self.doc.budget;
         let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
@@ -1058,6 +1079,70 @@ impl App {
         }
         self.show_active_level();
         self.workspace.notify(format!("{what}: {} → {} triangles", fmt_count(before), fmt_count(after)));
+    }
+
+    /// Geometry › Decimation: decimate the shown level of the active subtool on a thread of
+    /// its own; [`poll_decimation`](Self::poll_decimation) puts the result in.
+    fn start_decimation(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify("Decimation: bake or delete the layers first · Mesh › Layers");
+            return;
+        }
+        let mesh = decimate::Raw::of(self.doc.mesh());
+        let settings = self.workspace.decimation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decimate::decimate_raw(&mesh, &settings))).unwrap_or(None);
+            let _ = tx.send(r);
+        });
+        self.decimation = Some(DecimateJob {
+            rx,
+            tool: self.subtools[self.active_tool].id,
+            edits: self.history.edits(),
+            level: self.doc.active(),
+            started: Instant::now(),
+        });
+        self.status = format!("Decimating {} triangles…", fmt_count(self.doc.mesh().triangle_count()));
+    }
+
+    /// Put a finished decimation in (waiting for it with `wait`). Each frame.
+    fn poll_decimation(&mut self, wait: bool) {
+        let Some(job) = &self.decimation else {
+            return;
+        };
+        let result = if wait {
+            job.rx.recv().ok()
+        } else {
+            match job.rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.status = format!("Decimating… {:.0} s", job.started.elapsed().as_secs_f32());
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        let job = self.decimation.take().unwrap();
+        let secs = job.started.elapsed().as_secs_f32();
+        let Some(Some(d)) = result else {
+            self.workspace.notify("Decimation: nothing to decimate at this percentage");
+            self.status.clear();
+            return;
+        };
+        let same = self.subtools[self.active_tool].id == job.tool && self.history.edits() == job.edits && self.doc.active() == job.level;
+        if !same {
+            self.workspace.notify("Decimation dropped: the subtool changed while it ran · run it again");
+            return;
+        }
+        let levels = self.doc.count() > 1;
+        self.replace_topology("Decimation", d.mesh);
+        self.status = format!("Decimation: {} → {} triangles in {secs:.1} s", fmt_count(d.before), fmt_count(d.after));
+        if levels {
+            self.workspace.notify("Decimation replaced the subdivision levels with the decimated mesh · undo brings them back");
+        }
     }
 
     /// SubTool › Project › ProjectAll: the shown level of the active subtool moved onto
@@ -6831,6 +6916,11 @@ impl App {
             // The press that closes a popup or menu does nothing else.
             return;
         }
+        if self.decimation.is_some() && !consumed && !over_ui && self.nav.is_none() {
+            // While decimating the model must not change: a press only turns the view.
+            self.begin_nav(MouseButton::Left);
+            return;
+        }
         // ZBrush: Ctrl + Shift uses the Ctrl + Shift tool (the last Select, Clip, Trim, Slice
         // or Knife brush picked), Ctrl the mask brush, a plain drag the brush itself.
         let (ctrl, shift) = (self.modifiers.control_key(), self.modifiers.shift_key());
@@ -7119,6 +7209,7 @@ impl App {
             (None, Some(e)) => e.clone(),
             (None, None) => String::new(),
         };
+        self.poll_decimation(false);
         self.workspace.curve_preview = self.curve_preview();
         self.workspace.guides_preview = self.guides_preview();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
@@ -7294,6 +7385,9 @@ impl App {
         }
         if actions.gizmo_center || actions.gizmo_reset {
             self.gizmo_pivot(actions.gizmo_center);
+        }
+        if actions.decimate {
+            self.start_decimation();
         }
         if actions.delete_guides {
             let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
@@ -8664,6 +8758,13 @@ fn main() {
             app.toggle_subtool(source);
         }
     }
+    // `--decimate P`: decimate to P percent at startup (after `--retopo-demo`).
+    if let Some(p) = flag("--decimate").and_then(|v| v.parse::<f32>().ok()) {
+        app.workspace.decimation.keep_percent = p;
+        app.start_decimation();
+        app.poll_decimation(true);
+        log::info!("{}", app.status);
+    }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         app.workspace.zremesh.target_k = k;
@@ -8966,6 +9067,35 @@ mod subtool_tests {
         drag(&mut app, p2, p2);
         assert!(app.zm_bridge.is_none());
         assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 24 - 2 + 4);
+    }
+
+    #[test]
+    fn decimation_runs_in_the_background_replaces_the_levels_and_undoes() {
+        let mut app = App::new(40, false, usize::MAX);
+        assert!(app.doc.divide());
+        app.history.push(UndoStep::Divide(None));
+        let (tris, levels) = (app.doc.mesh().triangle_count(), app.doc.count());
+        let shown = app.doc.mesh().positions.clone();
+        app.workspace.decimation.keep_percent = 10.0;
+        app.start_decimation();
+        assert!(app.busy(), "nothing else starts while it runs");
+        app.poll_decimation(true);
+        assert!(!app.busy());
+        let after = app.doc.mesh().triangle_count();
+        assert!(after <= tris / 10 + tris / 500 && after > tris / 12, "{tris} → {after}");
+        assert_eq!(app.doc.count(), 1, "one level now");
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Decimation"));
+        // Undo brings the levels back, at the level shown before.
+        app.history_jump(-1);
+        assert_eq!(app.doc.count(), levels);
+        assert_eq!(app.doc.mesh().positions, shown);
+        // An edit while it runs drops the result.
+        app.start_decimation();
+        let edits = app.history.edits();
+        app.history.push(UndoStep::Divide(None));
+        assert_ne!(app.history.edits(), edits);
+        app.poll_decimation(true);
+        assert_eq!(app.doc.mesh().triangle_count(), tris, "dropped");
     }
 
     #[test]

@@ -375,6 +375,23 @@ The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
 
+### Decimation
+
+Geometry › **Decimation** (ZBrush: Decimation Master) cuts the triangle count a long way
+while keeping the shape, for export, 3D printing or a lighter copy to work against. Set
+**% kept** (default 20; the section shows the triangles you will get) and press
+**Decimate**. Flat areas lose their triangles first and detail keeps them, so a sculpt
+usually holds up well down to a few percent. **Keep Borders** keeps open borders in place,
+**Keep Groups** keeps polygroup borders, **Keep Polypaint** carries the colours over. The
+result stays closed and manifold where the model was.
+
+It runs in the background (about 1 s per million triangles here): the status bar counts the
+seconds, and a drag on the canvas still turns the view, but nothing else changes the model
+until it is done. It decimates the shown level; a subtool with subdivision levels becomes
+the decimated mesh alone, and **undo** brings the levels back. If the subtool is edited or
+switched while it runs, the result is dropped. The result is triangles: ZRemesher it if you
+need quads.
+
 ### ProjectAll
 
 SubTool › Project › **ProjectAll** moves the active subtool onto the other visible subtools,
