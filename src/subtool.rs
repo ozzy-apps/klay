@@ -37,6 +37,8 @@ pub struct SubTool {
     /// ZRemesher guide curves drawn on it (ZBrush: ZRemesherGuide brush), on its surface,
     /// each with its symmetry images as further pieces. Not saved in projects.
     pub guides: Vec<crate::curve::Curve>,
+    /// Dynamic Subdivision settings while it is on (ZBrush: Geometry › Dynamic Subdiv).
+    pub dynamic: Option<crate::dynamic::Settings>,
 }
 
 pub struct Parked {
@@ -57,6 +59,8 @@ pub enum Deform {
     Size,
     Smooth,
     Polish,
+    /// Polish by Features: polygroup borders, creases and open borders stay crisp.
+    PolishFeatures,
     Inflate,
     Spherize,
     Noise,
@@ -65,9 +69,9 @@ pub enum Deform {
 }
 
 impl Deform {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::OffsetX, Self::OffsetY, Self::OffsetZ, Self::Size, Self::Smooth, Self::Polish,
-        Self::Inflate, Self::Spherize, Self::Noise, Self::Twist, Self::Taper,
+        Self::PolishFeatures, Self::Inflate, Self::Spherize, Self::Noise, Self::Twist, Self::Taper,
     ];
 
     pub fn label(self) -> &'static str {
@@ -78,6 +82,7 @@ impl Deform {
             Self::Size => "Size",
             Self::Smooth => "Smooth",
             Self::Polish => "Polish",
+            Self::PolishFeatures => "Polish by Features",
             Self::Inflate => "Inflate",
             Self::Spherize => "Spherize",
             Self::Noise => "Noise",

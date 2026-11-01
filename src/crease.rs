@@ -43,7 +43,7 @@ impl CreaseOp {
 }
 
 /// Every edge once, as `(low, high, triangle, other triangle or NONE)`.
-fn edges(mesh: &SculptMesh) -> Vec<(u32, u32, u32, u32)> {
+pub(crate) fn edges(mesh: &SculptMesh) -> Vec<(u32, u32, u32, u32)> {
     mesh.indices
         .par_chunks_exact(3)
         .enumerate()

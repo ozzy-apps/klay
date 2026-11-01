@@ -14,24 +14,30 @@ mod curve;
 mod curve_tube;
 mod cut;
 mod deform;
+mod dynamics;
+mod fiber;
 mod file_dialog;
 #[cfg(feature = "strata")]
 mod strata_bridge;
 mod gizmo;
 mod insert_mesh;
 mod sculptris;
+mod spotlight;
 mod fx;
 mod boolean;
+mod bpr;
 mod zremesh;
 mod crease;
 mod reconstruct;
 mod project_all;
 mod bake;
 mod decimate;
+mod dynamic;
 mod uv;
 mod zmodeler;
 mod layers;
 mod obj;
+mod panel;
 mod pressure;
 mod print;
 mod stl;
@@ -49,6 +55,7 @@ mod tablet;
 mod update;
 mod transform;
 mod wedge;
+mod zsphere;
 mod workspace;
 
 use camera::Camera;
@@ -294,6 +301,8 @@ enum GeoOp {
     /// Geometry › Del Hidden, Close Holes; Deformation › Mirror And Weld.
     DelHidden,
     CloseHoles,
+    /// Geometry › Panel Loops.
+    PanelLoops,
     MirrorWeld,
     /// Geometry › ZRemesher.
     ZRemesh,
@@ -317,6 +326,65 @@ struct BakeJob {
     rx: std::sync::mpsc::Receiver<Result<BakeDone, String>>,
     kind: bake::Kind,
     path: String,
+    started: Instant,
+}
+
+/// A ZSphere being sized, moved or scaled with the mouse (Draw, Move, Scale mode), with the
+/// stack as it was before, for the one undo step it makes.
+struct ZsDrag {
+    kind: ZsKind,
+    before: multires::Packed,
+    name: &'static str,
+    start: Vec2,
+}
+
+#[derive(Clone, Copy)]
+enum ZsKind {
+    /// A new sphere `i` (and its mirror image) being sized by dragging away from it.
+    Size { i: u32, mirror: Option<u32> },
+    /// Sphere `i` dragged in the view plane, `grab` from its centre.
+    Move { i: u32, mirror: Option<u32>, grab: Vec3 },
+    /// Sphere `i` sized from radius `r0`.
+    Scale { i: u32, mirror: Option<u32>, r0: f32 },
+}
+
+/// A render running on its own thread (Document › Render); it works on a copy.
+struct RenderJob {
+    rx: std::sync::mpsc::Receiver<Result<(bpr::Image, u64), String>>,
+    path: String,
+    started: Instant,
+}
+
+/// Document › Render › Turntable under way: the view turns one step a frame and each
+/// frame's snapshot goes to ffmpeg, or into numbered PNGs without it.
+struct Turntable {
+    frames: u32,
+    done: u32,
+    yaw: f32,
+    path: String,
+    sink: TurntableSink,
+    size: Option<(u32, u32)>,
+    started: Instant,
+    /// Frames to let pass before the first is kept, so the view has settled.
+    warmup: u32,
+    /// Started by `--turntable`: quit when done.
+    quit_after: bool,
+}
+
+enum TurntableSink {
+    Ffmpeg(std::process::Child),
+    Frames(std::path::PathBuf),
+}
+
+/// A cloth simulation running on its own thread (Geometry › Dynamics): the model shows
+/// each step as it comes, and the whole run is one undo step.
+struct SimJob {
+    rx: std::sync::mpsc::Receiver<(bool, u32, Vec<Vec3>)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stroke: Stroke,
+    level: usize,
+    tool: u64,
+    steps: u32,
     started: Instant,
 }
 
@@ -637,6 +705,17 @@ struct App {
     zmodel: Option<ZModel>,
     zm_hover: Option<zmodeler::Hover>,
     zm_drag: Option<ZDrag>,
+    /// A ZSphere drag under way.
+    zs_drag: Option<ZsDrag>,
+    /// Spotlight edit: a drag moving the picture (cursor and centre at the press).
+    spot_drag: Option<(Vec2, glam::Vec2)>,
+    /// ZSpheres: the skin is shown in place of the spheres (A); the sphere last touched,
+    /// whose roundness the ZSphere section sets.
+    zs_preview: bool,
+    zs_selected: u32,
+    /// A roundness change from the ZSphere section, recorded as one undo step once the
+    /// slider rests: the stack before it.
+    zs_round_before: Option<multires::Packed>,
     /// Bridge: the polygon picked first (its vertices), waiting for the second.
     zm_bridge: Option<Vec<u32>>,
     /// Sculptris Pro during a stroke: the subtool as it was before (the stroke's undo step
@@ -687,6 +766,20 @@ struct App {
     /// `--bake-normal` / `--bake-displacement`: bakes to run once the startup project is open.
     bake_on_start: Vec<(bake::Kind, String)>,
     bake_count: u64,
+    /// Document › Render: a render under way, the turntable, where the last went, and
+    /// `--render` / `--turntable` to run at startup.
+    render_job: Option<RenderJob>,
+    turntable: Option<Turntable>,
+    render_path: String,
+    render_count: u64,
+    render_on_start: Option<String>,
+    turntable_on_start: Option<String>,
+    /// A cloth simulation under way.
+    sim: Option<SimJob>,
+    /// What the FiberMesh preview on the GPU was made from.
+    fiber_key: Option<(u64, u64, u64, fiber::Settings)>,
+    /// What the Dynamic Subdivision preview on the GPU was made from.
+    dynamic_key: Option<(u64, u64, u64, dynamic::Settings)>,
     /// The stats of the last unwrap, with the UV key they belong to.
     uv_stats: Option<(u64, uv::Stats)>,
     /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
@@ -755,7 +848,7 @@ impl App {
             gfx: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            subtools: vec![SubTool { guides: Default::default(),
+            subtools: vec![SubTool { guides: Default::default(), dynamic: None,
             boolean: Default::default(),
                 id: 1,
                 name: format!("{} 1", settings.kind.short()),
@@ -837,6 +930,11 @@ impl App {
             zmodel: None,
             zm_hover: None,
             zm_drag: None,
+            zs_drag: None,
+            spot_drag: None,
+            zs_preview: false,
+            zs_selected: 0,
+            zs_round_before: None,
             zm_bridge: None,
             sculptris_before: None,
             sculptris_track: (Vec::new(), Vec::new()),
@@ -868,6 +966,15 @@ impl App {
             map_path: String::new(),
             bake_on_start: Vec::new(),
             bake_count: 0,
+            dynamic_key: None,
+            fiber_key: None,
+            sim: None,
+            render_job: None,
+            turntable: None,
+            render_path: String::new(),
+            render_count: 0,
+            render_on_start: None,
+            turntable_on_start: None,
             uv_stats: None,
             selftest_wedge: None,
             pending_subtool: None,
@@ -914,7 +1021,10 @@ impl App {
             || self.curve.as_ref().is_some_and(|c| c.bend.is_some())
             || self.insert.is_some()
             || self.zm_drag.is_some()
+            || self.zs_drag.is_some()
+            || self.turntable.is_some()
             || self.decimation.is_some()
+            || self.sim.is_some()
     }
 
     /// Stands in for `doc` between parking one subtool and activating another.
@@ -931,7 +1041,10 @@ impl App {
         self.doc.freeze_layers();
         let mut doc = std::mem::replace(&mut self.doc, Self::placeholder());
         let mut doc_layers = std::mem::take(&mut doc.layers);
-        let stand_in = doc.stand_in(STAND_IN_VERTICES);
+        let stand_in = match self.subtools[self.active_tool].dynamic {
+            Some(s) if doc.count() == 1 => dynamic::preview(doc.mesh(), &s),
+            _ => doc.stand_in(STAND_IN_VERTICES),
+        };
         let packed = doc.pack();
         let mut history = std::mem::replace(&mut self.history, History::new(32));
         history.drop_redo();
@@ -1024,7 +1137,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
-        self.subtools.push(SubTool { guides: Default::default(),
+        self.subtools.push(SubTool { guides: Default::default(), dynamic: None,
             boolean: Default::default(),
             id,
             name: name.clone(),
@@ -1063,7 +1176,7 @@ impl App {
         let wedge = self.subtools[self.active_tool].wedge;
         self.subtools.insert(
             self.active_tool + 1,
-            SubTool { guides: Default::default(),
+            SubTool { guides: Default::default(), dynamic: None,
             boolean: Default::default(),
                 id,
                 name: name.clone(),
@@ -1294,8 +1407,279 @@ impl App {
         self.workspace.notify(self.status.clone());
     }
 
+    /// What Render draws: every visible subtool as shown (the Dynamic Subdivision preview
+    /// or a ZSphere skin where one is shown), seen as the canvas sees it.
+    fn render_scene(&mut self) -> bpr::Scene {
+        // Klay's own clays (the materials before the MatCaps) in their colours (shader.wgsl),
+        // lit by the neutral White Clay MatCap.
+        const CLAYS: [Vec3; 4] = [Vec3::new(0.78, 0.62, 0.50), Vec3::new(0.52, 0.58, 0.66), Vec3::new(0.62, 0.29, 0.20), Vec3::new(0.55, 0.43, 0.25)];
+        let (look, base) = match matcap::of_material(self.workspace.material) {
+            Some(l) => (l, l.base()),
+            None => (matcap::Look::WhiteClay, CLAYS[self.workspace.material.min(3)]),
+        };
+        let vp = self.viewport();
+        let (w, h) = (vp.x.max(1.0) as u32, vp.y.max(1.0) as u32);
+        let mut camera = self.camera.clone();
+        camera.aspect = w as f32 / h as f32;
+        let mut scene = bpr::Scene::new(camera, w, h, look, base, self.workspace.layout.document.back);
+        let active = self.subtools[self.active_tool].dynamic.filter(|_| self.doc.count() == 1);
+        match (&self.doc.zspheres, active) {
+            (Some(t), _) if self.zs_preview => match t.skin(self.workspace.zsphere_detail) {
+                Ok(skin) => scene.add(&skin),
+                Err(_) => scene.add(self.doc.mesh()),
+            },
+            (None, Some(d)) => scene.add(&dynamic::build(self.doc.mesh(), &d.fitted(self.doc.mesh(), dynamic::MAX_TRIANGLES))),
+            _ => scene.add(self.doc.mesh()),
+        }
+        if !self.workspace.solo {
+            for t in self.subtools.iter().filter(|t| t.visible) {
+                if let Some(p) = &t.parked {
+                    if let Ok(doc) = p.packed.clone().try_unpack() {
+                        match t.dynamic.filter(|_| doc.count() == 1) {
+                            Some(d) => scene.add(&dynamic::build(doc.mesh(), &d.fitted(doc.mesh(), dynamic::MAX_TRIANGLES))),
+                            None => scene.add(doc.mesh()),
+                        }
+                    }
+                }
+            }
+        }
+        scene
+    }
+
+    /// Spotlight › Load Image: lay the picture at `path` over the canvas, shown, at its
+    /// last place (or the middle), with Paint through on.
+    fn load_spotlight(&mut self, path: &Path) {
+        match spotlight::Picture::load(path) {
+            Ok(picture) => {
+                let place = self.workspace.spotlight.as_ref().map_or_else(spotlight::Placement::default, |s| s.place);
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.status = format!("Spotlight: {name}, {}×{} · Z moves it, Shift + Z hides it", picture.width, picture.height);
+                self.workspace.spotlight = Some(spotlight::Spotlight { picture: std::sync::Arc::new(picture), name, place, shown: true, edit: false, paint_through: true });
+            }
+            Err(e) => self.status = format!("Spotlight: {e}"),
+        }
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// The Spotlight a stroke starting now reads, if it is shown with Paint through.
+    fn spotlight_projector(&self) -> Option<std::sync::Arc<spotlight::Projector>> {
+        let sp = self.workspace.spotlight.as_ref().filter(|s| s.shown && s.paint_through)?;
+        let vp = self.viewport();
+        Some(std::sync::Arc::new(spotlight::Projector::new(sp, self.camera.view_proj(), vp)))
+    }
+
+    /// Document › Render: render the view on a thread of its own and save it to `path`;
+    /// [`poll_render`](Self::poll_render) reports it.
+    fn start_render(&mut self, path: String) {
+        if self.render_job.is_some() || self.turntable.is_some() {
+            return;
+        }
+        let scene = self.render_scene();
+        let settings = self.workspace.bpr;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = path.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let img = bpr::render(&scene, &settings);
+                image::save_buffer(&out, &img.rgba, img.width, img.height, image::ColorType::Rgba8).map_err(|e| format!("{out}: {e}"))?;
+                let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                Ok((img, bytes))
+            }))
+            .unwrap_or_else(|_| Err("the render failed".to_string()));
+            let _ = tx.send(r);
+        });
+        self.render_job = Some(RenderJob { rx, path, started: Instant::now() });
+        self.workspace.rendering = true;
+        self.status = "Rendering…".to_string();
+    }
+
+    /// Report a finished render (waiting for it with `wait`). Each frame.
+    fn poll_render(&mut self, wait: bool) {
+        let Some(job) = &self.render_job else { return };
+        let result = if wait {
+            job.rx.recv().unwrap_or_else(|_| Err("the render stopped".into()))
+        } else {
+            match job.rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.status = format!("Rendering… {:.0} s", job.started.elapsed().as_secs_f32());
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the render stopped".into()),
+            }
+        };
+        let job = self.render_job.take().unwrap();
+        self.workspace.rendering = self.turntable.is_some();
+        let secs = job.started.elapsed().as_secs_f32();
+        match result {
+            Ok((img, bytes)) => {
+                self.status = format!("Render {}×{} saved to {} ({:.1} MB) in {secs:.1} s", img.width, img.height, job.path, bytes as f64 / 1e6);
+                // A preview at most 256 wide.
+                let pw = 256.min(img.width as usize);
+                let ph = (img.height as usize * pw / img.width as usize).max(1);
+                let px: Vec<[u8; 4]> = (0..pw * ph)
+                    .map(|i| {
+                        let (x, y) = (i % pw * img.width as usize / pw, i / pw * img.height as usize / ph);
+                        let k = (y * img.width as usize + x) * 4;
+                        [img.rgba[k], img.rgba[k + 1], img.rgba[k + 2], img.rgba[k + 3]]
+                    })
+                    .collect();
+                self.render_count += 1;
+                self.workspace.render_preview = Some((self.render_count, format!("{}×{} · {secs:.1} s", img.width, img.height), [pw, ph], px));
+            }
+            Err(e) => self.status = format!("Render not saved: {e}"),
+        }
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Document › Render › Turntable: turn the view once round over the set number of
+    /// frames, saving each frame to an MP4 at `path` through ffmpeg, or as numbered PNGs in
+    /// a folder beside it when there is no ffmpeg.
+    fn start_turntable(&mut self, path: String, quit_after: bool) {
+        if self.turntable.is_some() || self.render_job.is_some() || self.gfx.is_none() {
+            return;
+        }
+        let has_ffmpeg = std::process::Command::new("ffmpeg").arg("-version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+        let sink = if has_ffmpeg && path.to_lowercase().ends_with(".mp4") {
+            None
+        } else {
+            let p = Path::new(&path);
+            let dir = p.with_extension("").with_file_name(format!("{} frames", p.file_stem().map_or("turntable".into(), |s| s.to_string_lossy())));
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.workspace.notify(format!("Turntable: cannot make {}: {e}", dir.display()));
+                return;
+            }
+            Some(TurntableSink::Frames(dir))
+        };
+        self.turntable = Some(Turntable {
+            frames: self.workspace.turntable_frames.max(2),
+            done: 0,
+            yaw: self.camera.yaw,
+            path,
+            // An empty folder stands for ffmpeg, started with the first frame once its size
+            // is known.
+            sink: sink.unwrap_or(TurntableSink::Frames(std::path::PathBuf::new())),
+            size: None,
+            started: Instant::now(),
+            warmup: 3,
+            quit_after,
+        });
+        self.workspace.rendering = true;
+    }
+
+    /// Each frame while a turntable runs: turn the view to this frame's angle and ask for
+    /// its snapshot.
+    fn turntable_step(&mut self) {
+        let Some(t) = &self.turntable else { return };
+        self.camera.yaw = t.yaw - std::f32::consts::TAU * t.done as f32 / t.frames as f32;
+        if self.gfx.as_ref().is_some_and(|g| g.snapshot.is_none() && g.snapshot_image.is_none()) {
+            self.request_snapshot();
+        }
+    }
+
+    /// A turntable frame was drawn: pass it on, and finish after the last.
+    fn turntable_frame(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        let Some(t) = self.turntable.as_mut() else { return };
+        // Frames drawn before the canvas is laid out and settled do not count.
+        if w < 16 || h < 16 {
+            return;
+        }
+        if t.warmup > 0 {
+            t.warmup -= 1;
+            return;
+        }
+        // Even sizes, as video encoders want; every frame the size of the first (scaled
+        // when the window was resized meanwhile).
+        let (fw, fh) = *t.size.get_or_insert((w & !1, h & !1));
+        let Some(img) = image::RgbaImage::from_raw(w, h, rgba) else { return };
+        let frame = if (w, h) == (fw, fh) {
+            img.into_raw()
+        } else if w >= fw && h >= fh && (w - fw, h - fh) == (w & 1, h & 1) {
+            image::imageops::crop_imm(&img, 0, 0, fw, fh).to_image().into_raw()
+        } else {
+            image::imageops::resize(&img, fw, fh, image::imageops::FilterType::Triangle).into_raw()
+        };
+        let result: Result<(), String> = match &mut t.sink {
+            TurntableSink::Frames(dir) if dir.as_os_str().is_empty() => {
+                // The first frame: start ffmpeg at this size.
+                let child = std::process::Command::new("ffmpeg")
+                    .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{fw}x{fh}"), "-r", "30", "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart", &t.path])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn();
+                match child {
+                    Ok(mut c) => {
+                        use std::io::Write;
+                        let r = c.stdin.as_mut().unwrap().write_all(&frame).map_err(|e| e.to_string());
+                        t.sink = TurntableSink::Ffmpeg(c);
+                        r
+                    }
+                    Err(e) => Err(format!("ffmpeg: {e}")),
+                }
+            }
+            TurntableSink::Frames(dir) => {
+                let path = dir.join(format!("frame {:04}.png", t.done + 1));
+                image::save_buffer(&path, &frame, fw, fh, image::ColorType::Rgba8).map_err(|e| e.to_string())
+            }
+            TurntableSink::Ffmpeg(c) => {
+                use std::io::Write;
+                c.stdin.as_mut().unwrap().write_all(&frame).map_err(|e| e.to_string())
+            }
+        };
+        t.done += 1;
+        if let Err(e) = result {
+            self.finish_turntable(Some(e));
+        } else if t.done >= t.frames {
+            self.finish_turntable(None);
+        } else {
+            self.status = format!("Turntable: frame {} of {}", t.done, t.frames);
+        }
+    }
+
+    /// End the turntable (`failure` when it went wrong, Esc stops it with nothing), putting
+    /// the view back.
+    fn finish_turntable(&mut self, failure: Option<String>) {
+        let Some(t) = self.turntable.take() else { return };
+        self.camera.yaw = t.yaw;
+        self.workspace.rendering = self.render_job.is_some();
+        let secs = t.started.elapsed().as_secs_f32();
+        let complete = t.done >= t.frames && failure.is_none();
+        let place = match t.sink {
+            TurntableSink::Ffmpeg(mut c) => {
+                drop(c.stdin.take());
+                match c.wait() {
+                    Ok(s) if s.success() => t.path.clone(),
+                    _ => return self.turntable_report(format!("Turntable not saved: ffmpeg failed on {}", t.path), t.quit_after),
+                }
+            }
+            TurntableSink::Frames(dir) => format!("{} (PNG frames; install ffmpeg for MP4)", dir.display()),
+        };
+        let msg = match failure {
+            Some(e) => format!("Turntable stopped: {e}"),
+            None if complete => format!("Turntable of {} frames saved to {place} in {secs:.1} s", t.frames),
+            None => format!("Turntable stopped after {} of {} frames · {place}", t.done, t.frames),
+        };
+        self.turntable_report(msg, t.quit_after);
+    }
+
+    fn turntable_report(&mut self, msg: String, quit: bool) {
+        self.status = msg;
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+        if quit {
+            self.quit = true;
+        }
+    }
+
     /// Run the `--bake-normal` / `--bake-displacement` bakes, waiting for each.
     fn bake_at_start(&mut self) {
+        if let Some(path) = self.render_on_start.take() {
+            self.start_render(path);
+            self.poll_render(true);
+        }
+        if let Some(path) = self.turntable_on_start.take() {
+            self.start_turntable(path, true);
+        }
         for (kind, path) in std::mem::take(&mut self.bake_on_start) {
             if self.doc.count() < 2 {
                 log::error!("{}: the active subtool has no subdivision levels", kind.name());
@@ -1693,22 +2077,498 @@ impl App {
                 self.workspace.notify(format!("{}: nothing to move", kind.label()));
                 return;
             };
-            let level = self.doc.active();
-            let mesh = self.doc.mesh_mut();
-            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
-            let mut stroke = Stroke::begin(false, false, false);
-            stroke.snapshot_now(mesh, &all);
-            mesh.positions.copy_from_slice(&new);
-            mesh.finish_edit(&all);
-            self.commit_stroke_named(stroke, level, kind.label());
-            self.subtools[self.active_tool].bounds = self.doc.bounds();
-            self.update_hover();
+            self.reshape_shown(kind.label(), &new);
             self.workspace.notify(format!("{} {:+.0} applied", kind.label(), value));
             return;
         }
         self.apply_transform(subtool::deform_map(kind, value, self.doc.bounds(), self.workspace.size_axes));
         self.workspace
             .notify(format!("{} {:+.0} applied", kind.label(), value));
+    }
+
+    /// Put `new` positions into the shown level as one stroke named `name` (other levels
+    /// follow, undo as usual).
+    fn reshape_shown(&mut self, name: &str, new: &[Vec3]) {
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+        let mut stroke = Stroke::begin(false, false, false);
+        stroke.snapshot_now(mesh, &all);
+        mesh.positions.copy_from_slice(new);
+        mesh.finish_edit(&all);
+        self.commit_stroke_named(stroke, level, name);
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.update_hover();
+    }
+
+    /// Dynamic Subdivision: keep the preview of the active subtool on the GPU up to date and
+    /// tell the renderer whether to draw it. The cage itself shows with PolyF, with
+    /// subdivision levels, and during a stroke on a model whose preview is large; a small
+    /// preview follows the stroke live.
+    fn update_dynamic(&mut self) {
+        // ZSpheres with A: the skin in place of the spheres, made again after each edit.
+        if self.doc.zspheres.is_some() {
+            let tool = &self.subtools[self.active_tool];
+            let wanted = self.zs_preview && (!self.busy() || self.turntable.is_some());
+            let key = wanted.then(|| (tool.id, self.doc.generation, self.history.edits() ^ (self.workspace.zsphere_detail.to_bits() as u64) << 32, dynamic::Settings { smooth: 255, ..Default::default() }));
+            let Some(gfx) = self.gfx.as_mut() else { return };
+            if key != self.dynamic_key {
+                gfx.dynamic = false;
+                gfx.drop_stand_in(render::DYNAMIC_KEY);
+                if wanted {
+                    if let Ok(skin) = self.doc.zspheres.as_ref().unwrap().skin(self.workspace.zsphere_detail) {
+                        let pv = dynamic::preview(&skin, &dynamic::Settings { smooth: 0, ..Default::default() });
+                        gfx.dynamic = gfx.upload_stand_in(render::DYNAMIC_KEY, &pv);
+                    }
+                }
+                self.dynamic_key = key;
+            }
+            return;
+        }
+        let tool = &self.subtools[self.active_tool];
+        let settings = tool.dynamic.filter(|_| self.doc.count() == 1 && !self.workspace.polyframe);
+        let live = settings.is_some_and(|s| {
+            let fitted = s.fitted(self.doc.mesh(), dynamic::MAX_TRIANGLES);
+            self.doc.mesh().triangle_count() << (2 * fitted.steps()) <= 400_000
+        });
+        let stroking = self.busy() && self.turntable.is_none();
+        let wanted = settings.filter(|_| !stroking || live);
+        let key = wanted.map(|s| (tool.id, self.doc.generation, if stroking { u64::MAX - self.history.edits() } else { self.history.edits() }, s));
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        if key != self.dynamic_key || (stroking && live) {
+            match wanted {
+                Some(s) => {
+                    let pv = dynamic::preview(self.doc.mesh(), &s);
+                    gfx.dynamic = gfx.upload_stand_in(render::DYNAMIC_KEY, &pv);
+                }
+                None => {
+                    gfx.drop_stand_in(render::DYNAMIC_KEY);
+                    gfx.dynamic = false;
+                }
+            }
+            self.dynamic_key = key;
+        }
+    }
+
+    /// Geometry › Dynamics › Run Simulation (or Stop while one runs): simulate the shown
+    /// level as cloth on a thread of its own; [`poll_sim`](Self::poll_sim) shows it.
+    fn simulate(&mut self) {
+        if let Some(s) = &self.sim {
+            s.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if self.busy() {
+            return;
+        }
+        if self.doc.zspheres.is_some() {
+            self.workspace.notify("Dynamics: skin the ZSpheres first (Make Adaptive Skin)");
+            return;
+        }
+        // Colliders: the other visible subtools as shown; the floor at the grid, or under
+        // the lowest of them.
+        let mut others = Vec::new();
+        if !self.workspace.solo {
+            for t in self.subtools.iter().filter(|t| t.visible) {
+                if let Some(p) = &t.parked {
+                    if let Ok(doc) = p.packed.clone().try_unpack() {
+                        others.push(doc);
+                    }
+                }
+            }
+        }
+        let meshes: Vec<&SculptMesh> = others.iter().map(|d| d.mesh()).collect();
+        let floor = meshes.iter().flat_map(|m| m.positions.iter().map(|p| p.y)).fold(-1.12f32, f32::min);
+        let colliders = (!meshes.is_empty()).then(|| project_all::Sources::new(&meshes));
+        let cloth = dynamics::Cloth::new(self.doc.mesh(), colliders, floor);
+        drop(others);
+        let settings = self.workspace.dynamics;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let tx2 = tx.clone();
+                cloth.run(&settings, &flag, |step, x| {
+                    let _ = tx2.send((false, step, x.to_vec()));
+                })
+            }));
+            if let Ok(x) = r {
+                let _ = tx.send((true, settings.steps, x));
+            }
+        });
+        let level = self.doc.active();
+        let mesh = self.doc.mesh_mut();
+        let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+        let mut stroke = Stroke::begin(false, false, false);
+        stroke.snapshot_now(mesh, &all);
+        self.sim = Some(SimJob { rx, stop, stroke, level, tool: self.subtools[self.active_tool].id, steps: settings.steps, started: Instant::now() });
+        self.workspace.simulating = true;
+        self.status = "Simulating…".to_string();
+    }
+
+    /// Show the simulation's latest step, and finish it when it is done (waiting for it with
+    /// `wait`). Each frame.
+    fn poll_sim(&mut self, wait: bool) {
+        let Some(job) = &self.sim else { return };
+        let mut latest = None;
+        let mut done = false;
+        loop {
+            let msg = if wait && !done { job.rx.recv().ok() } else { job.rx.try_recv().ok() };
+            let Some((last, step, x)) = msg else { break };
+            done |= last;
+            latest = Some((step, x));
+            if done && !wait {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+        // A thread that died counts as done, with what it last sent.
+        if !done && matches!(job.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+            done = true;
+        }
+        let (tool, level, steps, started) = (job.tool, job.level, job.steps, job.started);
+        if let Some((step, x)) = latest {
+            if self.subtools[self.active_tool].id == tool && self.doc.active() == level && x.len() == self.doc.mesh().vertex_count() {
+                let mesh = self.doc.mesh_mut();
+                mesh.positions.copy_from_slice(&x);
+                let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+                mesh.finish_edit(&all);
+            }
+            self.status = format!("Simulating… step {step} of {steps}");
+        }
+        if done {
+            let job = self.sim.take().unwrap();
+            self.workspace.simulating = false;
+            if self.subtools[self.active_tool].id == tool && self.doc.active() == level {
+                self.commit_stroke_named(job.stroke, level, "Simulation");
+                self.subtools[self.active_tool].bounds = self.doc.bounds();
+                self.status = format!("Simulation done in {:.1} s · one undo step", started.elapsed().as_secs_f32());
+            } else {
+                self.status = "Simulation dropped: the subtool changed".to_string();
+            }
+            self.workspace.notify(self.status.clone());
+        }
+    }
+
+    /// FiberMesh › Preview: keep the fibres of the active subtool on the GPU up to date
+    /// (made again after each edit and settings change, not during strokes).
+    fn update_fibers(&mut self) {
+        let tool = self.subtools[self.active_tool].id;
+        let wanted = self.workspace.fiber_preview && self.doc.zspheres.is_none();
+        let key = wanted.then(|| (tool, self.doc.generation, self.history.edits(), self.workspace.fiber));
+        if self.busy() && wanted {
+            return;
+        }
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        if key == self.fiber_key {
+            return;
+        }
+        gfx.fibers = false;
+        gfx.drop_stand_in(render::FIBER_KEY);
+        if wanted {
+            if let Some(f) = fiber::grow(self.doc.mesh(), &self.workspace.fiber) {
+                let pv = dynamic::preview(&f, &dynamic::Settings { smooth: 0, ..Default::default() });
+                gfx.fibers = gfx.upload_stand_in(render::FIBER_KEY, &pv);
+            }
+        }
+        self.fiber_key = key;
+    }
+
+    /// Geometry › FiberMesh › Accept: the fibres as a new subtool; the preview goes off.
+    fn fiber_accept_now(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let Some(fibers) = fiber::grow(self.doc.mesh(), &self.workspace.fiber) else {
+            self.workspace.notify("FiberMesh: no surface to grow on");
+            return;
+        };
+        let source = self.subtools[self.active_tool].name.clone();
+        let budget = self.doc.budget;
+        self.park_active();
+        self.doc = Multires::new(fibers, budget);
+        let id = self.new_tool_id();
+        let name = format!("Fibers_{source}");
+        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.active_tool = self.subtools.len() - 1;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.workspace.fiber_preview = false;
+        self.status = format!("{name}: {} fibres, {} vertices in {:.0} ms", self.workspace.fiber.count, fmt_count(self.mesh().vertex_count()), t.elapsed().as_secs_f32() * 1000.0);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Geometry › Dynamic Subdiv › Apply: the preview becomes the model (one undo step) and
+    /// Dynamic goes off. With Smooth Subdiv alone it becomes real subdivision levels instead.
+    fn dynamic_apply_now(&mut self) {
+        let Some(s) = self.subtools[self.active_tool].dynamic else { return };
+        if self.busy() || self.doc.count() > 1 {
+            return;
+        }
+        let s = s.fitted(self.doc.mesh(), dynamic::MAX_TRIANGLES);
+        if s.flat == 0 && s.qgrid == 0 && s.thickness <= 0.0 {
+            for _ in 0..s.smooth {
+                self.divide();
+            }
+            self.status = format!("Dynamic Subdiv applied as {} subdivision levels", s.smooth);
+        } else {
+            let m = dynamic::applied(self.doc.mesh(), &s);
+            let n = m.triangle_count();
+            self.replace_topology("Apply Dynamic Subdiv", m);
+            self.status = format!("Dynamic Subdiv applied: {} triangles", fmt_count(n));
+        }
+        self.subtools[self.active_tool].dynamic = None;
+        self.workspace.dynamic_subdiv = None;
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Show `tree` as the active subtool's mesh, without an undo step (during a drag, and
+    /// for the step [`end_zsphere`](Self::end_zsphere) records).
+    fn zsphere_show(&mut self, tree: zsphere::Tree) {
+        let budget = self.doc.budget;
+        let mut doc = Multires::new(tree.display(), budget);
+        doc.zspheres = Some(tree);
+        self.doc = doc;
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+    }
+
+    /// The point where the ray through the cursor meets the view plane through `c`.
+    fn view_plane_point(&self, c: Vec3) -> Vec3 {
+        let (o, d) = self.cursor_ray();
+        let n = self.camera.forward();
+        let t = (c - o).dot(n) / d.dot(n).abs().max(1e-6).copysign(d.dot(n));
+        o + d * t
+    }
+
+    /// A press on a ZSphere subtool. On a sphere: Draw adds a child there (sized by
+    /// dragging), Alt + click deletes it, Shift + click turns it between sphere and cube,
+    /// Move drags it, Scale sizes it; X symmetry does the same to its mirror image. Off
+    /// the spheres it turns the view.
+    fn begin_zsphere(&mut self) {
+        let Some(mut tree) = self.doc.zspheres.clone() else { return };
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d) else {
+            self.begin_nav(MouseButton::Left);
+            return;
+        };
+        let i = tree.sphere_of(self.mesh().group(hit.tri), hit.point);
+        self.zs_selected = i;
+        let sym = self.workspace.sym().x;
+        let mirror = if sym { tree.mirror_of(i).filter(|&m| m != i) } else { None };
+        let before = self.doc.pack_copy();
+        let (alt, shift) = (self.modifiers.alt_key(), self.modifiers.shift_key());
+        let commit = |app: &mut Self, tree: zsphere::Tree, name: &str, before: multires::Packed| {
+            app.zsphere_show(tree);
+            app.history.push(UndoStep::Replace(Box::new(before)));
+            app.history.name_last(name);
+        };
+        if alt {
+            let mut gone = vec![i];
+            gone.extend(mirror);
+            gone.sort_unstable();
+            let mut any = false;
+            for &k in gone.iter().rev() {
+                any |= tree.delete(k);
+            }
+            self.zs_selected = 0;
+            if any {
+                commit(self, tree, "Delete ZSphere", before);
+            }
+            return;
+        }
+        if shift {
+            let round = if tree.spheres[i as usize].roundness > 0.5 { 0.0 } else { 1.0 };
+            for k in std::iter::once(i).chain(mirror) {
+                tree.spheres[k as usize].roundness = round;
+            }
+            commit(self, tree, if round < 0.5 { "ZSphere to Cube" } else { "ZSphere to Sphere" }, before);
+            return;
+        }
+        let kind = match self.workspace.mode {
+            Mode::Draw => {
+                let r = tree.spheres[i as usize].radius * 0.5;
+                let child = tree.add(i, hit.point, r);
+                let mirror_child = if sym && hit.point.x.abs() > 1e-4 * r {
+                    let j = tree.mirror_of(i).unwrap_or(i);
+                    Some(tree.add(j, Vec3::new(-hit.point.x, hit.point.y, hit.point.z), r))
+                } else {
+                    None
+                };
+                self.zs_selected = child;
+                ZsKind::Size { i: child, mirror: mirror_child }
+            }
+            Mode::Move => ZsKind::Move { i, mirror, grab: self.view_plane_point(tree.spheres[i as usize].center) - tree.spheres[i as usize].center },
+            _ => ZsKind::Scale { i, mirror, r0: tree.spheres[i as usize].radius },
+        };
+        let name = match kind {
+            ZsKind::Size { .. } => "Add ZSphere",
+            ZsKind::Move { .. } => "Move ZSphere",
+            ZsKind::Scale { .. } => "Scale ZSphere",
+        };
+        self.zsphere_show(tree);
+        self.zs_drag = Some(ZsDrag { kind, before, name, start: self.cursor });
+    }
+
+    /// The ZSphere drag follows the cursor.
+    fn zsphere_move(&mut self) {
+        let Some(drag) = &self.zs_drag else { return };
+        let Some(mut tree) = self.doc.zspheres.clone() else { return };
+        let mirror_to = |tree: &mut zsphere::Tree, i: u32, m: Option<u32>| {
+            if let Some(m) = m {
+                let z = tree.spheres[i as usize];
+                let w = &mut tree.spheres[m as usize];
+                w.center = Vec3::new(-z.center.x, z.center.y, z.center.z);
+                w.radius = z.radius;
+            }
+        };
+        let moved = (self.cursor - drag.start).length();
+        match drag.kind {
+            ZsKind::Size { i, mirror } => {
+                if moved < 4.0 {
+                    return;
+                }
+                let z = tree.spheres[i as usize];
+                let parent_r = tree.spheres[z.parent as usize].radius;
+                let r = self.view_plane_point(z.center).distance(z.center).clamp(parent_r * 0.05, parent_r * 4.0);
+                tree.spheres[i as usize].radius = r;
+                if let Some(m) = mirror {
+                    tree.spheres[m as usize].radius = r;
+                }
+            }
+            ZsKind::Move { i, mirror, grab } => {
+                let c = tree.spheres[i as usize].center;
+                tree.spheres[i as usize].center = self.view_plane_point(c) - grab;
+                mirror_to(&mut tree, i, mirror);
+            }
+            ZsKind::Scale { i, mirror, r0 } => {
+                let d = (self.cursor.x - drag.start.x) - (self.cursor.y - drag.start.y);
+                tree.spheres[i as usize].radius = (r0 * (d / 150.0).exp()).max(1e-3);
+                mirror_to(&mut tree, i, mirror);
+            }
+        }
+        self.zsphere_show(tree);
+    }
+
+    /// The ZSphere drag ends as one undo step.
+    fn end_zsphere(&mut self) {
+        if let Some(drag) = self.zs_drag.take() {
+            self.history.push(UndoStep::Replace(Box::new(drag.before)));
+            self.history.name_last(drag.name);
+        }
+    }
+
+    /// Tool › ZSphere › New ZSphere: a new subtool holding one ZSphere at the origin.
+    fn new_zsphere(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let tree = zsphere::Tree::default();
+        let budget = self.doc.budget;
+        self.park_active();
+        let mut doc = Multires::new(tree.display(), budget);
+        doc.zspheres = Some(tree);
+        self.doc = doc;
+        let id = self.new_tool_id();
+        let name = format!("ZSphere {id}");
+        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.active_tool = self.subtools.len() - 1;
+        self.zs_selected = 0;
+        // It starts at the origin, where the model usually is: the others are hidden.
+        let hidden = self.subtools.iter_mut().rev().skip(1).filter(|t| t.visible).map(|t| t.visible = false).count();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.status = format!(
+            "{name}: Draw on it to add spheres · Alt + click deletes · Shift + click makes a cube · A previews the skin{}",
+            if hidden > 0 { " · other subtools hidden (show them in SubTool)" } else { "" }
+        );
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Tool › ZSphere › Make Adaptive Skin: the skin as a new subtool, the ZSpheres kept.
+    fn make_adaptive_skin(&mut self) {
+        let Some(tree) = self.doc.zspheres.clone() else { return };
+        if self.busy() {
+            return;
+        }
+        let t = Instant::now();
+        let skin = match tree.skin(self.workspace.zsphere_detail) {
+            Ok(m) => m,
+            Err(e) => {
+                self.workspace.notify(format!("Make Adaptive Skin: {e}"));
+                return;
+            }
+        };
+        let source = self.subtools[self.active_tool].name.clone();
+        let budget = self.doc.budget;
+        self.park_active();
+        self.doc = Multires::new(skin, budget);
+        let id = self.new_tool_id();
+        let name = format!("Skin_{source}");
+        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.active_tool = self.subtools.len() - 1;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.status = format!("{name}: {} vertices in {:.0} ms", fmt_count(self.mesh().vertex_count()), t.elapsed().as_secs_f32() * 1000.0);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Tool › ZSphere › Roundness: the sphere last touched (and its mirror) takes the
+    /// section's value; one undo step once the slider rests.
+    fn zsphere_roundness(&mut self, value: Option<f32>) {
+        let Some(mut tree) = self.doc.zspheres.clone() else {
+            self.zs_round_before = None;
+            return;
+        };
+        let i = self.zs_selected.min(tree.spheres.len() as u32 - 1);
+        match value {
+            Some(v) if (tree.spheres[i as usize].roundness - v).abs() > 1e-4 => {
+                if self.zs_round_before.is_none() {
+                    self.zs_round_before = Some(self.doc.pack_copy());
+                }
+                let mirror = if self.workspace.sym().x { tree.mirror_of(i) } else { None };
+                for k in std::iter::once(i).chain(mirror) {
+                    tree.spheres[k as usize].roundness = v;
+                }
+                self.zsphere_show(tree);
+            }
+            _ => {
+                if let Some(before) = self.zs_round_before.take() {
+                    self.history.push(UndoStep::Replace(Box::new(before)));
+                    self.history.name_last("ZSphere Roundness");
+                }
+            }
+        }
+    }
+
+    /// Deformation › Smart ReSym across the first symmetry axis that is on (X when none is).
+    fn smart_resym_now(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let w = &self.workspace;
+        let axis = if w.symmetry || !(w.symmetry_y || w.symmetry_z) { 0 } else if w.symmetry_y { 1 } else { 2 };
+        let t = Instant::now();
+        match deform::smart_resym(self.doc.mesh(), axis, w.resym_from_negative) {
+            Some(new) => {
+                self.reshape_shown("Smart ReSym", &new);
+                self.status = format!("Smart ReSym across {} in {:.0} ms", ["X", "Y", "Z"][axis], t.elapsed().as_secs_f32() * 1000.0);
+            }
+            None => self.status = "Smart ReSym: already symmetric".to_string(),
+        }
+        self.workspace.notify(self.status.clone());
     }
 
     /// Map every level of the active subtool by `map` as one undo step. Returns the time
@@ -2291,6 +3151,7 @@ impl App {
                 }),
                 morph: self.morph_targets.get(&t.id).map(|(level, pts)| (*level, pts.as_slice())),
                 boolean: t.boolean,
+                dynamic: t.dynamic,
             })
             .collect();
         let tools: Vec<(&str, bool, &multires::Packed)> = self
@@ -2360,6 +3221,17 @@ impl App {
                     self.start_bake(kind, path);
                     return;
                 }
+                Ask::OpenSpotlight => return,
+                Ask::ExportRender => {
+                    let path = self.render_path.clone();
+                    self.start_render(path);
+                    return;
+                }
+                Ask::ExportTurntable => {
+                    let path = self.render_path.clone();
+                    self.start_turntable(path, false);
+                    return;
+                }
             });
             return;
         }
@@ -2384,6 +3256,9 @@ impl App {
             Ask::ExportDisplacementMap => {
                 (&self.map_path, file_dialog::file_name(&format!("{tool}_displacement"), if self.workspace.bake.exr { "exr" } else { "png" }))
             }
+            Ask::ExportRender => (&self.render_path, file_dialog::file_name(&format!("{project_stem} render"), "png")),
+            Ask::OpenSpotlight => (&self.import_path, String::new()),
+            Ask::ExportTurntable => (&self.render_path, file_dialog::file_name(&format!("{project_stem} turntable"), "mp4")),
         };
         // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
         let dir = file_dialog::start_dir(near, self.last_dir.as_deref());
@@ -2439,6 +3314,15 @@ impl App {
                     self.import_path = text(path);
                     self.import_mesh(&text(path));
                 }
+            }
+            Ask::ExportRender => {
+                self.render_path = text(first);
+                self.start_render(text(first));
+            }
+            Ask::OpenSpotlight => self.load_spotlight(first),
+            Ask::ExportTurntable => {
+                self.render_path = text(first);
+                self.start_turntable(text(first), false);
             }
             Ask::ExportNormalMap | Ask::ExportDisplacementMap => {
                 self.map_path = text(first);
@@ -2499,6 +3383,10 @@ impl App {
         let Some((w, h, rgba)) = self.gfx.as_mut().and_then(|g| g.snapshot_image.take()) else {
             return;
         };
+        if self.turntable.is_some() {
+            self.turntable_frame(w, h, rgba);
+            return;
+        }
         if let Some((path, _)) = self.snapshot_to.take() {
             match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
                 Ok(()) => log::info!("snapshot {w}×{h} saved to {path}"),
@@ -2589,6 +3477,7 @@ impl App {
             layers: Some(&self.doc.layers),
             morph: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, p)| (*l, p.as_slice())),
             boolean: self.subtools[self.active_tool].boolean,
+            dynamic: self.subtools[self.active_tool].dynamic,
         }];
         self.status = match project::save_with(Path::new(&path), &[(name.as_str(), true, &packed)], &extras, 0) {
             Ok(bytes) => format!(
@@ -2645,16 +3534,24 @@ impl App {
     }
 
     /// A parked subtool holding `doc`, its stand-in uploaded.
-    fn parked_subtool(&mut self, name: String, visible: bool, mut doc: Multires) -> SubTool {
+    fn parked_subtool(&mut self, name: String, visible: bool, doc: Multires) -> SubTool {
+        self.parked_subtool_with(name, visible, doc, None)
+    }
+
+    /// [`parked_subtool`](Self::parked_subtool) with Dynamic Subdivision `dynamic`.
+    fn parked_subtool_with(&mut self, name: String, visible: bool, mut doc: Multires, dynamic: Option<dynamic::Settings>) -> SubTool {
         let id = self.new_tool_id();
-        let stand_in = doc.stand_in(STAND_IN_VERTICES);
+        let stand_in = match dynamic {
+            Some(s) if doc.count() == 1 => dynamic::preview(doc.mesh(), &s),
+            _ => doc.stand_in(STAND_IN_VERTICES),
+        };
         let mut stand_in_vertices = stand_in.positions.len();
         if let Some(gfx) = self.gfx.as_mut() {
             if !gfx.upload_stand_in(id, &stand_in) {
                 stand_in_vertices = 0;
             }
         }
-        SubTool { guides: Default::default(),
+        SubTool { guides: Default::default(), dynamic,
             boolean: Default::default(),
             id,
             name,
@@ -2829,7 +3726,7 @@ impl App {
         self.doc = Multires::new(mesh, budget);
         let id = self.new_tool_id();
         let name = Path::new(path).file_stem().map_or_else(|| format!("Import {id}"), |s| s.to_string_lossy().to_string());
-        self.subtools.push(SubTool { guides: Default::default(), boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -2921,7 +3818,7 @@ impl App {
             let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
             if i == active {
                 let id = self.new_tool_id();
-                staged.push(SubTool { guides: Default::default(),
+                staged.push(SubTool { guides: Default::default(), dynamic: saved.dynamic,
                     boolean: saved.boolean,
                     id,
                     name: saved.name,
@@ -2932,7 +3829,7 @@ impl App {
                 });
                 active_doc = Some(doc);
             } else {
-                let mut tool = self.parked_subtool(saved.name, saved.visible, doc);
+                let mut tool = self.parked_subtool_with(saved.name, saved.visible, doc, saved.dynamic);
                 tool.boolean = saved.boolean;
                 staged.push(tool);
             }
@@ -2984,7 +3881,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
-        self.subtools = vec![SubTool { guides: Default::default(),
+        self.subtools = vec![SubTool { guides: Default::default(), dynamic: None,
             boolean: Default::default(),
             id,
             name: format!("{} {id}", self.primitive.kind.short()),
@@ -3522,6 +4419,10 @@ impl App {
                 if m.hidden.is_empty() { None } else { subtool_ops::part(m, |t| m.visible(t)) }
             }),
             Some(GeoOp::CloseHoles) => self.topology_op("Close Holes", subtool_ops::holes_closed),
+            Some(GeoOp::PanelLoops) => {
+                let s = self.workspace.panel;
+                self.topology_op("Panel Loops", |m| panel::panels(m, &s));
+            }
             Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
             Some(GeoOp::ZRemesh) => self.zremesh_now(),
             Some(GeoOp::ProjectAll) => self.project_all_now(),
@@ -5504,9 +6405,11 @@ impl App {
         let invert = self.modifiers.alt_key() ^ self.workspace.subtract;
         let symmetry = self.workspace.sym();
         log::trace!("stroke {:?} invert={invert} symmetry={}", self.stroke_brush.kind, symmetry.label());
+        let mut assets = self.workspace.assets.clone();
+        assets.spotlight = self.spotlight_projector();
         self.stroke = Some(
             Stroke::begin(invert, gpu, symmetry)
-                .with_assets(self.workspace.assets.clone())
+                .with_assets(assets)
                 .with_spacing(self.workspace.spacing)
                 .with_morph(self.morph_target()),
         );
@@ -7270,6 +8173,13 @@ impl App {
             self.insert_move();
         } else if self.zm_drag.is_some() {
             self.zmodel_move();
+        } else if self.zs_drag.is_some() {
+            self.zsphere_move();
+        } else if let Some((start, centre)) = self.spot_drag {
+            let size = self.viewport();
+            if let Some(sp) = self.workspace.spotlight.as_mut() {
+                sp.place.center = centre + (self.cursor - start) / size.max(Vec2::ONE);
+            }
         } else if self.mask_press.is_some() || self.mask_stroke.is_some() {
             self.mask_move();
         } else if self.curve_draw.is_some() {
@@ -7310,7 +8220,7 @@ impl App {
             // The press that closes a popup or menu does nothing else.
             return;
         }
-        if self.decimation.is_some() && !consumed && !over_ui && self.nav.is_none() {
+        if (self.decimation.is_some() || self.sim.is_some()) && !consumed && !over_ui && self.nav.is_none() {
             // While decimating the model must not change: a press only turns the view.
             self.begin_nav(MouseButton::Left);
             return;
@@ -7369,6 +8279,14 @@ impl App {
                 self.begin_nav(MouseButton::Left);
                 return;
             }
+            if let Some(sp) = self.workspace.spotlight.as_ref().filter(|s| s.shown && s.edit) {
+                self.spot_drag = Some((self.cursor, sp.place.center));
+                return;
+            }
+            if self.doc.zspheres.is_some() {
+                self.begin_zsphere();
+                return;
+            }
             if self.workspace.mode != Mode::Draw {
                 // Gizmo 3D (Y) replaces the action line; a press off its handles navigates.
                 let started = if self.workspace.gizmo { self.begin_gizmo() } else { self.begin_transpose() };
@@ -7421,6 +8339,8 @@ impl App {
         self.end_transpose();
         self.end_insert();
         self.end_zmodel();
+        self.end_zsphere();
+        self.spot_drag = None;
         self.end_nav(MouseButton::Left);
     }
 
@@ -7462,6 +8382,16 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Escape && self.sim.is_some() {
+            if let Some(s) = &self.sim {
+                s.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        if key == KeyCode::Escape && self.turntable.is_some() {
+            self.finish_turntable(None);
+            return;
+        }
         if key==KeyCode::Escape && self.gesture.is_some() {
             self.gesture=None;self.workspace.gesture_preview=None;return;
         }
@@ -7488,16 +8418,34 @@ impl App {
             KeyCode::KeyI if ctrl => self.pending_mask = Some(MaskOp::Invert),
             KeyCode::KeyA if ctrl && shift => self.pending_mask = Some(MaskOp::Clear),
             KeyCode::KeyA if ctrl => self.pending_mask = Some(MaskOp::All),
+            // ZBrush: A previews a ZSphere's skin.
+            KeyCode::KeyA if !shift && !self.modifiers.alt_key() && self.doc.zspheres.is_some() => self.zs_preview = !self.zs_preview,
             KeyCode::KeyH if ctrl => self.workspace.show_mask = !self.workspace.show_mask,
             KeyCode::KeyZ if ctrl && shift => self.pending_redo = true,
             KeyCode::KeyZ if ctrl => self.pending_undo = true,
+            // ZBrush: Z edits the Spotlight, Shift + Z shows or hides it.
+            KeyCode::KeyZ if shift && self.workspace.spotlight.is_some() => {
+                let s = self.workspace.spotlight.as_mut().unwrap();
+                s.shown = !s.shown;
+            }
+            KeyCode::KeyZ if self.workspace.spotlight.is_some() => {
+                let s = self.workspace.spotlight.as_mut().unwrap();
+                s.edit = !s.edit;
+                s.shown |= s.edit;
+            }
             KeyCode::KeyY if ctrl => self.pending_redo = true,
             // ZBrush: Ctrl + W groups the visible polygons; Shift + F shows polygroups (PolyF).
             KeyCode::KeyW if ctrl => self.pending_vis = Some(VisOp::GroupVisible),
             KeyCode::KeyF if shift => self.toggle_polyframe(),
-            // ZBrush: Ctrl + D divides, D and Shift + D step through the levels.
+            // ZBrush: Ctrl + D divides, D and Shift + D step through the levels; without
+            // levels they turn Dynamic Subdivision on and off.
             KeyCode::KeyD if ctrl => self.pending_divide = true,
+            KeyCode::KeyD if shift && self.doc.count() == 1 => self.subtools[self.active_tool].dynamic = None,
             KeyCode::KeyD if shift => self.pending_level = Some(self.doc.active().saturating_sub(1)),
+            KeyCode::KeyD if self.doc.count() == 1 => {
+                let tool = &mut self.subtools[self.active_tool];
+                tool.dynamic.get_or_insert_with(dynamic::Settings::default);
+            }
             KeyCode::KeyD => self.pending_level = Some(self.doc.active() + 1),
             KeyCode::BracketLeft => self.brush.radius = (self.brush.radius * 0.8).max(0.01),
             KeyCode::BracketRight => self.brush.radius = (self.brush.radius * 1.25).min(2.0),
@@ -7605,6 +8553,8 @@ impl App {
         };
         self.poll_decimation(false);
         self.poll_bake(false);
+        self.poll_render(false);
+        self.poll_sim(false);
         self.workspace.curve_preview = self.curve_preview();
         self.update_uv_layout();
         self.workspace.guides_preview = self.guides_preview();
@@ -7612,6 +8562,10 @@ impl App {
         let creases = self.crease_lines().iter().map(|l| l.len().saturating_sub(1)).sum::<usize>();
         let frozen_levels = self.doc.frozen_levels();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
+        self.workspace.dynamic_subdiv = self.subtools[self.active_tool].dynamic;
+        self.workspace.zsphere_round = self.doc.zspheres.as_ref().map(|t| t.spheres[(self.zs_selected as usize).min(t.spheres.len() - 1)].roundness);
+        let round_before = self.workspace.zsphere_round;
+        self.workspace.zsphere_preview = self.zs_preview;
         self.workspace.held_brush = self.held_brush();
         let print_extent = self.print_extent();
         let print_stale = self.print_report.as_ref().is_some_and(|r| r.stamp != self.print_stamp());
@@ -7674,6 +8628,32 @@ impl App {
                 pressure: self.pressure,
             },
         );
+        // Geometry › Dynamic Subdiv edits the active subtool's settings.
+        self.subtools[self.active_tool].dynamic = self.workspace.dynamic_subdiv;
+        self.zs_preview = self.workspace.zsphere_preview;
+        let round = self.workspace.zsphere_round.filter(|r| Some(*r) != round_before);
+        self.zsphere_roundness(round);
+        if actions.simulate {
+            self.simulate();
+        }
+        if actions.fiber_accept {
+            self.fiber_accept_now();
+        }
+        if actions.spotlight_load {
+            self.ask_file(file_dialog::Ask::OpenSpotlight);
+        }
+        if actions.render && self.render_job.is_none() && self.turntable.is_none() {
+            self.ask_file(file_dialog::Ask::ExportRender);
+        }
+        if actions.turntable && self.render_job.is_none() && self.turntable.is_none() {
+            self.ask_file(file_dialog::Ask::ExportTurntable);
+        }
+        if actions.new_zsphere {
+            self.new_zsphere();
+        }
+        if actions.adaptive_skin {
+            self.make_adaptive_skin();
+        }
         if actions.new_project {
             self.pending_doc = Some(DocOp::New);
         }
@@ -7793,6 +8773,12 @@ impl App {
         if actions.uv_unwrap {
             self.uv_unwrap_now();
         }
+        if actions.smart_resym {
+            self.smart_resym_now();
+        }
+        if actions.dynamic_apply {
+            self.dynamic_apply_now();
+        }
         if let Some(kind) = actions.bake {
             self.bake_ask(kind);
         }
@@ -7814,7 +8800,7 @@ impl App {
             let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
             self.status = format!("ZRemesher: deleted {n} guide curves");
         }
-        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
+        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.panel_loops, GeoOp::PanelLoops), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
             if on {
                 self.pending_geo = Some(op);
             }
@@ -7881,6 +8867,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.turntable_step();
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -8308,6 +9295,9 @@ impl App {
         if self.selftest_cull.is_none() && self.selftest_splat.is_none() {
             gfx.splatting = self.workspace.layout.dense_points && !self.render_triangles;
         }
+        self.update_dynamic();
+        self.update_fibers();
+        let Some(gfx) = self.gfx.as_mut() else { return };
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -9192,6 +10182,57 @@ fn main() {
         app.uv_unwrap_now();
         log::info!("{}", app.status);
     }
+    // `--zsphere-demo`: a ZSphere figure (arms ending in cubes) with its skin previewed.
+    if args.iter().any(|a| a == "--zsphere-demo") {
+        app.new_zsphere();
+        let mut t = zsphere::Tree::default();
+        t.spheres[0].radius = 0.4;
+        let hips = t.add(0, Vec3::new(0.0, -0.55, 0.0), 0.32);
+        let head = t.add(0, Vec3::new(0.0, 0.62, 0.0), 0.22);
+        let _ = (hips, head);
+        for side in [1.0f32, -1.0] {
+            let shoulder = t.add(0, Vec3::new(0.45 * side, 0.2, 0.0), 0.18);
+            let elbow = t.add(shoulder, Vec3::new(0.85 * side, 0.05, 0.0), 0.13);
+            let hand = t.add(elbow, Vec3::new(1.2 * side, -0.05, 0.0), 0.14);
+            t.spheres[hand as usize].roundness = 0.0;
+            let knee = t.add(hips, Vec3::new(0.2 * side, -1.0, 0.0), 0.15);
+            let foot = t.add(knee, Vec3::new(0.22 * side, -1.4, 0.1), 0.13);
+            t.spheres[foot as usize].roundness = 0.0;
+        }
+        app.zsphere_show(t);
+        app.zs_preview = args.iter().any(|a| a == "--zsphere-skin");
+    }
+    // `--render PATH`: Render the view to PATH at startup; `--turntable PATH`: record a
+    // turntable (`--turntable-frames N`) and quit.
+    app.render_on_start = flag("--render").cloned();
+    // `--fibers N`: FiberMesh preview with N fibres at startup.
+    if let Some(n) = flag("--fibers").and_then(|v| v.parse().ok()) {
+        app.workspace.fiber.count = n;
+        app.workspace.fiber_preview = true;
+    }
+    // `--spotlight IMAGE`: lay IMAGE over the canvas at startup.
+    if let Some(path) = flag("--spotlight") {
+        app.load_spotlight(Path::new(path));
+    }
+    app.turntable_on_start = flag("--turntable").cloned();
+    if let Some(n) = flag("--turntable-frames").and_then(|v| v.parse().ok()) {
+        app.workspace.turntable_frames = n;
+    }
+    // `--panel-loops`: Panel Loops with the default settings at startup.
+    if args.iter().any(|a| a == "--panel-loops") {
+        app.pending_geo = Some(GeoOp::PanelLoops);
+    }
+    // `--dynamic-subdiv S[,Q[,F]]`: Dynamic Subdivision on at startup with S smooth, Q QGrid
+    // and F flat steps.
+    if let Some(spec) = flag("--dynamic-subdiv") {
+        let n: Vec<u8> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        app.subtools[app.active_tool].dynamic = Some(dynamic::Settings {
+            smooth: n.first().copied().unwrap_or(2),
+            qgrid: n.get(1).copied().unwrap_or(0),
+            flat: n.get(2).copied().unwrap_or(0),
+            ..Default::default()
+        });
+    }
     // `--bake-normal PATH` / `--bake-displacement PATH`: bake that map of the active subtool
     // once the startup model is ready (after `--demo` strokes and `--open`), unwrapping it
     // first if needed.
@@ -9537,6 +10578,190 @@ mod subtool_tests {
         // Undo goes back to the frozen, remeshed lowest level.
         app.history_jump(-1);
         assert_eq!((app.doc.top(), app.doc.frozen_levels()), (0, 2));
+    }
+
+    #[test]
+    fn a_simulation_hangs_the_unmasked_part_as_one_undo_step() {
+        let mut app = App::new(24, false, usize::MAX);
+        let before = app.doc.mesh().positions.clone();
+        let mask: Vec<u8> = before.iter().map(|p| if p.y > 0.3 { 255 } else { 0 }).collect();
+        mask::replace(app.doc.mesh_mut(), mask);
+        app.workspace.dynamics.steps = 60;
+        app.workspace.dynamics.floor = false;
+        app.simulate();
+        assert!(app.busy());
+        app.poll_sim(true);
+        assert!(!app.busy() && !app.workspace.simulating);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Simulation"));
+        let after = app.doc.mesh().positions.clone();
+        for (a, b) in before.iter().zip(&after) {
+            if a.y > 0.3 {
+                assert_eq!(a, b, "pinned");
+            }
+        }
+        let low = |p: &[Vec3]| p.iter().map(|q| q.y).fold(f32::INFINITY, f32::min);
+        assert!(low(&after) < low(&before) - 0.1, "{} {}", low(&after), low(&before));
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().positions, before);
+    }
+
+    #[test]
+    fn fibermesh_accept_makes_a_fibre_subtool() {
+        let mut app = App::new(16, false, usize::MAX);
+        app.workspace.fiber = fiber::Settings { count: 120, ..Default::default() };
+        app.workspace.fiber_preview = true;
+        let tools = app.subtools.len();
+        app.fiber_accept_now();
+        assert_eq!(app.subtools.len(), tools + 1);
+        assert!(app.subtools.last().unwrap().name.starts_with("Fibers_"));
+        assert_eq!(app.doc.mesh().vertex_count(), 120 * (6 * 4 + 2));
+        assert!(!app.workspace.fiber_preview);
+    }
+
+    #[test]
+    fn spotlight_paints_its_colours_where_the_model_lies_under_it() {
+        let mut app = App::new(48, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-spot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Left half red, right half blue.
+        let img = image::RgbaImage::from_fn(64, 64, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        img.save(dir.join("rb.png")).unwrap();
+        app.load_spotlight(&dir.join("rb.png"));
+        let vp = app.viewport();
+        app.camera.aspect = vp.x / vp.y;
+        // The picture as tall as the canvas, over the model in the middle.
+        app.workspace.spotlight.as_mut().unwrap().place.scale = vp.y / vp.x;
+        app.brush = Brush { kind: BrushKind::Paint, radius: 0.6, strength: 1.0, rgb_intensity: 1.0, paint: true, sculpt: false, color: [255, 255, 255], ..Brush::default() };
+        let c = app.canvas_origin() + vp * 0.5;
+        for (k, dx) in [-60.0f32, -30.0, 0.0, 30.0, 60.0].into_iter().enumerate() {
+            app.cursor = c + Vec2::new(dx, 0.0);
+            if k == 0 { app.begin_stroke() } else { app.apply_stroke() }
+        }
+        app.end_stroke();
+        let m = app.doc.mesh();
+        assert!(!m.colors.is_empty(), "painted");
+        // Painted vertices on the screen's left are red, on its right blue (never white).
+        let right = app.camera.forward().cross(app.camera.up()).normalize();
+        let (mut red, mut blue, mut white) = (0, 0, 0);
+        for (p, col) in m.positions.iter().zip(&m.colors) {
+            if col[3] < 60 {
+                continue;
+            }
+            let side = p.dot(right);
+            if col[0] > col[2] + 20 && side < 0.0 { red += 1 }
+            if col[2] > col[0] + 20 && side > 0.0 { blue += 1 }
+            if col[0] > 100 && col[1] > 100 && col[2] > 100 { white += 1 }
+        }
+        assert!(red > 20 && blue > 20 && white == 0, "{red} {blue} {white}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_saves_the_view_in_the_background_and_shows_a_preview() {
+        let mut app = App::new(16, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.render_path = dir.join("r.png").to_string_lossy().into_owned();
+        app.workspace.bpr.samples = 1;
+        app.ask_file(file_dialog::Ask::ExportRender);
+        app.poll_render(true);
+        assert!(app.status.starts_with("Render "), "{}", app.status);
+        let img = image::open(dir.join("r.png")).unwrap();
+        let vp = app.viewport();
+        assert_eq!((img.width(), img.height()), (vp.x as u32, vp.y as u32));
+        assert!(app.workspace.render_preview.is_some() && !app.workspace.rendering);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zspheres_are_drawn_mirrored_turned_to_cubes_deleted_and_skinned() {
+        let mut app = App::new(8, false, usize::MAX);
+        app.new_zsphere();
+        let vp = app.viewport();
+        app.camera.aspect = vp.x / vp.y;
+        let screen = |app: &App, p: Vec3| {
+            let c = app.camera.view_proj() * p.extend(1.0);
+            let n = c.truncate() / c.w;
+            app.canvas_origin() + Vec2::new((n.x + 1.0) * 0.5 * vp.x, (1.0 - n.y) * 0.5 * vp.y)
+        };
+        let tree = |app: &App| app.doc.zspheres.clone().unwrap();
+        let last = |app: &App| app.history.names().0.last().cloned();
+        // Draw with X symmetry: a drag on the root's right side adds a sphere there and its
+        // mirror image on the left, as one undo step.
+        app.workspace.symmetry = true;
+        let right = screen(&app, Vec3::new(0.3, 0.1, 0.0));
+        app.cursor = right;
+        app.begin_zsphere();
+        app.cursor = right + Vec2::new(25.0, 0.0);
+        app.zsphere_move();
+        app.end_zsphere();
+        let t = tree(&app);
+        assert_eq!(t.spheres.len(), 3, "a sphere and its mirror image");
+        assert_eq!(last(&app).as_deref(), Some("Add ZSphere"));
+        let (a, b) = (t.spheres[1], t.spheres[2]);
+        assert!(a.center.x > 0.1 && (a.center.x + b.center.x).abs() < 1e-5 && a.radius == b.radius);
+        assert!(a.radius != 0.25, "the drag sized it");
+        // Shift + click turns it (and its mirror) into a cube.
+        app.modifiers = ModifiersState::SHIFT;
+        app.cursor = screen(&app, a.center);
+        app.begin_zsphere();
+        let t = tree(&app);
+        assert_eq!((t.spheres[1].roundness, t.spheres[2].roundness), (0.0, 0.0));
+        // Alt + click deletes both.
+        app.modifiers = ModifiersState::ALT;
+        app.cursor = screen(&app, t.spheres[1].center);
+        app.begin_zsphere();
+        app.modifiers = ModifiersState::empty();
+        assert_eq!(tree(&app).spheres.len(), 1);
+        // Undo brings them back, cubes still.
+        app.history_jump(-1);
+        assert_eq!(tree(&app).spheres.len(), 3);
+        assert_eq!(tree(&app).spheres[1].roundness, 0.0);
+        // The skin is a new subtool; the ZSpheres stay.
+        let tools = app.subtools.len();
+        app.make_adaptive_skin();
+        assert_eq!(app.subtools.len(), tools + 1);
+        assert!(app.doc.zspheres.is_none() && crate::wedge::closed(app.doc.mesh()));
+    }
+
+    #[test]
+    fn d_turns_dynamic_subdivision_on_and_apply_makes_it_real() {
+        let mut app = App::new(4, false, usize::MAX);
+        let tris = app.doc.mesh().triangle_count();
+        app.on_key(KeyCode::KeyD);
+        assert_eq!(app.subtools[app.active_tool].dynamic, Some(dynamic::Settings::default()));
+        // Smooth steps alone become real levels.
+        app.workspace.dynamic_subdiv = app.subtools[app.active_tool].dynamic;
+        app.dynamic_apply_now();
+        assert_eq!(app.doc.count(), 3);
+        assert_eq!(app.subtools[app.active_tool].dynamic, None);
+        // With QGrid the preview becomes new topology, one undo step.
+        let mut app = App::new(4, false, usize::MAX);
+        app.subtools[app.active_tool].dynamic = Some(dynamic::Settings { smooth: 1, qgrid: 1, ..Default::default() });
+        app.dynamic_apply_now();
+        assert_eq!((app.doc.count(), app.doc.mesh().triangle_count()), (1, tris * 16));
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().triangle_count(), tris);
+        // Shift + D turns it off.
+        app.on_key(KeyCode::KeyD);
+        app.modifiers = ModifiersState::SHIFT;
+        app.on_key(KeyCode::KeyD);
+        assert_eq!(app.subtools[app.active_tool].dynamic, None);
+    }
+
+    #[test]
+    fn smart_resym_and_polish_by_features_are_one_undo_step_each() {
+        let mut app = App::new(24, false, usize::MAX);
+        app.deform(Deform::OffsetX, 30.0);
+        let before = app.doc.mesh().positions.clone();
+        app.smart_resym_now();
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Smart ReSym"));
+        let after = app.doc.mesh().positions.clone();
+        assert!(after.iter().all(|p| p.x >= -1e-4) || after != before, "{}", app.status);
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().positions, before);
+        app.deform(Deform::PolishFeatures, 50.0);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Polish by Features"));
     }
 
     #[test]

@@ -920,6 +920,24 @@ pub struct Actions {
     pub del_hidden: bool,
     pub close_holes: bool,
     pub mirror_weld: bool,
+    /// Deformation › Smart ReSym.
+    pub smart_resym: bool,
+    /// Geometry › Dynamic Subdiv › Apply.
+    pub dynamic_apply: bool,
+    /// Geometry › Panel Loops.
+    pub panel_loops: bool,
+    /// Spotlight › Load Image.
+    pub spotlight_load: bool,
+    /// Geometry › FiberMesh › Accept.
+    pub fiber_accept: bool,
+    /// Geometry › Dynamics › Run Simulation.
+    pub simulate: bool,
+    /// Document › Render › Render, Turntable.
+    pub render: bool,
+    pub turntable: bool,
+    /// Tool › ZSphere › New ZSphere, Make Adaptive Skin.
+    pub new_zsphere: bool,
+    pub adaptive_skin: bool,
     /// Gizmo 3D: to the unmasked centre, or back to the subtool centre and world axes.
     pub gizmo_center: bool,
     pub gizmo_reset: bool,
@@ -1044,6 +1062,8 @@ pub struct Workspace {
     pub symmetry: bool,
     /// Symmetry › Y and Z mirrors, and Radial (axis, count).
     pub symmetry_y: bool,
+    /// Deformation › Smart ReSym copies the negative side onto the positive one.
+    pub resym_from_negative: bool,
     pub symmetry_z: bool,
     pub radial: bool,
     pub radial_axis: crate::symmetry::Axis,
@@ -1084,6 +1104,34 @@ pub struct Workspace {
     /// unwrap that made it when known.
     pub uv_info: Option<(usize, Option<crate::uv::Stats>)>,
     uv_texture: Option<(u64, egui::TextureHandle)>,
+    /// The active subtool's Dynamic Subdivision settings while it is on; the app copies
+    /// them in before the interface and back out after.
+    pub dynamic_subdiv: Option<crate::dynamic::Settings>,
+    /// Geometry › Panel Loops settings.
+    pub panel: crate::panel::Settings,
+    /// Geometry › Dynamics settings, and whether a simulation runs (set by the app).
+    pub dynamics: crate::dynamics::Settings,
+    pub simulating: bool,
+    /// Geometry › FiberMesh settings, and whether the fibres are previewed.
+    pub fiber: crate::fiber::Settings,
+    pub fiber_preview: bool,
+    /// Spotlight: the picture over the canvas, and its texture once uploaded.
+    pub spotlight: Option<crate::spotlight::Spotlight>,
+    spotlight_texture: Option<(u64, egui::TextureHandle)>,
+    /// Document › Render settings, turntable frames, and the last render as a picture (a
+    /// key, a caption, size and RGBA pixels), set by the app.
+    pub bpr: crate::bpr::Settings,
+    pub turntable_frames: u32,
+    pub render_preview: Option<(u64, String, [usize; 2], Vec<[u8; 4]>)>,
+    render_texture: Option<(u64, egui::TextureHandle)>,
+    /// Set by the app while a render or a turntable runs.
+    pub rendering: bool,
+    /// Tool › ZSphere: skin detail (voxels across the smallest sphere's radius), whether
+    /// the skin is previewed (A), and the roundness of the sphere last touched (`None`
+    /// when the active subtool is not a ZSphere); the app copies the last two in and out.
+    pub zsphere_detail: f32,
+    pub zsphere_preview: bool,
+    pub zsphere_round: Option<f32>,
     /// Geometry › Texture Maps settings.
     pub bake: crate::bake::Settings,
     /// The last baked map as a picture (a key that changes with each bake, what it was, and
@@ -1287,6 +1335,7 @@ impl Workspace {
             perspective: true,
             symmetry: false,
             symmetry_y: false,
+            resym_from_negative: false,
             symmetry_z: false,
             radial: false,
             radial_axis: crate::symmetry::Axis::Y,
@@ -1308,6 +1357,22 @@ impl Workspace {
             uv_info: None,
             uv_texture: None,
             bake: crate::bake::Settings::default(),
+            dynamic_subdiv: None,
+            panel: crate::panel::Settings::default(),
+            dynamics: crate::dynamics::Settings::default(),
+            simulating: false,
+            fiber: crate::fiber::Settings::default(),
+            fiber_preview: false,
+            spotlight: None,
+            spotlight_texture: None,
+            bpr: crate::bpr::Settings::default(),
+            turntable_frames: 120,
+            render_preview: None,
+            render_texture: None,
+            rendering: false,
+            zsphere_detail: 5.0,
+            zsphere_preview: false,
+            zsphere_round: None,
             bake_preview: None,
             bake_texture: None,
             baking: false,
@@ -2994,6 +3059,90 @@ impl Workspace {
                         note(ui, "Saves every subtool with its levels and sculpting; undo history is not saved.");
                     },
                 );
+                self.sec(ui, h, id, "spotlight", "Spotlight", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Load Image"))
+                        .on_hover_text("Lay a picture over the canvas to work from, and to paint and sculpt through (ZBrush: Spotlight)");
+                    if r.shelf(ui, "cmd:spotlight").clicked() {
+                        a.spotlight_load = true;
+                    }
+                    let mut remove = false;
+                    if let Some(sp) = ws.spotlight.as_mut() {
+                        ui.add(egui::Label::new(RichText::new(&sp.name).size(12.0).color(FG2())).truncate());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut sp.shown, "Show").on_hover_text("Show the picture (Shift + Z)");
+                            ui.checkbox(&mut sp.edit, "Edit").on_hover_text("Drag on the canvas moves the picture instead of sculpting (Z)");
+                            ui.checkbox(&mut sp.paint_through, "Paint through").on_hover_text("Polypaint takes the picture's colours and brushes its brightness as strength, where the model lies under it");
+                        });
+                        zslider(ui, "Opacity", &mut sp.place.opacity, 0.05..=1.0, false, false, 2);
+                        zslider(ui, "Scale", &mut sp.place.scale, 0.05..=4.0, true, false, 2);
+                        let mut deg = sp.place.angle.to_degrees();
+                        if zslider(ui, "Rotate", &mut deg, -180.0..=180.0, false, false, 0) {
+                            sp.place.angle = deg.to_radians();
+                        }
+                        remove = ui
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Remove").size(12.0)))
+                            .on_hover_text("Take the picture away")
+                            .clicked();
+                    } else {
+                        note(ui, "No picture · PNG, JPEG or BMP");
+                    }
+                    if remove {
+                        ws.spotlight = None;
+                    }
+                });
+                self.sec(ui, h, id, "render", "Render", None, false, true, &mut |ws, ui| {
+                    ui.add_enabled_ui(!ws.rendering, |ui| {
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                            let r = ui
+                                .add_sized([w, 20.0], egui::Button::new("Render").truncate())
+                                .on_hover_text("Draw the view again with shadows and ambient occlusion, antialiased, and save it as PNG (ZBrush: BPR) · runs in the background");
+                            if r.shelf(ui, "cmd:render").clicked() {
+                                a.render = true;
+                            }
+                            let r = ui
+                                .add_sized([w, 20.0], egui::Button::new("Turntable").truncate())
+                                .on_hover_text("Turn the view once round the model and save it as a video (MP4 with ffmpeg; PNG frames without) (ZBrush: Movie › Turntable)");
+                            if r.shelf(ui, "cmd:turntable").clicked() {
+                                a.turntable = true;
+                            }
+                        });
+                    });
+                    if let Some(i) = seg(ui, &["1×", "2×"], (ws.bpr.scale.clamp(1, 2) - 1) as usize, false) {
+                        ws.bpr.scale = i as u32 + 1;
+                    }
+                    let mut v = ws.bpr.samples as f32;
+                    if zslider(ui, "Samples", &mut v, 1.0..=4.0, false, false, 0) {
+                        ws.bpr.samples = v.round() as u32;
+                    }
+                    zslider(ui, "Shadow", &mut ws.bpr.shadow, 0.0..=1.0, false, false, 2);
+                    zslider(ui, "AO", &mut ws.bpr.ao_strength, 0.0..=1.0, false, false, 2);
+                    let mut v = ws.bpr.ao_rays as f32;
+                    if zslider(ui, "AO rays", &mut v, 0.0..=32.0, false, false, 0) {
+                        ws.bpr.ao_rays = v.round() as u32;
+                    }
+                    ui.checkbox(&mut ws.bpr.transparent, "Transparent").on_hover_text("No background: the PNG keeps only the model");
+                    let mut v = ws.turntable_frames as f32;
+                    if zslider(ui, "Turntable frames", &mut v, 24.0..=720.0, true, false, 0) {
+                        ws.turntable_frames = v.round() as u32;
+                    }
+                    match &ws.render_preview {
+                        Some((key, what, [w, h], px)) => {
+                            if ws.render_texture.as_ref().is_none_or(|t| t.0 != *key) {
+                                let image = egui::ColorImage::from_rgba_unmultiplied([*w, *h], bytemuck::cast_slice(px));
+                                ws.render_texture = Some((*key, ui.ctx().load_texture("render-preview", image, TextureOptions::LINEAR)));
+                            }
+                            let side = ui.available_width().min(260.0);
+                            if let Some((_, tex)) = &ws.render_texture {
+                                ui.add(egui::Image::new((tex.id(), vec2(side, side * *h as f32 / (*w).max(1) as f32))));
+                            }
+                            note(ui, what);
+                        }
+                        None => ws.render_texture = None,
+                    }
+                    note(ui, if ws.rendering { "Rendering… · Esc stops a turntable" } else { "Render: the view with shadows and occlusion · Turntable: 30 frames a second, Esc stops it" });
+                });
                 self.sec(
                     ui,
                     h,
@@ -3471,6 +3620,26 @@ impl Workspace {
                                 a.deform = Some((kind, v));
                             }
                         }
+                        ui.horizontal(|ui| {
+                            let axis = if ws.symmetry || !(ws.symmetry_y || ws.symmetry_z) { "X" } else if ws.symmetry_y { "Y" } else { "Z" };
+                            let from = if ws.resym_from_negative { format!("−{axis} → +{axis}") } else { format!("+{axis} → −{axis}") };
+                            let w = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                            if ui
+                                .add_sized([w, CONTROL_H], egui::Button::new("Smart ReSym").truncate())
+                                .on_hover_text("Make the shown level symmetric across the symmetry axis: each vertex on one side goes to the mirror of the other side's surface; any topology, levels kept, masks hold · one undo step")
+                                .shelf(ui, "cmd:smart-resym")
+                                .clicked()
+                            {
+                                a.smart_resym = true;
+                            }
+                            if ui
+                                .add_sized([w, CONTROL_H], egui::Button::new(RichText::new(from).size(12.0)).truncate())
+                                .on_hover_text("Which side Smart ReSym keeps")
+                                .clicked()
+                            {
+                                ws.resym_from_negative = !ws.resym_from_negative;
+                            }
+                        });
                         if ui
                             .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror And Weld"))
                             .on_hover_text("Make the subtool symmetric: the +X half mirrored onto −X and welded (no subdivision levels)")
@@ -3926,6 +4095,161 @@ impl Workspace {
                         }
                         None => note(ui, "No UVs yet · Unwrap lays out the lowest level"),
                     }
+                });
+                self.sec(ui, h, id, "zsphere", "ZSphere", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("New ZSphere"))
+                        .on_hover_text("A new subtool with one ZSphere to build an armature from (ZBrush: the ZSphere tool)");
+                    if r.shelf(ui, "cmd:new-zsphere").clicked() {
+                        a.new_zsphere = true;
+                    }
+                    if ws.zsphere_round.is_some() {
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Make Adaptive Skin"))
+                            .on_hover_text("One closed mesh around the ZSpheres, as a new subtool to sculpt");
+                        if r.shelf(ui, "cmd:adaptive-skin").clicked() {
+                            a.adaptive_skin = true;
+                        }
+                        ui.checkbox(&mut ws.zsphere_preview, "Preview skin (A)");
+                        if let Some(round) = ws.zsphere_round.as_mut() {
+                            zslider(ui, "Roundness", round, 0.0..=1.0, false, false, 2);
+                        }
+                        zslider(ui, "Skin detail", &mut ws.zsphere_detail, 2.0..=12.0, false, false, 1);
+                        note(ui, "Draw: drag on a sphere adds one · Move, Scale: drag a sphere · Alt + click deletes · Shift + click turns a sphere into a cube and back · Roundness: the sphere last touched, 1 round, 0 square; links blend between their ends");
+                    } else {
+                        note(ui, "The active subtool is not a ZSphere");
+                    }
+                });
+                self.sec(ui, h, id, "dynamicsubdiv", "Dynamic Subdiv", None, false, true, &mut |ws, ui| {
+                    let levels = m.levels.len() > 1;
+                    ui.add_enabled_ui(!levels, |ui| {
+                        let on = ws.dynamic_subdiv.is_some();
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Dynamic").selected(on))
+                            .on_hover_text("Show the model smoothly divided while you keep editing the low polygon model (D on, Shift + D off) · PolyF shows the model itself");
+                        if r.shelf(ui, "cmd:dynamic-subdiv").clicked() {
+                            ws.dynamic_subdiv = if on { None } else { Some(crate::dynamic::Settings::default()) };
+                        }
+                    });
+                    if let Some(d) = ws.dynamic_subdiv.as_mut() {
+                        let mut v = d.smooth as f32;
+                        if zslider(ui, "SmoothSubdiv", &mut v, 0.0..=4.0, false, false, 0) {
+                            d.smooth = v.round() as u8;
+                        }
+                        let mut v = d.qgrid as f32;
+                        if zslider(ui, "QGrid", &mut v, 0.0..=3.0, false, false, 0) {
+                            d.qgrid = v.round() as u8;
+                        }
+                        let mut v = d.flat as f32;
+                        if zslider(ui, "Flat Subdiv", &mut v, 0.0..=3.0, false, false, 0) {
+                            d.flat = v.round() as u8;
+                        }
+                        let mut v = d.thickness * 100.0;
+                        if zslider(ui, "Thickness %", &mut v, 0.0..=20.0, false, false, 1) {
+                            d.thickness = v / 100.0;
+                        }
+                        let after = (m.triangles as u64) << (2 * d.steps().min(15));
+                        kv(ui, "Triangles shown", &crate::fmt_count(after.min(crate::dynamic::MAX_TRIANGLES as u64) as usize));
+                        if ui
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Apply").size(12.0)))
+                            .on_hover_text("Make the preview the model: real subdivision levels with SmoothSubdiv alone, otherwise new topology · undo brings the model back")
+                            .clicked()
+                        {
+                            a.dynamic_apply = true;
+                        }
+                    }
+                    if levels {
+                        note(ui, "Needs a model without subdivision levels");
+                    } else {
+                        note(ui, "QGrid keeps polygroup borders, creases and sharp edges crisp; SmoothSubdiv then bevels them · Thickness gives an open surface a shell");
+                    }
+                });
+                self.sec(ui, h, id, "panelloops", "Panel Loops", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Panel Loops"))
+                        .on_hover_text("Make every visible polygroup a panel of its own: a slab with a rounded rim, grooves between panels (ZBrush: Geometry › EdgeLoop › Panel Loops) · one undo step");
+                    if r.shelf(ui, "cmd:panel-loops").clicked() {
+                        a.panel_loops = true;
+                    }
+                    let mut v = ws.panel.thickness * 100.0;
+                    if zslider(ui, "Thickness %", &mut v, 0.1..=10.0, true, false, 1) {
+                        ws.panel.thickness = v / 100.0;
+                    }
+                    let mut v = ws.panel.loops as f32;
+                    if zslider(ui, "Loops", &mut v, 1.0..=8.0, false, false, 0) {
+                        ws.panel.loops = v.round() as u32;
+                    }
+                    zslider(ui, "Bevel", &mut ws.panel.bevel, 0.0..=1.0, false, false, 2);
+                    zslider(ui, "Elevation", &mut ws.panel.elevation, -100.0..=100.0, false, false, 0);
+                    note(ui, "Elevation 100 grows the panels outward, −100 inward, 0 centres them · needs polygroups or open borders · no subdivision levels");
+                });
+                self.sec(ui, h, id, "dynamics", "Dynamics", None, false, true, &mut |ws, ui| {
+                    let label = if ws.simulating { "Stop" } else { "Run Simulation" };
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new(label))
+                        .on_hover_text("Simulate the shown level as cloth: it drapes under gravity over the other visible subtools and the floor; masked parts stay pinned (ZBrush: Dynamics) · one undo step · Esc stops");
+                    if r.shelf(ui, "cmd:simulate").clicked() {
+                        a.simulate = true;
+                    }
+                    let d = &mut ws.dynamics;
+                    let mut v = d.steps as f32;
+                    if zslider(ui, "Steps", &mut v, 10.0..=1000.0, true, false, 0) {
+                        d.steps = v.round() as u32;
+                    }
+                    zslider(ui, "Gravity", &mut d.gravity, 0.0..=3.0, false, false, 2);
+                    zslider(ui, "Inflate", &mut d.inflate, -1.0..=1.0, false, false, 2);
+                    zslider(ui, "Stiffness", &mut d.stiffness, 0.05..=1.0, false, false, 2);
+                    zslider(ui, "Bend", &mut d.bend, 0.0..=1.0, false, false, 2);
+                    zslider(ui, "Friction", &mut d.friction, 0.0..=1.0, false, false, 2);
+                    let mut v = d.thickness * 100.0;
+                    if zslider(ui, "Thickness %", &mut v, 0.0..=5.0, false, false, 2) {
+                        d.thickness = v / 100.0;
+                    }
+                    ui.checkbox(&mut d.floor, "Floor").on_hover_text("Collide with the floor grid (or below the lowest visible subtool)");
+                    note(ui, "Mask what should stay pinned · the other visible subtools are colliders · Inflate with no gravity puffs a model up");
+                });
+                self.sec(ui, h, id, "fibermesh", "FiberMesh", None, false, true, &mut |ws, ui| {
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                        if ui
+                            .add_sized([w, 20.0], egui::Button::new("Preview").selected(ws.fiber_preview).truncate())
+                            .on_hover_text("Show the fibres on the model as the settings change (mask where they should grow)")
+                            .clicked()
+                        {
+                            ws.fiber_preview = !ws.fiber_preview;
+                        }
+                        let r = ui
+                            .add_sized([w, 20.0], egui::Button::new("Accept").truncate())
+                            .on_hover_text("Make the fibres a subtool of their own, to groom with brushes (ZBrush: FiberMesh › Accept)");
+                        if r.shelf(ui, "cmd:fibermesh").clicked() {
+                            a.fiber_accept = true;
+                        }
+                    });
+                    let f = &mut ws.fiber;
+                    let mut v = f.count as f32;
+                    if zslider(ui, "Fibers", &mut v, 10.0..=crate::fiber::MAX_FIBERS as f32, true, false, 0) {
+                        f.count = v.round() as u32;
+                    }
+                    let mut v = f.length * 100.0;
+                    if zslider(ui, "Length %", &mut v, 1.0..=60.0, true, false, 1) {
+                        f.length = v / 100.0;
+                    }
+                    zslider(ui, "Length variation", &mut f.length_variation, 0.0..=1.0, false, false, 2);
+                    let mut v = f.segments as f32;
+                    if zslider(ui, "Segments", &mut v, 1.0..=16.0, false, false, 0) {
+                        f.segments = v.round() as u32;
+                    }
+                    zslider(ui, "Gravity", &mut f.gravity, -1.0..=1.0, false, false, 2);
+                    zslider(ui, "Curl", &mut f.curl, -2.0..=2.0, false, false, 2);
+                    zslider(ui, "Spread", &mut f.spread, 0.0..=1.0, false, false, 2);
+                    zslider(ui, "Base width", &mut f.base_width, 0.0..=0.3, false, false, 3);
+                    zslider(ui, "Tip width", &mut f.tip_width, 0.0..=0.3, false, false, 3);
+                    let mut v = f.sides as f32;
+                    if zslider(ui, "Sides", &mut v, 1.0..=8.0, false, false, 0) {
+                        let n = v.round() as u32;
+                        f.sides = if n == 2 { 3 } else { n };
+                    }
+                    note(ui, "Grows on the masked part (all of it with no mask) · Sides 1: flat ribbons · widths are shares of the length");
                 });
                 self.sec(ui, h, id, "texturemaps", "Texture Maps", None, false, true, &mut |ws, ui| {
                     use crate::bake::{Kind, Space};
@@ -4888,6 +5212,33 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if let Some(sp) = self.spotlight.as_ref().filter(|s| s.shown) {
+            // Spotlight: the picture over the canvas, under the other overlays.
+            let pic = &sp.picture;
+            if self.spotlight_texture.as_ref().is_none_or(|t| t.0 != pic.key) {
+                let image = egui::ColorImage::from_rgba_unmultiplied([pic.width as usize, pic.height as usize], bytemuck::cast_slice(&pic.rgba));
+                self.spotlight_texture = Some((pic.key, ui.ctx().load_texture("spotlight", image, TextureOptions::LINEAR)));
+            }
+            let canvas = self.canvas;
+            let size = glam::Vec2::new(canvas.width(), canvas.height());
+            let corners = sp.place.corners(glam::Vec2::new(canvas.min.x, canvas.min.y), size, pic.height as f32 / pic.width.max(1) as f32);
+            let pts: Vec<Pos2> = corners.iter().map(|c| pos2(c.x, c.y)).collect();
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("spotlight"))).with_clip_rect(canvas);
+            if let Some((_, tex)) = &self.spotlight_texture {
+                let tint = Color32::from_white_alpha((sp.place.opacity.clamp(0.0, 1.0) * 255.0) as u8);
+                let mut mesh = egui::Mesh::with_texture(tex.id());
+                for (k, uv) in [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)].into_iter().enumerate() {
+                    mesh.vertices.push(egui::epaint::Vertex { pos: pts[k], uv, color: tint });
+                }
+                mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                p.add(egui::Shape::mesh(mesh));
+            }
+            if sp.edit {
+                let mut ring = pts.clone();
+                ring.push(pts[0]);
+                p.add(egui::Shape::dashed_line(&ring, Stroke::new(1.5, Color32::from_rgb(242, 160, 64)), 6.0, 4.0));
+            }
+        }
         if !self.crease_preview.is_empty() {
             // Creased edges, with PolyF on: dashed, as ZBrush draws them.
             let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("creases"))).with_clip_rect(self.canvas);

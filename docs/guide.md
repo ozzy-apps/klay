@@ -435,6 +435,97 @@ are bent, 0 % for none) and the **Coverage** of the square. One undo step.
 
 A 120k-triangle model unwraps in under a second.
 
+### Polish by Features and Smart ReSym
+
+**Deformation › Polish by Features** polishes like Polish (evens the surface, keeps the
+volume), except that polygroup borders, creased edges and open borders only slide along
+their own line, and where lines end or meet the vertices stay put: hard-surface edges stay
+crisp while the faces between them even out.
+
+**Deformation › Smart ReSym** makes the shown level symmetric across the first symmetry
+axis that is on (X when none is). Each vertex on the replaced side moves to the mirror image
+of the nearest point of the kept side's surface facing the same way, so the two sides need
+not have matching vertices; the topology and subdivision levels stay, masks hold, and it is
+one undo step. The button next to it picks the kept side (**+X → −X** or **−X → +X**).
+
+### Dynamic Subdivision
+
+Geometry › **Dynamic Subdiv** (ZBrush's Dynamic Subdivision) shows a model without
+subdivision levels smoothly divided, while you keep editing the model itself with brushes,
+ZModeler and Transpose. **D** turns it on and **Shift + D** off (on a model with levels they
+still step through the levels); PolyF shows the model itself.
+
+- **SmoothSubdiv** (0–4): smooth steps.
+- **QGrid** (0–3): steps before them that hold polygroup borders, creases and edges
+  sharper than 40° sharp; the smooth steps then round those edges into bevels, narrower
+  with more QGrid.
+- **Flat Subdiv** (0–3): steps that divide without changing the shape.
+- **Thickness**: an open surface is shown as a shell this thick.
+
+The preview is kept under 4 million triangles and follows a stroke as you make it when it
+is small (after the stroke otherwise). **Apply** makes it the model: with SmoothSubdiv alone
+as real subdivision levels, otherwise as new topology (undo brings the model back). The
+setting is saved with the subtool.
+
+### Panel Loops
+
+Geometry › **Panel Loops** makes every visible polygroup a panel of its own: a closed slab
+with a rounded rim, so grooves run between the panels. **Thickness** (share of the model's
+size), **Loops** (rows in the rim), **Bevel** (0 square rim, 1 half round) and **Elevation**
+(100 grows the panels outward from the surface, −100 inward, 0 centres them). Hidden
+polygons stay as they are. One undo step; needs a model without subdivision levels.
+
+### ZSpheres
+
+Geometry › **ZSphere › New ZSphere** adds a subtool holding one ZSphere: an armature you
+sketch with spheres and then skin.
+
+- Draw mode: drag on a sphere to add a child sphere there, sized by how far you drag.
+  With X symmetry on, the mirror image is added too.
+- Move (W) drags a sphere, Scale (E) sizes it; **Alt + click** deletes a sphere (its
+  children move to its parent).
+- **Shift + click** turns a sphere into a cube and back, and **Roundness** sets the sphere
+  last touched anywhere between (1 round, 0 square). A cube is turned to follow its link,
+  and the shapes along a link blend between its ends, so a chain from a sphere to a cube
+  goes smoothly from round to square (a Klay addition).
+- **A** (or **Preview skin**) shows the skin in place of the spheres.
+- **Make Adaptive Skin** adds the skin as a new subtool to sculpt; the ZSpheres stay.
+  **Skin detail** sets how fine it is.
+
+The skin is the union of the spheres and of shapes placed along each link, remeshed into one
+closed, even surface and polished so the joints blend. Every edit is one undo step, and
+ZSpheres are saved in projects.
+
+### FiberMesh
+
+Geometry › **FiberMesh** grows fibres for hair, fur, grass or bristles from the masked part
+of the active subtool (all of its visible part when nothing is masked). **Preview** shows
+them on the model as you change the settings; **Accept** makes them a subtool of their own,
+to groom with brushes like any other.
+
+- **Fibers** (count), **Length %** (of the model's size) and **Length variation**.
+- **Segments** along each fibre; **Gravity** droops them (negative lifts); **Curl** turns
+  them about their root's normal; **Spread** leans them at random.
+- **Base width** and **Tip width** (shares of the length; a tip of 0 comes to a point) and
+  **Sides**: 1 gives flat ribbons, 3 to 8 closed tubes.
+
+The same settings always give the same fibres.
+
+### Dynamics
+
+Geometry › **Dynamics › Run Simulation** simulates the shown level as cloth: it falls under
+**Gravity**, drapes over the other visible subtools, and settles on the **Floor** (the floor
+grid, or under the lowest visible subtool). Masked vertices stay pinned, so mask a collar or
+an edge to hang cloth from it. The model updates as it settles; **Stop** or Esc ends it early,
+and the whole run is one undo step.
+
+- **Steps**: how long it runs. **Stiffness**: how firmly edges keep their length. **Bend**:
+  how firmly the surface resists folding. **Friction**: how much contacts stop sliding.
+- **Inflate** pushes along the normals each step (with no gravity it puffs a model up,
+  negative values shrink it). **Thickness** is the distance kept from colliders.
+
+Denser cloth folds more finely; divide a plane a couple of times before draping it.
+
 ### Texture Maps
 
 Geometry › **Texture Maps** (ZBrush: Tool › Normal Map and Displacement Map) bakes the
@@ -569,6 +660,34 @@ and **Skip this version**; **Preferences › Updates** turns checking off or che
 an update: make the repository (or a releases repository) public, tag the version (`v0.25.0`),
 and create a GitHub release with the packaged file attached (`scripts/package-linux.sh` writes
 `dist/Klay-<version>-<arch>.AppDir.tar.gz`).
+
+### Render and Turntable
+
+Document › **Render** (ZBrush: BPR) draws the view again by ray tracing, with what the
+viewport leaves out: shadows the model casts on itself and on other subtools, and ambient
+occlusion in its creases. It is antialiased, uses the material and polypaint as shown, and
+is saved as a PNG you pick, in the background; the section shows the last render.
+
+- **1× / 2×** the canvas size; **Samples** per pixel side (1–4); **Shadow** and **AO**
+  strength and **AO rays** (more is smoother and slower); **Transparent** leaves out the
+  background.
+
+**Turntable** turns the view once round the model and saves it as an MP4 (30 frames a second,
+**Turntable frames** long) through ffmpeg when it is installed, or as numbered PNG frames in
+a folder beside the file without it (as in the Flatpak). The view comes back where it was;
+Esc stops early. `--render PATH`, `--turntable PATH` and `--turntable-frames N` at startup.
+
+### Spotlight
+
+Document › **Spotlight › Load Image** lays a picture (PNG, JPEG, BMP) over the canvas, to
+work from as a reference and to paint and sculpt through. **Opacity**, **Scale** and **Rotate**
+place it; **Z** (or **Edit**) makes a drag on the canvas move it instead of sculpting, and
+**Shift + Z** (or **Show**) hides it.
+
+With **Paint through** on, strokes read the picture where the model lies under it: polypaint
+takes its colours (Paint brush with RGB), and sculpting brushes its brightness as strength,
+so a photo goes onto the model as seen, or a pattern presses into it. Off the picture,
+brushes do nothing. The picture is not saved with the project.
 
 ### Canvas and Document
 

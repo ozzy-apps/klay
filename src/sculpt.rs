@@ -849,10 +849,12 @@ pub struct StampSettings {
     /// Stroke › Alpha rotation and its angle (degrees).
     pub turn: AlphaTurn,
     pub angle: f32,
+    /// Texture › Spotlight with Paint through: the picture the stroke reads.
+    pub spotlight: Option<std::sync::Arc<crate::spotlight::Projector>>,
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0,spotlight:None}}
 }
 
 impl StampSettings {
@@ -1084,7 +1086,9 @@ impl Stroke {
     /// Alpha and texture at `p`, a vertex of symmetry copy `k` of `images`, for a dab at
     /// `hit` with `normal` in the brush's own frame (so every copy shows the same stamp).
     fn stamp_weight(&self,images:&Images,k:usize,p:Vec3,hit:Vec3,normal:Vec3,r:f32)->f32 {
-        if self.assets.alpha==Pattern::Off && self.assets.texture==Pattern::Off {return 1.0;}
+        // Spotlight: the picture's brightness where the point lands on screen.
+        let spot=self.assets.spotlight.as_ref().map_or(1.0,|s|s.strength(p));
+        if self.assets.alpha==Pattern::Off && self.assets.texture==Pattern::Off {return spot;}
         let p=images.unmap(k,p);
         let (u,v)=self.frame(normal);
         let delta=p-hit;
@@ -1092,7 +1096,7 @@ impl Stroke {
         let a=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
         let t=self.assets.texture.sample(self.assets.texture_uv(uv),true);
         let h=t.truncate().dot(Vec3::new(0.2126,0.7152,0.0722))*t.w;
-        a*(1.0-self.assets.texture_strength+h*self.assets.texture_strength)
+        spot*a*(1.0-self.assets.texture_strength+h*self.assets.texture_strength)
     }
 
     /// Polypaint under a dab at `hit` with `normal` in the brush's own frame. Vertex `i`
@@ -1108,8 +1112,12 @@ impl Stroke {
             let delta=p-hit;
             let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*brush.radius)+glam::Vec2::splat(0.5);
             let tex=self.assets.texture.sample(self.assets.texture_uv(uv),true);
-            let rgb=base*tex.truncate();
-            let weight=focal_falloff(sel.dist[i],brush.radius,brush.focal_shift)
+            // Spotlight: the picture's colour where the vertex lands on screen, none off it.
+            let (rgb,cover)=match &self.assets.spotlight {
+                Some(s)=>s.sample(mesh.positions[vert as usize]).map_or((base,0.0),|c|(Vec3::new(c[0],c[1],c[2])*tex.truncate(),c[3])),
+                None=>(base*tex.truncate(),1.0),
+            };
+            let weight=cover*focal_falloff(sel.dist[i],brush.radius,brush.focal_shift)
                 *if self.assets.alpha==Pattern::Off{1.0}else{self.assets.alpha.alpha(uv)}
                 *crate::mask::freedom(&mesh.mask,vert)*tex.w*brush.rgb_intensity*0.35*auto.map_or(1.0,|a|a[i]);
             crate::paint::blend(crate::paint::at(mesh,vert as usize),rgb.to_array(),weight)

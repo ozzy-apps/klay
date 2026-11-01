@@ -28,6 +28,12 @@ pub enum Ask {
     ExportNormalMap,
     /// Geometry › Texture Maps › Displacement, as EXR or PNG.
     ExportDisplacementMap,
+    /// Spotlight › Load Image.
+    OpenSpotlight,
+    /// Document › Render › Render.
+    ExportRender,
+    /// Document › Render › Turntable.
+    ExportTurntable,
 }
 
 impl Ask {
@@ -43,6 +49,9 @@ impl Ask {
             Ask::ImportMesh => "Import OBJ or STL",
             Ask::ExportNormalMap => "Save Normal Map",
             Ask::ExportDisplacementMap => "Save Displacement Map",
+            Ask::ExportRender => "Save Render",
+            Ask::OpenSpotlight => "Spotlight Image",
+            Ask::ExportTurntable => "Save Turntable",
         }
     }
 
@@ -59,7 +68,9 @@ impl Ask {
             Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
             Ask::ExportStl => &["stl"],
             Ask::ImportMesh => &["obj", "stl"],
-            Ask::ExportNormalMap => &["png"],
+            Ask::ExportNormalMap | Ask::ExportRender => &["png"],
+            Ask::ExportTurntable => &["mp4"],
+            Ask::OpenSpotlight => &["png", "jpg", "jpeg", "bmp"],
             Ask::ExportDisplacementMap => &["exr", "png"],
         }
     }
@@ -72,6 +83,8 @@ impl Ask {
             ["stl"] => "STL",
             ["png"] => "PNG image",
             ["exr", "png"] => "OpenEXR or PNG image",
+            ["mp4"] => "MP4 video",
+            ["png", "jpg", "jpeg", "bmp"] => "Images (PNG, JPEG, BMP)",
             _ => "Meshes (OBJ, STL)",
         }
     }
@@ -79,7 +92,7 @@ impl Ask {
     pub fn saves(self) -> bool {
         matches!(
             self,
-            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap
+            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportRender | Ask::ExportTurntable
         )
     }
 

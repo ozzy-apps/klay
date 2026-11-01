@@ -37,6 +37,19 @@ pub fn shaped(mesh: &SculptMesh, kind: Deform, value: f32) -> Option<Vec<Vec3>> 
             }
             p
         }
+        Deform::PolishFeatures => {
+            // Polish, with the vertices on feature lines (polygroup borders, creases, open
+            // borders) relaxed only along their line, and the ends and corners of the lines
+            // held: the features stay crisp while the surface between them evens out.
+            let lines = feature_neighbours(mesh);
+            let passes = (t.abs() * 10.0).ceil() as usize;
+            let mut p = mesh.positions.clone();
+            for _ in 0..passes {
+                p = relax_along(mesh, &lines, &p, 0.5);
+                p = relax_along(mesh, &lines, &p, -0.53);
+            }
+            p
+        }
         Deform::Inflate => {
             let amount = t * extent * 0.05;
             (0..mesh.vertex_count() as u32).into_par_iter().map(|v| mesh.positions[v as usize] + mesh.normal_at(v) * amount).collect()
@@ -84,7 +97,12 @@ pub fn shaped(mesh: &SculptMesh, kind: Deform, value: f32) -> Option<Vec<Vec3>> 
             .collect(),
         Deform::OffsetX | Deform::OffsetY | Deform::OffsetZ | Deform::Size => unreachable!(),
     };
-    // Masks hold vertices back; hidden-only vertices stay.
+    held(mesh, moved)
+}
+
+/// `moved` with masks holding vertices back and hidden-only vertices staying, or `None`
+/// when nothing moves.
+fn held(mesh: &SculptMesh, moved: Vec<Vec3>) -> Option<Vec<Vec3>> {
     let out: Vec<Vec3> = (0..mesh.vertex_count())
         .into_par_iter()
         .map(|v| {
@@ -113,6 +131,94 @@ fn relax(mesh: &SculptMesh, p: &[Vec3], k: f32) -> Vec<Vec3> {
             own + (mean - own) * k
         })
         .collect()
+}
+
+/// Per vertex, its neighbours along feature lines (polygroup borders, creased edges, open
+/// borders); `None` for a vertex off every line.
+fn feature_neighbours(mesh: &SculptMesh) -> Vec<Option<Vec<u32>>> {
+    let creased = mesh.crease_edges();
+    let mut out: Vec<Option<Vec<u32>>> = vec![None; mesh.vertex_count()];
+    for (a, b, t, u) in crate::crease::edges(mesh) {
+        let feature = u == u32::MAX || mesh.group(t) != mesh.group(u) || creased.binary_search(&(a, b)).is_ok();
+        if feature {
+            out[a as usize].get_or_insert_with(Vec::new).push(b);
+            out[b as usize].get_or_insert_with(Vec::new).push(a);
+        }
+    }
+    out
+}
+
+/// [`relax`], except that a vertex on two feature lines' edges moves toward the mean of
+/// those two neighbours only, and one at a line's end or where lines meet stays.
+fn relax_along(mesh: &SculptMesh, lines: &[Option<Vec<u32>>], p: &[Vec3], k: f32) -> Vec<Vec3> {
+    (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            let own = p[v as usize];
+            let nb: &[u32] = match &lines[v as usize] {
+                None => mesh.neighbors(v),
+                Some(l) if l.len() == 2 => l,
+                Some(_) => return own,
+            };
+            if nb.is_empty() {
+                return own;
+            }
+            let mean = nb.iter().map(|&n| p[n as usize]).sum::<Vec3>() / nb.len() as f32;
+            own + (mean - own) * k
+        })
+        .collect()
+}
+
+/// Deformation › Smart ReSym (ZBrush): make the shown level symmetric across the plane
+/// through the origin perpendicular to `axis` (0 X, 1 Y, 2 Z), the positive side copied
+/// onto the negative one (the other way with `from_negative`). Each vertex on the side
+/// being replaced goes to the mirror image of the nearest point of the other side's
+/// surface facing the same way, so the two sides need not have matching vertices, and the
+/// topology does not change. Vertices on the plane stay on it. Masks hold, as with the other
+/// deformations.
+pub fn smart_resym(mesh: &SculptMesh, axis: usize, from_negative: bool) -> Option<Vec<Vec3>> {
+    let sign = if from_negative { -1.0 } else { 1.0 };
+    let mirror = |mut q: Vec3| {
+        q[axis] = -q[axis];
+        q
+    };
+    let (lo, hi) = mesh
+        .positions
+        .par_iter()
+        .fold(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &p| (a.min(p), b.max(p)))
+        .reduce(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |x, y| (x.0.min(y.0), x.1.max(y.1)));
+    let tol = (hi - lo).max_element().max(1e-6) * 1e-5;
+    // The kept side: triangles whose centre is on it (or on the plane).
+    let p = &mesh.positions;
+    let tri: Vec<[u32; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .filter(|t| (p[t[0] as usize][axis] + p[t[1] as usize][axis] + p[t[2] as usize][axis]) * sign >= -3.0 * tol)
+        .map(|t| [t[0], t[1], t[2]])
+        .collect();
+    if tri.is_empty() {
+        return None;
+    }
+    let kept = crate::project_all::Sources::from_triangles(p.clone(), tri);
+    let moved: Vec<Vec3> = (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            let q = p[v as usize];
+            let side = q[axis] * sign;
+            if side > tol {
+                return q;
+            }
+            if side >= -tol {
+                let mut on = q;
+                on[axis] = 0.0;
+                return on;
+            }
+            let image = mirror(q);
+            let facing = mirror(mesh.normal_at(v));
+            kept.closest(image, facing).or_else(|| kept.closest(image, Vec3::ZERO)).map_or(q, |(x, _)| mirror(x))
+        })
+        .collect();
+    held(mesh, moved)
 }
 
 /// Smooth value noise in -1..1.
@@ -189,5 +295,73 @@ mod tests {
         assert!(tapered[ring].truncate().length() > m.positions[ring].truncate().length());
         // Noise is deterministic.
         assert_eq!(shaped(&m, Deform::Noise, 40.0), shaped(&m, Deform::Noise, 40.0));
+    }
+
+    /// A cube with one polygroup per face.
+    fn grouped_cube() -> SculptMesh {
+        let (p, i) = crate::primitive::box_surface([6; 3], |p| p);
+        let mut m = SculptMesh::from_raw(p, i);
+        let groups: Vec<u16> = m
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let c = (m.positions[t[0] as usize] + m.positions[t[1] as usize] + m.positions[t[2] as usize]) / 3.0;
+                let a = c.abs();
+                let axis = if a.x >= a.y && a.x >= a.z { 0 } else if a.y >= a.z { 1 } else { 2 };
+                (2 * axis + (c[axis] > 0.0) as usize) as u16
+            })
+            .collect();
+        m.set_groups(groups);
+        m
+    }
+
+    #[test]
+    fn polish_by_features_keeps_group_borders_and_corners_crisp() {
+        let m = grouped_cube();
+        let half = m.positions.iter().map(|p| p.x.abs()).fold(0.0, f32::max);
+        let on_edge = |p: Vec3| [p.x, p.y, p.z].iter().filter(|c| (c.abs() - half).abs() < 1e-5).count() >= 2;
+        let corner = |p: Vec3| [p.x, p.y, p.z].iter().all(|c| (c.abs() - half).abs() < 1e-5);
+        let out = shaped(&m, Deform::PolishFeatures, 100.0).unwrap();
+        for (a, b) in m.positions.iter().zip(&out) {
+            if corner(*a) {
+                assert!(a.distance(*b) < 1e-6, "a corner moved");
+            } else if on_edge(*a) {
+                assert!(on_edge(*b), "an edge vertex left its edge: {a} -> {b}");
+            }
+        }
+        // Plain Polish rounds the same cube's corners off.
+        let plain = shaped(&m, Deform::Polish, 100.0).unwrap();
+        assert!(m.positions.iter().zip(&plain).any(|(a, b)| corner(*a) && a.distance(*b) > 0.01));
+    }
+
+    #[test]
+    fn smart_resym_mirrors_one_side_onto_the_other_without_matching_vertices() {
+        // A sphere turned a little, so no vertex has a mirror partner, with a bump on +X only.
+        let mut m = sphere();
+        let turn = glam::Quat::from_rotation_y(0.21) * glam::Quat::from_rotation_z(0.13);
+        let bumped: Vec<Vec3> = m.positions.iter().map(|&p| {
+            let p = turn * p;
+            p * (1.0 + 0.2 * (-(p - Vec3::new(0.8, 0.3, 0.3)).length_squared() * 12.0).exp())
+        }).collect();
+        m.positions = bumped;
+        let out = smart_resym(&m, 0, false).unwrap();
+        // The +X side is untouched; every −X vertex lies on the mirror of the +X surface.
+        let kept: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        let surface = crate::project_all::Sources::from_triangles(m.positions.clone(), kept);
+        for (a, b) in m.positions.iter().zip(&out) {
+            if a.x > 1e-4 {
+                assert_eq!(a, b);
+            } else {
+                let image = Vec3::new(-b.x, b.y, b.z);
+                let (x, _) = surface.closest(image, Vec3::ZERO).unwrap();
+                assert!(x.distance(image) < 1e-4, "{a} -> {b}, {}", x.distance(image));
+            }
+        }
+        // The bump now shows on −X too.
+        let r = |p: &[Vec3]| p.iter().filter(|q| q.x < -0.5).map(|q| q.length()).fold(0.0, f32::max);
+        assert!(r(&out) > r(&m.positions) + 0.1, "{} {}", r(&out), r(&m.positions));
+        // From −X instead keeps −X.
+        let back = smart_resym(&m, 0, true).unwrap();
+        assert!(m.positions.iter().zip(&back).all(|(a, b)| a.x > -1e-4 || a == b));
     }
 }

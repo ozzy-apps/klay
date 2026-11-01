@@ -807,6 +807,22 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     )
 }
 
+/// One Loop subdivision of `mesh` as a mesh of its own (Dynamic Subdivision). With `flat`
+/// the new vertices stay on the old triangles: corners in place, new ones at the edges'
+/// midpoints. Polygroups, hidden polygons and creases are carried.
+pub fn divided(mesh: &SculptMesh, flat: bool) -> SculptMesh {
+    let (mut child, link) = subdivide(mesh);
+    if flat {
+        let p = &mesh.positions;
+        child.positions = link
+            .stencil
+            .par_iter()
+            .map(|s| if s[1] == NONE { p[s[0] as usize] } else { (p[s[0] as usize] + p[s[1] as usize]) * 0.5 })
+            .collect();
+    }
+    child
+}
+
 /// Lossless compact form of a level stack, kept for a parked subtool: the base mesh in chunk
 /// order, and for each level above it the labels that replay its subdivision plus the
 /// offsets of the chunks that were ever sculpted at that level. Adjacency, stencils and the
@@ -833,6 +849,8 @@ pub struct Packed {
     creases: Vec<Vec<u32>>,
     /// The frozen stack (see [`Multires::frozen`]).
     frozen: Option<Box<Packed>>,
+    /// The ZSphere tree (see [`Multires::zspheres`]).
+    zspheres: Option<crate::zsphere::Tree>,
 }
 
 /// The creased triangles of `mesh` as `triangle << 3 | bits`, in triangle order.
@@ -986,6 +1004,56 @@ impl Packed {
         f.read_uvs(input)?;
         f.read_creases(input)?;
         self.frozen = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// The ZSphere tree, if this is a ZSphere subtool.
+    #[cfg(test)]
+    pub fn zspheres(&self) -> Option<&crate::zsphere::Tree> {
+        self.zspheres.as_ref()
+    }
+
+    /// Write the ZSphere tree: u8 0, or 1 · centres (u64 count + 3 f32 each) · radii
+    /// (u64 count + f32 each) · parents (u64 count + u32 each, `u32::MAX` for the root) ·
+    /// roundness (u64 count + f32 each, 1 a sphere, 0 a cube).
+    pub fn write_zspheres<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        match &self.zspheres {
+            None => out.u8(0),
+            Some(t) => {
+                out.u8(1)?;
+                out.slice(&t.spheres.iter().map(|z| z.center).collect::<Vec<_>>())?;
+                out.slice(&t.spheres.iter().map(|z| z.radius).collect::<Vec<_>>())?;
+                out.slice(&t.spheres.iter().map(|z| z.parent).collect::<Vec<_>>())?;
+                out.slice(&t.spheres.iter().map(|z| z.roundness).collect::<Vec<_>>())
+            }
+        }
+    }
+
+    /// Read what [`write_zspheres`](Self::write_zspheres) wrote, checking that the parents
+    /// form a tree.
+    pub fn read_zspheres<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+        if input.u8()? == 0 {
+            return Ok(());
+        }
+        let centers: Vec<Vec3> = input.vec()?;
+        let radii: Vec<f32> = input.vec()?;
+        let parents: Vec<u32> = input.vec()?;
+        let roundness: Vec<f32> = input.vec()?;
+        let n = centers.len();
+        let roots = parents.iter().filter(|&&p| p == u32::MAX).count();
+        // Parents come before their children, as spheres are added.
+        let ordered = parents.iter().enumerate().all(|(i, &p)| p == u32::MAX || (p as usize) < i);
+        if n == 0 || radii.len() != n || parents.len() != n || roundness.len() != n || roots != 1 || !ordered || radii.iter().any(|r| !r.is_finite() || *r <= 0.0) || centers.iter().any(|c| !c.is_finite()) {
+            return Err("the ZSpheres are not a tree".into());
+        }
+        self.zspheres = Some(crate::zsphere::Tree {
+            spheres: (0..n).map(|i| crate::zsphere::ZSphere {
+                center: centers[i],
+                radius: radii[i],
+                parent: parents[i],
+                roundness: if roundness[i].is_finite() { roundness[i].clamp(0.0, 1.0) } else { 1.0 },
+            }).collect(),
+        });
         Ok(())
     }
 
@@ -1154,6 +1222,7 @@ impl Packed {
             uvs: Vec::new(),
             creases: Vec::new(),
             frozen: None,
+            zspheres: None,
         })
     }
 
@@ -1191,6 +1260,7 @@ impl Packed {
             colors,
             creases,
             frozen,
+            zspheres,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
@@ -1266,6 +1336,7 @@ impl Packed {
             layers: crate::layers::Layers::default(),
             uvs,
             frozen,
+            zspheres,
         })
     }
 }
@@ -1374,6 +1445,9 @@ pub struct Multires {
     /// Freeze SubDivision Levels: the whole stack as it was when frozen, kept while this one
     /// is edited at its lowest level (even its topology), to be brought back by Unfreeze.
     pub frozen: Option<Box<Packed>>,
+    /// ZSpheres: the sphere tree this subtool is built from, its mesh being the spheres and
+    /// their links as drawn (see [`crate::zsphere`]). `None` for an ordinary subtool.
+    pub zspheres: Option<crate::zsphere::Tree>,
 }
 
 fn next_generation() -> u64 {
@@ -1391,6 +1465,7 @@ impl Multires {
             layers: crate::layers::Layers::default(),
             uvs: Vec::new(),
             frozen: None,
+            zspheres: None,
         }
     }
 
@@ -1576,6 +1651,7 @@ impl Multires {
             layers: crate::layers::Layers::default(),
             uvs: Vec::new(),
             frozen: self.frozen.clone(),
+            zspheres: self.zspheres.clone(),
         };
         let not_same = || "the rebuilt levels do not match the old ones".to_string();
         // Each old level k becomes new level k + 1: `map` takes its vertices there.
@@ -2254,6 +2330,7 @@ impl Multires {
             budget,
             uvs,
             frozen,
+            zspheres,
             ..
         } = self;
         let mut it = levels.into_iter();
@@ -2282,6 +2359,7 @@ impl Multires {
             uvs,
             creases,
             frozen,
+            zspheres,
         }
     }
 
@@ -2316,6 +2394,7 @@ impl Multires {
             uvs: self.uvs.clone(),
             creases: self.crease_lists(),
             frozen: self.frozen.clone(),
+            zspheres: self.zspheres.clone(),
         }
     }
 

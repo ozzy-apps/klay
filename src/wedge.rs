@@ -1178,7 +1178,7 @@ fn snap_borders(mesh: &SculptMesh, positions: &mut [Vec3], quads: &[([u32; 4], u
 }
 
 /// Closest point to `p` on triangle `abc` (Ericson, Real-Time Collision Detection).
-fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+pub(crate) fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     let (ab, ac, ap) = (b - a, c - a, p - a);
     let (d1, d2) = (ab.dot(ap), ac.dot(ap));
     if d1 <= 0.0 && d2 <= 0.0 {

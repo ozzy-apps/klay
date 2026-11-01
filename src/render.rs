@@ -3,6 +3,11 @@
 
 use crate::mesh::SculptMesh;
 use crate::multires::StandIn;
+
+/// The stand-in key of the active subtool's Dynamic Subdivision preview.
+pub const DYNAMIC_KEY: u64 = u64::MAX;
+/// The stand-in key of the FiberMesh preview, drawn with the active subtool.
+pub const FIBER_KEY: u64 = u64::MAX - 1;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -414,6 +419,11 @@ pub struct Gfx {
     pick_readback: wgpu::Buffer,
     /// Parked subtools, by subtool id.
     stand_ins: HashMap<u64, StandInBuffers>,
+    /// Dynamic Subdivision: the active subtool is drawn as the stand-in under
+    /// [`DYNAMIC_KEY`] instead of its own level.
+    pub dynamic: bool,
+    /// FiberMesh: the stand-in under [`FIBER_KEY`] is drawn with the active subtool.
+    pub fibers: bool,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     mask_bgl: wgpu::BindGroupLayout,
@@ -1238,6 +1248,8 @@ impl Gfx {
             pick_target: None,
             pick_readback,
             stand_ins: HashMap::new(),
+            dynamic: false,
+            fibers: false,
             bind_group,
             mask_bgl,
             no_mask,
@@ -2607,7 +2619,7 @@ impl Gfx {
             && self.active_buffers().is_some();
         // Points stand in for triangles only where shading needs nothing per triangle:
         // not with polygroups shown or Live Boolean, which cuts per fragment.
-        let splat_on = cull_on && self.splatting && self.splat_pipeline.is_some() && !groups_on && self.bool_count == 0;
+        let splat_on = cull_on && !self.dynamic && self.splatting && self.splat_pipeline.is_some() && !groups_on && self.bool_count == 0;
         let (fw, fh) = (self.config.width, self.config.height);
         if splat_on && self.splat_keys.as_ref().is_none_or(|k| (k.1, k.2) != (fw, fh)) {
             let keys = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2755,7 +2767,7 @@ impl Gfx {
                 pass.set_bind_group(3, bg, &[]);
                 pass.draw(0..3, 0..1);
             }
-            if let Some(m) = self.active_buffers() {
+            if let Some(m) = self.active_buffers().filter(|_| !self.dynamic) {
                 match (&self.group_pipeline, &m.groups, polyframe) {
                     (Some((pipeline, bool_pipeline)), Some(g), true) => {
                         pass.set_pipeline(if boolean { bool_pipeline } else { pipeline });
@@ -2790,6 +2802,21 @@ impl Gfx {
                     // Boolean, 1 + its operand slot).
                     pass.draw_indexed(0..s.index_count, 0, instance..instance + 1);
                 }
+            }
+            if let Some(s) = self.stand_ins.get(&FIBER_KEY).filter(|_| self.fibers) {
+                pass.set_vertex_buffer(0, s.positions.slice(..));
+                pass.set_vertex_buffer(1, s.normals.slice(..));
+                pass.set_vertex_buffer(2, s.colors.slice(..));
+                pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..s.index_count, 0, 0..1);
+            }
+            if let Some(s) = self.stand_ins.get(&DYNAMIC_KEY).filter(|_| self.dynamic) {
+                // Instance 0: drawn as the active subtool.
+                pass.set_vertex_buffer(0, s.positions.slice(..));
+                pass.set_vertex_buffer(1, s.normals.slice(..));
+                pass.set_vertex_buffer(2, s.colors.slice(..));
+                pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..s.index_count, 0, 0..1);
             }
         }
 

@@ -19,6 +19,9 @@
 //!                level, base first, the creased triangles as u32 `triangle << 3 | bits`
 //!              · (version 9 on) Freeze SubDivision Levels: u8 0, or 1 and the frozen stack
 //!                laid out as above from the packed stack to its creases
+//!              · (version 10 on) Dynamic Subdivision: u8 0, or 1 · smooth, flat and QGrid
+//!                steps u8 each · thickness f32; then ZSpheres: u8 0, or 1 · centres ·
+//!                radii · parents · roundness (see `Packed::write_zspheres`)
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -38,9 +41,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
+/// 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
 /// polygroups and hidden triangles; 2: mask. Every older version still opens.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -53,6 +56,8 @@ pub struct SavedTool {
     pub morph: Option<(usize, Vec<glam::Vec3>)>,
     /// How it joins the subtools above it (version 6; Add before).
     pub boolean: crate::boolean::BoolOp,
+    /// Dynamic Subdivision while it is on (version 10).
+    pub dynamic: Option<crate::dynamic::Settings>,
 }
 
 /// What a subtool has besides its stack (version 5): layers and a Morph Target.
@@ -61,6 +66,7 @@ pub struct Extras<'a> {
     pub layers: Option<&'a crate::layers::Layers>,
     pub morph: Option<(usize, &'a [glam::Vec3])>,
     pub boolean: crate::boolean::BoolOp,
+    pub dynamic: Option<crate::dynamic::Settings>,
 }
 
 pub struct Project {
@@ -246,6 +252,19 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
         if version >= 9 {
             packed.write_frozen(&mut out)?;
         }
+        if version >= 10 {
+            match extras.get(k).and_then(|e| e.dynamic) {
+                Some(d) => {
+                    out.u8(1)?;
+                    out.u8(d.smooth)?;
+                    out.u8(d.flat)?;
+                    out.u8(d.qgrid)?;
+                    out.u32(d.thickness.to_bits())?;
+                }
+                None => out.u8(0)?,
+            }
+            packed.write_zspheres(&mut out)?;
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -323,6 +342,17 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         if version >= 9 {
             packed.read_frozen(&mut input)?;
         }
+        let dynamic = if version >= 10 && input.u8()? != 0 {
+            let (smooth, flat, qgrid) = (input.u8()?.min(4), input.u8()?.min(3), input.u8()?.min(3));
+            let thickness = f32::from_bits(input.u32()?);
+            let thickness = if thickness.is_finite() { thickness.clamp(0.0, 1.0) } else { 0.0 };
+            Some(crate::dynamic::Settings { smooth, flat, qgrid, thickness })
+        } else {
+            None
+        };
+        if version >= 10 {
+            packed.read_zspheres(&mut input)?;
+        }
         tools.push(SavedTool {
             name,
             visible,
@@ -330,6 +360,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
             layers,
             morph,
             boolean,
+            dynamic,
         });
     }
     input.exact(END, "end of project marker")?;
@@ -535,11 +566,47 @@ mod tests {
         wrong.set_uvs(vec![[glam::Vec2::ZERO; 3]; m]);
         let mut bytes = bytes_of(&[("Wrong", true, &wrong.pack_copy())], 0);
         // The UV count is the u64 right before the UV data, which the crease count (a u32,
-        // 0) and the frozen flag (a u8, 0) follow at the end of the subtool.
-        let at = bytes.len() - END.len() - 1 - 4 - m * 24 - 8;
+        // 0), the frozen flag (a u8, 0) and the Dynamic Subdivision and ZSphere flags (a u8,
+        // 0, each) follow at the end of the subtool.
+        let at = bytes.len() - END.len() - 1 - 1 - 1 - 4 - m * 24 - 8;
         assert_eq!(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()), m as u64);
         bytes.drain(at + 8..at + 8 + 24);
         bytes[at..at + 8].copy_from_slice(&((m - 1) as u64).to_le_bytes());
+        assert!(read_from(&bytes[..], bytes.len() as u64).is_err());
+    }
+
+    #[test]
+    fn dynamic_subdivision_round_trips_and_version_9_opens_without() {
+        let a = Multires::new(sphere(6, 1.0), usize::MAX);
+        let p = a.pack_copy();
+        let d = crate::dynamic::Settings { smooth: 3, flat: 1, qgrid: 2, thickness: 0.05 };
+        let extras = [Extras { dynamic: Some(d), ..Default::default() }];
+        let bytes = write_full(Vec::new(), &[("Dyn", true, &p)], &extras, 0, VERSION).unwrap();
+        let project = read_from(&bytes[..], bytes.len() as u64).expect("reads back");
+        assert_eq!(project.tools[0].dynamic, Some(d));
+        let v9 = write_full(Vec::new(), &[("Old", true, &p)], &extras, 0, 9).unwrap();
+        let project = read_from(&v9[..], v9.len() as u64).expect("version 9 opens");
+        assert_eq!(project.tools[0].dynamic, None);
+    }
+
+    #[test]
+    fn zsphere_trees_round_trip_and_broken_trees_are_refused() {
+        let mut tree = crate::zsphere::Tree::default();
+        let a = tree.add(0, glam::Vec3::new(0.6, 0.0, 0.0), 0.3);
+        tree.add(a, glam::Vec3::new(1.1, 0.2, 0.0), 0.2);
+        tree.spheres[2].roundness = 0.0;
+        let mut doc = Multires::new(tree.display(), usize::MAX);
+        doc.zspheres = Some(tree.clone());
+        let bytes = bytes_of(&[("ZSphere", true, &doc.pack_copy())], 0);
+        let project = read_from(&bytes[..], bytes.len() as u64).expect("reads back");
+        assert_eq!(project.tools[0].packed.zspheres(), Some(&tree));
+        let back = project.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.zspheres.as_ref(), Some(&tree));
+        // A parent after its child is refused.
+        let mut bad = tree.clone();
+        bad.spheres[1].parent = 2;
+        doc.zspheres = Some(bad);
+        let bytes = bytes_of(&[("Bad", true, &doc.pack_copy())], 0);
         assert!(read_from(&bytes[..], bytes.len() as u64).is_err());
     }
 }

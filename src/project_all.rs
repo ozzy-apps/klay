@@ -185,6 +185,63 @@ impl Sources {
         best
     }
 
+    /// Sources made of the given triangles only (no paint).
+    pub fn from_triangles(p: Vec<Vec3>, tri: Vec<[u32; 3]>) -> Self {
+        let mut s = Self { p, tri, colors: Vec::new(), nodes: Vec::new() };
+        s.build();
+        s
+    }
+
+    /// The corners of triangle `t` as [`hit`](Self::hit) numbers them.
+    pub fn triangle(&self, t: u32) -> [u32; 3] {
+        self.tri[t as usize]
+    }
+
+    /// The point of the sources nearest to `q`, on a triangle facing within 90° of `facing`
+    /// (any triangle when it is zero), with that triangle's normal.
+    pub fn closest(&self, q: Vec3, facing: Vec3) -> Option<(Vec3, Vec3)> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let box_dist = |n: &Node| (n.min - q).max(q - n.max).max(Vec3::ZERO).length_squared();
+        let mut best: Option<(Vec3, Vec3)> = None;
+        let mut limit = f32::INFINITY;
+        let mut stack = [0u32; 64];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let k = stack[top] as usize;
+            let node = self.nodes[k];
+            if box_dist(&node) >= limit {
+                continue;
+            }
+            if node.count > 0 {
+                for t in node.start..node.start + node.count {
+                    let [a, b, c] = self.tri[t as usize];
+                    let (a, b, c) = (self.p[a as usize], self.p[b as usize], self.p[c as usize]);
+                    let n = (b - a).cross(c - a).normalize_or_zero();
+                    if facing != Vec3::ZERO && n.dot(facing) < 0.0 {
+                        continue;
+                    }
+                    let x = crate::wedge::closest_on_triangle(q, a, b, c);
+                    let d = x.distance_squared(q);
+                    if d < limit {
+                        limit = d;
+                        best = Some((x, n));
+                    }
+                }
+            } else if top + 2 <= stack.len() {
+                // The nearer child last, so it is searched first.
+                let (l, r) = (k as u32 + 1, node.start);
+                let (near, far) = if box_dist(&self.nodes[l as usize]) <= box_dist(&self.nodes[r as usize]) { (l, r) } else { (r, l) };
+                stack[top] = far;
+                stack[top + 1] = near;
+                top += 2;
+            }
+        }
+        best
+    }
+
     /// The colour at a hit, if the sources have paint there.
     fn color(&self, h: &Hit) -> Option<[u8; 4]> {
         if self.colors.is_empty() {
