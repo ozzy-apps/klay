@@ -826,6 +826,8 @@ pub struct Packed {
     uvs: Vec<[glam::Vec2; 3]>,
     /// Creased edges of every level, base first (see [`crease_list`]); empty for none.
     creases: Vec<Vec<u32>>,
+    /// The frozen stack (see [`Multires::frozen`]).
+    frozen: Option<Box<Packed>>,
 }
 
 /// The creased triangles of `mesh` as `triangle << 3 | bits`, in triangle order.
@@ -950,6 +952,41 @@ impl Packed {
         }
         self.uvs = uvs;
         Ok(())
+    }
+
+    /// Serialise the frozen stack, if any (project version 9): a flag, then the stack as a
+    /// subtool's is (version-9 layout, without layers or a frozen stack of its own).
+    pub fn write_frozen<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        match &self.frozen {
+            None => out.u8(0),
+            Some(f) => {
+                out.u8(1)?;
+                f.write_to(out, 9)?;
+                f.write_marks(out)?;
+                f.write_colors(out)?;
+                f.write_uvs(out)?;
+                f.write_creases(out)
+            }
+        }
+    }
+
+    /// Read what [`write_frozen`](Self::write_frozen) wrote.
+    pub fn read_frozen<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+        if input.u8()? == 0 {
+            return Ok(());
+        }
+        let mut f = Packed::read_from(input, 9)?;
+        f.read_marks(input)?;
+        f.read_colors(input)?;
+        f.read_uvs(input)?;
+        f.read_creases(input)?;
+        self.frozen = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// How many subdivision levels the stack had above its base (not counting the base).
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
     }
 
     /// Serialise the creased edges of every level (project version 8).
@@ -1111,6 +1148,7 @@ impl Packed {
             colors: Vec::new(),
             uvs: Vec::new(),
             creases: Vec::new(),
+            frozen: None,
         })
     }
 
@@ -1147,6 +1185,7 @@ impl Packed {
             mask,
             colors,
             creases,
+            frozen,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
@@ -1221,6 +1260,7 @@ impl Packed {
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
             uvs,
+            frozen,
         })
     }
 }
@@ -1326,6 +1366,9 @@ pub struct Multires {
     /// UV Master: UVs of the base level's triangle corners, in its triangle order; empty
     /// for none. Dropped whenever the base level's triangles change.
     uvs: Vec<[glam::Vec2; 3]>,
+    /// Freeze SubDivision Levels: the whole stack as it was when frozen, kept while this one
+    /// is edited at its lowest level (even its topology), to be brought back by Unfreeze.
+    pub frozen: Option<Box<Packed>>,
 }
 
 fn next_generation() -> u64 {
@@ -1342,6 +1385,7 @@ impl Multires {
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
             uvs: Vec::new(),
+            frozen: None,
         }
     }
 
@@ -1369,6 +1413,259 @@ impl Multires {
         level.stale.resize(n, false);
         self.active = 0;
         old
+    }
+
+    /// Freeze SubDivision Levels (ZBrush: Geometry › Freeze SubDivision Levels): keep the
+    /// whole stack aside and go on with its lowest level alone, which may then be edited in
+    /// any way, its topology included, until [`unfreeze`](Self::unfreeze). False when there
+    /// are no levels to freeze or they are frozen already.
+    pub fn freeze(&mut self) -> bool {
+        if self.top() == 0 || self.frozen.is_some() {
+            return false;
+        }
+        let packed = Box::new(self.pack_copy());
+        self.set_active(0);
+        self.delete_higher();
+        self.frozen = Some(packed);
+        self.generation = next_generation();
+        true
+    }
+
+    /// The number of frozen subdivision levels (0 for none).
+    pub fn frozen_levels(&self) -> usize {
+        self.frozen.as_ref().map_or(0, |f| f.level_count())
+    }
+
+    /// Unfreeze: bring the frozen levels back. When the lowest level kept its topology they
+    /// come back exactly, riding on it as it is now. Otherwise it is divided as many times
+    /// as they were (while the budget allows) and each new level is projected onto the
+    /// frozen highest level with `project`. Returns whether it was exact.
+    pub fn unfreeze(&mut self, project: &crate::project_all::Settings) -> Result<bool, String> {
+        if self.top() > 0 {
+            return Err("delete the higher levels first: Unfreeze divides the lowest level again".into());
+        }
+        let frozen = self.frozen.take().ok_or("nothing is frozen")?;
+        let mut old = match (*frozen).clone().try_unpack() {
+            Ok(old) => old,
+            Err(e) => {
+                self.frozen = Some(frozen);
+                return Err(e);
+            }
+        };
+        let base = &self.levels[0].mesh;
+        let ob = &old.levels[0].mesh;
+        if ob.indices == base.indices && ob.vertex_count() == base.vertex_count() {
+            // Same topology: the frozen levels over the lowest level as it is now.
+            let shown = old.active;
+            old.set_active(0);
+            let all: Vec<u32> = (0..base.chunks.len() as u32).collect();
+            let snap = old.levels[0].mesh.snapshot_chunks(&all);
+            let m = &mut old.levels[0].mesh;
+            m.positions.copy_from_slice(&base.positions);
+            m.colors = base.colors.clone();
+            m.chunks.iter_mut().for_each(|c| c.dirty_color = true);
+            m.set_groups(base.groups.clone());
+            m.set_hidden(base.hidden.clone());
+            m.set_creases(base.creases.clone());
+            m.finish_edit(&all);
+            old.finish_stroke(0, snap);
+            old.set_active(shown);
+            old.uvs = self.uvs.clone();
+            old.budget = self.budget;
+            *self = old;
+            self.generation = next_generation();
+            return Ok(true);
+        }
+        // New topology: divide and project, level by level.
+        let levels = old.top();
+        old.set_active(levels);
+        let sources = crate::project_all::Sources::new(&[old.mesh()]);
+        drop(old);
+        for _ in 0..levels {
+            if !self.divide() {
+                break;
+            }
+            let level = self.active;
+            let r = crate::project_all::project(self.mesh(), &sources, project);
+            let mesh = self.mesh_mut();
+            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+            let snap = mesh.snapshot_chunks(&all);
+            mesh.positions.copy_from_slice(&r.positions);
+            if let Some(c) = r.colors {
+                mesh.colors = c;
+                mesh.chunks.iter_mut().for_each(|ch| ch.dirty_color = true);
+            }
+            mesh.finish_edit(&all);
+            self.finish_stroke(level, snap);
+        }
+        self.generation = next_generation();
+        Ok(false)
+    }
+
+    /// Reconstruct Subdiv (ZBrush: Geometry › Reconstruct Subdiv): this stack with a new,
+    /// coarser lowest level under it, found from the base level's 1:4 pattern (see
+    /// [`crate::reconstruct`]). The new level is fitted so that dividing it gives back the old
+    /// base's even vertices; every old level keeps its exact shape (as offsets one level
+    /// higher), polygroups, hidden polygons, paint and creases, and the same level stays
+    /// shown, mask included. The old base's UVs are not carried over.
+    pub fn reconstructed(&mut self) -> Result<Multires, String> {
+        let top = self.top();
+        self.sync_to(top);
+        let old_base = &self.levels[0].mesh;
+        let c = crate::reconstruct::coarse(old_base)?;
+        let pos: Vec<Vec3> = c.even.iter().map(|&v| old_base.positions[v as usize]).collect();
+        let groups: Vec<u16> = if old_base.groups.is_empty() { Vec::new() } else { c.centre.iter().map(|&t| old_base.groups[t as usize]).collect() };
+        let colors: Vec<[u8; 4]> = if old_base.colors.is_empty() { Vec::new() } else { c.even.iter().map(|&v| old_base.colors[v as usize]).collect() };
+        let (mut pm, vmap, tmap) = SculptMesh::from_raw_tracked(pos, c.indices.clone(), groups, colors);
+        if !old_base.hidden.is_empty() {
+            let h: Vec<u8> = tmap.iter().map(|&t| old_base.hidden[c.centre[t as usize] as usize]).collect();
+            pm.set_hidden(h);
+        }
+        // A coarse edge is creased when both its halves are.
+        let old_creases = old_base.crease_edges();
+        if !old_creases.is_empty() {
+            let half = |a: u32, b: u32| old_creases.binary_search(&(a.min(b), a.max(b))).is_ok();
+            let mut edges: Vec<(u32, u32)> = (0..old_base.vertex_count())
+                .filter_map(|m| {
+                    let (a, b) = c.of[m];
+                    (b != NONE && half(m as u32, c.even[a as usize]) && half(m as u32, c.even[b as usize])).then(|| {
+                        let (x, y) = (vmap[a as usize], vmap[b as usize]);
+                        (x.min(y), x.max(y))
+                    })
+                })
+                .collect();
+            edges.sort_unstable();
+            edges.dedup();
+            let bits = pm.crease_bits(&edges);
+            pm.set_creases(bits);
+        }
+        // Fit: move the coarse vertices until their smoothed even children land on the old
+        // even vertices (Loop's even rule is a contraction, so this converges).
+        {
+            let (_, link) = subdivide(&pm);
+            let mut even_child = vec![0u32; pm.vertex_count()];
+            for (i, st) in link.stencil.iter().enumerate() {
+                if st[1] == NONE {
+                    even_child[st[0] as usize] = i as u32;
+                }
+            }
+            let mut target = vec![Vec3::ZERO; pm.vertex_count()];
+            for (k, &v) in c.even.iter().enumerate() {
+                target[vmap[k] as usize] = old_base.positions[v as usize];
+            }
+            for _ in 0..60 {
+                let moved: Vec<Vec3> = (0..pm.vertex_count())
+                    .into_par_iter()
+                    .map(|v| pm.positions[v] + (target[v] - smooth(&pm, link.stencil[even_child[v] as usize])))
+                    .collect();
+                pm.positions = moved;
+            }
+            let all: Vec<u32> = (0..pm.chunks.len() as u32).collect();
+            pm.finish_edit(&all);
+        }
+        let mut out = Multires {
+            levels: vec![Level::base(pm)],
+            active: self.active + 1,
+            budget: self.budget,
+            generation: next_generation(),
+            layers: crate::layers::Layers::default(),
+            uvs: Vec::new(),
+            frozen: self.frozen.clone(),
+        };
+        let not_same = || "the rebuilt levels do not match the old ones".to_string();
+        // Each old level k becomes new level k + 1: `map` takes its vertices there.
+        let mut map: Vec<u32> = Vec::new();
+        for k in 0..=top {
+            let parent = &out.levels[k].mesh;
+            let (mut mesh, link) = subdivide(parent);
+            let mut even_of = vec![NONE; parent.vertex_count()];
+            let mut odd_of: crate::fx::FxHashMap<(u32, u32), u32> = Default::default();
+            for (i, st) in link.stencil.iter().enumerate() {
+                if st[1] == NONE {
+                    even_of[st[0] as usize] = i as u32;
+                } else {
+                    odd_of.insert((st[0].min(st[1]), st[0].max(st[1])), i as u32);
+                }
+            }
+            let odd = |a: u32, b: u32| odd_of.get(&(a.min(b), a.max(b))).copied();
+            let old = &self.levels[k].mesh;
+            map = if k == 0 {
+                c.of.iter()
+                    .map(|&(a, b)| if b == NONE { Some(even_of[vmap[a as usize] as usize]) } else { odd(vmap[a as usize], vmap[b as usize]) })
+                    .collect::<Option<Vec<u32>>>()
+                    .ok_or_else(not_same)?
+            } else {
+                self.levels[k].link.as_ref().unwrap().stencil.iter()
+                    .map(|st| if st[1] == NONE { Some(even_of[map[st[0] as usize] as usize]) } else { odd(map[st[0] as usize], map[st[1] as usize]) })
+                    .collect::<Option<Vec<u32>>>()
+                    .ok_or_else(not_same)?
+            };
+            for (v, &p) in old.positions.iter().enumerate() {
+                mesh.positions[map[v] as usize] = p;
+            }
+            if !old.colors.is_empty() {
+                let mut col = vec![[0u8; 4]; mesh.vertex_count()];
+                for (v, &x) in old.colors.iter().enumerate() {
+                    col[map[v] as usize] = x;
+                }
+                mesh.colors = col;
+                mesh.chunks.iter_mut().for_each(|ch| ch.dirty_color = true);
+            }
+            // Triangles: every old one must be a new one (checked on the first level, where
+            // the pattern was found; the others are divided from it).
+            if k == 0 || !old.groups.is_empty() || !old.hidden.is_empty() {
+                let key = |t: &[u32]| {
+                    let mut x = [t[0], t[1], t[2]];
+                    x.sort_unstable();
+                    x
+                };
+                let at: crate::fx::FxHashMap<[u32; 3], u32> = mesh.indices.chunks_exact(3).enumerate().map(|(t, tri)| (key(tri), t as u32)).collect();
+                let tri_map: Vec<u32> = old
+                    .indices
+                    .chunks_exact(3)
+                    .map(|t| at.get(&key(&[map[t[0] as usize], map[t[1] as usize], map[t[2] as usize]])).copied())
+                    .collect::<Option<Vec<u32>>>()
+                    .ok_or_else(not_same)?;
+                let mut g = vec![0u16; mesh.triangle_count()];
+                let mut h = vec![0u8; mesh.triangle_count()];
+                for (t, &n) in tri_map.iter().enumerate() {
+                    g[n as usize] = old.group(t as u32);
+                    if !old.hidden.is_empty() {
+                        h[n as usize] = old.hidden[t];
+                    }
+                }
+                mesh.set_groups(if old.groups.is_empty() { Vec::new() } else { g });
+                mesh.set_hidden(if old.hidden.is_empty() { Vec::new() } else { h });
+            }
+            let mut creased: Vec<(u32, u32)> = old.crease_edges().into_iter().map(|(a, b)| {
+                let (x, y) = (map[a as usize], map[b as usize]);
+                (x.min(y), x.max(y))
+            }).collect();
+            creased.sort_unstable();
+            let bits = mesh.crease_bits(&creased);
+            mesh.set_creases(bits);
+            let offsets: Vec<Vec<Vec3>> = mesh
+                .chunks
+                .par_iter()
+                .map(|ch| {
+                    let (s, e) = ch.range();
+                    (s..e).map(|i| mesh.positions[i] - smooth(parent, link.stencil[i])).collect()
+                })
+                .collect();
+            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+            mesh.finish_edit(&all);
+            if k == self.active && !old.mask.is_empty() {
+                let mut m = vec![0u8; mesh.vertex_count()];
+                for (v, &x) in old.mask.iter().enumerate() {
+                    m[map[v] as usize] = x;
+                }
+                crate::mask::replace(&mut mesh, m);
+            }
+            let n = mesh.chunks.len();
+            out.levels.push(Level { mesh, link: Some(link), offsets, stale: vec![false; n] });
+        }
+        // Lower levels than the shown one carry no mask.
+        Ok(out)
     }
 
     /// Delete the levels above the shown one (ZBrush: Del Higher). Returns how many went.
@@ -1885,6 +2182,7 @@ impl Multires {
             active,
             budget,
             uvs,
+            frozen,
             ..
         } = self;
         let mut it = levels.into_iter();
@@ -1912,6 +2210,7 @@ impl Multires {
             colors,
             uvs,
             creases,
+            frozen,
         }
     }
 
@@ -1945,6 +2244,7 @@ impl Multires {
             colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
             uvs: self.uvs.clone(),
             creases: self.crease_lists(),
+            frozen: self.frozen.clone(),
         }
     }
 
@@ -2340,6 +2640,183 @@ mod tests {
             assert!((ch.vert_end - ch.vert_start) as usize <= CHUNK_TARGET);
         }
         assert_eq!(next as usize, m.triangle_count(), "every triangle is in a range");
+    }
+
+    /// Positions as a sorted list of rounded triples, to compare shapes whatever the order.
+    fn shape(m: &SculptMesh) -> Vec<[i64; 3]> {
+        let mut v: Vec<[i64; 3]> = m.positions.iter().map(|p| p.to_array().map(|x| (x * 1e5).round() as i64)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A sphere divided three times with bumps sculpted on top.
+    fn bumpy_stack() -> Multires {
+        let mut doc = Multires::new(sphere(5), 10_000_000);
+        for _ in 0..3 {
+            doc.divide();
+        }
+        let top = doc.top();
+        let all: Vec<u32> = (0..doc.mesh().chunks.len() as u32).collect();
+        let snap = doc.mesh().snapshot_chunks(&all);
+        for p in doc.mesh_mut().positions.iter_mut() {
+            *p *= 1.0 + 0.05 * (p.x * 9.0).sin() * (p.y * 7.0).cos();
+        }
+        doc.mesh_mut().finish_edit(&all);
+        doc.finish_stroke(top, snap);
+        doc
+    }
+
+    /// Move the base level of `doc` (shown) by `f`.
+    fn edit_base(doc: &mut Multires, f: impl Fn(Vec3) -> Vec3) {
+        doc.set_active(0);
+        let all: Vec<u32> = (0..doc.mesh().chunks.len() as u32).collect();
+        let snap = doc.mesh().snapshot_chunks(&all);
+        for p in doc.mesh_mut().positions.iter_mut() {
+            *p = f(*p);
+        }
+        doc.mesh_mut().finish_edit(&all);
+        doc.finish_stroke(0, snap);
+    }
+
+    #[test]
+    fn freeze_and_unfreeze_with_the_same_topology_is_exact() {
+        let stretch = |p: Vec3| Vec3::new(p.x * 1.3, p.y, p.z);
+        // Reference: the same base edit made with the levels in place.
+        let mut reference = bumpy_stack();
+        edit_base(&mut reference, stretch);
+        reference.set_active(3);
+        let mut doc = bumpy_stack();
+        assert!(doc.freeze());
+        assert!(!doc.freeze(), "already frozen");
+        assert_eq!((doc.top(), doc.frozen_levels()), (0, 3));
+        edit_base(&mut doc, stretch);
+        // Saved and opened again while frozen.
+        let packed = doc.pack_copy();
+        let bytes = crate::project::write_to(Vec::new(), &[("Frozen", true, &packed)], 0).unwrap();
+        let mut doc = crate::project::read_from(&bytes[..], bytes.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+        assert_eq!(doc.frozen_levels(), 3);
+        let settings = crate::project_all::Settings::default();
+        assert_eq!(doc.unfreeze(&settings), Ok(true));
+        assert_eq!(doc.top(), 3);
+        assert!(doc.frozen.is_none());
+        doc.set_active(3);
+        let worst = doc.mesh().positions.iter().zip(&reference.mesh().positions).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "{worst}");
+    }
+
+    #[test]
+    fn unfreeze_after_a_topology_change_projects_the_detail_back() {
+        let mut doc = bumpy_stack();
+        doc.set_active(3);
+        let want: Vec<Vec3> = doc.mesh().positions.clone();
+        let radius = |p: Vec3| -> f32 {
+            // The bumpy surface's radius in the direction of p, from the nearest sample.
+            let d = p.normalize();
+            want.iter().max_by(|a, b| a.normalize().dot(d).total_cmp(&b.normalize().dot(d))).unwrap().length()
+        };
+        assert!(doc.freeze());
+        // New topology at the lowest level: a different sphere.
+        let frozen = doc.frozen.take();
+        let mut doc2 = Multires::new(sphere(7), 10_000_000);
+        doc2.frozen = frozen;
+        let settings = crate::project_all::Settings { dist: 10.0, ..Default::default() };
+        assert_eq!(doc2.unfreeze(&settings), Ok(false));
+        assert_eq!(doc2.top(), 3);
+        let m = doc2.mesh();
+        let worst = m.positions.iter().step_by(37).map(|&p| (p.length() - radius(p)).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.01, "{worst}");
+        // A plain sphere would be off by the bumps' height.
+        assert!(want.iter().map(|p| (p.length() - 1.0).abs()).fold(0.0f32, f32::max) > 0.03);
+    }
+
+    #[test]
+    fn reconstruct_subdiv_gives_back_the_lowest_level_and_keeps_every_shape() {
+        let mut base = sphere(5);
+        // A crease ring around the middle, so creases have to come back too.
+        let ring: Vec<(u32, u32)> = {
+            let mut e: Vec<(u32, u32)> = base.indices.chunks_exact(3).flat_map(|t| (0..3).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])))).filter(|&(a, b)| base.positions[a as usize].y.abs() < 0.25 && base.positions[b as usize].y.abs() < 0.25 && (base.positions[a as usize].y - base.positions[b as usize].y).abs() < 1e-6).collect();
+            e.sort_unstable();
+            e.dedup();
+            e
+        };
+        let bits = base.crease_bits(&ring);
+        base.set_creases(bits);
+        let original = shape(&base);
+        let mut doc = Multires::new(base, 10_000_000);
+        for _ in 0..3 {
+            doc.divide();
+        }
+        // Sculpt the top: bumps.
+        let top = doc.top();
+        let all: Vec<u32> = (0..doc.mesh().chunks.len() as u32).collect();
+        let snap = doc.mesh().snapshot_chunks(&all);
+        for p in doc.mesh_mut().positions.iter_mut() {
+            *p *= 1.0 + 0.05 * (p.x * 9.0).sin() * (p.y * 7.0).cos();
+        }
+        doc.mesh_mut().finish_edit(&all);
+        doc.finish_stroke(top, snap);
+        let groups: Vec<u16> = (0..doc.level_mesh(2).triangle_count()).map(|t| (t % 3) as u16).collect();
+        doc.set_groups(2, groups);
+        doc.set_active(1);
+        assert_eq!(doc.delete_lower(), 1);
+        doc.set_active(doc.top());
+        let before: Vec<Vec<[i64; 3]>> = (0..=doc.top()).map(|l| shape(doc.level_mesh(l))).collect();
+        let groups_before = doc.level_mesh(1).group_count();
+        let mut back = doc.reconstructed().unwrap();
+        assert_eq!(back.top(), 3);
+        assert_eq!(back.active(), 3);
+        for l in 0..=2 {
+            back.set_active(l + 1);
+            assert_eq!(shape(back.mesh()), before[l], "level {l} keeps its shape");
+        }
+        assert_eq!(back.level_mesh(2).group_count(), groups_before);
+        // The new lowest level is the sphere it all came from, and its crease ring is back.
+        let got = shape(back.level_mesh(0));
+        assert_eq!(got.len(), original.len());
+        let near = |a: &[i64; 3]| got.iter().map(|b| (0..3).map(|k| (a[k] - b[k]).abs()).max().unwrap()).min().unwrap();
+        let worst = original.iter().map(near).max().unwrap();
+        assert!(worst < 50, "within 5e-4: {worst}");
+        assert_eq!(back.level_mesh(0).crease_edges().len(), ring.len());
+        // It packs and unpacks to the same shape.
+        let top_shape = shape(back.mesh());
+        let again = back.pack_copy().unpack();
+        assert_eq!(shape(again.mesh()), top_shape);
+    }
+
+    #[test]
+    #[ignore]
+    fn time_reconstruct_subdiv() {
+        // cargo test --release time_reconstruct_subdiv -- --ignored --nocapture
+        let mut doc = Multires::new(sphere(100), usize::MAX);
+        doc.divide();
+        doc.divide();
+        doc.set_active(1);
+        doc.delete_lower();
+        doc.set_active(1);
+        let n = doc.mesh().vertex_count();
+        let t = std::time::Instant::now();
+        let back = doc.reconstructed().unwrap();
+        eprintln!("{} levels over {n} vertices shown: {:.0} ms", back.count(), t.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    #[test]
+    fn reconstruct_subdiv_works_on_an_imported_mesh_in_any_order() {
+        let mut doc = Multires::new(sphere(3), 10_000_000);
+        doc.divide();
+        doc.divide();
+        let m = doc.mesh();
+        // Import: vertices in reverse order, triangles too.
+        let n = m.vertex_count() as u32;
+        let p: Vec<Vec3> = m.positions.iter().rev().copied().collect();
+        let i: Vec<u32> = m.indices.chunks_exact(3).rev().flat_map(|t| [n - 1 - t[0], n - 1 - t[1], n - 1 - t[2]]).collect();
+        let mut imported = Multires::new(SculptMesh::from_raw(p, i), 10_000_000);
+        let want = shape(imported.mesh());
+        let mut once = imported.reconstructed().unwrap();
+        let mut twice = once.reconstructed().unwrap();
+        assert_eq!(twice.top(), 2);
+        assert_eq!(twice.level_mesh(0).vertex_count(), sphere(3).vertex_count());
+        assert_eq!(shape(twice.mesh()), want);
+        assert!(twice.reconstructed().is_err(), "the cube-sphere of three cells is not divided");
     }
 
     #[test]

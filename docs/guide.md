@@ -381,6 +381,23 @@ triangles where the two sides have different vertex counts), so a remeshed piece
 to what it was cut from. With X symmetry a border that crosses the middle is frozen on both
 sides.
 
+### Reconstruct Subdiv and Freeze SubDivision Levels
+
+Geometry › **Reconstruct Subdiv** adds a lower level under the lowest one, found from how
+the mesh was divided: every triangle cut into four, as Divide does. Use it on a dense mesh
+divided elsewhere and imported, or after Del Lower. Every level keeps its exact shape,
+polygroups, hidden polygons, paint and creases; the new lowest level is fitted so dividing it
+lands on the old one. Press it again for more levels. A mesh that was not divided that way is
+refused with a message. One undo step. The old lowest level's UVs do not come along.
+
+**Freeze SubDiv** keeps the levels aside and goes to the lowest level, which you can then
+edit in any way, its topology included (ZModeler, ZRemesher, Remesh, Decimation, Sculptris
+Pro). **Unfreeze** brings the levels back: if the lowest level still has the same topology,
+exactly, with all the detail riding on the edited shape; otherwise the new mesh is divided as
+many times as before and each level is projected onto the frozen highest level (ProjectAll's
+settings, Dist at least 10 %). Both are one undo step, and frozen levels are saved in
+projects (project version 9).
+
 ### Crease
 
 Geometry › **Crease** tags edges as creases (ZBrush: Tool › Geometry › Crease). **Divide**

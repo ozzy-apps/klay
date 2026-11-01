@@ -24,6 +24,7 @@ mod fx;
 mod boolean;
 mod zremesh;
 mod crease;
+mod reconstruct;
 mod project_all;
 mod decimate;
 mod uv;
@@ -1085,6 +1086,8 @@ impl App {
         let (before, after) = (self.doc.mesh().triangle_count(), mesh.triangle_count());
         let budget = self.doc.budget;
         let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
+        // Frozen subdivision levels stay frozen through topology changes.
+        self.doc.frozen = old.frozen.clone();
         self.history.push(UndoStep::Replace(Box::new(old.pack())));
         self.history.name_last(what);
         self.morph_targets.remove(&self.subtools[self.active_tool].id);
@@ -1326,7 +1329,9 @@ impl App {
     /// go).
     fn replace_active_mesh(&mut self, mesh: SculptMesh) {
         let budget = self.doc.budget;
+        let frozen = self.doc.frozen.take();
         self.doc = Multires::new(mesh, budget);
+        self.doc.frozen = frozen;
         self.history = History::new(32);
         let tool = &mut self.subtools[self.active_tool];
         self.morph_targets.remove(&tool.id);
@@ -3436,6 +3441,74 @@ impl App {
         out
     }
 
+    /// The active stack replaced by `new` after `what` changed its levels: one undo step.
+    fn replace_levels(&mut self, what: &str, old: multires::Packed) {
+        self.history.push(UndoStep::Replace(Box::new(old)));
+        self.history.name_last(what);
+        self.morph_targets.remove(&self.subtools[self.active_tool].id);
+        self.subtools[self.active_tool].bounds = self.doc.bounds();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.update_hover();
+    }
+
+    /// Geometry › Reconstruct Subdiv: a coarser lowest level under the active subtool.
+    fn reconstruct_now(&mut self) {
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify("Reconstruct Subdiv: bake or delete the layers first · Mesh › Layers");
+            return;
+        }
+        let t = Instant::now();
+        match self.doc.reconstructed() {
+            Ok(new) => {
+                let old = std::mem::replace(&mut self.doc, new);
+                self.replace_levels("Reconstruct Subdiv", old.pack());
+                self.status = format!(
+                    "Reconstruct Subdiv: new lowest level of {} vertices, {} levels ({:.0} ms)",
+                    fmt_count(self.doc.level_mesh(0).vertex_count()),
+                    self.doc.count(),
+                    t.elapsed().as_secs_f32() * 1000.0
+                );
+                self.workspace.notify(self.status.clone());
+            }
+            Err(e) => self.workspace.notify(format!("Reconstruct Subdiv: {e}")),
+        }
+    }
+
+    /// Geometry › Freeze SubDivision Levels, or Unfreeze when frozen.
+    fn freeze_now(&mut self) {
+        let old = self.doc.pack_copy();
+        if self.doc.frozen.is_some() {
+            let settings = project_all::Settings { dist: self.workspace.project.dist.max(10.0), ..self.workspace.project };
+            match self.doc.unfreeze(&settings) {
+                Ok(exact) => {
+                    self.replace_levels("Unfreeze SubDiv Levels", old);
+                    self.status = format!(
+                        "Unfreeze: {} levels back, {}",
+                        self.doc.top(),
+                        if exact { "exactly" } else { "the detail projected onto the new topology" }
+                    );
+                    self.workspace.notify(self.status.clone());
+                }
+                Err(e) => self.workspace.notify(format!("Unfreeze: {e}")),
+            }
+        } else {
+            if !self.doc.layers.list.is_empty() {
+                self.workspace.notify("Freeze SubDiv Levels: bake or delete the layers first · Mesh › Layers");
+                return;
+            }
+            if self.doc.freeze() {
+                self.replace_levels("Freeze SubDiv Levels", old);
+                self.status = format!("Freeze SubDiv Levels: {} levels kept aside · edit the lowest level, then Unfreeze", self.doc.frozen_levels());
+                self.workspace.notify(self.status.clone());
+            } else {
+                self.workspace.notify("Freeze SubDiv Levels: no levels to freeze");
+            }
+        }
+    }
+
     /// Geometry › Crease: Crease PG, Crease or UnCrease on the shown level, undoably.
     fn crease_now(&mut self, op: crease::CreaseOp) {
         let level = self.doc.active();
@@ -3502,6 +3575,7 @@ impl App {
         let mesh = SculptMesh::from_raw_painted(out.positions, out.indices, out.groups, out.colors);
         let budget = self.doc.budget;
         let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
+        self.doc.frozen = old.frozen.clone();
         self.history.push(UndoStep::Replace(Box::new(old.pack())));
         let build_ms = t2.elapsed().as_secs_f32() * 1000.0;
         self.subtools[self.active_tool].bounds = self.doc.bounds();
@@ -5379,7 +5453,9 @@ impl App {
         let tris = (0..shared).into_par_iter().find_first(|&i| old.indices[i] != mesh.indices[i]).unwrap_or(shared) / 3;
         let generation = self.doc.generation;
         let budget = self.doc.budget;
+        let frozen = self.doc.frozen.take();
         self.doc = Multires::new(mesh, budget);
+        self.doc.frozen = frozen;
         self.sculptris_changed = true;
         let written = self.gfx.as_mut().is_some_and(|gfx| gfx.generation == generation && gfx.rewrite_from(self.doc.mesh_mut(), verts, tris, true));
         if let Some(gfx) = self.gfx.as_mut() {
@@ -6022,7 +6098,9 @@ impl App {
     fn show_zmodel(&mut self, poly: zmodeler::PolyMesh) {
         let (mesh, face_of, vmap) = poly.to_mesh();
         let budget = self.doc.budget;
+        let frozen = self.doc.frozen.take();
         self.doc = Multires::new(mesh, budget);
+        self.doc.frozen = frozen;
         self.zmodel = Some(ZModel { poly, face_of, vmap, generation: self.doc.generation });
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -7382,6 +7460,7 @@ impl App {
         self.workspace.guides_preview = self.guides_preview();
         self.workspace.crease_preview = self.crease_preview();
         let creases = self.crease_lines().iter().map(|l| l.len().saturating_sub(1)).sum::<usize>();
+        let frozen_levels = self.doc.frozen_levels();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
         self.workspace.held_brush = self.held_brush();
         let print_extent = self.print_extent();
@@ -7431,6 +7510,7 @@ impl App {
                 groups,
                 hidden,
                 creases,
+                frozen_levels,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
                 wedge: &mut self.wedge,
                 wedge_on,
@@ -7562,6 +7642,12 @@ impl App {
         }
         if actions.uv_unwrap {
             self.uv_unwrap_now();
+        }
+        if actions.reconstruct && !self.busy() {
+            self.reconstruct_now();
+        }
+        if actions.freeze && !self.busy() {
+            self.freeze_now();
         }
         if let Some(op) = actions.crease {
             if !self.busy() {
@@ -9257,6 +9343,38 @@ mod subtool_tests {
         drag(&mut app, p2, p2);
         assert!(app.zm_bridge.is_none());
         assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 24 - 2 + 4);
+    }
+
+    #[test]
+    fn reconstruct_and_freeze_through_the_app_undo_and_survive_zremesher() {
+        let mut app = App::new(12, false, usize::MAX);
+        let base_vertices = app.doc.mesh().vertex_count();
+        for _ in 0..2 {
+            assert!(app.doc.divide());
+            app.history.push(UndoStep::Divide(None));
+        }
+        // Lose the lowest level, then get it back.
+        app.doc.set_active(1);
+        app.doc.delete_lower();
+        app.reconstruct_now();
+        assert_eq!(app.doc.top(), 2);
+        assert_eq!(app.doc.level_mesh(0).vertex_count(), base_vertices);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Reconstruct Subdiv"));
+        app.history_jump(-1);
+        assert_eq!(app.doc.top(), 1);
+        app.history_jump(1);
+        assert_eq!(app.doc.top(), 2);
+        // Freeze, change the topology with ZRemesher, Unfreeze: the levels come back.
+        app.freeze_now();
+        assert_eq!((app.doc.top(), app.doc.frozen_levels()), (0, 2));
+        app.workspace.zremesh.target_k = 0.3;
+        app.zremesh_now();
+        assert_eq!(app.doc.frozen_levels(), 2, "frozen levels stay through ZRemesher");
+        app.freeze_now();
+        assert_eq!((app.doc.top(), app.doc.frozen_levels()), (2, 0));
+        // Undo goes back to the frozen, remeshed lowest level.
+        app.history_jump(-1);
+        assert_eq!((app.doc.top(), app.doc.frozen_levels()), (0, 2));
     }
 
     #[test]

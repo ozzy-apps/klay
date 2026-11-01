@@ -791,6 +791,8 @@ pub struct Model<'a> {
     pub hidden: usize,
     /// Creased edges at the shown level of the active subtool.
     pub creases: usize,
+    /// Subdivision levels frozen on the active subtool (0 for none).
+    pub frozen_levels: usize,
     /// The GPU can show polygroup colours.
     pub polyframe_supported: bool,
     /// Wedge settings, whether Wedge is on for the active subtool, why it cannot run (if
@@ -930,6 +932,9 @@ pub struct Actions {
     pub delete_guides: bool,
     /// Geometry › Decimation › Decimate.
     pub decimate: bool,
+    /// Geometry › Reconstruct Subdiv; Freeze SubDivision Levels (or Unfreeze).
+    pub reconstruct: bool,
+    pub freeze: bool,
     /// Geometry › Crease › Crease PG, Crease, UnCrease.
     pub crease: Option<crate::crease::CreaseOp>,
     /// Geometry › UV Map › Unwrap, Delete UVs.
@@ -3650,6 +3655,30 @@ impl Workspace {
                             });
                         });
                         note(ui, "D / Shift + D: higher / lower level");
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 4.0) * 0.5;
+                            if ui
+                                .add_sized([w, CONTROL_H], egui::Button::new("Reconstruct Subdiv").truncate())
+                                .on_hover_text("Add a lower level under the lowest one, found from how it was divided (a mesh divided here or elsewhere and imported)")
+                                .shelf(ui, "cmd:reconstruct").clicked()
+                            {
+                                a.reconstruct = true;
+                            }
+                            let frozen = m.frozen_levels > 0;
+                            ui.add_enabled_ui(frozen || top > 0, |ui| {
+                                let (label, tip) = if frozen {
+                                    ("Unfreeze", "Divide back and bring the frozen detail back: exactly if the topology is unchanged, else projected")
+                                } else {
+                                    ("Freeze SubDiv", "Keep the levels aside and go to the lowest one, to edit it freely (even its topology) and Unfreeze later")
+                                };
+                                if ui.add_sized([w, CONTROL_H], egui::Button::new(label).selected(frozen).truncate()).on_hover_text(tip).shelf(ui, "cmd:freeze").clicked() {
+                                    a.freeze = true;
+                                }
+                            });
+                        });
+                        if m.frozen_levels > 0 {
+                            note(ui, &format!("{} levels frozen · edit the lowest level freely, then Unfreeze", m.frozen_levels));
+                        }
                         // ZBrush: Geometry › Modify Topology.
                         ui.add_enabled_ui(top == 0, |ui| {
                             ui.horizontal(|ui| {
@@ -6347,6 +6376,7 @@ mod tests {
                         groups: 1,
                         hidden: 0,
                         creases: 0,
+                        frozen_levels: 0,
                         polyframe_supported: true,
                         wedge: &mut crate::wedge::Settings::default(),
                         wedge_on: false,

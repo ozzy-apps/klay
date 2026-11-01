@@ -17,6 +17,8 @@
 //!                triangles, 0 for none, then six f32 per triangle)
 //!              · (version 8 on) creased edges: u32 count of levels (0 for none), then per
 //!                level, base first, the creased triangles as u32 `triangle << 3 | bits`
+//!              · (version 9 on) Freeze SubDivision Levels: u8 0, or 1 and the frozen stack
+//!                laid out as above from the packed stack to its creases
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -36,9 +38,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 8: creases; 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
+/// 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
 /// polygroups and hidden triangles; 2: mask. Every older version still opens.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -241,6 +243,9 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
         if version >= 8 {
             packed.write_creases(&mut out)?;
         }
+        if version >= 9 {
+            packed.write_frozen(&mut out)?;
+        }
     }
     out.bytes(END)?;
     Ok(out.into_inner())
@@ -314,6 +319,9 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         }
         if version >= 8 {
             packed.read_creases(&mut input)?;
+        }
+        if version >= 9 {
+            packed.read_frozen(&mut input)?;
         }
         tools.push(SavedTool {
             name,
@@ -467,7 +475,7 @@ mod tests {
         let err = project.tools.into_iter().next().unwrap().packed.try_unpack().err();
         assert!(err.is_some_and(|e| e.contains("missing vertices")));
         let mut wrong_version = bytes.clone();
-        wrong_version[8] = 9;
+        wrong_version[8] = (VERSION + 1) as u8;
         assert!(read_from(&wrong_version[..], bytes.len() as u64).is_err_and(|e| e.contains("version")));
     }
 
@@ -527,8 +535,8 @@ mod tests {
         wrong.set_uvs(vec![[glam::Vec2::ZERO; 3]; m]);
         let mut bytes = bytes_of(&[("Wrong", true, &wrong.pack_copy())], 0);
         // The UV count is the u64 right before the UV data, which the crease count (a u32,
-        // 0) follows at the end of the subtool.
-        let at = bytes.len() - END.len() - 4 - m * 24 - 8;
+        // 0) and the frozen flag (a u8, 0) follow at the end of the subtool.
+        let at = bytes.len() - END.len() - 1 - 4 - m * 24 - 8;
         assert_eq!(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()), m as u64);
         bytes.drain(at + 8..at + 8 + 24);
         bytes[at..at + 8].copy_from_slice(&((m - 1) as u64).to_le_bytes());
