@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Texture Maps** (Geometry › Texture Maps, ZBrush: Tool › Normal Map and Displacement Map): bake the highest level's detail over the lowest level's UVs. **Normal Map** saves a PNG in tangent space (smooth lowest-level normals and UV tangents, as Blender and game engines read them; **Flip G** for DirectX and Unreal) or **Object Space**. **Displacement Map** saves the distance from the lowest level divided smoothly, as 32-bit float OpenEXR in model units or a 16-bit PNG with mid grey for none. Sizes 1K to 8K, 1–4 samples per side per texel, padding at the island borders. Each triangle of the highest level is placed through the subdivision itself, so nothing is ray cast and nothing misses. Runs in the background on a copy (4.9M triangles to a 2K map in 0.7 s). Shelf commands `cmd:bake-normal` and `cmd:bake-displacement`; `--bake-normal PATH` and `--bake-displacement PATH` at startup.
+- Verification: 348 tests (new: every top triangle lies in its base triangle, sixteen per base triangle after two divides; an unsculpted stack bakes flat; a raised cap reads back its height in the displacement map; bumps tilt the normal map and Flip G mirrors green exactly; maps write as PNG, 16-bit PNG and EXR; in the app the bake waits for UVs and levels, then saves both maps). Checked in Blender 5.2: the lowest level with the normal map shades like the sculpt (mean difference 7/255 against 17 without it, the rest at the silhouette), and divided with the displacement map it matches the sculpt to 1.9/255.
+
 ## 0.28.0 — 2026-11-01
 
 - **Reconstruct Subdiv** (Geometry, ZBrush: Reconstruct Subdiv): adds a lower level under the lowest one, found from the 1:4 pattern Divide leaves (every triangle cut into four), for a divided mesh imported from elsewhere or after Del Lower. Every level keeps its exact shape, polygroups, hidden polygons, paint and creases; the new level is fitted so its division lands on the old one. Works on any vertex order, again and again down to an undivided mesh, which is refused with a message. One undo step. 0.4 s for a stack showing 960k vertices.

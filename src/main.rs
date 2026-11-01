@@ -26,6 +26,7 @@ mod zremesh;
 mod crease;
 mod reconstruct;
 mod project_all;
+mod bake;
 mod decimate;
 mod uv;
 mod zmodeler;
@@ -308,6 +309,24 @@ struct DecimateJob {
     edits: u64,
     level: usize,
     started: Instant,
+}
+
+/// A texture-map bake running on its own thread (Geometry › Texture Maps); it works on a
+/// copy, so the model may change meanwhile.
+struct BakeJob {
+    rx: std::sync::mpsc::Receiver<Result<BakeDone, String>>,
+    kind: bake::Kind,
+    path: String,
+    started: Instant,
+}
+
+/// What a finished bake reports.
+struct BakeDone {
+    preview: Vec<[u8; 4]>,
+    size: usize,
+    coverage: f32,
+    max_abs: f32,
+    bytes: u64,
 }
 
 /// SubTool operations queued by the interface.
@@ -662,6 +681,12 @@ struct App {
     pending_geo: Option<GeoOp>,
     /// Decimation running in the background (Geometry › Decimation).
     decimation: Option<DecimateJob>,
+    /// Texture-map bake running in the background, and where the last map was saved.
+    bake_job: Option<BakeJob>,
+    map_path: String,
+    /// `--bake-normal` / `--bake-displacement`: bakes to run once the startup project is open.
+    bake_on_start: Vec<(bake::Kind, String)>,
+    bake_count: u64,
     /// The stats of the last unwrap, with the UV key they belong to.
     uv_stats: Option<(u64, uv::Stats)>,
     /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
@@ -839,6 +864,10 @@ impl App {
             pending_vis: None,
             pending_geo: None,
             decimation: None,
+            bake_job: None,
+            map_path: String::new(),
+            bake_on_start: Vec::new(),
+            bake_count: 0,
             uv_stats: None,
             selftest_wedge: None,
             pending_subtool: None,
@@ -1173,6 +1202,111 @@ impl App {
         }
         let stats = self.uv_stats.as_ref().filter(|s| s.0 == key).map(|s| s.1.clone());
         self.workspace.uv_info = Some((self.doc.uvs().len(), stats));
+    }
+
+    /// Geometry › Texture Maps › Normal Map / Displacement: check the subtool can be baked,
+    /// then ask where to save the map.
+    fn bake_ask(&mut self, kind: bake::Kind) {
+        let why = if self.bake_job.is_some() {
+            Some("a bake is already running")
+        } else if self.doc.uvs().is_empty() {
+            Some("needs UVs · Unwrap in Geometry › UV Map first")
+        } else if self.doc.count() < 2 {
+            Some("needs subdivision levels · Divide and sculpt the detail first")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.workspace.notify(format!("{}: {why}", kind.name()));
+            return;
+        }
+        self.ask_file(if kind == bake::Kind::Normal { file_dialog::Ask::ExportNormalMap } else { file_dialog::Ask::ExportDisplacementMap });
+    }
+
+    /// Bake a map of `kind` from the active subtool on a thread of its own and save it to
+    /// `path`; [`poll_bake`](Self::poll_bake) reports it. What it reads is copied first.
+    fn start_bake(&mut self, kind: bake::Kind, path: String) {
+        if self.bake_job.is_some() || self.doc.uvs().is_empty() || self.doc.count() < 2 {
+            return;
+        }
+        let t = Instant::now();
+        let src = bake::Source::of(&mut self.doc, kind);
+        log::info!("bake: read {} triangles in {:.0} ms", fmt_count(src.places.len()), t.elapsed().as_secs_f32() * 1000.0);
+        let settings = self.workspace.bake;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = path.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let map = bake::bake(&src, kind, &settings)?;
+                drop(src);
+                let bytes = bake::write(&map, Path::new(&out))?;
+                Ok(BakeDone { preview: bake::preview(&map, 256), size: map.size, coverage: map.coverage, max_abs: map.max_abs, bytes })
+            }))
+            .unwrap_or_else(|_| Err("the bake failed".to_string()));
+            let _ = tx.send(r);
+        });
+        self.bake_job = Some(BakeJob { rx, kind, path, started: t });
+        self.workspace.baking = true;
+        self.status = format!("Baking the {}…", kind.name().to_lowercase());
+    }
+
+    /// Report a finished bake (waiting for it with `wait`). Each frame.
+    fn poll_bake(&mut self, wait: bool) {
+        let Some(job) = &self.bake_job else {
+            return;
+        };
+        let result = if wait {
+            job.rx.recv().unwrap_or_else(|_| Err("the bake stopped".into()))
+        } else {
+            match job.rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the bake stopped".into()),
+            }
+        };
+        let job = self.bake_job.take().unwrap();
+        self.workspace.baking = false;
+        let secs = job.started.elapsed().as_secs_f32();
+        match result {
+            Ok(d) => {
+                let exr = job.path.to_lowercase().ends_with(".exr");
+                let read = match job.kind {
+                    bake::Kind::Normal => String::new(),
+                    bake::Kind::Displacement if exr => format!(" · up to {:.4} in or out · Blender: Midlevel 0, Scale 1", d.max_abs),
+                    bake::Kind::Displacement => {
+                        format!(" · white is {:.4} out · Blender: Midlevel 0.5, Scale {:.4}", d.max_abs, 2.0 * d.max_abs)
+                    }
+                };
+                self.status = format!(
+                    "{} {}² saved to {} ({:.1} MB) in {secs:.1} s{read}",
+                    job.kind.name(),
+                    d.size,
+                    job.path,
+                    d.bytes as f64 / 1e6
+                );
+                self.bake_count += 1;
+                let what = format!("{} · {}² · {:.0} % of the square covered", job.kind.name(), d.size, d.coverage * 100.0);
+                self.workspace.bake_preview = Some((self.bake_count, what, 256, d.preview));
+            }
+            Err(e) => self.status = format!("{} not saved: {e}", job.kind.name()),
+        }
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Run the `--bake-normal` / `--bake-displacement` bakes, waiting for each.
+    fn bake_at_start(&mut self) {
+        for (kind, path) in std::mem::take(&mut self.bake_on_start) {
+            if self.doc.count() < 2 {
+                log::error!("{}: the active subtool has no subdivision levels", kind.name());
+                continue;
+            }
+            if self.doc.uvs().is_empty() {
+                self.uv_unwrap_now();
+            }
+            self.start_bake(kind, path);
+            self.poll_bake(true);
+        }
     }
 
     /// Geometry › Decimation: decimate the shown level of the active subtool on a thread of
@@ -2220,6 +2354,12 @@ impl App {
                     self.pending_export = true;
                     return;
                 }
+                Ask::ExportNormalMap | Ask::ExportDisplacementMap => {
+                    let kind = if ask == Ask::ExportNormalMap { bake::Kind::Normal } else { bake::Kind::Displacement };
+                    let path = self.map_path.clone();
+                    self.start_bake(kind, path);
+                    return;
+                }
             });
             return;
         }
@@ -2240,6 +2380,10 @@ impl App {
             Ask::ExportStl if self.project_has_file => (&self.stl_path, file_dialog::file_name(&project_stem, "stl")),
             Ask::ExportStl => (&self.stl_path, file_of(&self.stl_path).unwrap_or_else(|| "export.stl".into())),
             Ask::ImportMesh => (&self.import_path, String::new()),
+            Ask::ExportNormalMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_normal"), "png")),
+            Ask::ExportDisplacementMap => {
+                (&self.map_path, file_dialog::file_name(&format!("{tool}_displacement"), if self.workspace.bake.exr { "exr" } else { "png" }))
+            }
         };
         // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
         let dir = file_dialog::start_dir(near, self.last_dir.as_deref());
@@ -2295,6 +2439,11 @@ impl App {
                     self.import_path = text(path);
                     self.import_mesh(&text(path));
                 }
+            }
+            Ask::ExportNormalMap | Ask::ExportDisplacementMap => {
+                self.map_path = text(first);
+                let kind = if ask == Ask::ExportNormalMap { bake::Kind::Normal } else { bake::Kind::Displacement };
+                self.start_bake(kind, text(first));
             }
         }
     }
@@ -7455,6 +7604,7 @@ impl App {
             (None, None) => String::new(),
         };
         self.poll_decimation(false);
+        self.poll_bake(false);
         self.workspace.curve_preview = self.curve_preview();
         self.update_uv_layout();
         self.workspace.guides_preview = self.guides_preview();
@@ -7642,6 +7792,9 @@ impl App {
         }
         if actions.uv_unwrap {
             self.uv_unwrap_now();
+        }
+        if let Some(kind) = actions.bake {
+            self.bake_ask(kind);
         }
         if actions.reconstruct && !self.busy() {
             self.reconstruct_now();
@@ -8261,6 +8414,7 @@ impl ApplicationHandler for App {
         if std::mem::take(&mut self.print_check_on_start) {
             self.print_check();
         }
+        self.bake_at_start();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -9038,6 +9192,14 @@ fn main() {
         app.uv_unwrap_now();
         log::info!("{}", app.status);
     }
+    // `--bake-normal PATH` / `--bake-displacement PATH`: bake that map of the active subtool
+    // once the startup model is ready (after `--demo` strokes and `--open`), unwrapping it
+    // first if needed.
+    for (f, kind) in [("--bake-normal", bake::Kind::Normal), ("--bake-displacement", bake::Kind::Displacement)] {
+        if let Some(path) = flag(f) {
+            app.bake_on_start.push((kind, path.clone()));
+        }
+    }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         // With `--detect-edges` / `--freeze-border`, those ZRemesher options on.
@@ -9375,6 +9537,33 @@ mod subtool_tests {
         // Undo goes back to the frozen, remeshed lowest level.
         app.history_jump(-1);
         assert_eq!((app.doc.top(), app.doc.frozen_levels()), (0, 2));
+    }
+
+    #[test]
+    fn texture_maps_need_uvs_and_levels_then_bake_in_the_background() {
+        let mut app = App::new(24, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-app-bake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.map_path = dir.join("n.png").to_string_lossy().into_owned();
+        app.workspace.bake.size = 256;
+        app.bake_ask(bake::Kind::Normal);
+        assert!(app.bake_job.is_none());
+        assert!(app.workspace.pending_notice.take().is_some_and(|n| n.contains("needs UVs")));
+        app.uv_unwrap_now();
+        app.bake_ask(bake::Kind::Normal);
+        assert!(app.workspace.pending_notice.take().is_some_and(|n| n.contains("subdivision levels")));
+        assert!(app.doc.divide());
+        app.bake_ask(bake::Kind::Normal);
+        app.poll_bake(true);
+        assert!(app.status.starts_with("Normal map 256²"), "{}", app.status);
+        assert!(app.workspace.bake_preview.as_ref().is_some_and(|p| p.3.len() == 256 * 256));
+        assert_eq!(image::open(dir.join("n.png")).unwrap().width(), 256);
+        app.map_path = dir.join("d.exr").to_string_lossy().into_owned();
+        app.bake_ask(bake::Kind::Displacement);
+        app.poll_bake(true);
+        assert!(app.status.contains("Midlevel 0"), "{}", app.status);
+        assert!(dir.join("d.exr").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -940,6 +940,8 @@ pub struct Actions {
     /// Geometry › UV Map › Unwrap, Delete UVs.
     pub uv_unwrap: bool,
     pub uv_delete: bool,
+    /// Geometry › Texture Maps › Bake Normal Map, Bake Displacement Map.
+    pub bake: Option<crate::bake::Kind>,
 }
 
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
@@ -1082,6 +1084,14 @@ pub struct Workspace {
     /// unwrap that made it when known.
     pub uv_info: Option<(usize, Option<crate::uv::Stats>)>,
     uv_texture: Option<(u64, egui::TextureHandle)>,
+    /// Geometry › Texture Maps settings.
+    pub bake: crate::bake::Settings,
+    /// The last baked map as a picture (a key that changes with each bake, what it was, and
+    /// RGBA pixels), set by the app.
+    pub bake_preview: Option<(u64, String, usize, Vec<[u8; 4]>)>,
+    bake_texture: Option<(u64, egui::TextureHandle)>,
+    /// Set by the app while a bake runs.
+    pub baking: bool,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
     /// Light palette: where the key light is, as a point on the front of a sphere seen from
@@ -1297,6 +1307,10 @@ impl Workspace {
             uv_layout: None,
             uv_info: None,
             uv_texture: None,
+            bake: crate::bake::Settings::default(),
+            bake_preview: None,
+            bake_texture: None,
+            baking: false,
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
@@ -3911,6 +3925,70 @@ impl Workspace {
                             note(ui, "UVs live on the lowest level and go out with Export OBJ while it is shown");
                         }
                         None => note(ui, "No UVs yet · Unwrap lays out the lowest level"),
+                    }
+                });
+                self.sec(ui, h, id, "texturemaps", "Texture Maps", None, false, true, &mut |ws, ui| {
+                    use crate::bake::{Kind, Space};
+                    let ready = ws.uv_info.is_some() && m.levels.len() > 1 && !ws.baking;
+                    ui.add_enabled_ui(ready, |ui| {
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Normal Map"))
+                            .on_hover_text("Bake the highest level's detail into a normal map over the lowest level's UVs, and save it as PNG (ZBrush: Tool › Normal Map)");
+                        if r.shelf(ui, "cmd:bake-normal").clicked() {
+                            a.bake = Some(Kind::Normal);
+                        }
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Displacement Map"))
+                            .on_hover_text("Bake how far the highest level stands out from the smoothly divided lowest level, and save it as EXR or PNG (ZBrush: Tool › Displacement Map)");
+                        if r.shelf(ui, "cmd:bake-displacement").clicked() {
+                            a.bake = Some(Kind::Displacement);
+                        }
+                    });
+                    const SIZES: [usize; 4] = [1024, 2048, 4096, 8192];
+                    let at = SIZES.iter().position(|&x| x == ws.bake.size).unwrap_or(1);
+                    if let Some(i) = seg(ui, &["1K", "2K", "4K", "8K"], at, false) {
+                        ws.bake.size = SIZES[i];
+                    }
+                    let mut ss = ws.bake.samples as f32;
+                    if zslider(ui, "Samples", &mut ss, 1.0..=4.0, false, false, 0) {
+                        ws.bake.samples = ss.round() as u32;
+                    }
+                    let mut pad = ws.bake.padding as f32;
+                    if zslider(ui, "Padding", &mut pad, 0.0..=32.0, false, false, 0) {
+                        ws.bake.padding = pad.round() as usize;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let mut object = ws.bake.space == Space::Object;
+                        if ui.checkbox(&mut object, "Object Space").on_hover_text("Normals as object-space directions instead of relative to the surface (tangent space)").changed() {
+                            ws.bake.space = if object { Space::Object } else { Space::Tangent };
+                        }
+                        ui.add_enabled_ui(ws.bake.space == Space::Tangent, |ui| {
+                            ui.checkbox(&mut ws.bake.flip_g, "Flip G").on_hover_text("Green points down, for DirectX and Unreal; off for Blender, Unity and Godot");
+                        });
+                        ui.checkbox(&mut ws.bake.exr, "Float EXR").on_hover_text("Displacement as 32-bit float OpenEXR in model units (midlevel 0); off: 16-bit PNG with mid grey for none");
+                    });
+                    match &ws.bake_preview {
+                        Some((key, what, size, px)) => {
+                            if ws.bake_texture.as_ref().is_none_or(|t| t.0 != *key) {
+                                let image = egui::ColorImage::from_rgba_unmultiplied([*size, *size], bytemuck::cast_slice(px));
+                                ws.bake_texture = Some((*key, ui.ctx().load_texture("bake-preview", image, TextureOptions::LINEAR)));
+                            }
+                            let side = ui.available_width().min(260.0);
+                            if let Some((_, tex)) = &ws.bake_texture {
+                                ui.add(egui::Image::new((tex.id(), vec2(side, side))));
+                            }
+                            note(ui, what);
+                        }
+                        None => ws.bake_texture = None,
+                    }
+                    if ws.baking {
+                        note(ui, "Baking…");
+                    } else if ws.uv_info.is_none() {
+                        note(ui, "Needs UVs · Unwrap in UV Map first");
+                    } else if m.levels.len() < 2 {
+                        note(ui, "Needs subdivision levels · Divide and sculpt the detail first");
+                    } else {
+                        note(ui, "From the highest level onto the lowest level's UVs · runs in the background");
                     }
                 });
                 self.sec(
@@ -7090,7 +7168,7 @@ mod tests {
     fn initialize_picks_the_primitive_its_resolution_and_rebuilds() {
         use crate::primitive::{Primitive, Settings};
         let (mut workspace, ctx) = test_workspace("initialize");
-        let size = vec2(1600.0, 2600.0);
+        let size = vec2(1600.0, 2800.0);
         let mut settings = Settings::default();
         let rows = [row("Sphere 1", true)];
         let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);

@@ -104,7 +104,12 @@ fn loop_beta_exact(n: usize) -> f32 {
 /// Smoothed position of a child vertex from its parent level.
 #[inline]
 fn smooth(parent: &SculptMesh, s: Stencil) -> Vec3 {
-    let p = &parent.positions;
+    smooth_from(parent, &parent.positions, s)
+}
+
+/// [`smooth`] with the parent's topology but positions `p`.
+#[inline]
+fn smooth_from(parent: &SculptMesh, p: &[Vec3], s: Stencil) -> Vec3 {
     if s[1] == NONE {
         let v = s[0] as usize;
         if s[2] != NONE {
@@ -1692,6 +1697,72 @@ impl Multires {
     pub fn swap_uvs(&mut self, uvs: Vec<[glam::Vec2; 3]>) -> Vec<[glam::Vec2; 3]> {
         let fits = uvs.is_empty() || uvs.len() == self.levels[0].mesh.triangle_count();
         std::mem::replace(&mut self.uvs, if fits { uvs } else { Vec::new() })
+    }
+
+    /// Baking (see [`crate::bake`]): where each triangle of the highest level lies in the
+    /// base level, found level by level from the subdivision stencils. A child triangle is
+    /// a corner (one even vertex and the midpoints of its two edges) or the centre (three
+    /// midpoints) of its parent, so its corners are fixed blends of the parent's corners.
+    pub fn top_places(&self) -> Vec<crate::bake::Place> {
+        use crate::bake::Place;
+        use glam::Vec2;
+        let base = &self.levels[0].mesh;
+        let mut places: Vec<Place> =
+            (0..base.triangle_count() as u32).map(|tri| Place { tri, w: [Vec2::ZERO, Vec2::X, Vec2::Y] }).collect();
+        for l in 1..self.levels.len() {
+            let parent = &self.levels[l - 1].mesh;
+            let st = &self.levels[l].link.as_ref().expect("level above the base has a link").stencil;
+            places = self.levels[l]
+                .mesh
+                .indices
+                .par_chunks_exact(3)
+                .map(|tri| {
+                    let s = [st[tri[0] as usize], st[tri[1] as usize], st[tri[2] as usize]];
+                    let mut verts = [NONE; 6];
+                    let mut n = 0;
+                    for x in &s {
+                        let ends: &[u32] = if x[1] == NONE { &x[..1] } else { &x[..2] };
+                        for &v in ends {
+                            if !verts[..n].contains(&v) {
+                                verts[n] = v;
+                                n += 1;
+                            }
+                        }
+                    }
+                    debug_assert_eq!(n, 3, "a child triangle spans one parent triangle");
+                    let t = parent
+                        .incident(verts[0])
+                        .iter()
+                        .copied()
+                        .find(|&t| {
+                            let p = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                            p.contains(&verts[1]) && p.contains(&verts[2])
+                        })
+                        .expect("the parent triangle of a child triangle");
+                    let ptri = &parent.indices[3 * t as usize..3 * t as usize + 3];
+                    let pp = places[t as usize];
+                    let at = |v: u32| pp.w[ptri.iter().position(|&x| x == v).expect("a corner of the parent")];
+                    Place {
+                        tri: pp.tri,
+                        w: s.map(|x| if x[1] == NONE { at(x[0]) } else { (at(x[0]) + at(x[1])) * 0.5 }),
+                    }
+                })
+                .collect();
+        }
+        places
+    }
+
+    /// Baking: the base level divided up to the highest level with nothing sculpted above
+    /// the base, in the highest level's vertex order (what a displacement map is measured
+    /// from).
+    pub fn smooth_top(&self) -> Vec<Vec3> {
+        let mut p = self.levels[0].mesh.positions.clone();
+        for l in 1..self.levels.len() {
+            let parent = &self.levels[l - 1].mesh;
+            let st = &self.levels[l].link.as_ref().expect("level above the base has a link").stencil;
+            p = st.par_iter().map(|&s| smooth_from(parent, &p, s)).collect();
+        }
+        p
     }
 
     /// The base level (the one UVs belong to).

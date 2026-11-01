@@ -24,6 +24,10 @@ pub enum Ask {
     ExportStl,
     /// Document › Import: OBJ or STL files (several at once).
     ImportMesh,
+    /// Geometry › Texture Maps › Normal Map.
+    ExportNormalMap,
+    /// Geometry › Texture Maps › Displacement, as EXR or PNG.
+    ExportDisplacementMap,
 }
 
 impl Ask {
@@ -37,6 +41,8 @@ impl Ask {
             Ask::ExportObj => "Export OBJ",
             Ask::ExportStl => "Export STL",
             Ask::ImportMesh => "Import OBJ or STL",
+            Ask::ExportNormalMap => "Save Normal Map",
+            Ask::ExportDisplacementMap => "Save Displacement Map",
         }
     }
 
@@ -53,6 +59,8 @@ impl Ask {
             Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
             Ask::ExportStl => &["stl"],
             Ask::ImportMesh => &["obj", "stl"],
+            Ask::ExportNormalMap => &["png"],
+            Ask::ExportDisplacementMap => &["exr", "png"],
         }
     }
 
@@ -62,12 +70,17 @@ impl Ask {
             ["klay"] => "Klay project",
             ["obj"] => "Wavefront OBJ",
             ["stl"] => "STL",
+            ["png"] => "PNG image",
+            ["exr", "png"] => "OpenEXR or PNG image",
             _ => "Meshes (OBJ, STL)",
         }
     }
 
     pub fn saves(self) -> bool {
-        matches!(self, Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl)
+        matches!(
+            self,
+            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap
+        )
     }
 
     fn many(self) -> bool {
@@ -111,7 +124,7 @@ pub fn open(ask: Ask, dir: &Path, file_name: &str, parent: Option<&winit::window
         .name("file dialog".into())
         .spawn(move || {
             let paths = if ask.saves() {
-                dialog.save_file().map(|p| vec![with_extension(p, ext)])
+                dialog.save_file().map(|p| vec![with_any_extension(p, ask.extensions(), ext)])
             } else if ask.many() {
                 dialog.pick_files()
             } else {
@@ -133,6 +146,14 @@ pub fn with_extension(path: PathBuf, ext: &str) -> PathBuf {
     name.push(".");
     name.push(ext);
     path.with_file_name(name)
+}
+
+/// `path` as it is when it ends in one of `exts`, else with `.ext` added.
+fn with_any_extension(path: PathBuf, exts: &[&str], ext: &str) -> PathBuf {
+    if path.extension().is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x))) {
+        return path;
+    }
+    with_extension(path, ext)
 }
 
 /// Where a dialog for `path` starts: the folder `path` is in when it exists, else

@@ -13,7 +13,7 @@
 - **Millions of polygons**, subdivision levels and layers, on any Vulkan GPU
 - **67 brushes**: Clay, Dam Standard, Move, Snake Hook, hPolish, Trim, Slash, Noise and more, picked ZBrush-style with **B** and two letters
 - **Retopology**: **ZRemesher** with guide curves, polypaint density, symmetry, KeepCreases, Detect Edges and FreezeBorder; **ProjectAll** to bring the sculpt's detail onto the new mesh; **Reconstruct Subdiv** and **Freeze SubDiv Levels**
-- **Geometry**: **Sculptris Pro**, **Live Boolean**, **Decimation**, **UV Master**, **ZModeler**, creases that Divide keeps sharp, Remesh, Insert Mesh and CurveTube
+- **Geometry**: **Sculptris Pro**, **Live Boolean**, **Decimation**, **UV Master**, **normal and displacement map baking**, **ZModeler**, creases that Divide keeps sharp, Remesh, Insert Mesh and CurveTube
 - **Select, Clip, Trim, Slice and Knife** tools, masking, polygroups and polypaint
 - **Your workspace**: dock any palette, drag any shelf item anywhere, themes, UI scale, stored configs
 - **Pen pressure** on Linux tablets, symmetry (mirror and radial), MatCaps

@@ -435,6 +435,35 @@ are bent, 0 % for none) and the **Coverage** of the square. One undo step.
 
 A 120k-triangle model unwraps in under a second.
 
+### Texture Maps
+
+Geometry › **Texture Maps** (ZBrush: Tool › Normal Map and Displacement Map) bakes the
+detail of the highest level into an image over the lowest level's UVs, so the lowest level
+can stand in for the sculpt in another program: a game engine, Blender or a renderer. It
+needs UVs (Unwrap in UV Map) and subdivision levels with the detail on them.
+
+- **Normal Map** saves an 8-bit PNG. In tangent space (the default) blue is flat and the
+  directions are relative to the lowest level's smooth surface and UV tangents, the way
+  Blender, Unity, Godot and Unreal read normal maps. **Flip G** makes green point down,
+  for DirectX and Unreal. **Object Space** saves directions in model space instead, for a
+  model that does not deform.
+- **Displacement Map** saves how far the highest level stands out from the lowest level
+  divided smoothly with nothing sculpted above it, along the surface. **Float EXR** (the
+  default) saves 32-bit floats in model units: in Blender use Midlevel 0 and Scale 1. Off,
+  it saves a 16-bit grey PNG with mid grey for none; the status line gives the Scale to use
+  (Midlevel 0.5). The displacement goes on the lowest level divided smoothly, as Blender's
+  Subdivision Surface does.
+- **1K 2K 4K 8K** is the size. **Samples** (1–4, default 2) is how many samples each texel
+  takes along each side, for smoother maps. **Padding** (default 8) grows each island by that
+  many texels, so filtering at the seams does not pull in the background.
+
+Nothing is ray cast: Klay knows where every triangle of the highest level lies in the
+lowest one, so every texel gets its value and nothing misses or hits the wrong part. The
+bake runs in the background on a copy, so you can keep sculpting; the section shows the
+last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-normal PATH`
+and `--bake-displacement PATH` bake at startup (after `--demo` and `--open`), unwrapping
+first if needed. Shelf commands `cmd:bake-normal` and `cmd:bake-displacement`.
+
 ### Decimation
 
 Geometry › **Decimation** (ZBrush: Decimation Master) cuts the triangle count a long way
