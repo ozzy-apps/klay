@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.0 — 2026-11-01
 
 - **BPR** on the right shelf: render the view straight away, save it next to the project (`<project> render.png`, numbered after that) and show it on the canvas until the view turns.
 - **Local**, **Transp** and **Ghost** on the right shelf now work (they were placeholders): Local turns the view about the last place sculpted; Transp draws the other subtools see-through over the active one; Ghost makes them pale and glass-like with their outlines kept. Shelves saved before keep their buttons.
