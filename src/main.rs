@@ -2439,6 +2439,28 @@ impl App {
             commit(self, tree, if round < 0.5 { "ZSphere to Cube" } else { "ZSphere to Sphere" }, before);
             return;
         }
+        // Draw on a link sphere: insert a ZSphere there (and on the mirrored link), sized
+        // by dragging, as ZBrush does.
+        if let Some(c) = tree.link_of(self.mesh().group(hit.tri)).filter(|_| self.workspace.mode == Mode::Draw) {
+            let point = hit.point;
+            let image = Vec3::new(-point.x, point.y, point.z);
+            let (new, mirror_new) = match if sym { tree.mirror_of(c).filter(|&m| m != c) } else { None } {
+                // Inserting goes in before the link's child, shifting later indices by one.
+                Some(m) if m > c => {
+                    let mn = tree.insert(m, image);
+                    (tree.insert(c, point), Some(mn + 1))
+                }
+                Some(m) => {
+                    let n = tree.insert(c, point);
+                    (n + 1, Some(tree.insert(m, image)))
+                }
+                None => (tree.insert(c, point), None),
+            };
+            self.zs_selected = new;
+            self.zsphere_show(tree);
+            self.zs_drag = Some(ZsDrag { kind: ZsKind::Size { i: new, mirror: mirror_new }, before, name: "Insert ZSphere", start: self.cursor });
+            return;
+        }
         let kind = match self.workspace.mode {
             Mode::Draw => {
                 let r = tree.spheres[i as usize].radius * 0.5;
@@ -10818,6 +10840,18 @@ mod subtool_tests {
         app.history_jump(-1);
         assert_eq!(tree(&app).spheres.len(), 3);
         assert_eq!(tree(&app).spheres[1].roundness, 0.0);
+        // Draw on the middle of a link: a sphere is inserted there and on the mirrored link.
+        let t = tree(&app);
+        let mid = t.spheres[0].center.lerp(t.spheres[1].center, 0.55);
+        app.cursor = screen(&app, mid + (app.camera.eye() - mid).normalize() * t.spheres[1].radius * 0.5);
+        app.begin_zsphere();
+        app.end_zsphere();
+        let t = tree(&app);
+        assert_eq!(t.spheres.len(), 5, "inserted on both links");
+        assert_eq!(last(&app).as_deref(), Some("Insert ZSphere"));
+        assert!(t.spheres.iter().enumerate().all(|(i, z)| z.parent == zsphere::NONE || (z.parent as usize) < i));
+        app.history_jump(-1);
+        assert_eq!(tree(&app).spheres.len(), 3);
         // The skin is a new subtool; the ZSpheres stay.
         let tools = app.subtools.len();
         app.make_adaptive_skin();

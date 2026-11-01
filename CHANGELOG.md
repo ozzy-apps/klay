@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.30.1 — 2026-11-01
+
+- ZSpheres: the links between spheres are drawn as chains of overlapping link spheres that taper from one end to the other (and blend between a sphere and a cube), as ZBrush draws them, instead of thin tubes, so the armature shows the volume of the skin before it is made. Drawing on a link sphere inserts a ZSphere there, on the mirrored link too with X symmetry, sized by dragging; one undo step.
+- Verification: 379 tests (new: link spheres fill a link overlapping and shrinking toward the smaller end, a link's polygroup leads back to it, inserting keeps every parent before its children; in the app a symmetric draw on a link inserts two spheres in one undo step).
+
 ## 0.30.0 — 2026-11-01
 
 - **BPR** on the right shelf: render the view straight away, save it next to the project (`<project> render.png`, numbered after that) and show it on the canvas until the view turns.

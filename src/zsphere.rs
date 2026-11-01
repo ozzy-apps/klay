@@ -2,8 +2,10 @@
 //! armature, turned into a mesh to sculpt by **Make Adaptive Skin**.
 //!
 //! A ZSphere subtool's mesh is the tree as drawn ([`Tree::display`]): every sphere, one
-//! polygroup each so a click knows which sphere it hit, and a thin link between each sphere
-//! and its parent. Editing replaces that mesh; the tree itself rides on the level stack
+//! polygroup each so a click knows which sphere it hit, and between each sphere and its
+//! parent a chain of overlapping link spheres tapering from one to the other (as ZBrush draws
+//! them, so the armature already reads as a body), one polygroup per link so a click on it
+//! can insert a sphere there. Editing replaces that mesh; the tree itself rides on the level stack
 //! ([`crate::multires::Multires::zspheres`]), so undo, parking and projects keep it.
 //!
 //! The skin ([`Tree::skin`]) is the union of the spheres and of further spheres placed
@@ -127,7 +129,7 @@ impl Tree {
     }
 
     /// The sphere whose polygroup is `group` in [`display`](Self::display), or for a link
-    /// (group 0) the sphere nearest `point`.
+    /// the sphere nearest `point`.
     pub fn sphere_of(&self, group: u16, point: Vec3) -> u32 {
         if group > 0 && (group as usize) <= self.spheres.len() {
             return group as u32 - 1;
@@ -140,10 +142,71 @@ impl Tree {
             .unwrap_or(0)
     }
 
-    /// The tree as drawn: each sphere in polygroup `index + 1`, and between each sphere and
-    /// its parent a thin tapered tube in polygroup 0.
+    /// The polygroup of the link from sphere `child` to its parent in
+    /// [`display`](Self::display), after the spheres' own.
+    fn link_group(&self, child: u32) -> u16 {
+        (self.spheres.len() + 1 + child as usize).min(u16::MAX as usize) as u16
+    }
+
+    /// The sphere whose link to its parent has polygroup `group`, if it is a link's.
+    pub fn link_of(&self, group: u16) -> Option<u32> {
+        let n = self.spheres.len();
+        let g = group as usize;
+        (g > n && g <= 2 * n && g < u16::MAX as usize).then(|| (g - n - 1) as u32).filter(|&c| self.spheres[c as usize].parent != NONE)
+    }
+
+    /// The link spheres between sphere `child` and its parent, `spacing` of their own
+    /// radius apart: (share of the way from the parent, centre, radius, roundness).
+    fn link_spheres(&self, child: u32, spacing: f32) -> Vec<(f32, Vec3, f32, f32)> {
+        let z = self.spheres[child as usize];
+        if z.parent == NONE {
+            return Vec::new();
+        }
+        let q = self.spheres[z.parent as usize];
+        let len = z.center.distance(q.center);
+        if len < 1e-6 {
+            return Vec::new();
+        }
+        let at = |t: f32| (q.radius + (z.radius - q.radius) * t, q.roundness + (z.roundness - q.roundness) * t);
+        let mut out = Vec::new();
+        let mut t = spacing * q.radius / len;
+        while t < 1.0 - spacing * z.radius / len && out.len() < 512 {
+            let (r, round) = at(t);
+            out.push((t, q.center.lerp(z.center, t), r, round));
+            t += (spacing * r / len).max(1e-3);
+        }
+        out
+    }
+
+    /// Insert a sphere on the link from sphere `child` to its parent, nearest `point`,
+    /// sized and shaped between its ends; returns its index. It goes in just before `child`
+    /// (parents always come before their children).
+    pub fn insert(&mut self, child: u32, point: Vec3) -> u32 {
+        let z = self.spheres[child as usize];
+        let q = self.spheres[z.parent as usize];
+        let axis = z.center - q.center;
+        let t = ((point - q.center).dot(axis) / axis.length_squared().max(1e-12)).clamp(0.05, 0.95);
+        let new = ZSphere {
+            center: q.center.lerp(z.center, t),
+            radius: q.radius + (z.radius - q.radius) * t,
+            parent: z.parent,
+            roundness: q.roundness + (z.roundness - q.roundness) * t,
+        };
+        for s in &mut self.spheres {
+            if s.parent != NONE && s.parent >= child {
+                s.parent += 1;
+            }
+        }
+        self.spheres.insert(child as usize, new);
+        self.spheres[child as usize + 1].parent = child;
+        child
+    }
+
+    /// The tree as drawn: each sphere in polygroup `index + 1`, and the link spheres between
+    /// each sphere and its parent in one polygroup per link.
     pub fn display(&self) -> SculptMesh {
         let (up, ui) = unit_sphere(6);
+        let (lp, li) = unit_sphere(6);
         let (mut p, mut idx, mut groups) = (Vec::new(), Vec::new(), Vec::new());
         for k in 0..self.spheres.len() {
             let base = p.len() as u32;
@@ -151,42 +214,17 @@ impl Tree {
             idx.extend(ui.iter().map(|&i| base + i));
             groups.extend(std::iter::repeat_n(k as u16 + 1, ui.len() / 3));
         }
-        const SIDES: u32 = 8;
-        for z in &self.spheres {
+        for (c, z) in self.spheres.iter().enumerate() {
             if z.parent == NONE {
                 continue;
             }
-            let q = self.spheres[z.parent as usize];
-            let axis = z.center - q.center;
-            let len = axis.length();
-            if len <= (z.radius + q.radius) * 0.5 {
-                continue;
-            }
-            let d = axis / len;
-            let u = d.any_orthonormal_vector();
-            let v = d.cross(u);
-            let (ra, rb) = (q.radius * 0.25, z.radius * 0.25);
-            let base = p.len() as u32;
-            for (c, r) in [(q.center + d * q.radius * 0.9, ra), (z.center - d * z.radius * 0.9, rb)] {
-                for k in 0..SIDES {
-                    let a = k as f32 / SIDES as f32 * std::f32::consts::TAU;
-                    p.push(c + (u * a.cos() + v * a.sin()) * r);
-                }
-            }
-            for k in 0..SIDES {
-                let (a0, a1) = (base + k, base + (k + 1) % SIDES);
-                let (b0, b1) = (a0 + SIDES, a1 + SIDES);
-                idx.extend_from_slice(&[a0, a1, b1, a0, b1, b0]);
-                groups.extend_from_slice(&[0, 0]);
-            }
-            // Caps close the tube.
-            let (ca, cb) = (p.len() as u32, p.len() as u32 + 1);
-            p.push(q.center + d * q.radius * 0.9);
-            p.push(z.center - d * z.radius * 0.9);
-            for k in 0..SIDES {
-                let (a0, a1) = (base + k, base + (k + 1) % SIDES);
-                idx.extend_from_slice(&[ca, a1, a0, cb, a0 + SIDES, a1 + SIDES]);
-                groups.extend_from_slice(&[0, 0]);
+            let m = frame(z.center - self.spheres[z.parent as usize].center);
+            let g = self.link_group(c as u32);
+            for (_, centre, r, round) in self.link_spheres(c as u32, 0.5) {
+                let base = p.len() as u32;
+                p.extend(lp.iter().map(|&q| centre + m * shaped(q, round) * r));
+                idx.extend(li.iter().map(|&i| base + i));
+                groups.extend(std::iter::repeat_n(g, li.len() / 3));
             }
         }
         SculptMesh::from_raw_with_groups(p, idx, groups)
@@ -212,15 +250,11 @@ impl Tree {
             if z.parent == NONE {
                 continue;
             }
-            // Along the link: radius and roundness blend, the shapes turned with the link.
-            let q = self.spheres[z.parent as usize];
-            let m = frame(z.center - q.center);
-            let len = z.center.distance(q.center);
-            let step = 0.12 * z.radius.min(q.radius);
-            let n = ((len / step).ceil() as usize).clamp(1, 256);
-            for k in 1..n {
-                let t = k as f32 / n as f32;
-                ball(q.center.lerp(z.center, t), q.radius + (z.radius - q.radius) * t, m, q.roundness + (z.roundness - q.roundness) * t);
+            // Along the link: radius and roundness blend, the shapes turned with the link,
+            // close enough that the union is smooth.
+            let m = frame(z.center - self.spheres[z.parent as usize].center);
+            for (_, centre, r, round) in self.link_spheres(i as u32, 0.12) {
+                ball(centre, r, m, round);
             }
         }
         let union = SculptMesh::from_raw(p, idx);
@@ -307,5 +341,29 @@ mod tests {
         let square = reach(1.5, diag) / reach(1.5, Vec3::Y);
         let round = reach(0.0, diag) / reach(0.0, Vec3::Y);
         assert!(square > 1.2 && (round - 1.0).abs() < 0.1, "{square} {round}");
+    }
+
+    #[test]
+    fn links_are_drawn_as_tapering_spheres_and_a_click_on_one_inserts_a_sphere() {
+        let mut t = Tree::default();
+        let a = t.add(0, Vec3::new(2.0, 0.0, 0.0), 0.2);
+        let b = t.add(a, Vec3::new(3.0, 0.0, 0.0), 0.1);
+        // Link spheres fill the gap, each overlapping the next, shrinking toward the child.
+        let link = t.link_spheres(a, 0.5);
+        assert!(link.len() >= 4, "{}", link.len());
+        assert!(link.windows(2).all(|w| w[0].1.distance(w[1].1) < w[0].2 + w[1].2 && w[1].2 <= w[0].2));
+        let m = t.display();
+        let g = t.link_group(a);
+        let tri = (0..m.triangle_count() as u32).find(|&k| m.group(k) == g).expect("the link is drawn");
+        assert_eq!(t.link_of(m.group(tri)), Some(a));
+        assert_eq!(t.link_of(1), None, "a sphere's group is not a link");
+        // Inserting on the root-to-a link puts a sphere between them and keeps parents first.
+        let new = t.insert(a, Vec3::new(1.0, 0.3, 0.0));
+        assert_eq!(new, 1);
+        assert_eq!(t.spheres.len(), 4);
+        let s = t.spheres[1];
+        assert!((s.center.x - 1.0).abs() < 1e-4 && s.center.y == 0.0 && s.radius > 0.2 && s.radius < 0.5);
+        assert_eq!((s.parent, t.spheres[2].parent, t.spheres[b as usize + 1].parent), (0, 1, 2));
+        assert!(t.spheres.iter().enumerate().all(|(i, z)| z.parent == NONE || (z.parent as usize) < i));
     }
 }

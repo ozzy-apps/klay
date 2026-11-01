@@ -481,7 +481,9 @@ Geometry › **ZSphere › New ZSphere** adds a subtool holding one ZSphere: an 
 sketch with spheres and then skin.
 
 - Draw mode: drag on a sphere to add a child sphere there, sized by how far you drag.
-  With X symmetry on, the mirror image is added too.
+  With X symmetry on, the mirror image is added too. Between each sphere and its parent,
+  link spheres taper from one size to the other, as in ZBrush, so the armature already shows
+  the volume the skin will have; drag on a link sphere to insert a ZSphere there.
 - Move (W) drags a sphere, Scale (E) sizes it; **Alt + click** deletes a sphere (its
   children move to its parent).
 - **Shift + click** turns a sphere into a cube and back, and **Roundness** sets the sphere
