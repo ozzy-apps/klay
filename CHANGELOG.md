@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.29.0 — 2026-11-01
 
 - **Dynamics** (Geometry › Dynamics): the shown level simulated as cloth (position-based, stretch and bend constraints): it falls under **Gravity**, drapes over the other visible subtools with **Friction**, and settles on the floor; masked vertices stay pinned; **Inflate** puffs a model up. Runs in the background with the model updating live; Stop or Esc ends it; one undo step. Shelf command `cmd:simulate`.
 - **FiberMesh** (Geometry › FiberMesh): fibres grown from the masked (or visible) surface, previewed live: count, length and variation, segments, gravity, curl, spread, base and tip width, and tubes (3–8 sides, closed) or flat ribbons. **Accept** makes them a subtool to groom. Shelf command `cmd:fibermesh`; `--fibers N` at startup.
