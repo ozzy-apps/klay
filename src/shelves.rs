@@ -53,8 +53,8 @@ pub fn default_items(side: ShelfSide) -> Vec<String> {
         ShelfSide::Left => &["thumb:brush", "thumb:stroke", "thumb:alpha", "thumb:texture", "thumb:material", "color", "alternate"],
         ShelfSide::Right => &[
             "cmd:frame", "toggle:persp", "toggle:floor", "toggle:sym", "sep",
-            "toggle:polyf", "stub:local", "stub:transp", "stub:ghost", "toggle:solo", "sep",
-            "toggle:detail", "cmd:hide-ui",
+            "toggle:polyf", "toggle:local", "toggle:transp", "toggle:ghost", "toggle:solo", "sep",
+            "cmd:bpr", "toggle:detail", "cmd:hide-ui",
         ],
         ShelfSide::Bottom => &[],
     };
@@ -80,12 +80,20 @@ const BUILTIN: &[(&str, &str)] = &[
     ("thumb:material", "Material"),
     ("color", "Colour picker"),
     ("alternate", "Alternate"),
-    ("stub:local", "Local"),
-    ("stub:transp", "Transp"),
-    ("stub:ghost", "Ghost"),
     ("sep", "Separator"),
     ("space", "Spring (pushes the rest to the end)"),
 ];
+
+/// The id an item saved by an older version has now (Local, Transp and Ghost were
+/// placeholders before 0.30).
+pub fn current_id(id: &str) -> &str {
+    match id {
+        "stub:local" => "toggle:local",
+        "stub:transp" => "toggle:transp",
+        "stub:ghost" => "toggle:ghost",
+        other => other,
+    }
+}
 
 pub fn known(id: &str) -> bool {
     BUILTIN.iter().any(|(b, _)| *b == id) || custom_shelf::known(id)
@@ -167,9 +175,10 @@ fn icon(id: &str) -> Option<&'static str> {
         "toggle:floor" => "floor",
         "toggle:sym" => "sym",
         "toggle:polyf" => "polyf",
-        "stub:local" => "local",
-        "stub:transp" => "transp",
-        "stub:ghost" => "ghost",
+        "toggle:local" => "local",
+        "toggle:transp" => "transp",
+        "toggle:ghost" => "ghost",
+        "cmd:bpr" => "bpr",
         "toggle:solo" => "solo",
         "toggle:detail" => "detail",
         "cmd:hide-ui" => "hide",
@@ -537,7 +546,8 @@ impl Workspace {
                                 self.subtract = i == 1;
                             }
                         });
-                        ui.add_enabled(false, egui::Button::new("Zcut").min_size(vec2(50.0, CONTROL_H)));
+                        ui.add_enabled(false, egui::Button::new("Zcut").min_size(vec2(50.0, CONTROL_H)))
+                            .on_disabled_hover_text("Zcut carves 2.5D pixols; ZBrush greys it out for 3D sculpting too · use Zsub to carve");
                     });
                 } else if let Some(i) = seg(ui, &["Zadd", "Zsub"], self.subtract as usize, false) {
                     self.subtract = i == 1;
@@ -753,9 +763,10 @@ pub fn migrate(top: Option<&str>, right: Option<&str>, mine: Option<&str>) -> [V
                     "floor" => "toggle:floor",
                     "sym" => "toggle:sym",
                     "polyf" => "toggle:polyf",
-                    "local" => "stub:local",
-                    "transp" => "stub:transp",
-                    "ghost" => "stub:ghost",
+                    "local" => "toggle:local",
+                    "transp" => "toggle:transp",
+                    "ghost" => "toggle:ghost",
+                    "bpr" => "cmd:bpr",
                     "solo" => "toggle:solo",
                     "detail" => "toggle:detail",
                     "hide" => "cmd:hide-ui",

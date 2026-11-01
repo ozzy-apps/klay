@@ -329,6 +329,17 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
     // Parked subtools: a little darker, and never under the brush.
     if (in.parked > 0u) {
         color *= 0.78;
+        // Transp (sym.w: how opaque) and Ghost (back_shape.w): see-through, Ghost pale and
+        // clearer where the surface faces the viewer, so only outlines stay.
+        if (u.sym.w > 0.0) {
+            var alpha = u.sym.w;
+            if (u.back_shape.w > 0.5) {
+                let edge = pow(1.0 - abs(dot(n, v)), 2.0);
+                color = mix(vec3<f32>(0.72, 0.80, 0.92), color, 0.3);
+                alpha = 0.06 + 0.7 * edge;
+            }
+            return vec4<f32>(pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), alpha);
+        }
     }
 
     // Mask (Ctrl): masked clay goes dark, as in ZBrush.

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **BPR** on the right shelf: render the view straight away, save it next to the project (`<project> render.png`, numbered after that) and show it on the canvas until the view turns.
+- **Local**, **Transp** and **Ghost** on the right shelf now work (they were placeholders): Local turns the view about the last place sculpted; Transp draws the other subtools see-through over the active one; Ghost makes them pale and glass-like with their outlines kept. Shelves saved before keep their buttons.
+- Zcut explains on hover why it is greyed out (it carves 2.5D pixols; ZBrush greys it out for 3D sculpting too).
+- Verification: 378 tests (new: turning about a pivot keeps it on the same screen point; a stroke sets the Local pivot on the surface; old shelf ids map to the new buttons and the default right shelf has BPR; BPR saves `model render.png`, then `model render 2.png`, and its picture goes when the view turns).
+
 ## 0.29.0 — 2026-11-01
 
 - **Dynamics** (Geometry › Dynamics): the shown level simulated as cloth (position-based, stretch and bend constraints): it falls under **Gravity**, drapes over the other visible subtools with **Friction**, and settles on the floor; masked vertices stay pinned; **Inflate** puffs a model up. Runs in the background with the model updating live; Stop or Esc ends it; one undo step. Shelf command `cmd:simulate`.

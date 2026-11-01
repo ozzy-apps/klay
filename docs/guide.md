@@ -663,7 +663,10 @@ and create a GitHub release with the packaged file attached (`scripts/package-li
 
 ### Render and Turntable
 
-Document › **Render** (ZBrush: BPR) draws the view again by ray tracing, with what the
+**BPR** on the right shelf renders the view at once, saves it next to the project as
+`<project> render.png` (then `render 2`, and so on) and shows it on the canvas until you turn
+the view. Document › **Render** (ZBrush: BPR) does the same with a file you pick, and holds
+the settings. It draws the view again by ray tracing, with what the
 viewport leaves out: shadows the model casts on itself and on other subtools, and ambient
 occlusion in its creases. It is antialiased, uses the material and polypaint as shown, and
 is saved as a PNG you pick, in the background; the section shows the last render.
@@ -676,6 +679,17 @@ is saved as a PNG you pick, in the background; the section shows the last render
 **Turntable frames** long) through ffmpeg when it is installed, or as numbered PNG frames in
 a folder beside the file without it (as in the Flatpak). The view comes back where it was;
 Esc stops early. `--render PATH`, `--turntable PATH` and `--turntable-frames N` at startup.
+
+### Local, Transp and Ghost
+
+The right shelf's view buttons, as in ZBrush:
+
+- **Local**: the view turns about the last place you sculpted instead of the middle of the
+  view, so the spot you work on stays put on screen while you look around it.
+- **Transp**: the other visible subtools are drawn see-through, so the active one shows
+  through them (and stays the only one brushes reach).
+- **Ghost**: with Transp, the other subtools turn pale and glass-like, nearly clear where they
+  face you, so only their outlines remain. Ghost turns Transp on; Transp off turns Ghost off.
 
 ### Spotlight
 

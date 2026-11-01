@@ -28,7 +28,7 @@ mod brush_ui;
 mod custom_shelf;
 use custom_shelf::ShelfSource;
 #[path = "shelves.rs"]
-mod shelves;
+pub(crate) mod shelves;
 pub use shelves::ShelfSide;
 
 // ---------------------------------------------------------------- theme tokens
@@ -685,7 +685,7 @@ impl DockLayout {
                 ["shelf", side, list] => {
                     if let Some(side) = ShelfSide::parse(side) {
                         let mut items: Vec<String> = Vec::new();
-                        for id in list.split(';').filter(|id| shelves::known(id)) {
+                        for id in list.split(';').map(shelves::current_id).filter(|id| shelves::known(id)) {
                             if id == "sep" || id == "space" || !items.iter().any(|x| x == id) {
                                 items.push(id.to_string());
                             }
@@ -932,6 +932,8 @@ pub struct Actions {
     pub fiber_accept: bool,
     /// Geometry › Dynamics › Run Simulation.
     pub simulate: bool,
+    /// Right shelf › BPR: render the view now and show it on the canvas.
+    pub bpr: bool,
     /// Document › Render › Render, Turntable.
     pub render: bool,
     pub turntable: bool,
@@ -1115,6 +1117,15 @@ pub struct Workspace {
     /// Geometry › FiberMesh settings, and whether the fibres are previewed.
     pub fiber: crate::fiber::Settings,
     pub fiber_preview: bool,
+    /// Right shelf: Local (turn about the last edited point), Transp and Ghost (the other
+    /// subtools see-through, and glass-like).
+    pub local: bool,
+    pub transp: bool,
+    pub ghost: bool,
+    /// BPR: the last render shown over the canvas until the view moves (a key, size and
+    /// RGBA), set by the app; and its texture.
+    pub bpr_view: Option<(u64, [usize; 2], std::sync::Arc<Vec<u8>>)>,
+    bpr_texture: Option<(u64, egui::TextureHandle)>,
     /// Spotlight: the picture over the canvas, and its texture once uploaded.
     pub spotlight: Option<crate::spotlight::Spotlight>,
     spotlight_texture: Option<(u64, egui::TextureHandle)>,
@@ -1363,6 +1374,11 @@ impl Workspace {
             simulating: false,
             fiber: crate::fiber::Settings::default(),
             fiber_preview: false,
+            local: false,
+            transp: false,
+            ghost: false,
+            bpr_view: None,
+            bpr_texture: None,
             spotlight: None,
             spotlight_texture: None,
             bpr: crate::bpr::Settings::default(),
@@ -5212,6 +5228,19 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if let Some((key, [w, h], px)) = &self.bpr_view {
+            // BPR: the render over the canvas, until the view moves.
+            if self.bpr_texture.as_ref().is_none_or(|t| t.0 != *key) {
+                let image = egui::ColorImage::from_rgba_unmultiplied([*w, *h], px);
+                self.bpr_texture = Some((*key, ui.ctx().load_texture("bpr", image, TextureOptions::LINEAR)));
+            }
+            if let Some((_, tex)) = &self.bpr_texture {
+                let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("bpr"))).with_clip_rect(self.canvas);
+                p.image(tex.id(), self.canvas, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        } else {
+            self.bpr_texture = None;
+        }
         if let Some(sp) = self.spotlight.as_ref().filter(|s| s.shown) {
             // Spotlight: the picture over the canvas, under the other overlays.
             let pic = &sp.picture;
@@ -6545,6 +6574,12 @@ fn glyph(p: &egui::Painter, c: Pos2, name: &str, color: Color32) {
             };
             wave(3.0, 2.5, color);
             wave(-3.0, 1.5, color.gamma_multiply(0.5));
+        }
+        "bpr" => {
+            // A camera: body, lens and the viewfinder bump.
+            line(&[vec2(-7.0, -3.0), vec2(7.0, -3.0), vec2(7.0, 6.0), vec2(-7.0, 6.0), vec2(-7.0, -3.0)]);
+            line(&[vec2(-3.0, -3.0), vec2(-2.0, -6.0), vec2(2.0, -6.0), vec2(3.0, -3.0)]);
+            p.circle_stroke(c + vec2(0.0, 1.5), 3.0, s);
         }
         "hide" => {
             let pts: Vec<Vec2> = (0..13)

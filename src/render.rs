@@ -424,6 +424,9 @@ pub struct Gfx {
     pub dynamic: bool,
     /// FiberMesh: the stand-in under [`FIBER_KEY`] is drawn with the active subtool.
     pub fibers: bool,
+    /// Transp: parked subtools are drawn blended over the active one, without depth.
+    pub transparent_parked: bool,
+    transp_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     mask_bgl: wgpu::BindGroupLayout,
@@ -756,7 +759,7 @@ impl Gfx {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
+                    depth_write_enabled: Some(!label.contains("transparent")),
                     depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -768,7 +771,7 @@ impl Gfx {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
+                        blend: Some(if label.contains("transparent") { wgpu::BlendState::ALPHA_BLENDING } else { wgpu::BlendState::REPLACE }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -777,6 +780,8 @@ impl Gfx {
             })
         };
         let pipeline = mesh_pipeline(&shader, &mesh_layout, "mesh pipeline", "vs_main", "fs_main", Some(wgpu::Face::Back));
+        // Transp: the same, blended, writing no depth (the label says so).
+        let transp_pipeline = mesh_pipeline(&shader, &mesh_layout, "transparent mesh pipeline", "vs_main", "fs_main", Some(wgpu::Face::Back));
         let bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "live boolean pipeline", "vs_main", "fs_bool", None);
         let active_pipeline = mesh_pipeline(&shader, &mesh_layout, "active mesh pipeline", "vs_active", "fs_main", Some(wgpu::Face::Back));
         let active_bool_pipeline = mesh_pipeline(&shader, &mesh_layout, "active live boolean pipeline", "vs_active", "fs_bool", None);
@@ -1250,6 +1255,8 @@ impl Gfx {
             stand_ins: HashMap::new(),
             dynamic: false,
             fibers: false,
+            transparent_parked: false,
+            transp_pipeline,
             bind_group,
             mask_bgl,
             no_mask,
@@ -2789,20 +2796,11 @@ impl Gfx {
                     pass.draw_indexed(0..count, 0, 0..1);
                 }
             }
+            // The active subtool's previews (opaque), then the parked subtools (blended last
+            // with Transp).
             pass.set_pipeline(plain);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &self.no_mask, &[]);
-            for &(key, instance) in parked {
-                if let Some(s) = self.stand_ins.get(&key) {
-                    pass.set_vertex_buffer(0, s.positions.slice(..));
-                    pass.set_vertex_buffer(1, s.normals.slice(..));
-                    pass.set_vertex_buffer(2, s.colors.slice(..));
-                    pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    // An instance from 1 on marks a parked subtool for the shader (with Live
-                    // Boolean, 1 + its operand slot).
-                    pass.draw_indexed(0..s.index_count, 0, instance..instance + 1);
-                }
-            }
             if let Some(s) = self.stand_ins.get(&FIBER_KEY).filter(|_| self.fibers) {
                 pass.set_vertex_buffer(0, s.positions.slice(..));
                 pass.set_vertex_buffer(1, s.normals.slice(..));
@@ -2817,6 +2815,20 @@ impl Gfx {
                 pass.set_vertex_buffer(2, s.colors.slice(..));
                 pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..s.index_count, 0, 0..1);
+            }
+            pass.set_pipeline(if self.transparent_parked && !boolean { &self.transp_pipeline } else { plain });
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.no_mask, &[]);
+            for &(key, instance) in parked {
+                if let Some(s) = self.stand_ins.get(&key) {
+                    pass.set_vertex_buffer(0, s.positions.slice(..));
+                    pass.set_vertex_buffer(1, s.normals.slice(..));
+                    pass.set_vertex_buffer(2, s.colors.slice(..));
+                    pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    // An instance from 1 on marks a parked subtool for the shader (with Live
+                    // Boolean, 1 + its operand slot).
+                    pass.draw_indexed(0..s.index_count, 0, instance..instance + 1);
+                }
             }
         }
 

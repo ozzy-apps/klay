@@ -353,6 +353,8 @@ struct RenderJob {
     rx: std::sync::mpsc::Receiver<Result<(bpr::Image, u64), String>>,
     path: String,
     started: Instant,
+    /// BPR from the right shelf: show the result over the canvas.
+    show: bool,
 }
 
 /// Document › Render › Turntable under way: the view turns one step a frame and each
@@ -774,6 +776,10 @@ struct App {
     render_count: u64,
     render_on_start: Option<String>,
     turntable_on_start: Option<String>,
+    /// The view a BPR shown on the canvas was rendered from; it goes when the view moves.
+    bpr_camera: Option<[f32; 8]>,
+    /// Local: the last place sculpted, which the view turns about.
+    local_pivot: Option<Vec3>,
     /// A cloth simulation under way.
     sim: Option<SimJob>,
     /// What the FiberMesh preview on the GPU was made from.
@@ -975,6 +981,8 @@ impl App {
             render_count: 0,
             render_on_start: None,
             turntable_on_start: None,
+            bpr_camera: None,
+            local_pivot: None,
             uv_stats: None,
             selftest_wedge: None,
             pending_subtool: None,
@@ -1488,9 +1496,42 @@ impl App {
             .unwrap_or_else(|_| Err("the render failed".to_string()));
             let _ = tx.send(r);
         });
-        self.render_job = Some(RenderJob { rx, path, started: Instant::now() });
+        self.render_job = Some(RenderJob { rx, path, started: Instant::now(), show: false });
         self.workspace.rendering = true;
         self.status = "Rendering…".to_string();
+    }
+
+    /// The view as numbers, to notice when it moves.
+    fn camera_key(&self) -> [f32; 8] {
+        let c = &self.camera;
+        [c.yaw, c.pitch, c.distance, c.roll, c.target.x, c.target.y, c.target.z, c.fov_y]
+    }
+
+    /// Right shelf › BPR: render the view now, save it next to the project as
+    /// `<project> render N.png`, and show it over the canvas until the view moves.
+    fn bpr_now(&mut self) {
+        if self.render_job.is_some() || self.turntable.is_some() {
+            return;
+        }
+        let project = Path::new(&self.project_path);
+        let stem = project.file_stem().map_or_else(|| "untitled".into(), |s| s.to_string_lossy().to_string());
+        let dir = project.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let path = (1..)
+            .map(|n| dir.join(if n == 1 { format!("{stem} render.png") } else { format!("{stem} render {n}.png") }))
+            .find(|p| !p.exists())
+            .unwrap();
+        self.start_render(path.to_string_lossy().into_owned());
+        if let Some(job) = self.render_job.as_mut() {
+            job.show = true;
+        }
+    }
+
+    /// Take the BPR off the canvas once the view moves.
+    fn update_bpr_view(&mut self) {
+        if self.workspace.bpr_view.is_some() && self.bpr_camera != Some(self.camera_key()) {
+            self.workspace.bpr_view = None;
+            self.bpr_camera = None;
+        }
     }
 
     /// Report a finished render (waiting for it with `wait`). Each frame.
@@ -1514,6 +1555,11 @@ impl App {
         match result {
             Ok((img, bytes)) => {
                 self.status = format!("Render {}×{} saved to {} ({:.1} MB) in {secs:.1} s", img.width, img.height, job.path, bytes as f64 / 1e6);
+                if job.show {
+                    self.status.push_str(" · turn the view to go back to sculpting");
+                    self.bpr_camera = Some(self.camera_key());
+                    self.workspace.bpr_view = Some((self.render_count + 1, [img.width as usize, img.height as usize], std::sync::Arc::new(img.rgba.clone())));
+                }
                 // A preview at most 256 wide.
                 let pw = 256.min(img.width as usize);
                 let ph = (img.height as usize * pw / img.width as usize).max(1);
@@ -6399,6 +6445,11 @@ impl App {
     }
 
     fn begin_stroke(&mut self) {
+        // Local: the view will turn about where this stroke starts.
+        let (o, d) = self.cursor_ray();
+        if let Some(h) = self.mesh().raycast(o, d) {
+            self.local_pivot = Some(h.point);
+        }
         self.stroke_brush = self.effective_brush();
         let gpu = self.gfx.is_some() && self.stroke_brush.kind.gpu_drag();
         // Alt is ZBrush's alternate (ZSub) modifier.
@@ -7861,7 +7912,10 @@ impl App {
         log::trace!("nav {mode:?} {:?} dx={} dy={}", drag.button, delta.x, delta.y);
         match mode {
             NavMode::Orbit => {
-                self.camera.orbit(delta.x, delta.y);
+                match self.local_pivot.filter(|_| self.workspace.local) {
+                    Some(pivot) => self.camera.orbit_about(pivot, delta.x, delta.y),
+                    None => self.camera.orbit(delta.x, delta.y),
+                }
                 if self.modifiers.shift_key() {
                     self.camera.snap_to_axis();
                 }
@@ -8554,6 +8608,7 @@ impl App {
         self.poll_decimation(false);
         self.poll_bake(false);
         self.poll_render(false);
+        self.update_bpr_view();
         self.poll_sim(false);
         self.workspace.curve_preview = self.curve_preview();
         self.update_uv_layout();
@@ -8641,6 +8696,9 @@ impl App {
         }
         if actions.spotlight_load {
             self.ask_file(file_dialog::Ask::OpenSpotlight);
+        }
+        if actions.bpr {
+            self.bpr_now();
         }
         if actions.render && self.render_job.is_none() && self.turntable.is_none() {
             self.ask_file(file_dialog::Ask::ExportRender);
@@ -9268,7 +9326,8 @@ impl App {
             },
             back_shape: {
                 let d = &self.workspace.layout.document;
-                [d.center, d.rate, self.workspace.layout.document.inset * self.scale, 0.0]
+                // w: Ghost.
+                [d.center, d.rate, self.workspace.layout.document.inset * self.scale, if self.workspace.ghost { 1.0 } else { 0.0 }]
             },
             border: {
                 let c = self.workspace.layout.document.border.map(|c| c as f32 / 255.0);
@@ -9278,7 +9337,8 @@ impl App {
                 let s = self.workspace.sym();
                 let bits = s.x as u32 | (s.y as u32) << 1 | (s.z as u32) << 2;
                 let (axis, count) = s.radial.map_or((-1.0, 1.0), |(a, n)| (symmetry::Axis::ALL.iter().position(|x| *x == a).unwrap() as f32, n as f32));
-                [bits as f32, axis, count, 0.0]
+                // w: Transp, how opaque the other subtools are (0 when off).
+                [bits as f32, axis, count, if self.workspace.transp { 0.35 } else { 0.0 }]
             },
         };
         if Gfx::take_gpu_error() {
@@ -9291,6 +9351,7 @@ impl App {
             .map(|(key, i)| (key, slots.iter().find(|s| s.0 == i).map_or(1, |s| 1 + s.1 as u32)))
             .collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.transparent_parked = self.workspace.transp;
         // Performance › Drawing (self-tests switch points themselves).
         if self.selftest_cull.is_none() && self.selftest_splat.is_none() {
             gfx.splatting = self.workspace.layout.dense_points && !self.render_triangles;
@@ -10210,6 +10271,9 @@ fn main() {
         app.workspace.fiber.count = n;
         app.workspace.fiber_preview = true;
     }
+    // `--transp` / `--ghost`: Transp (and Ghost) on at startup.
+    app.workspace.ghost = args.iter().any(|a| a == "--ghost");
+    app.workspace.transp = app.workspace.ghost || args.iter().any(|a| a == "--transp");
     // `--spotlight IMAGE`: lay IMAGE over the canvas at startup.
     if let Some(path) = flag("--spotlight") {
         app.load_spotlight(Path::new(path));
@@ -10654,6 +10718,43 @@ mod subtool_tests {
         }
         assert!(red > 20 && blue > 20 && white == 0, "{red} {blue} {white}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bpr_renders_next_to_the_project_and_shows_until_the_view_moves() {
+        let mut app = App::new(16, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-bpr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.project_path = dir.join("model.klay").to_string_lossy().into_owned();
+        app.workspace.bpr.samples = 1;
+        app.bpr_now();
+        app.poll_render(true);
+        assert!(dir.join("model render.png").exists(), "{}", app.status);
+        assert!(app.workspace.bpr_view.is_some());
+        app.update_bpr_view();
+        assert!(app.workspace.bpr_view.is_some(), "stays while the view is still");
+        app.camera.orbit(10.0, 0.0);
+        app.update_bpr_view();
+        assert!(app.workspace.bpr_view.is_none(), "goes when the view turns");
+        // A second BPR does not overwrite the first.
+        app.bpr_now();
+        app.poll_render(true);
+        assert!(dir.join("model render 2.png").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_turns_about_the_last_stroke_and_old_shelves_get_the_new_buttons() {
+        let mut app = App::new(16, false, usize::MAX);
+        let c = app.canvas_origin() + app.viewport() * 0.5;
+        app.cursor = c + Vec2::new(40.0, 20.0);
+        app.begin_stroke();
+        app.end_stroke();
+        let pivot = app.local_pivot.expect("the stroke set the pivot");
+        assert!((pivot.length() - 1.0).abs() < 0.1, "on the sphere: {pivot}");
+        assert_eq!(workspace::shelves::current_id("stub:ghost"), "toggle:ghost");
+        assert!(workspace::shelves::default_items(workspace::ShelfSide::Right).iter().all(|id| workspace::shelves::known(id)));
+        assert!(workspace::shelves::default_items(workspace::ShelfSide::Right).iter().any(|id| id == "cmd:bpr"));
     }
 
     #[test]

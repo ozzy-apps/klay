@@ -140,6 +140,20 @@ impl Camera {
         self.proj() * self.view()
     }
 
+    /// [`orbit`](Self::orbit) about `pivot` instead of the target (ZBrush: Local): the pivot
+    /// keeps its place on screen and the view turns around it.
+    pub fn orbit_about(&mut self, pivot: Vec3, dx: f32, dy: f32) {
+        let (eye, f, u) = (self.eye(), self.forward(), self.up());
+        let r = f.cross(u).normalize();
+        let d = pivot - eye;
+        let local = Vec3::new(d.dot(r), d.dot(u), d.dot(f));
+        self.orbit(dx, dy);
+        let (f2, u2) = (self.forward(), self.up());
+        let r2 = f2.cross(u2).normalize();
+        let eye2 = pivot - (r2 * local.x + u2 * local.y + f2 * local.z);
+        self.target = eye2 + f2 * self.distance;
+    }
+
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.008;
         self.pitch = (self.pitch + dy * 0.008).clamp(-MAX_PITCH, MAX_PITCH);
@@ -210,6 +224,21 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_orbit_keeps_the_pivot_where_it_is_on_screen() {
+        let mut c = Camera::new();
+        c.aspect = 1.5;
+        let pivot = Vec3::new(0.6, 0.3, 0.2);
+        let screen = |c: &Camera| {
+            let p = c.view_proj() * pivot.extend(1.0);
+            p.truncate().truncate() / p.w
+        };
+        let before = screen(&c);
+        c.orbit_about(pivot, 40.0, -25.0);
+        assert!(screen(&c).distance(before) < 1e-4, "{} {}", screen(&c), before);
+        assert!((c.yaw - Camera::new().yaw).abs() > 0.1, "it turned");
+    }
 
     /// Pixel position of a world point, origin top-left.
     fn project(cam: &Camera, p: Vec3, w: f32, h: f32) -> (f32, f32) {

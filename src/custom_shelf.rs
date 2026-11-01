@@ -10,6 +10,10 @@ const ACTIONS: &[(&str, &str, &str)] = &[
     ("toggle:sym", "Sym X", "Symmetry across X · X"),
     ("toggle:polyf", "PolyF", "Polygroup colours · Shift + F"),
     ("toggle:solo", "Solo", "Show only the active subtool"),
+    ("toggle:local", "Local", "Turn the view around the last place you sculpted instead of the middle of the view"),
+    ("toggle:transp", "Transp", "Show the other subtools see-through, so the active one shows through them"),
+    ("toggle:ghost", "Ghost", "With Transp: the other subtools pale and outlined, like glass"),
+    ("cmd:bpr", "BPR", "Render the view with shadows and ambient occlusion and save it next to the project (Document › Render)"),
     ("toggle:detail", "Detail", "Surface detail shading"),
     ("toggle:sculptris", "Sculptris Pro", "Strokes add and remove triangles under the brush"),
     ("toggle:live-boolean", "Live Boolean", "Show the subtools' boolean result"),
@@ -148,6 +152,9 @@ pub fn action_on(ws: &Workspace, id: &str, m: &Model<'_>) -> bool {
         "toggle:sym" => ws.symmetry,
         "toggle:polyf" => ws.polyframe,
         "toggle:solo" => ws.solo,
+        "toggle:local" => ws.local,
+        "toggle:transp" => ws.transp,
+        "toggle:ghost" => ws.ghost,
         "toggle:detail" => ws.wireframe,
         "toggle:sculptris" => ws.sculptris,
         "toggle:live-boolean" => ws.live_boolean,
@@ -171,6 +178,16 @@ impl Workspace {
             "toggle:sym" => self.symmetry = !self.symmetry,
             "toggle:polyf" => self.polyframe = !self.polyframe,
             "toggle:solo" => self.solo = !self.solo,
+            "toggle:local" => self.local = !self.local,
+            "toggle:transp" => {
+                self.transp = !self.transp;
+                self.ghost &= self.transp;
+            }
+            "toggle:ghost" => {
+                self.ghost = !self.ghost;
+                self.transp |= self.ghost;
+            }
+            "cmd:bpr" => a.bpr = true,
             "toggle:detail" => self.wireframe = !self.wireframe,
             "toggle:sculptris" => self.sculptris = !self.sculptris,
             "toggle:live-boolean" => self.live_boolean = !self.live_boolean,
