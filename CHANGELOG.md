@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.0 — 2026-11-01
 
 - **Reconstruct Subdiv** (Geometry, ZBrush: Reconstruct Subdiv): adds a lower level under the lowest one, found from the 1:4 pattern Divide leaves (every triangle cut into four), for a divided mesh imported from elsewhere or after Del Lower. Every level keeps its exact shape, polygroups, hidden polygons, paint and creases; the new level is fitted so its division lands on the old one. Works on any vertex order, again and again down to an undivided mesh, which is refused with a message. One undo step. 0.4 s for a stack showing 960k vertices.
 - **Freeze SubDivision Levels** (Geometry › Freeze SubDiv / Unfreeze): keeps the levels aside and goes to the lowest one, which can then be edited freely, topology included; ZRemesher, Remesh, Decimation, ZModeler and Sculptris Pro keep the levels frozen. **Unfreeze** brings them back exactly when the topology is unchanged (the detail rides on the edited shape), or divides the new mesh as often as before and projects each level onto the frozen highest one. One undo step each; saved in projects (project version 9). Shelf commands `cmd:reconstruct` and `cmd:freeze`.
