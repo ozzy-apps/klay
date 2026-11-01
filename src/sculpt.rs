@@ -496,6 +496,8 @@ pub enum UndoStep {
     LayerIntensity { index: usize, intensity: f32 },
     /// The base level's UVs before UV Master changed them (empty for none).
     Uvs(Vec<[glam::Vec2; 3]>),
+    /// The crease bits of `level` before a crease change (empty for none).
+    Creases { level: usize, bits: Vec<u8> },
 }
 
 pub struct History {
@@ -641,6 +643,7 @@ fn step_name(s: &UndoStep) -> &'static str {
         UndoStep::Layers { .. } => "Layers",
         UndoStep::LayerIntensity { .. } => "Layer intensity",
         UndoStep::Uvs(_) => "UV Unwrap",
+        UndoStep::Creases { .. } => "Crease",
     }
 }
 
@@ -661,6 +664,7 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Layers { state, .. } => state.bytes(),
         UndoStep::LayerIntensity { .. } => 0,
         UndoStep::Uvs(uvs) => uvs.len() * 24,
+        UndoStep::Creases { bits, .. } => bits.len(),
     }
 }
 
@@ -742,6 +746,7 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             intensity: doc.set_layer_intensity(index, intensity),
         },
         UndoStep::Uvs(uvs) => UndoStep::Uvs(doc.swap_uvs(uvs)),
+        UndoStep::Creases { level, bits } => UndoStep::Creases { level, bits: doc.swap_creases(level, bits) },
         UndoStep::Steps(steps) => {
             // Applied in order; their inverses run the other way.
             let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, s)).collect();

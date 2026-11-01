@@ -218,6 +218,13 @@ pub struct SculptMesh {
     /// 1 per vertex with at least one visible triangle: the vertices brushes may move.
     /// Empty while nothing is hidden.
     pub shown: Vec<u8>,
+    /// Creased edges (ZBrush: Geometry › Crease), as three bits per triangle: bit `k` for
+    /// its edge from corner `k` to corner `k + 1`, set on both triangles of the edge. Empty
+    /// while nothing is creased. Divide keeps creased edges sharp; anything that rebuilds
+    /// the triangles drops them.
+    pub creases: Vec<u8>,
+    /// Bumped whenever `creases` change, so the crease lines are redrawn.
+    pub crease_version: u32,
     /// Bumped whenever `hidden` / `groups` change, so the renderer knows to re-upload.
     pub vis_version: u32,
     pub group_version: u32,
@@ -555,6 +562,8 @@ impl SculptMesh {
         groups.truncate(kt);
         let mut hidden = std::mem::take(&mut self.hidden);
         hidden.truncate(kt);
+        let mut creases = std::mem::take(&mut self.creases);
+        creases.truncate(kt);
         if let Some(p) = part {
             let (v, t, c) = (kv as u32, kt as u32, kc as u32);
             let (pv, pt) = (p.vertex_count(), p.triangle_count());
@@ -593,9 +602,11 @@ impl SculptMesh {
             extend(&mut self.colors, kv, &p.colors, pv, [0; 4]);
             extend(&mut groups, kt, &p.groups, pt, 0);
             extend(&mut hidden, kt, &p.hidden, pt, 0);
+            extend(&mut creases, kt, &p.creases, pt, 0);
         }
         self.set_groups(groups);
         self.set_hidden(hidden);
+        self.set_creases(creases);
         old
     }
 
@@ -731,6 +742,8 @@ impl SculptMesh {
             groups: Vec::new(),
             hidden: Vec::new(),
             shown: Vec::new(),
+            creases: Vec::new(),
+            crease_version: 0,
             vis_version: 0,
             group_version: 0,
             group_count: 1,
@@ -1092,6 +1105,58 @@ impl SculptMesh {
         self.hidden = hidden;
         self.hidden_count = count;
         self.vis_version = self.vis_version.wrapping_add(1);
+    }
+
+    /// Replace the crease bits (one byte per triangle, see [`creases`](Self::creases), or
+    /// empty for none). Nothing creased is stored as empty.
+    pub fn set_creases(&mut self, mut bits: Vec<u8>) {
+        debug_assert!(bits.is_empty() || bits.len() == self.triangle_count());
+        if bits.par_iter().all(|&b| b & 7 == 0) {
+            bits = Vec::new();
+        }
+        self.creases = bits;
+        self.crease_version = self.crease_version.wrapping_add(1);
+    }
+
+    /// The creased edges, each once as `(low, high)` vertex ids, sorted.
+    pub fn crease_edges(&self) -> Vec<(u32, u32)> {
+        if self.creases.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, u32)> = self
+            .indices
+            .par_chunks_exact(3)
+            .zip(self.creases.par_iter())
+            .flat_map_iter(|(tri, &b)| {
+                (0..3).filter(move |k| b >> k & 1 != 0).map(move |k| {
+                    let (a, c) = (tri[k], tri[(k + 1) % 3]);
+                    (a.min(c), a.max(c))
+                })
+            })
+            .collect();
+        out.par_sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Crease bits that crease exactly `edges` (`(low, high)` pairs, sorted).
+    pub fn crease_bits(&self, edges: &[(u32, u32)]) -> Vec<u8> {
+        if edges.is_empty() {
+            return Vec::new();
+        }
+        self.indices
+            .par_chunks_exact(3)
+            .map(|tri| {
+                let mut b = 0u8;
+                for k in 0..3 {
+                    let (a, c) = (tri[k], tri[(k + 1) % 3]);
+                    if edges.binary_search(&(a.min(c), a.max(c))).is_ok() {
+                        b |= 1 << k;
+                    }
+                }
+                b
+            })
+            .collect()
     }
 
     /// Replace the polygroups (one per triangle, or empty for all group 0). A single group

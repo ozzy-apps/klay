@@ -789,6 +789,8 @@ pub struct Model<'a> {
     /// Polygroups and hidden triangles at the shown level of the active subtool.
     pub groups: usize,
     pub hidden: usize,
+    /// Creased edges at the shown level of the active subtool.
+    pub creases: usize,
     /// The GPU can show polygroup colours.
     pub polyframe_supported: bool,
     /// Wedge settings, whether Wedge is on for the active subtool, why it cannot run (if
@@ -928,6 +930,8 @@ pub struct Actions {
     pub delete_guides: bool,
     /// Geometry › Decimation › Decimate.
     pub decimate: bool,
+    /// Geometry › Crease › Crease PG, Crease, UnCrease.
+    pub crease: Option<crate::crease::CreaseOp>,
     /// Geometry › UV Map › Unwrap, Delete UVs.
     pub uv_unwrap: bool,
     pub uv_delete: bool,
@@ -1105,6 +1109,8 @@ pub struct Workspace {
     /// ZRemesher guide curves of the active subtool, in logical pixels, per visible run, and
     /// whether Alt + click would delete that one (shown while ZRemesherGuide is the brush).
     pub guides_preview: Vec<(Vec<Pos2>, bool)>,
+    /// Creased edges on screen (shown with PolyF), as lines in canvas points.
+    pub crease_preview: Vec<Vec<Pos2>>,
     /// How many guide curves the active subtool has.
     pub guide_count: usize,
     /// Pen pressure scales Draw Size and Z Intensity (ZBrush: Brush > Tablet Pressure).
@@ -1304,6 +1310,7 @@ impl Workspace {
             tube_sides: 12,
             curve_preview: None,
             guides_preview: Vec::new(),
+            crease_preview: Vec::new(),
             guide_count: 0,
             pressure_size: true,
             pressure_intensity: true,
@@ -3667,6 +3674,37 @@ impl Workspace {
                         .on_disabled_hover_text("Needs a subtool without subdivision levels");
                     },
                 );
+                self.sec(ui, h, id, "crease", "Crease", None, false, true, &mut |_, ui| {
+                    let top = m.levels.len().saturating_sub(1);
+                    let r = ui.add_enabled_ui(m.level == top, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            let w = (ui.available_width() - 6.0) / 3.0;
+                            use crate::crease::CreaseOp;
+                            for (op, tip, can) in [
+                                (CreaseOp::Groups, "Crease every polygroup border", m.groups > 1),
+                                (CreaseOp::Visible, "Crease the border of the visible part (hide the rest first)", m.hidden > 0),
+                                (CreaseOp::Uncrease, "Take the creases off the visible part", m.creases > 0),
+                            ] {
+                                let id = match op {
+                                    CreaseOp::Groups => "cmd:crease-pg",
+                                    CreaseOp::Visible => "cmd:crease",
+                                    CreaseOp::Uncrease => "cmd:uncrease",
+                                };
+                                if ui
+                                    .add_enabled_ui(can, |ui| ui.add_sized([w, CONTROL_H], egui::Button::new(RichText::new(op.name()).size(12.0)).truncate())).inner
+                                    .on_hover_text(tip)
+                                    .shelf(ui, id).clicked()
+                                {
+                                    a.crease = Some(op);
+                                }
+                            }
+                        });
+                    });
+                    r.response.on_disabled_hover_text("Crease on the highest subdivision level");
+                    kv(ui, "Creased edges", &crate::fmt_count(m.creases));
+                    note(ui, "Divide keeps creased edges sharp · ZRemesher KeepCreases runs loops along them · PolyF (Shift + F) shows them");
+                });
                 self.sec(
                     ui,
                     h,
@@ -3749,8 +3787,16 @@ impl Workspace {
                         }
                     });
                     zslider(ui, "AdaptiveSize", &mut ws.zremesh.adaptive, 0.0..=100.0, false, false, 0);
-                    ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
-                        .on_hover_text("Edge loops run along polygroup borders");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
+                            .on_hover_text("Edge loops run along polygroup borders");
+                        ui.checkbox(&mut ws.zremesh.keep_creases, "KeepCreases")
+                            .on_hover_text("Edge loops run exactly along creased edges, which stay creased");
+                        ui.checkbox(&mut ws.zremesh.detect_edges, "Detect Edges")
+                            .on_hover_text(format!("Edge loops run exactly along sharp edges (turning more than {:.0}°)", crate::zremesh::EDGE_ANGLE));
+                        ui.checkbox(&mut ws.zremesh.freeze_border, "FreezeBorder")
+                            .on_hover_text("Open borders keep every vertex where it is, so the result welds back to what it was cut from");
+                    });
                     zslider(ui, "Curves Strength", &mut ws.zremesh.curves_strength, 0.0..=100.0, false, false, 0);
                     ui.checkbox(&mut ws.zremesh.use_polypaint, "Use Polypaint")
                         .on_hover_text("Paint red where you want more quads, blue where you want fewer");
@@ -4735,6 +4781,13 @@ impl Workspace {
 
     // ------------------------------------------------------------ canvas
     fn canvas_overlays(&mut self, ui: &mut Ui, m: &Model<'_>, a: &mut Actions) {
+        if !self.crease_preview.is_empty() {
+            // Creased edges, with PolyF on: dashed, as ZBrush draws them.
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("creases"))).with_clip_rect(self.canvas);
+            for run in &self.crease_preview {
+                p.extend(egui::Shape::dashed_line(run, Stroke::new(1.6, Color32::from_rgb(120, 220, 235)), 5.0, 3.0));
+            }
+        }
         if !self.guides_preview.is_empty() {
             // ZRemesher guides: solid lines, the one Alt + click would delete in red. They
             // stay on screen, so they go under menus and popups.
@@ -6293,6 +6346,7 @@ mod tests {
                         redo_names: Vec::new(),
                         groups: 1,
                         hidden: 0,
+                        creases: 0,
                         polyframe_supported: true,
                         wedge: &mut crate::wedge::Settings::default(),
                         wedge_on: false,

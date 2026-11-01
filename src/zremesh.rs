@@ -26,6 +26,15 @@
 //! curve turn toward its direction and shift their lattice so a lattice line runs on it, both
 //! by Curves Strength, and the smoothing carries that into the rest of the field. Vertices of
 //! the loop that comes out on a curve are put on it.
+//!
+//! **Edge lines** are held the same way at full strength, and the loop on each is put
+//! exactly on it, corners where lines meet included: creased edges (KeepCreases, and the
+//! result is creased along them again) and edges sharper than [`EDGE_ANGLE`] (Detect
+//! Edges, keeping only lines at least two quads long, so surface noise does not count).
+//!
+//! **FreezeBorder** keeps every open border exactly as it was, vertex for vertex, so the
+//! result welds back to whatever it was cut from: a strip of quads (and triangles where
+//! the counts differ) joins the old border to the new one.
 
 use crate::mesh::SculptMesh;
 use crate::fx::FxHashMap as HashMap;
@@ -55,11 +64,34 @@ pub struct Settings {
     /// Symmetric across X (ZBrush: with X symmetry on): the +X half is remeshed and
     /// mirrored, with an edge loop on X = 0.
     pub symmetric: bool,
+    /// Keep open borders exactly, vertex for vertex (ZBrush: FreezeBorder).
+    pub freeze_border: bool,
+    /// Edge loops along creased edges, creased again (ZBrush: KeepCreases).
+    pub keep_creases: bool,
+    /// Edge loops along sharp edges (ZBrush: Detect Edges).
+    pub detect_edges: bool,
+}
+
+/// Detect Edges: how sharply the surface must turn at an edge, in degrees.
+pub const EDGE_ANGLE: f32 = 40.0;
+
+/// Lines ZRemesher puts an edge loop exactly on, and the points where they meet.
+#[derive(Default)]
+struct Features {
+    lines: Vec<Vec<Vec3>>,
+    corners: Vec<Vec3>,
+}
+
+impl Features {
+    fn folded(&self) -> Self {
+        let f = |p: &Vec3| Vec3::new(p.x.abs(), p.y, p.z);
+        Self { lines: self.lines.iter().map(|l| l.iter().map(f).collect()).collect(), corners: self.corners.iter().map(f).collect() }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false, freeze_border: false, keep_creases: true, detect_edges: false }
     }
 }
 
@@ -620,17 +652,57 @@ fn project(mesh: &SculptMesh, p: Vec3, n: Vec3, reach: f32) -> Option<(Vec3, u32
 /// ZRemesh `mesh` into about `s.target_k` thousand quads, with edge loops steered along
 /// `guides` (curves on the surface, ZBrush: ZRemesherGuide) by `s.curves_strength`.
 pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
-    if s.symmetric {
-        symmetric(mesh, s, guides)
-    } else {
-        remesh(mesh, s, guides, &[])
+    // The edge lines: creases, and sharp edges in lines of two quads or more.
+    let quad = (surface_area(mesh) / (s.target_k * 1000.0).max(50.0)).sqrt();
+    let creased = if s.keep_creases { mesh.crease_edges() } else { Vec::new() };
+    let mut edges = if s.detect_edges { crate::crease::long_lines_only(mesh, &crate::crease::sharp_edges(mesh, EDGE_ANGLE), quad * 2.0) } else { Vec::new() };
+    edges.extend_from_slice(&creased);
+    edges.sort_unstable();
+    edges.dedup();
+    let (lines, corners) = crate::crease::lines(mesh, &edges, 0.0);
+    let features = Features { lines, corners };
+    let (mut out, stats) = if s.symmetric { symmetric(mesh, s, guides, &features)? } else { remesh(mesh, s, guides, &[], &features, false)? };
+    if !creased.is_empty() {
+        let (lines, _) = crate::crease::lines(mesh, &creased, 0.0);
+        let quad = stats_quad(&out);
+        crease_along(&mut out, &lines, quad);
     }
+    Ok((out, stats))
+}
+
+fn surface_area(mesh: &SculptMesh) -> f32 {
+    mesh.indices
+        .par_chunks_exact(3)
+        .map(|t| (mesh.positions[t[1] as usize] - mesh.positions[t[0] as usize]).cross(mesh.positions[t[2] as usize] - mesh.positions[t[0] as usize]).length() * 0.5)
+        .sum()
+}
+
+/// Crease the edges of `out` that lie on `lines` (KeepCreases).
+fn crease_along(out: &mut SculptMesh, lines: &[Vec<Vec3>], quad: f32) {
+    let g = Guides::new(lines, quad);
+    let (on, mid) = (quad * 0.02, quad * 0.15);
+    let near: Vec<bool> = out.positions.par_iter().map(|&p| g.nearest(p, on).is_some()).collect();
+    let mut edges: Vec<(u32, u32)> = out
+        .indices
+        .par_chunks_exact(3)
+        .flat_map_iter(|t| {
+            let (near, g, p) = (&near, &g, &out.positions);
+            (0..3).filter_map(move |k| {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                (near[a as usize] && near[b as usize] && g.nearest((p[a as usize] + p[b as usize]) * 0.5, mid).is_some()).then_some((a.min(b), a.max(b)))
+            })
+        })
+        .collect();
+    edges.par_sort_unstable();
+    edges.dedup();
+    let bits = out.crease_bits(&edges);
+    out.set_creases(bits);
 }
 
 /// Symmetric across X: the +X half remeshed to half the target, with its cut edge on X = 0
 /// held as a full-strength guide so an edge loop runs on the plane, then mirrored and welded.
 /// Guides on −X are folded over to +X.
-fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
+fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &Features) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
     let half = crate::subtool_ops::plus_x_half(mesh).ok_or("nothing on the +X side to mirror")?;
     let folded: Vec<Vec<Vec3>> = guides.iter().map(|g| g.iter().map(|p| Vec3::new(p.x.abs(), p.y, p.z)).collect()).collect();
@@ -648,7 +720,9 @@ fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(S
         .map(|(&(a, b), _)| vec![half.positions[a as usize], half.positions[b as usize]])
         .collect();
     let hs = Settings { target_k: s.target_k * 0.5, symmetric: false, ..*s };
-    let (out, mut stats) = remesh(&half, &hs, &folded, &seam)?;
+    let (out, mut stats) = remesh(&half, &hs, &folded, &seam, &features.folded(), true)?;
+    // Frozen border vertices stay exactly where they are.
+    let frozen: crate::fx::FxHashSet<[u32; 3]> = if s.freeze_border { half.positions.iter().map(|p| p.to_array().map(f32::to_bits)).collect() } else { Default::default() };
     // Its open border goes onto the plane; nothing else may reach it, or it would weld.
     let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
     for t in out.indices.chunks_exact(3) {
@@ -669,6 +743,9 @@ fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(S
     let reach = stats_quad(&out);
     let mut positions = out.positions.clone();
     for (v, p) in positions.iter_mut().enumerate() {
+        if frozen.contains(&p.to_array().map(f32::to_bits)) {
+            continue;
+        }
         if border[v] && p.x.abs() < reach {
             p.x = 0.0;
         } else if p.x <= 0.0 {
@@ -695,8 +772,10 @@ fn stats_quad(m: &SculptMesh) -> f32 {
     sum / n
 }
 
-/// ZRemesh `mesh`, with `seams` held as full-strength guides (the symmetry plane's cut).
-fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
+/// ZRemesh `mesh`, with `seams` held as full-strength guides (the symmetry plane's cut) and
+/// loops put exactly on the `features`. With `half` (the +X half of a symmetric remesh),
+/// FreezeBorder leaves out borders on the plane.
+fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, half: bool) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
     let mut stats = Stats::default();
     let target = (s.target_k * 1000.0).max(50.0);
@@ -748,7 +827,8 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     // Guide curves pull the samples within about a cell of them, at every level.
     let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
     let guides = Guides::new(guides, quad);
-    let seams = Guides::new(seams, quad);
+    let seams: Vec<Vec<Vec3>> = seams.iter().chain(&features.lines).cloned().collect();
+    let seams = Guides::new(&seams, quad);
     // A seam holds fully, ahead of any guide.
     let pull: Vec<Vec<Pull>> = levels
         .iter()
@@ -1126,7 +1206,17 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
             quads.push([f[i], ms[i], c, ms[(i + k - 1) % k]]);
         }
     }
-    stats.quads = quads.len();
+    // FreezeBorder: the old open borders come back exactly, each joined to the new border
+    // nearest it by a strip. A triangle is kept as a quad with its last corner repeated.
+    let mut pinned = vec![false; out_p.len()];
+    if s.freeze_border && !closed {
+        let strip = frozen_strips(mesh, &quads, &mut out_p, half);
+        pinned.resize(out_p.len(), true);
+        quads.extend(strip);
+    }
+    let is_tri = |q4: &[u32; 4]| q4[2] == q4[3];
+    stats.quads = quads.iter().filter(|q| !is_tri(q)).count();
+    stats.odd_faces += quads.len() - stats.quads;
 
     // Onto the old surface, then even spacing along it.
     let reach = biggest * 1.5;
@@ -1145,7 +1235,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     for q4 in &quads {
         for k in 0..4 {
             let (a, b) = (q4[k], q4[(k + 1) % 4]);
-            if !adj[a as usize].contains(&b) {
+            if a != b && !adj[a as usize].contains(&b) {
                 adj[a as usize].push(b);
                 adj[b as usize].push(a);
             }
@@ -1158,7 +1248,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
                 .into_par_iter()
                 .map(|v| {
                     let a = &adj[v];
-                    if a.is_empty() {
+                    if a.is_empty() || pinned[v] {
                         return out_p[v];
                     }
                     let c = a.iter().map(|&w| out_p[w as usize]).sum::<Vec3>() / a.len() as f32;
@@ -1172,7 +1262,9 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         let projected: Vec<Option<(Vec3, u32)>> = out_p.par_iter().zip(vnorm.par_iter()).map(|(&p, &n)| project(mesh, p, n, reach)).collect();
         for (v, hit) in projected.into_iter().enumerate() {
             if let Some((p, _)) = hit {
-                out_p[v] = p;
+                if !pinned[v] {
+                    out_p[v] = p;
+                }
             }
         }
     }
@@ -1180,9 +1272,45 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     if !guides.is_empty() && strength > 0.0 {
         let snapped: Vec<(usize, Vec3)> = (0..out_p.len())
             .into_par_iter()
+            .filter(|&v| !pinned[v])
             .filter_map(|v| guides.nearest(out_p[v], quad * 0.3).map(|(_, q, _)| (v, out_p[v].lerp(q, strength))))
             .collect();
         stats.on_guides = snapped.len();
+        for (v, q) in snapped {
+            out_p[v] = q;
+        }
+    }
+    // The loops on edge lines go exactly onto them, corners first.
+    if !features.lines.is_empty() {
+        let lines = Guides::new(&features.lines, quad);
+        let cell = quad.max(1e-6);
+        let mut corners: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::default();
+        for &c in &features.corners {
+            let k = (c / cell).floor();
+            corners.entry((k.x as i32, k.y as i32, k.z as i32)).or_default().push(c);
+        }
+        let corner = |p: Vec3| -> Option<Vec3> {
+            let k = (p / cell).floor();
+            let mut best: Option<(f32, Vec3)> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &c in corners.get(&(k.x as i32 + dx, k.y as i32 + dy, k.z as i32 + dz)).into_iter().flatten() {
+                            let d = c.distance(p);
+                            if d < quad * 0.5 && best.is_none_or(|b| d < b.0) {
+                                best = Some((d, c));
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|b| b.1)
+        };
+        let snapped: Vec<(usize, Vec3)> = (0..out_p.len())
+            .into_par_iter()
+            .filter(|&v| !pinned[v])
+            .filter_map(|v| corner(out_p[v]).or_else(|| lines.nearest(out_p[v], quad * 0.4).map(|(_, q, _)| q)).map(|q| (v, q)))
+            .collect();
         for (v, q) in snapped {
             out_p[v] = q;
         }
@@ -1245,7 +1373,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         }
         let snapped: Vec<(usize, Vec3)> = (0..out_p.len())
             .into_par_iter()
-            .filter(|&v| border[v])
+            .filter(|&v| border[v] && !pinned[v])
             .filter_map(|v| {
                 let p = out_p[v];
                 let c = (p / cell).floor();
@@ -1273,7 +1401,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         }
         // Where three groups meet, onto the old corner.
         for v in 0..out_p.len() {
-            if around[v].len() >= 3 {
+            if around[v].len() >= 3 && !pinned[v] {
                 if let Some(c) = corners.iter().copied().min_by(|a, b| a.distance_squared(out_p[v]).total_cmp(&b.distance_squared(out_p[v]))) {
                     if c.distance(out_p[v]) < quad * 1.5 {
                         out_p[v] = c;
@@ -1288,7 +1416,10 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let mut tri_groups = Vec::with_capacity(quads.len() * 2);
     for (q4, &g) in quads.iter().zip(&quad_group) {
         let p = |v: u32| out_p[v as usize];
-        if p(q4[0]).distance_squared(p(q4[2])) <= p(q4[1]).distance_squared(p(q4[3])) {
+        if is_tri(q4) {
+            indices.extend_from_slice(&[q4[0], q4[1], q4[2]]);
+            tri_groups.push(g);
+        } else if p(q4[0]).distance_squared(p(q4[2])) <= p(q4[1]).distance_squared(p(q4[3])) {
             indices.extend_from_slice(&[q4[0], q4[1], q4[2], q4[0], q4[2], q4[3]]);
         } else {
             indices.extend_from_slice(&[q4[0], q4[1], q4[3], q4[1], q4[2], q4[3]]);
@@ -1298,6 +1429,179 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let out = SculptMesh::from_raw_with_groups(out_p, indices, if grouped { tri_groups } else { Vec::new() });
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
     Ok((out, stats))
+}
+
+/// Open border loops of faces given as corner lists (a triangle as a quad with its last
+/// corner repeated), each in the direction its faces run along it.
+fn border_loops<'a>(faces: impl Iterator<Item = &'a [u32]>) -> Vec<Vec<u32>> {
+    let mut directed: crate::fx::FxHashSet<(u32, u32)> = Default::default();
+    for f in faces {
+        for k in 0..f.len() {
+            let (a, b) = (f[k], f[(k + 1) % f.len()]);
+            if a != b {
+                directed.insert((a, b));
+            }
+        }
+    }
+    let mut next: HashMap<u32, u32> = HashMap::default();
+    for &(a, b) in &directed {
+        if !directed.contains(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
+    let mut seen: crate::fx::FxHashSet<u32> = Default::default();
+    let mut out = Vec::new();
+    for s0 in starts {
+        if seen.contains(&s0) {
+            continue;
+        }
+        let mut lp = vec![s0];
+        seen.insert(s0);
+        let mut at = next[&s0];
+        while at != s0 && seen.insert(at) {
+            lp.push(at);
+            let Some(&n) = next.get(&at) else { break };
+            at = n;
+        }
+        if at == s0 && lp.len() >= 3 {
+            out.push(lp);
+        }
+    }
+    out
+}
+
+/// FreezeBorder: every open border of `mesh` is added to `out_p` as it is and joined to the
+/// new border of `quads` nearest it by a strip of quads, with triangles where one side has
+/// more vertices than the other. Returns the strip. With `half` (the +X half of a symmetric
+/// remesh) the cut on the X = 0 plane is not frozen: a border crossing the plane is frozen
+/// from the plane to the plane, joined to the stretch of the new border between the same
+/// points, and its mirror image joins it there.
+fn frozen_strips(mesh: &SculptMesh, quads: &[[u32; 4]], out_p: &mut Vec<Vec3>, half: bool) -> Vec<[u32; 4]> {
+    let mp = &mesh.positions;
+    let cut = |a: u32, b: u32| half && mp[a as usize].x == 0.0 && mp[b as usize].x == 0.0;
+    // Old borders: whole loops, and pieces of loops between cut edges.
+    let mut olds: Vec<(Vec<u32>, bool)> = Vec::new();
+    for l in border_loops(mesh.indices.chunks_exact(3)) {
+        let n = l.len();
+        let Some(k0) = (0..n).find(|&k| cut(l[k], l[(k + 1) % n])) else {
+            olds.push((l, true));
+            continue;
+        };
+        // Walk from just after a cut edge, splitting at every cut edge.
+        let mut piece = vec![l[(k0 + 1) % n]];
+        for s in 1..=n {
+            let (a, b) = (l[(k0 + s) % n], l[(k0 + s + 1) % n]);
+            if cut(a, b) {
+                if piece.len() >= 2 {
+                    olds.push((std::mem::take(&mut piece), false));
+                }
+                piece = vec![b];
+            } else {
+                piece.push(b);
+            }
+        }
+    }
+    let new_loops = border_loops(quads.iter().map(|q| &q[..]));
+    let length = |pts: &[Vec3], closed: bool| (0..pts.len() - (!closed) as usize).map(|k| pts[k].distance(pts[(k + 1) % pts.len()])).sum::<f32>();
+    let mut id: HashMap<u32, u32> = HashMap::default();
+    let mut strip = Vec::new();
+    let mut new_used = vec![false; new_loops.len()];
+    // Longest first, so a whole loop is matched before the pieces near it.
+    olds.sort_by(|a, b| length(&b.0.iter().map(|&v| mp[v as usize]).collect::<Vec<_>>(), b.1).total_cmp(&length(&a.0.iter().map(|&v| mp[v as usize]).collect::<Vec<_>>(), a.1)));
+    for (old, closed) in olds {
+        let op: Vec<Vec3> = old.iter().map(|&v| mp[v as usize]).collect();
+        let (ol, oc) = (length(&op, closed), op.iter().sum::<Vec3>() / op.len() as f32);
+        // The new border it joins: a whole loop of about the same length and place, or for
+        // a piece the stretch of a loop between the points nearest its ends.
+        let mut best: Option<(f32, usize, Vec<u32>)> = None;
+        for (i, c) in new_loops.iter().enumerate() {
+            if new_used[i] && closed {
+                continue;
+            }
+            let cp: Vec<Vec3> = c.iter().map(|&v| out_p[v as usize]).collect();
+            let m = c.len();
+            let (stretch, d) = if closed {
+                let (cl, cc) = (length(&cp, true), cp.iter().sum::<Vec3>() / m as f32);
+                if !(cl > ol * 0.5 && cl < ol * 2.0) {
+                    continue;
+                }
+                (c.clone(), cc.distance(oc))
+            } else {
+                let near = |q: Vec3| (0..m).min_by(|&x, &y| cp[x].distance_squared(q).total_cmp(&cp[y].distance_squared(q))).unwrap();
+                let (k0, k1) = (near(op[0]), near(*op.last().unwrap()));
+                if k0 == k1 {
+                    continue;
+                }
+                let run = |from: usize, to: usize| -> Vec<u32> { (0..=(to + m - from) % m).map(|s| c[(from + s) % m]).collect() };
+                let mid = op[op.len() / 2];
+                let off = |r: &[u32]| r.iter().map(|&v| out_p[v as usize].distance_squared(mid)).fold(f32::INFINITY, f32::min);
+                let (fwd, back) = (run(k0, k1), run(k1, k0));
+                let r = if off(&fwd) <= off(&back) { fwd } else { back };
+                let d = cp[k0].distance(op[0]) + cp[k1].distance(*op.last().unwrap()) + off(&r).sqrt();
+                (r, d)
+            };
+            if d < ol * 0.25 + 1e-6 && best.as_ref().is_none_or(|b| d < b.0) {
+                best = Some((d, i, stretch));
+            }
+        }
+        let Some((_, i, c)) = best else { continue };
+        if closed {
+            new_used[i] = true;
+        }
+        let mut b: Vec<u32> = old
+            .iter()
+            .map(|&v| {
+                *id.entry(v).or_insert_with(|| {
+                    out_p.push(mp[v as usize]);
+                    (out_p.len() - 1) as u32
+                })
+            })
+            .collect();
+        let (m, n) = (c.len(), b.len());
+        let pc = |k: usize| out_p[c[k % m] as usize];
+        if closed {
+            // Start at the vertex nearest the new loop's first, running the same way.
+            let start = (0..n).min_by(|&x, &y| out_p[b[x] as usize].distance_squared(pc(0)).total_cmp(&out_p[b[y] as usize].distance_squared(pc(0)))).unwrap();
+            b.rotate_left(start);
+            if (out_p[b[1] as usize] - out_p[b[n - 1] as usize]).dot(pc(1) - pc(m - 1)) < 0.0 {
+                b[1..].reverse();
+            }
+        } else if out_p[b[0] as usize].distance_squared(pc(0)) > out_p[b[n - 1] as usize].distance_squared(pc(0)) {
+            b.reverse();
+        }
+        let pb = |k: usize| out_p[b[k % n] as usize];
+        // Segments along each side, and how far along each vertex is (0 to 1).
+        let (sm, sn) = if closed { (m, n) } else { (m - 1, n - 1) };
+        let params = |len: usize, at: &dyn Fn(usize) -> Vec3| -> Vec<f32> {
+            let mut u = vec![0.0f32; len + 1];
+            for k in 0..len {
+                u[k + 1] = u[k] + at(k).distance(at(k + 1));
+            }
+            let total = u[len].max(1e-12);
+            u.iter_mut().for_each(|x| *x /= total);
+            u
+        };
+        let (uc, ub) = (params(sm, &pc), params(sn, &pb));
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < sm || j < sn {
+            let (ci, ci1, bj, bj1) = (c[i % m], c[(i + 1) % m], b[j % n], b[(j + 1) % n]);
+            let both = i < sm && j < sn && (uc[i + 1] - ub[j + 1]).abs() < 0.5 * (uc[i + 1] - uc[i]).min(ub[j + 1] - ub[j]);
+            if both {
+                strip.push([bj, bj1, ci1, ci]);
+                i += 1;
+                j += 1;
+            } else if i < sm && (j >= sn || uc[i + 1] < ub[j + 1]) {
+                strip.push([bj, ci1, ci, ci]);
+                i += 1;
+            } else {
+                strip.push([bj, bj1, ci, ci]);
+                j += 1;
+            }
+        }
+    }
+    strip
 }
 
 #[cfg(test)]
@@ -1319,6 +1623,87 @@ mod tests {
             }
         }
         c
+    }
+
+    /// Positions as exact bit patterns, for comparing vertex sets.
+    fn bits(p: Vec3) -> [u32; 3] {
+        p.to_array().map(f32::to_bits)
+    }
+
+    /// The open border vertices of `m`.
+    fn border_points(m: &SculptMesh) -> Vec<[u32; 3]> {
+        let mut out: Vec<[u32; 3]> = edge_counts(m).into_iter().filter(|e| e.1 == 1).flat_map(|((a, b), _)| [bits(m.positions[a as usize]), bits(m.positions[b as usize])]).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn detect_edges_puts_loops_on_a_cubes_edges_and_corners() {
+        let (p, i) = crate::primitive::box_surface([24; 3], |p| p);
+        let m = SculptMesh::from_raw(p, i);
+        let run = |detect: bool| zremesh(&m, &Settings { target_k: 0.6, keep_groups: false, adaptive: 0.0, detect_edges: detect, ..Settings::default() }, &[]).unwrap().0;
+        let on_edge = |o: &SculptMesh| o.positions.iter().filter(|p| p.abs().to_array().iter().filter(|&&c| (c - 1.0).abs() < 1e-5).count() >= 2).count();
+        let corners = |o: &SculptMesh| o.positions.iter().filter(|p| (p.abs() - Vec3::ONE).length() < 1e-5).count();
+        let (on, off) = (run(true), run(false));
+        eprintln!("on edges: {} with Detect Edges, {} without; corners {} / {}", on_edge(&on), on_edge(&off), corners(&on), corners(&off));
+        assert_eq!(corners(&on), 8);
+        // Quads about 0.2 across: some ten vertices along each of the twelve edges.
+        assert!(on_edge(&on) >= 12 * 8, "{}", on_edge(&on));
+        assert!(on_edge(&on) > on_edge(&off) * 2);
+        assert!(on.positions.iter().all(|p| (p.abs().max_element() - 1.0).abs() < 0.02));
+    }
+
+    #[test]
+    fn keep_creases_runs_a_creased_loop_along_a_crease() {
+        let mut m = sphere(30);
+        let ring: Vec<(u32, u32)> = edge_counts(&m).into_keys().filter(|&(a, b)| m.positions[a as usize].y.abs() < 1e-6 && m.positions[b as usize].y.abs() < 1e-6).collect();
+        let mut ring = ring;
+        ring.sort_unstable();
+        assert_eq!(ring.len(), 4 * 30);
+        let bits = m.crease_bits(&ring);
+        m.set_creases(bits);
+        let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, ..Settings::default() };
+        let (out, _) = zremesh(&m, &s, &[]).unwrap();
+        let creased = out.crease_edges();
+        eprintln!("{} creased edges", creased.len());
+        // About the equator over the quad size, all on it.
+        assert!(creased.len() >= 40, "{}", creased.len());
+        assert!(creased.iter().all(|&(a, b)| out.positions[a as usize].y.abs() < 1e-4 && out.positions[b as usize].y.abs() < 1e-4));
+        let (plain, _) = zremesh(&m, &Settings { keep_creases: false, ..s }, &[]).unwrap();
+        assert!(plain.creases.is_empty());
+    }
+
+    #[test]
+    fn freeze_border_keeps_every_border_vertex_also_with_symmetry() {
+        let s = sphere(30);
+        let dome = crate::subtool_ops::part(&s, |t| {
+            let i = 3 * t as usize;
+            (s.positions[s.indices[i] as usize] + s.positions[s.indices[i + 1] as usize] + s.positions[s.indices[i + 2] as usize]).y > 0.0
+        })
+        .unwrap();
+        let before = border_points(&dome);
+        assert_eq!(before.len(), 4 * 30);
+        for symmetric in [false, true] {
+            let st = Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, symmetric, ..Settings::default() };
+            let (out, stats) = zremesh(&dome, &st, &[]).unwrap();
+            eprintln!("symmetric {symmetric}: {stats:?}");
+            let after = border_points(&out);
+            assert_eq!(after.len(), before.len());
+            if symmetric {
+                // The −X side is the mirror of the +X side, which this sphere matches only to
+                // the last bit.
+                let f = |b: &[u32; 3]| Vec3::from_array(b.map(f32::from_bits));
+                assert!(before.iter().all(|b| after.iter().any(|a| f(a).distance(f(b)) < 1e-6)));
+            } else {
+                assert_eq!(after, before);
+            }
+            assert!(edge_counts(&out).values().all(|&k| k <= 2), "manifold");
+            assert_eq!(edge_counts(&out).values().filter(|&&k| k == 1).count(), 4 * 30, "one border, as before");
+            // Without it the border is the new one.
+            let (free, _) = zremesh(&dome, &Settings { freeze_border: false, ..st }, &[]).unwrap();
+            assert_ne!(border_points(&free), before);
+        }
     }
 
     #[test]
@@ -1496,6 +1881,28 @@ mod tests {
             let r = zremesh(&m, &Settings { target_k: k, keep_groups: false, adaptive: 0.0, ..Settings::default() }, &[]);
             eprintln!("{k}: {:?}", r.map(|x| x.1));
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_freeze_dome() {
+        // KLAY_OBJ=path cargo test --release debug_freeze_dome -- --ignored
+        let s = sphere(30);
+        let dome = crate::subtool_ops::part(&s, |t| {
+            let i = 3 * t as usize;
+            (s.positions[s.indices[i] as usize] + s.positions[s.indices[i + 1] as usize] + s.positions[s.indices[i + 2] as usize]).y > 0.0
+        })
+        .unwrap();
+        let sym = std::env::var("KLAY_SYM").is_ok();
+        let (out, _) = zremesh(&dome, &Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, symmetric: sym, ..Settings::default() }, &[]).unwrap();
+        let mut f = String::new();
+        for p in &out.positions {
+            f += &format!("v {} {} {}\n", p.x, p.y, p.z);
+        }
+        for t in out.indices.chunks_exact(3) {
+            f += &format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1);
+        }
+        std::fs::write(std::env::var("KLAY_OBJ").unwrap(), f).unwrap();
     }
 
     #[test]

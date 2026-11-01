@@ -32,6 +32,10 @@ const CENTRE: u32 = 1 << 31;
 /// `[p, NONE, a, b]` is the even vertex above a border vertex with border neighbours `a` and
 /// `b` (a corner, which stays put, has `a == b == p`); `[a, b, c, d]` is the odd vertex on
 /// parent edge `a-b` with opposite vertices `c` and `d` (`d == NONE` on a border edge).
+/// An odd vertex lists its edge low end first (`a < b`), except on a creased edge, which
+/// lists it high end first (`a > b`) and is smoothed like a border edge: its midpoint.
+/// Even vertices on creases take the border rules (a crease end, with one creased edge,
+/// stays smooth).
 type Stencil = [u32; 4];
 
 /// Chunk positions saved for undo: at level 0 these are positions, above it offsets.
@@ -118,7 +122,7 @@ fn smooth(parent: &SculptMesh, s: Stencil) -> Vec3 {
             sum += p[w as usize];
         }
         p[v] * (1.0 - n as f32 * beta) + sum * beta
-    } else if s[3] == NONE {
+    } else if s[3] == NONE || s[0] > s[1] {
         (p[s[0] as usize] + p[s[1] as usize]) * 0.5
     } else {
         (p[s[0] as usize] + p[s[1] as usize]) * 0.375
@@ -246,6 +250,14 @@ fn centre_tris(parent: &SculptMesh, a: u32, b: u32) -> impl Iterator<Item = u32>
         .map(|(t, _, _, _)| t)
 }
 
+/// The crease bits of child `k` of a triangle with crease bits `p` (see step 7 of
+/// [`subdivide_with`]): corner child `k` has the halves of the parent's edges `k` and
+/// `k + 2` as its edges 0 and 2; the centre child has no parent edge.
+fn child_crease(p: u8, k: u32) -> u8 {
+    let bit = |e: u32| p >> (e % 3) & 1;
+    if k == 3 { 0 } else { bit(k) | bit(k + 2) << 2 }
+}
+
 /// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
 pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
     subdivide_with(parent, None)
@@ -327,10 +339,36 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
             .collect()
     };
 
+    // Creased edges are smoothed as borders: their odd vertex is the midpoint.
+    let creased = parent.crease_edges();
+    for &(v, w) in &creased {
+        let s = &mut odd[edge_id(v, w) as usize];
+        *s = [w, v, s[2], s[3]];
+    }
     // Even stencils. On a mesh with a border every border vertex gets Loop's boundary rule:
     // it follows its two border neighbours, and one that touches a single triangle is a
-    // corner and stays put (so does a vertex where several borders meet). Topology alone
-    // decides, so a replay gets the same stencils whatever the positions are now.
+    // corner and stays put (so does a vertex where several borders meet). Creases count
+    // as borders, except that a vertex at the end of a crease (one creased edge, off any
+    // border) stays smooth. Topology and creases alone decide, so a replay gets the same
+    // stencils whatever the positions are now.
+    let on_border: Vec<bool> = if creased.is_empty() {
+        Vec::new()
+    } else {
+        let mut b = vec![false; v_count];
+        for &(v, w) in &border_edges {
+            b[v as usize] = true;
+            b[w as usize] = true;
+        }
+        b
+    };
+    let border_edges: Vec<(u32, u32)> = if creased.is_empty() {
+        border_edges
+    } else {
+        let mut all: Vec<(u32, u32)> = border_edges.into_iter().chain(creased.iter().copied()).collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    };
     let border: Option<Vec<Stencil>> = (!border_edges.is_empty()).then(|| {
         let mut st: Vec<Stencil> = (0..v_count as u32)
             .into_par_iter()
@@ -351,7 +389,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         for &(a, b) in &border_edges {
             for v in [a, b] {
                 let s = &mut st[v as usize];
-                if s[3] == NONE || parent.incident(v).len() == 1 {
+                if s[3] == NONE && !on_border.is_empty() && !on_border[v as usize] {
+                    *s = [v, NONE, NONE, NONE];
+                } else if s[3] == NONE || parent.incident(v).len() == 1 {
                     *s = [v, NONE, v, v];
                 }
             }
@@ -557,6 +597,8 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     // Polygroups and hidden flags are inherited from the parent triangle, when it has any.
     let mut child_groups = if parent.groups.is_empty() { Vec::new() } else { vec![0u16; t_count] };
     let mut child_hidden = if parent.hidden.is_empty() { Vec::new() } else { vec![0u8; t_count] };
+    // Creases go to the halves of each creased edge.
+    let mut child_creases = if parent.creases.is_empty() { Vec::new() } else { vec![0u8; t_count] };
     let borders: Vec<u32> = {
         let tri_ranges = chunk_tri
             .windows(2)
@@ -572,13 +614,18 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         } else {
             split_ranges(&mut child_hidden, per_tri()).into_iter().map(Some).collect()
         };
+        let crease_out: Vec<Option<&mut [u8]>> = if child_creases.is_empty() {
+            (0..c_count).map(|_| None).collect()
+        } else {
+            split_ranges(&mut child_creases, per_tri()).into_iter().map(Some).collect()
+        };
         split_ranges(&mut indices, tri_ranges)
             .into_par_iter()
             .zip(owned.par_iter())
             .zip(ranges().collect::<Vec<_>>().into_par_iter())
             .zip(chunk_tri.par_iter())
-            .zip(group_out.into_par_iter().zip(hidden_out.into_par_iter()))
-            .map(|((((out, o), (s, e)), &start), (mut group_out, mut hidden_out))| {
+            .zip(group_out.into_par_iter().zip(hidden_out.into_par_iter()).zip(crease_out.into_par_iter()))
+            .map(|((((out, o), (s, e)), &start), ((mut group_out, mut hidden_out), mut crease_out))| {
                 // The children of one parent triangle share its remapped corners and edge
                 // midpoints, and are consecutive in the sorted list when one chunk owns
                 // several of them.
@@ -623,6 +670,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
                             }
                             if let Some(h) = hidden_out.as_deref_mut() {
                                 h[n as usize] = parent.hidden[(nat / 4) as usize];
+                            }
+                            if let Some(c) = crease_out.as_deref_mut() {
+                                c[n as usize] = child_crease(parent.creases[(nat / 4) as usize], nat % 4);
                             }
                             n += 1;
                         }
@@ -734,6 +784,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     if !child_hidden.is_empty() {
         mesh.set_hidden(child_hidden);
     }
+    if !child_creases.is_empty() {
+        mesh.set_creases(child_creases);
+    }
     debug_assert!(
         mesh.chunks
             .iter()
@@ -771,6 +824,31 @@ pub struct Packed {
     marks: Vec<Marks>,
     /// UVs of the base level's triangle corners, in its triangle order (empty for none).
     uvs: Vec<[glam::Vec2; 3]>,
+    /// Creased edges of every level, base first (see [`crease_list`]); empty for none.
+    creases: Vec<Vec<u32>>,
+}
+
+/// The creased triangles of `mesh` as `triangle << 3 | bits`, in triangle order.
+fn crease_list(mesh: &SculptMesh) -> Vec<u32> {
+    mesh.creases.iter().enumerate().filter(|(_, b)| **b & 7 != 0).map(|(t, &b)| (t as u32) << 3 | (b & 7) as u32).collect()
+}
+
+/// Put back the creases of a [`crease_list`].
+fn apply_creases(mesh: &mut SculptMesh, list: &[u32]) -> Result<(), String> {
+    if list.is_empty() {
+        return Ok(());
+    }
+    let n = mesh.triangle_count();
+    let mut bits = vec![0u8; n];
+    for &x in list {
+        let t = (x >> 3) as usize;
+        if t >= n {
+            return Err("a creased edge is not on its level".into());
+        }
+        bits[t] = (x & 7) as u8;
+    }
+    mesh.set_creases(bits);
+    Ok(())
 }
 
 /// Polygroups and hidden triangles of one level in run-length form (see `crate::polygroup`).
@@ -871,6 +949,25 @@ impl Packed {
             return Err("UVs are not finite numbers".into());
         }
         self.uvs = uvs;
+        Ok(())
+    }
+
+    /// Serialise the creased edges of every level (project version 8).
+    pub fn write_creases<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        out.u32(self.creases.len() as u32)?;
+        for c in &self.creases {
+            out.slice(c)?;
+        }
+        Ok(())
+    }
+
+    /// Read what [`write_creases`](Self::write_creases) wrote.
+    pub fn read_creases<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+        let n = input.u32()? as usize;
+        if n != 0 && n != self.levels.len() + 1 {
+            return Err("creases are stored for a different number of levels".into());
+        }
+        self.creases = (0..n).map(|_| input.vec()).collect::<Result<_, _>>()?;
         Ok(())
     }
 
@@ -1013,6 +1110,7 @@ impl Packed {
             mask,
             colors: Vec::new(),
             uvs: Vec::new(),
+            creases: Vec::new(),
         })
     }
 
@@ -1048,13 +1146,20 @@ impl Packed {
             marks,
             mask,
             colors,
+            creases,
             ..
         } = self;
         let mut levels = vec![Level::base(SculptMesh::from_chunked(positions, indices, &ranges))];
         if levels[0].mesh.edges_over_two_triangles() {
             return Err("the stored mesh has edges shared by more than two triangles".into());
         }
-        for pl in packed {
+        if !creases.is_empty() && creases.len() != packed.len() + 1 {
+            return Err("creases are stored for a different number of levels".into());
+        }
+        // Each level's creases go on before the next level is built from it, as they shape it.
+        let crease_of = |l: usize| creases.get(l).map_or(&[][..], |c| &c[..]);
+        apply_creases(&mut levels[0].mesh, crease_of(0))?;
+        for (l, pl) in packed.into_iter().enumerate() {
             let parent = &levels.last().unwrap().mesh;
             check_labels(parent, &pl.labels)?;
             let (mut mesh, link) = subdivide_with(parent, Some(&pl.labels));
@@ -1082,6 +1187,8 @@ impl Packed {
                     });
             }
             mesh.finish_edit(&sculpted);
+            mesh.set_creases(Vec::new());
+            apply_creases(&mut mesh, crease_of(l + 1))?;
             let n = mesh.chunks.len();
             levels.push(Level {
                 mesh,
@@ -1770,6 +1877,7 @@ impl Multires {
     pub fn pack(mut self) -> Packed {
         let counts = self.vertex_counts();
         let marks = self.marks();
+        let creases = self.crease_lists();
         let colors=self.levels.iter_mut().map(|l|std::mem::take(&mut l.mesh.colors)).collect();
         let mask = std::mem::take(&mut self.levels[self.active].mesh.mask);
         let Multires {
@@ -1803,7 +1911,16 @@ impl Multires {
             mask,
             colors,
             uvs,
+            creases,
         }
+    }
+
+    /// The [`crease_list`] of every level, or empty when nothing is creased.
+    fn crease_lists(&self) -> Vec<Vec<u32>> {
+        if self.levels.iter().all(|l| l.mesh.creases.is_empty()) {
+            return Vec::new();
+        }
+        self.levels.iter().map(|l| crease_list(&l.mesh)).collect()
     }
 
     /// A compact copy, leaving this stack as it is (Duplicate).
@@ -1827,6 +1944,7 @@ impl Multires {
             mask: self.mesh().mask.clone(),
             colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
             uvs: self.uvs.clone(),
+            creases: self.crease_lists(),
         }
     }
 
@@ -1975,6 +2093,19 @@ impl Multires {
     }
 
     /// Put back what [`group_runs`](Self::group_runs) returned; returns the state it replaced.
+    /// Swap in crease bits for `level` (see [`SculptMesh::creases`]), returning those it
+    /// had. Creases shape the next Divide, so they change only on the highest level; on any
+    /// other, or bits of another topology, nothing changes and `bits` come back.
+    pub fn swap_creases(&mut self, level: usize, bits: Vec<u8>) -> Vec<u8> {
+        if level != self.top() || !(bits.is_empty() || bits.len() == self.levels[level].mesh.triangle_count()) {
+            return bits;
+        }
+        let mesh = &mut self.levels[level].mesh;
+        let old = std::mem::take(&mut mesh.creases);
+        mesh.set_creases(bits);
+        old
+    }
+
     pub fn restore_groups(&mut self, saved: Vec<GroupRuns>) -> Vec<GroupRuns> {
         let now = self.group_runs();
         for (lvl, runs) in self.levels.iter_mut().zip(&saved) {
@@ -2209,6 +2340,43 @@ mod tests {
             assert!((ch.vert_end - ch.vert_start) as usize <= CHUNK_TARGET);
         }
         assert_eq!(next as usize, m.triangle_count(), "every triangle is in a range");
+    }
+
+    #[test]
+    fn creased_edges_stay_sharp_through_divide_undo_and_a_project_file() {
+        let cube = || {
+            let (p, i) = crate::primitive::box_surface([2; 3], |p| p);
+            SculptMesh::from_raw(p, i)
+        };
+        let base = cube();
+        let sharp = crate::crease::sharp_edges(&base, 40.0);
+        assert_eq!(sharp.len(), 24);
+        let bits = base.crease_bits(&sharp);
+        let mut doc = Multires::new(cube(), 10_000_000);
+        assert!(doc.swap_creases(0, bits.clone()).is_empty());
+        let mut plain = Multires::new(cube(), 10_000_000);
+        for _ in 0..3 {
+            doc.divide();
+            plain.divide();
+        }
+        // Every face stays flat and every cube edge straight: the cube keeps its shape.
+        let off = |m: &SculptMesh| m.positions.iter().map(|p| (p.abs().max_element() - 1.0).abs()).fold(0.0f32, f32::max);
+        assert!(off(doc.mesh()) < 1e-5, "{}", off(doc.mesh()));
+        assert!(off(plain.mesh()) > 0.1, "without creases the cube rounds off");
+        assert_eq!(doc.mesh().crease_edges().len(), 24 * 8, "each crease halves at every level");
+        // Creases change only on the highest level.
+        assert_eq!(doc.swap_creases(1, Vec::new()), Vec::<u8>::new());
+        assert!(!doc.levels[1].mesh.creases.is_empty());
+        // A project file keeps them, and so the same shape; version 7 files have none.
+        let packed = doc.pack_copy();
+        let bytes = crate::project::write_to(Vec::new(), &[("Cube", true, &packed)], 0).unwrap();
+        let back = crate::project::read_from(&bytes[..], bytes.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+        assert_eq!(back.mesh().positions, doc.mesh().positions);
+        assert_eq!(back.mesh().creases, doc.mesh().creases);
+        assert_eq!(back.levels[0].mesh.creases, bits);
+        let bytes = crate::project::write_version(Vec::new(), &[("Cube", true, &packed)], 0, 7).unwrap();
+        let old = crate::project::read_from(&bytes[..], bytes.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+        assert!(old.mesh().creases.is_empty());
     }
 
     #[test]

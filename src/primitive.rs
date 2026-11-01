@@ -202,7 +202,7 @@ fn box_vertex_count([a, b, c]: [usize; 3]) -> usize {
 /// The surface of a box of `dims` quads along x, y and z, each lattice point mapped by
 /// `map` from its place in `[-1, 1]^3`. Quads are split along the same diagonal and wound
 /// outwards; vertices are numbered in the order the faces first reach them.
-fn box_surface(dims: [u32; 3], map: impl Fn(Vec3) -> Vec3) -> (Vec<Vec3>, Vec<u32>) {
+pub fn box_surface(dims: [u32; 3], map: impl Fn(Vec3) -> Vec3) -> (Vec<Vec3>, Vec<u32>) {
     let [a, b, c] = dims.map(|d| d as usize);
     let count = box_vertex_count([a, b, c]);
     let mut ids: HashMap<u64, u32> = HashMap::with_capacity(count);

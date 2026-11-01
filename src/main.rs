@@ -23,6 +23,7 @@ mod sculptris;
 mod fx;
 mod boolean;
 mod zremesh;
+mod crease;
 mod project_all;
 mod decimate;
 mod uv;
@@ -605,6 +606,9 @@ struct App {
     /// For the Wedge section: whether the shown mesh is closed and its area, kept for the
     /// stack generation and level they were measured on (both cost a pass over the mesh).
     wedge_info: Option<(u64, usize, bool, f32)>,
+    /// The creased edges of the shown level as lines of vertices, for the stack generation,
+    /// level and crease version they were found for.
+    crease_lines: Option<(u64, usize, u32, Vec<Vec<u32>>)>,
     hover: Option<Vec3>,
     /// The Transpose action line, kept between drags (shown in Move / Scale / Rotate mode).
     action_line: Option<ActionLine>,
@@ -799,6 +803,7 @@ impl App {
             select: None,
             wedge: wedge::Settings::default(),
             wedge_info: None,
+            crease_lines: None,
             hover: None,
             action_line: None,
             transpose: None,
@@ -3370,6 +3375,82 @@ impl App {
             Some(GeoOp::DelLower) => self.delete_levels(false),
             None => {}
         }
+    }
+
+    /// The creased edges of the shown level as lines of vertices, found again only when the
+    /// creases change.
+    fn crease_lines(&mut self) -> &[Vec<u32>] {
+        let mesh = self.doc.mesh();
+        let key = (self.doc.generation, self.doc.active(), mesh.crease_version);
+        if self.crease_lines.as_ref().is_none_or(|c| (c.0, c.1, c.2) != key) {
+            let lines = crease::chains(&mesh.crease_edges()).0;
+            self.crease_lines = Some((key.0, key.1, key.2, lines));
+        }
+        &self.crease_lines.as_ref().unwrap().3
+    }
+
+    /// The creased edges on screen while PolyF is on, broken where they face away.
+    fn crease_preview(&mut self) -> Vec<Vec<egui::Pos2>> {
+        if !self.workspace.polyframe || self.doc.mesh().creases.is_empty() {
+            return Vec::new();
+        }
+        let lines = std::mem::take(&mut self.crease_lines);
+        let eye = self.camera.eye();
+        let scale = self.scale;
+        let mesh = self.doc.mesh();
+        let mut out = Vec::new();
+        if let Some((_, _, _, lines)) = &lines {
+            let facing = |v: u32| {
+                let p = &mesh.positions;
+                let n: Vec3 = mesh
+                    .incident(v)
+                    .iter()
+                    .map(|&t| {
+                        let i = 3 * t as usize;
+                        let (a, b, c) = (p[mesh.indices[i] as usize], p[mesh.indices[i + 1] as usize], p[mesh.indices[i + 2] as usize]);
+                        (b - a).cross(c - a)
+                    })
+                    .sum();
+                n.dot(eye - p[v as usize]) > 0.0
+            };
+            for line in lines {
+                let mut run = Vec::new();
+                for &v in line {
+                    let q = facing(v).then(|| self.project_front(mesh.positions[v as usize])).flatten();
+                    match q {
+                        Some(q) => run.push(egui::pos2(q.x / scale, q.y / scale)),
+                        None => {
+                            if run.len() > 1 {
+                                out.push(std::mem::take(&mut run));
+                            }
+                            run.clear();
+                        }
+                    }
+                }
+                if run.len() > 1 {
+                    out.push(run);
+                }
+            }
+        }
+        self.crease_lines = lines;
+        out
+    }
+
+    /// Geometry › Crease: Crease PG, Crease or UnCrease on the shown level, undoably.
+    fn crease_now(&mut self, op: crease::CreaseOp) {
+        let level = self.doc.active();
+        if level != self.doc.top() {
+            self.status = format!("{}: crease on the highest subdivision level", op.name());
+            self.workspace.notify(self.status.clone());
+            return;
+        }
+        let bits = op.bits(self.doc.mesh());
+        let old = self.doc.swap_creases(level, bits);
+        self.history.push(UndoStep::Creases { level, bits: old });
+        let n = self.crease_lines().iter().map(|l| l.len().saturating_sub(1)).sum::<usize>();
+        self.status = format!("{}: {} creased edges", op.name(), fmt_count(n));
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
     }
 
     /// Whether the shown mesh is closed, and its area, measured once per stack and level.
@@ -7299,6 +7380,8 @@ impl App {
         self.workspace.curve_preview = self.curve_preview();
         self.update_uv_layout();
         self.workspace.guides_preview = self.guides_preview();
+        self.workspace.crease_preview = self.crease_preview();
+        let creases = self.crease_lines().iter().map(|l| l.len().saturating_sub(1)).sum::<usize>();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
         self.workspace.held_brush = self.held_brush();
         let print_extent = self.print_extent();
@@ -7347,6 +7430,7 @@ impl App {
                 redo_names: self.history.names().1.into_iter().cloned().collect(),
                 groups,
                 hidden,
+                creases,
                 polyframe_supported: self.gfx.as_ref().is_none_or(Gfx::group_overlay_supported),
                 wedge: &mut self.wedge,
                 wedge_on,
@@ -7478,6 +7562,11 @@ impl App {
         }
         if actions.uv_unwrap {
             self.uv_unwrap_now();
+        }
+        if let Some(op) = actions.crease {
+            if !self.busy() {
+                self.crease_now(op);
+            }
         }
         if actions.uv_delete {
             self.uv_delete_now();
@@ -8865,6 +8954,9 @@ fn main() {
     }
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
+        // With `--detect-edges` / `--freeze-border`, those ZRemesher options on.
+        app.workspace.zremesh.detect_edges |= args.iter().any(|a| a == "--detect-edges");
+        app.workspace.zremesh.freeze_border |= args.iter().any(|a| a == "--freeze-border");
         app.workspace.zremesh.target_k = k;
         app.pending_geo = Some(GeoOp::ZRemesh);
     }

@@ -371,6 +371,28 @@ With **X symmetry** on, ZRemesher makes symmetric topology: the +X half is remes
 edge loop held on X = 0, then mirrored and welded, so every vertex has its mirror image and
 the middle loop runs straight down the plane. Guides drawn on −X count for both sides.
 
+**KeepCreases** (on by default) runs an edge loop exactly along every creased edge (see
+Crease below) and creases the new edges there again, so the next Divide keeps them sharp.
+**Detect Edges** does the same along sharp edges, where the surface turns by more than 40°,
+counting only lines at least two quads long so surface noise does not; on a cube the loops
+land on all twelve edges and all eight corners. **FreezeBorder** keeps every open border
+exactly as it was, vertex for vertex, and joins it to the new quads by one strip (quads, with
+triangles where the two sides have different vertex counts), so a remeshed piece welds back
+to what it was cut from. With X symmetry a border that crosses the middle is frozen on both
+sides.
+
+### Crease
+
+Geometry › **Crease** tags edges as creases (ZBrush: Tool › Geometry › Crease). **Divide**
+smooths a creased edge as if it were a border, so it stays sharp at every new level, and each
+new level keeps the halves creased. **Crease PG** creases every polygroup border, **Crease**
+the border of the visible part (hide the rest first), **UnCrease** takes the creases off the
+visible part (all of them when nothing is hidden). Each is one undo step. With **PolyF**
+(Shift + F) creased edges show as dashed cyan lines. Creasing works on the highest
+subdivision level, since creases shape the next Divide; anything that rebuilds the mesh
+(ZRemesher without KeepCreases, Remesh, Decimation, Sculptris Pro, ZModeler) drops them.
+They are saved in projects (project version 8).
+
 The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and a quad
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
