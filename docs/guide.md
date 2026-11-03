@@ -51,7 +51,9 @@ cargo run --release -- --menu Preferences --ui-scale 0.8             # start wit
 cargo run --release -- --menu "3D Print" --print-check               # 3D Print open with Check Mesh already run
 cargo run --release -- --fake-update 0.30.0                          # show the update card for a pretend release (no network)
 cargo run --release -- --gizmo                                         # start in Move mode with Gizmo 3D
-cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number)
+cargo run --release -- --segments 200 --demo-brushes --material "MatCap Red Wax"   # strokes with the 0.7 brushes, in a chosen material (name or number, a loaded MatCap by its file name)
+cargo run --release -- --matcap sphere.png --snapshot m.png                # load a picture as a MatCap for this run (not kept) and start in it
+cargo run --release -- --reference sheet.png --reference-view side        # a reference image plane behind the model (front, side, top or free)
 cargo run --release -- --segments 100 --divide 1 --selftest-paint      # texture painting + GPU readback + undo/redo
 cargo run --release -- --version                                     # application version
 cargo run --release -- --remesh-resolution 256                       # start with this Remesh resolution (--wedge-resolution still works)
@@ -755,7 +757,23 @@ place it; **Z** (or **Edit**) makes a drag on the canvas move it instead of scul
 With **Paint through** on, strokes read the picture where the model lies under it: polypaint
 takes its colours (Paint brush with RGB), and sculpting brushes its brightness as strength,
 so a photo goes onto the model as seen, or a pattern presses into it. Off the picture,
-brushes do nothing. The picture is not saved with the project.
+brushes do nothing. The picture is saved with the project, with its placement (projects
+from 0.38 on).
+
+### Reference image
+
+Document › **Reference › Load Image** (ZBrush: Image Plane) puts a picture (PNG, JPEG, BMP)
+on a plane in the scene, behind the model, to model against: unlike the Spotlight it sits in
+3D, so the view turns round it and the model hides it where it is in front. **Front**,
+**Side** and **Top** put the plane just behind the model that way round (Side faces +X, as
+seen from the model's right; Top lies under it, the picture's top pointing away); **Free**
+puts it behind the model as you see it at that moment, facing the camera, and it stays
+there while you turn the view. **Opacity** blends it; **Size** is the plane's width in the
+scene (it starts one and a half times the model's longest side, the picture keeping its
+proportions); **Show** hides it without taking it away; **Lock** keeps the plane where it is:
+the view buttons and Size are disabled, and a new picture loaded then takes the locked
+plane's place. The plane is saved in the project with its picture, so the file stands alone.
+`--reference FILE --reference-view free` loads one at start.
 
 ### Canvas and Document
 
@@ -943,6 +961,15 @@ view while the model turns. Each one is two 256 px images painted by Klay at sta
 and a specular layer added on top. Polypaint and polygroup colours therefore tint a MatCap
 the way they tint clay, and the highlight stays white. Brush thumbnails are shaded with the
 current material.
+
+**Load MatCap** (Material palette, ZBrush: Material › Load) adds your own: a picture of a lit
+sphere filling its square (PNG, JPEG, BMP), looked up by the view-space normal like the
+built-in ones. The picture is the whole look (there is no separate highlight layer) and its
+unpainted colour is white, so polypaint and polygroup colours tint it. Loaded MatCaps are
+listed after the built-in ones by their file name, shade the brush thumbnails too, and are
+copied into the config folder (`klay/matcaps/`, listed in `klay/matcaps.list`), so they are
+there again at the next start; **Remove MatCap** takes the selected one away. `--material`
+takes a loaded MatCap's name; `--matcap FILE` loads one for a run without keeping it.
 
 ### Masking brushes
 

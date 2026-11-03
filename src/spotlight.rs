@@ -17,15 +17,38 @@ pub struct Picture {
     pub rgba: Vec<[u8; 4]>,
     /// Changes with every picture loaded, so the interface knows to upload it again.
     pub key: u64,
+    /// The picture's file as read (PNG, JPEG or BMP), kept so a project can store it;
+    /// empty for a picture made in memory ([`Picture::encoded`] makes a PNG then).
+    pub encoded: Arc<Vec<u8>>,
 }
 
 impl Picture {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.to_rgba8();
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::decode(bytes).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// A picture from its file's bytes (as a project stores them).
+    pub fn decode(bytes: Vec<u8>) -> Result<Self, String> {
+        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?.to_rgba8();
         let (width, height) = img.dimensions();
+        Ok(Self { width, height, rgba: bytemuck::cast_vec(img.into_raw()), key: Self::next_key(), encoded: Arc::new(bytes) })
+    }
+
+    fn next_key() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let key = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self { width, height, rgba: bytemuck::cast_vec(img.into_raw()), key })
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The picture as a file's bytes: as loaded, or a PNG made from the pixels.
+    pub fn encoded(&self) -> Arc<Vec<u8>> {
+        if !self.encoded.is_empty() {
+            return self.encoded.clone();
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        let img = image::RgbaImage::from_raw(self.width, self.height, bytemuck::cast_slice(&self.rgba).to_vec()).expect("pixels match the size");
+        let _ = img.write_to(&mut out, image::ImageFormat::Png);
+        Arc::new(out.into_inner())
     }
 
     /// Bilinear colour at `uv` (0..1, V down), each channel 0..1.
@@ -144,7 +167,7 @@ mod tests {
     fn picture() -> Arc<Picture> {
         // Left half red, right half blue, 4 × 2.
         let rgba = (0..8).map(|i| if i % 4 < 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
-        Arc::new(Picture { width: 4, height: 2, rgba, key: 1 })
+        Arc::new(Picture { width: 4, height: 2, rgba, key: 1, encoded: Default::default() })
     }
 
     #[test]

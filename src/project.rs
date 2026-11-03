@@ -22,6 +22,11 @@
 //!              · (version 10 on) Dynamic Subdivision: u8 0, or 1 · smooth, flat and QGrid
 //!                steps u8 each · thickness f32; then ZSpheres: u8 0, or 1 · centres ·
 //!                radii · parents · roundness (see `Packed::write_zspheres`)
+//! (version 12 on) the reference image: u8 0, or 1 · name · view u8 · opacity f32 ·
+//!                size f32 · locked u8 · shown u8 · pose (centre, right, up: nine f32) ·
+//!                the picture's file bytes (u64 count + bytes); then the Spotlight: u8 0,
+//!                or 1 · name · centre x y, scale, angle, opacity f32 each · shown, edit,
+//!                paint-through u8 each · the picture's file bytes
 //! end marker "KLAYEND\0"
 //! ```
 //!
@@ -41,9 +46,42 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 11: quads (which triangles pair); 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and
+/// 12: the reference image and the Spotlight with their pictures; 11: quads (which triangles pair); 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and
 /// Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2: mask. Every older version still opens.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
+
+/// Document › Reference as a project stores it (version 12): the plane and its picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedReference {
+    pub name: String,
+    pub view: crate::reference::View,
+    pub opacity: f32,
+    pub size: f32,
+    pub locked: bool,
+    pub shown: bool,
+    pub pose: crate::reference::Pose,
+    /// The picture's file (PNG, JPEG or BMP).
+    pub image: std::sync::Arc<Vec<u8>>,
+}
+
+/// The Spotlight as a project stores it (version 12): its placement and its picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedSpotlight {
+    pub name: String,
+    pub place: crate::spotlight::Placement,
+    pub shown: bool,
+    pub edit: bool,
+    pub paint_through: bool,
+    pub image: std::sync::Arc<Vec<u8>>,
+}
+
+/// The pictures a project carries besides its subtools (version 12).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pictures {
+    pub reference: Option<SavedReference>,
+    pub spotlight: Option<SavedSpotlight>,
+}
+
 
 /// One subtool as stored in a project.
 pub struct SavedTool {
@@ -72,6 +110,8 @@ pub struct Extras<'a> {
 pub struct Project {
     pub tools: Vec<SavedTool>,
     pub active: usize,
+    /// The reference image and the Spotlight (none before version 12).
+    pub pictures: Pictures,
 }
 
 /// Writer for the file layout: plain values and whole slices of plain data.
@@ -198,16 +238,21 @@ pub fn write_to<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize) 
 
 /// Serialise with each subtool's layers and Morph Target (`extras`, one per tool or none).
 pub fn write_with<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize) -> io::Result<W> {
-    write_full(w, tools, extras, active, VERSION)
+    write_full(w, tools, extras, active, VERSION, &Pictures::default())
+}
+
+/// [`write_with`] with the reference image and the Spotlight.
+pub fn write_pictures<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize, pictures: &Pictures) -> io::Result<W> {
+    write_full(w, tools, extras, active, VERSION, pictures)
 }
 
 /// Serialise in the layout of `version` (1 to 5; tests write older files with it).
 #[cfg(test)]
 pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize, version: u32) -> io::Result<W> {
-    write_full(w, tools, &[], active, version)
+    write_full(w, tools, &[], active, version, &Pictures::default())
 }
 
-fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize, version: u32) -> io::Result<W> {
+fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize, version: u32, pictures: &Pictures) -> io::Result<W> {
     let mut out = Out::new(w);
     out.bytes(MAGIC)?;
     out.u32(version)?;
@@ -266,6 +311,40 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
             packed.write_zspheres(&mut out)?;
         }
     }
+    if version >= 12 {
+        match &pictures.reference {
+            Some(r) => {
+                out.u8(1)?;
+                out.slice(r.name.as_bytes())?;
+                out.u8(r.view.code())?;
+                out.u32(r.opacity.to_bits())?;
+                out.u32(r.size.to_bits())?;
+                out.u8(r.locked as u8)?;
+                out.u8(r.shown as u8)?;
+                for v in [r.pose.center, r.pose.right, r.pose.up] {
+                    for x in v.to_array() {
+                        out.u32(x.to_bits())?;
+                    }
+                }
+                out.slice(&r.image)?;
+            }
+            None => out.u8(0)?,
+        }
+        match &pictures.spotlight {
+            Some(sp) => {
+                out.u8(1)?;
+                out.slice(sp.name.as_bytes())?;
+                for x in [sp.place.center.x, sp.place.center.y, sp.place.scale, sp.place.angle, sp.place.opacity] {
+                    out.u32(x.to_bits())?;
+                }
+                out.u8(sp.shown as u8)?;
+                out.u8(sp.edit as u8)?;
+                out.u8(sp.paint_through as u8)?;
+                out.slice(&sp.image)?;
+            }
+            None => out.u8(0)?,
+        }
+    }
     out.bytes(END)?;
     Ok(out.into_inner())
 }
@@ -279,9 +358,14 @@ pub fn save(path: &Path, tools: &[(&str, bool, &Packed)], active: usize) -> io::
 
 /// [`save`] with each subtool's layers and Morph Target.
 pub fn save_with(path: &Path, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize) -> io::Result<u64> {
+    save_pictures(path, tools, extras, active, &Pictures::default())
+}
+
+/// [`save_with`] with the reference image and the Spotlight.
+pub fn save_pictures(path: &Path, tools: &[(&str, bool, &Packed)], extras: &[Extras], active: usize, pictures: &Pictures) -> io::Result<u64> {
     let tmp = path.with_extension("klay-saving");
     let file = std::fs::File::create(&tmp)?;
-    let w = write_with(io::BufWriter::with_capacity(8 << 20, file), tools, extras, active)?;
+    let w = write_pictures(io::BufWriter::with_capacity(8 << 20, file), tools, extras, active, pictures)?;
     let file = w.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     drop(file);
@@ -363,11 +447,54 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
             dynamic,
         });
     }
+    let mut pictures = Pictures::default();
+    if version >= 12 {
+        let f32_of = |input: &mut In<R>| -> Result<f32, Fail> {
+            let x = f32::from_bits(input.u32()?);
+            if !x.is_finite() {
+                return Err("a picture's placement is not a number".into());
+            }
+            Ok(x)
+        };
+        let text = |input: &mut In<R>| -> Result<String, Fail> {
+            let name: Vec<u8> = input.vec()?;
+            String::from_utf8(name).map_err(|_| "a picture's name is not valid text".into())
+        };
+        let image = |input: &mut In<R>| -> Result<std::sync::Arc<Vec<u8>>, Fail> { Ok(std::sync::Arc::new(input.vec()?)) };
+        if input.u8()? != 0 {
+            let name = text(&mut input)?;
+            let view = crate::reference::View::from_code(input.u8()?);
+            let opacity = f32_of(&mut input)?.clamp(0.0, 1.0);
+            let size = f32_of(&mut input)?.clamp(0.01, 1e6);
+            let locked = input.u8()? != 0;
+            let shown = input.u8()? != 0;
+            let mut v = [glam::Vec3::ZERO; 3];
+            for k in 0..3 {
+                v[k] = glam::Vec3::new(f32_of(&mut input)?, f32_of(&mut input)?, f32_of(&mut input)?);
+            }
+            let (right, up) = (v[1].normalize_or(glam::Vec3::X), v[2].normalize_or(glam::Vec3::Y));
+            if right.dot(up).abs() > 1e-3 {
+                return Err("the reference plane's axes are not perpendicular".into());
+            }
+            let pose = crate::reference::Pose { center: v[0], right, up };
+            pictures.reference = Some(SavedReference { name, view, opacity, size, locked, shown, pose, image: image(&mut input)? });
+        }
+        if input.u8()? != 0 {
+            let name = text(&mut input)?;
+            let mut x = [0.0f32; 5];
+            for v in &mut x {
+                *v = f32_of(&mut input)?;
+            }
+            let place = crate::spotlight::Placement { center: glam::Vec2::new(x[0], x[1]), scale: x[2].clamp(0.01, 100.0), angle: x[3], opacity: x[4].clamp(0.0, 1.0) };
+            let (shown, edit, paint_through) = (input.u8()? != 0, input.u8()? != 0, input.u8()? != 0);
+            pictures.spotlight = Some(SavedSpotlight { name, place, shown, edit, paint_through, image: image(&mut input)? });
+        }
+    }
     input.exact(END, "end of project marker")?;
     if input.left() != 0 {
         return Err("unexpected data after the end of the project".into());
     }
-    Ok(Project { tools, active })
+    Ok(Project { tools, active, pictures })
 }
 
 pub fn open(path: &Path) -> Result<Project, Fail> {
@@ -567,8 +694,9 @@ mod tests {
         let mut bytes = bytes_of(&[("Wrong", true, &wrong.pack_copy())], 0);
         // The UV count is the u64 right before the UV data, which the crease count (a u32,
         // 0), the frozen flag (a u8, 0) and the Dynamic Subdivision and ZSphere flags (a u8,
-        // 0, each) follow at the end of the subtool.
-        let at = bytes.len() - END.len() - 1 - 1 - 1 - 4 - m * 24 - 8;
+        // 0, each) follow at the end of the subtool, then the reference and Spotlight
+        // flags (a u8, 0, each) of the project.
+        let at = bytes.len() - END.len() - 2 - 1 - 1 - 1 - 4 - m * 24 - 8;
         assert_eq!(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()), m as u64);
         bytes.drain(at + 8..at + 8 + 24);
         bytes[at..at + 8].copy_from_slice(&((m - 1) as u64).to_le_bytes());
@@ -581,12 +709,67 @@ mod tests {
         let p = a.pack_copy();
         let d = crate::dynamic::Settings { smooth: 3, flat: 1, qgrid: 2, thickness: 0.05 };
         let extras = [Extras { dynamic: Some(d), ..Default::default() }];
-        let bytes = write_full(Vec::new(), &[("Dyn", true, &p)], &extras, 0, VERSION).unwrap();
+        let bytes = write_full(Vec::new(), &[("Dyn", true, &p)], &extras, 0, VERSION, &Pictures::default()).unwrap();
         let project = read_from(&bytes[..], bytes.len() as u64).expect("reads back");
         assert_eq!(project.tools[0].dynamic, Some(d));
-        let v9 = write_full(Vec::new(), &[("Old", true, &p)], &extras, 0, 9).unwrap();
+        let v9 = write_full(Vec::new(), &[("Old", true, &p)], &extras, 0, 9, &Pictures::default()).unwrap();
         let project = read_from(&v9[..], v9.len() as u64).expect("version 9 opens");
         assert_eq!(project.tools[0].dynamic, None);
+    }
+
+    #[test]
+    fn the_reference_image_and_spotlight_round_trip_from_version_12_and_version_11_opens_without() {
+        use crate::reference::{Pose, View};
+        let a = Multires::new(sphere(6, 1.0), usize::MAX);
+        let p = a.pack_copy();
+        let png = {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 200, 30, 255])).write_to(&mut out, image::ImageFormat::Png).unwrap();
+            std::sync::Arc::new(out.into_inner())
+        };
+        let pictures = Pictures {
+            reference: Some(SavedReference {
+                name: "sheet.png".into(),
+                view: View::Side,
+                opacity: 0.35,
+                size: 4.5,
+                locked: true,
+                shown: true,
+                pose: Pose { center: Vec3::new(-1.2, 0.1, 0.0), right: -Vec3::Z, up: Vec3::Y },
+                image: png.clone(),
+            }),
+            spotlight: Some(SavedSpotlight {
+                name: "photo.jpg".into(),
+                place: crate::spotlight::Placement { center: glam::Vec2::new(0.3, 0.7), scale: 0.8, angle: 0.4, opacity: 0.9 },
+                shown: true,
+                edit: false,
+                paint_through: true,
+                image: png.clone(),
+            }),
+        };
+        let bytes = write_pictures(Vec::new(), &[("A", true, &p)], &[], 0, &pictures).unwrap();
+        let project = read_from(&bytes[..], bytes.len() as u64).expect("reads back");
+        assert_eq!(project.pictures, pictures);
+        // The pictures decode again.
+        let pic = crate::spotlight::Picture::decode(project.pictures.reference.unwrap().image.to_vec()).unwrap();
+        assert_eq!((pic.width, pic.height, pic.rgba[0]), (3, 2, [10, 200, 30, 255]));
+        // Without pictures, the project says so.
+        let plain = write_to(Vec::new(), &[("A", true, &p)], 0).unwrap();
+        assert_eq!(read_from(&plain[..], plain.len() as u64).unwrap().pictures, Pictures::default());
+        // Version 11 has no trailer, and still opens.
+        let v11 = write_full(Vec::new(), &[("Old", true, &p)], &[], 0, 11, &pictures).unwrap();
+        let project = read_from(&v11[..], v11.len() as u64).expect("version 11 opens");
+        assert_eq!(project.pictures, Pictures::default());
+        assert!(project.tools[0].packed.clone().try_unpack().is_ok());
+        // A plane whose axes are not perpendicular, or a picture longer than the file, is
+        // refused.
+        let mut bad = pictures.clone();
+        bad.reference.as_mut().unwrap().pose.up = Vec3::new(0.0, 0.7, 0.7);
+        let bytes = write_pictures(Vec::new(), &[("A", true, &p)], &[], 0, &bad).unwrap();
+        assert!(read_from(&bytes[..], bytes.len() as u64).is_err());
+        let mut cut = write_pictures(Vec::new(), &[("A", true, &p)], &[], 0, &pictures).unwrap();
+        cut.truncate(cut.len() - END.len() - 3);
+        assert!(read_from(&cut[..], cut.len() as u64).is_err());
     }
 
     #[test]

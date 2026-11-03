@@ -247,6 +247,14 @@ pub struct BoolParams {
 }
 
 /// The operands' volumes, one slab of `BOOL_VOLUME`³ after another along z.
+/// Uniform of the reference plane (`vs_reference`): world corners and the opacity.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RefParams {
+    corners: [[f32; 4]; 4],
+    opacity: [f32; 4],
+}
+
 struct BoolAtlas {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -412,6 +420,15 @@ pub struct Gfx {
     bool_atlas: BoolAtlas,
     bool_count: usize,
     bool_keys: Vec<u64>,
+    /// `matcap::generation` of the MatCap texture array uploaded (loaded MatCaps change it).
+    matcap_generation: u64,
+    /// Document › Reference: the plane's pipeline, its corners and opacity, and the
+    /// picture's bind group under its key once uploaded.
+    reference_pipeline: wgpu::RenderPipeline,
+    reference_bgl: wgpu::BindGroupLayout,
+    reference_params: wgpu::Buffer,
+    reference_sampler: wgpu::Sampler,
+    reference: Option<(u64, wgpu::BindGroup)>,
     group_bgl: wgpu::BindGroupLayout,
     background_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
@@ -548,42 +565,10 @@ impl Gfx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // MatCaps: every image in one sRGB texture array, written once (see `matcap.rs`).
-        let size = crate::matcap::SIZE as u32;
-        let matcap_size = wgpu::Extent3d {
-            width: size,
-            height: size,
-            depth_or_array_layers: crate::matcap::layer_count(),
-        };
-        let matcap_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("matcaps"),
-            size: matcap_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &matcap_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &crate::matcap::gpu_layers(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size * 4),
-                rows_per_image: Some(size),
-            },
-            matcap_size,
-        );
-        let matcap_view = matcap_texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        // MatCaps: every image in one sRGB texture array, written once (see `matcap.rs`),
+        // and again when a MatCap is loaded.
+        let matcap_generation = crate::matcap::generation();
+        let matcap_view = matcap_texture_view(&device, &queue);
         let matcap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("matcap sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -668,6 +653,74 @@ impl Gfx {
             label: Some("uniform layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
+        });
+
+        // Document › Reference: the picture's plane (corners and opacity in a uniform, the
+        // picture as an sRGB texture), blended over what is drawn, behind the surfaces that
+        // are nearer, writing no depth.
+        let reference_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("reference bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let reference_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("reference layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&reference_bgl)],
+            immediate_size: 0,
+        });
+        let reference_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("reference plane"),
+            layout: Some(&reference_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_reference"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_reference"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let reference_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reference params"),
+            size: std::mem::size_of::<RefParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let reference_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("reference sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
         // The mesh pipeline also reads the mask in the vertex shader.
         let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1248,6 +1301,12 @@ impl Gfx {
             bool_count: 0,
             bool_keys: Vec::new(),
             uniform_buf,
+            matcap_generation,
+            reference_pipeline,
+            reference_bgl,
+            reference_params,
+            reference_sampler,
+            reference: None,
             background_pipeline,
             pick_pipeline,
             pick_target: None,
@@ -1392,6 +1451,58 @@ impl Gfx {
     }
 
     /// Live Boolean off: everything is drawn as it is.
+    /// Upload the MatCap texture array again when a MatCap was loaded or removed.
+    pub fn sync_matcaps(&mut self) {
+        let generation = crate::matcap::generation();
+        if generation == self.matcap_generation {
+            return;
+        }
+        self.matcap_generation = generation;
+        self.shared.matcap_view = matcap_texture_view(&self.device, &self.queue);
+        self.bind_group = self.shared.bind_group(&self.device, &self.uniform_buf, &self.bool_atlas.view);
+    }
+
+    /// Document › Reference: the plane to draw this frame (`None` for none): its picture
+    /// (uploaded when its key changes), world corners and opacity.
+    pub fn set_reference(&mut self, reference: Option<(&crate::spotlight::Picture, [glam::Vec3; 4], f32)>) {
+        let Some((picture, corners, opacity)) = reference else {
+            self.reference = None;
+            return;
+        };
+        if self.reference.as_ref().is_none_or(|(key, _)| *key != picture.key) {
+            let size = wgpu::Extent3d { width: picture.width.max(1), height: picture.height.max(1), depth_or_array_layers: 1 };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("reference picture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&picture.rgba),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(picture.width.max(1) * 4), rows_per_image: Some(picture.height.max(1)) },
+                size,
+            );
+            let view = texture.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("reference bg"),
+                layout: &self.reference_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 1, resource: self.reference_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.reference_sampler) },
+                ],
+            });
+            self.reference = Some((picture.key, bind_group));
+        }
+        let params = RefParams { corners: corners.map(|c| c.extend(1.0).to_array()), opacity: [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0] };
+        self.queue.write_buffer(&self.reference_params, 0, bytemuck::bytes_of(&params));
+    }
+
     pub fn clear_boolean(&mut self) {
         self.bool_count = 0;
     }
@@ -2527,6 +2638,7 @@ impl Gfx {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
+        self.sync_matcaps();
         self.take_counts();
 
         let mut encoder = self
@@ -2816,6 +2928,13 @@ impl Gfx {
                 pass.set_index_buffer(s.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..s.index_count, 0, 0..1);
             }
+            // The reference plane: blended after the opaque surfaces, under Transp.
+            if let Some((_, bg)) = &self.reference {
+                pass.set_pipeline(&self.reference_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, bg, &[]);
+                pass.draw(0..6, 0..1);
+            }
             pass.set_pipeline(if self.transparent_parked && !boolean { &self.transp_pipeline } else { plain });
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &self.no_mask, &[]);
@@ -3020,6 +3139,35 @@ fn normal_scale(mesh: &SculptMesh) -> f32 {
     }
     let mean = if n > 0 { sum / n as f64 } else { 0.0 };
     if mean > 0.0 { NORMAL_TYPICAL / mean as f32 } else { 1.0 }
+}
+
+/// The MatCap texture array (built-in and loaded MatCaps, see `matcap::gpu_layers`),
+/// uploaded and viewed as a 2D array.
+fn matcap_texture_view(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    let size = crate::matcap::SIZE as u32;
+    let layers = crate::matcap::gpu_layers();
+    let matcap_size = wgpu::Extent3d {
+        width: size,
+        height: size,
+        depth_or_array_layers: (layers.len() / (size as usize * size as usize * 4)).max(1) as u32,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("matcaps"),
+        size: matcap_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &layers,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+        matcap_size,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

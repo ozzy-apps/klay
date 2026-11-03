@@ -24,6 +24,7 @@ mod insert_mesh;
 mod jobs;
 mod sculptris;
 mod spotlight;
+mod reference;
 mod fx;
 mod boolean;
 mod bpr;
@@ -1687,6 +1688,100 @@ impl App {
             Err(e) => self.status = format!("Spotlight: {e}"),
         }
         self.workspace.notify(self.status.clone());
+    }
+
+    /// Document › Reference › Load Image: put the picture at `path` on a plane behind the
+    /// model, in Front view (or where the last one was, if its view was locked).
+    fn load_reference(&mut self, path: &Path) {
+        match spotlight::Picture::load(path) {
+            Ok(picture) => {
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.status = format!("Reference: {name}, {}×{}", picture.width, picture.height);
+                let bounds = self.model_bounds();
+                let mut r = reference::Reference::new(std::sync::Arc::new(picture), name, &bounds, &self.camera);
+                if let Some(old) = self.workspace.reference.take().filter(|o| o.locked) {
+                    r.view = old.view;
+                    r.pose = old.pose;
+                    r.size = old.size;
+                    r.opacity = old.opacity;
+                    r.locked = true;
+                }
+                self.workspace.reference = Some(r);
+            }
+            Err(e) => self.status = format!("Reference: {e}"),
+        }
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Document › Reference › Front / Side / Top / Free: place the plane again behind the
+    /// model (as the camera sees it, for Free).
+    fn place_reference(&mut self, view: reference::View) {
+        let bounds = self.model_bounds();
+        if let Some(r) = self.workspace.reference.as_mut() {
+            r.place(view, &bounds, &self.camera);
+        }
+    }
+
+    /// Material › Load MatCap: the picture at `path` as a new material, selected; it is
+    /// copied into the config folder unless `keep` is false (`--matcap`).
+    fn load_matcap(&mut self, path: &Path, keep: bool) {
+        let root = self.workspace.config_root.clone();
+        match matcap::load_user(path, keep.then_some(root.as_path())) {
+            Ok(i) => {
+                self.workspace.material = i;
+                self.workspace.prerender_previews();
+                self.status = format!("MatCap: {}", workspace::material_name(i));
+            }
+            Err(e) => self.status = format!("MatCap: {e}"),
+        }
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// Material › Remove MatCap: loaded MatCap `k` goes, the materials after it move up.
+    fn remove_matcap(&mut self, k: usize) {
+        let index = workspace::MATERIALS.len() + k;
+        let root = self.workspace.config_root.clone();
+        matcap::remove_user(k, Some(&root));
+        self.workspace.forget_materials_from(index);
+        if self.workspace.material >= index {
+            self.workspace.material = if self.workspace.material == index { 0 } else { self.workspace.material - 1 };
+        }
+        self.workspace.prerender_previews();
+    }
+
+    /// The reference image and the Spotlight, for the project file.
+    fn pictures(&self) -> project::Pictures {
+        let reference = self.workspace.reference.as_ref().map(|r| project::SavedReference {
+            name: r.name.clone(),
+            view: r.view,
+            opacity: r.opacity,
+            size: r.size,
+            locked: r.locked,
+            shown: r.shown,
+            pose: r.pose,
+            image: r.picture.encoded(),
+        });
+        let spotlight = self.workspace.spotlight.as_ref().map(|s| project::SavedSpotlight {
+            name: s.name.clone(),
+            place: s.place,
+            shown: s.shown,
+            edit: s.edit,
+            paint_through: s.paint_through,
+            image: s.picture.encoded(),
+        });
+        project::Pictures { reference, spotlight }
+    }
+
+    /// Put a project's pictures in place of the current ones (none when it has none).
+    fn take_pictures(&mut self, pictures: project::Pictures) {
+        self.workspace.reference = pictures.reference.and_then(|r| {
+            let picture = spotlight::Picture::decode(r.image.to_vec()).ok()?;
+            Some(reference::Reference { picture: std::sync::Arc::new(picture), name: r.name, view: r.view, opacity: r.opacity, size: r.size, locked: r.locked, shown: r.shown, pose: r.pose })
+        });
+        self.workspace.spotlight = pictures.spotlight.and_then(|s| {
+            let picture = spotlight::Picture::decode(s.image.to_vec()).ok()?;
+            Some(spotlight::Spotlight { picture: std::sync::Arc::new(picture), name: s.name, place: s.place, shown: s.shown, edit: s.edit, paint_through: s.paint_through })
+        });
     }
 
     /// The Spotlight a stroke starting now reads, if it is shown with Paint through.
@@ -3426,7 +3521,7 @@ impl App {
                     self.start_bake(kind, path);
                     return;
                 }
-                Ask::OpenSpotlight => return,
+                Ask::OpenSpotlight | Ask::OpenMatCap | Ask::OpenReference => return,
                 Ask::ExportRender => {
                     let path = self.render_path.clone();
                     self.start_render(path);
@@ -3463,7 +3558,7 @@ impl App {
                 (&self.map_path, file_dialog::file_name(&format!("{tool}_displacement"), if self.workspace.bake.exr { "exr" } else { "png" }))
             }
             Ask::ExportRender => (&self.render_path, file_dialog::file_name(&format!("{project_stem} render"), "png")),
-            Ask::OpenSpotlight => (&self.import_path, String::new()),
+            Ask::OpenSpotlight | Ask::OpenReference | Ask::OpenMatCap => (&self.import_path, String::new()),
             Ask::ExportTurntable => (&self.render_path, file_dialog::file_name(&format!("{project_stem} turntable"), "mp4")),
         };
         // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
@@ -3526,6 +3621,8 @@ impl App {
                 self.start_render(text(first));
             }
             Ask::OpenSpotlight => self.load_spotlight(first),
+            Ask::OpenMatCap => self.load_matcap(first, true),
+            Ask::OpenReference => self.load_reference(first),
             Ask::ExportTurntable => {
                 self.render_path = text(first);
                 self.start_turntable(text(first), false);
@@ -3545,7 +3642,8 @@ impl App {
         let t = Instant::now();
         let path = self.project_path.clone();
         self.doc.freeze_layers();
-        let result = self.with_project_tools(|tools, extras| project::save_with(Path::new(&path), tools, extras, self.active_tool));
+        let pictures = self.pictures();
+        let result = self.with_project_tools(|tools, extras| project::save_pictures(Path::new(&path), tools, extras, self.active_tool, &pictures));
         self.project_has_file |= result.is_ok();
         self.status = match result {
             Ok(bytes) => format!(
@@ -3644,7 +3742,8 @@ impl App {
                 .map(|n| dir.join(format!("QuickSave_{n}.klay")))
                 .min_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
                 .unwrap();
-            self.with_project_tools(|tools, extras| project::save_with(&path, tools, extras, self.active_tool)).map(|_| path)
+            let pictures = self.pictures();
+            self.with_project_tools(|tools, extras| project::save_pictures(&path, tools, extras, self.active_tool, &pictures)).map(|_| path)
         });
         self.last_quicksave = Instant::now();
         self.quicksaved_at = (self.subtools[self.active_tool].id, self.history.edits());
@@ -4008,6 +4107,7 @@ impl App {
     fn load_project(&mut self, path: &str) -> Result<(), String> {
         let project = project::open(Path::new(path))?;
         let active = project.active;
+        let pictures = project.pictures;
         let mut staged: Vec<SubTool> = Vec::with_capacity(project.tools.len());
         let mut active_doc = None;
         let mut failure = None;
@@ -4063,6 +4163,7 @@ impl App {
         self.active_tool = active;
         self.doc = doc;
         self.history = History::new(32);
+        self.take_pictures(pictures);
         self.show_active_level();
         self.frame_camera();
         Ok(())
@@ -4398,7 +4499,8 @@ impl App {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let result = self.with_project_tools(|tools, extras| project::save_with(path, tools, extras, self.active_tool));
+        let pictures = self.pictures();
+        let result = self.with_project_tools(|tools, extras| project::save_pictures(path, tools, extras, self.active_tool, &pictures));
         self.workspace.notify(match result {
             Ok(bytes) => format!("Config stored with the model as the startup document ({:.1} MB)", bytes as f64 / 1e6),
             Err(e) => format!("Startup document not saved: {e}"),
@@ -9076,6 +9178,18 @@ impl App {
         if actions.spotlight_load {
             self.ask_file(file_dialog::Ask::OpenSpotlight);
         }
+        if actions.matcap_load {
+            self.ask_file(file_dialog::Ask::OpenMatCap);
+        }
+        if let Some(k) = actions.matcap_remove {
+            self.remove_matcap(k);
+        }
+        if actions.reference_load {
+            self.ask_file(file_dialog::Ask::OpenReference);
+        }
+        if let Some(view) = actions.reference_view {
+            self.place_reference(view);
+        }
         if actions.bpr {
             self.bpr_now();
         }
@@ -9741,6 +9855,7 @@ impl App {
         self.update_dynamic();
         self.update_fibers();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.set_reference(self.workspace.reference.as_ref().filter(|r| r.shown).map(|r| (&*r.picture, r.corners(), r.opacity)));
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
         self.upload_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -10667,6 +10782,20 @@ fn main() {
     if let Some(path) = flag("--spotlight") {
         app.load_spotlight(Path::new(path));
     }
+    // `--matcap IMAGE`: load IMAGE as a MatCap and start in it (not kept for the next start).
+    if let Some(path) = flag("--matcap") {
+        app.load_matcap(Path::new(path), false);
+    }
+    // `--reference IMAGE [--reference-view front|side|top|free]`: a reference image plane.
+    if let Some(path) = flag("--reference") {
+        app.load_reference(Path::new(path));
+        if let Some(view) = flag("--reference-view") {
+            match reference::View::ALL.iter().find(|v| v.label().eq_ignore_ascii_case(view)) {
+                Some(&v) => app.place_reference(v),
+                None => eprintln!("--reference-view: one of front, side, top, free"),
+            }
+        }
+    }
     app.turntable_on_start = flag("--turntable").cloned();
     if let Some(n) = flag("--turntable-frames").and_then(|v| v.parse().ok()) {
         app.workspace.turntable_frames = n;
@@ -10704,10 +10833,9 @@ fn main() {
     }
     // `--material <name or number>`: start in that material (e.g. "MatCap Red Wax").
     if let Some(m) = flag("--material") {
-        let names = workspace::MATERIALS.iter().map(|(_, n)| n.to_lowercase()).collect::<Vec<_>>();
-        match m.parse::<usize>().ok().or_else(|| names.iter().position(|n| *n == m.to_lowercase())) {
-            Some(i) if i < names.len() => app.workspace.material = i,
-            _ => eprintln!("unknown material {m}; one of: {}", workspace::MATERIALS.map(|(_, n)| n).join(", ")),
+        match matcap::material_named(m) {
+            Some(i) => app.workspace.material = i,
+            None => eprintln!("unknown material {m}; one of: {}", (0..matcap::material_count()).map(workspace::material_name).collect::<Vec<_>>().join(", ")),
         }
     }
     // The brush catalog's previews, drawn ahead so B opens at once.
@@ -11152,6 +11280,93 @@ mod subtool_tests {
         assert!(app.subtools.last().unwrap().name.starts_with("Fibers_"));
         assert_eq!(app.doc.mesh().vertex_count(), 120 * (6 * 4 + 2));
         assert!(!app.workspace.fiber_preview);
+    }
+
+    #[test]
+    fn the_reference_image_and_spotlight_are_saved_with_the_project_and_old_projects_open_without() {
+        use reference::View;
+        let mut app = App::new(48, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-reference-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = image::RgbaImage::from_fn(16, 8, |x, _| if x < 8 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        img.save(dir.join("sheet.png")).unwrap();
+        app.load_reference(&dir.join("sheet.png"));
+        let bounds = app.model_bounds();
+        {
+            let r = app.workspace.reference.as_ref().expect("loaded");
+            assert_eq!((r.name.as_str(), r.view, r.shown, r.locked), ("sheet.png", View::Front, true, false));
+            assert!(r.pose.center.z < bounds.min.z, "behind the model: {:?}", r.pose);
+            assert_eq!(r.aspect(), 0.5);
+            let c = r.corners();
+            assert!((c[1] - c[0]).length() - r.size < 1e-5 && c[0].x < c[1].x && c[0].y > c[3].y);
+        }
+        app.place_reference(View::Side);
+        {
+            let r = app.workspace.reference.as_mut().unwrap();
+            assert!(r.view == View::Side && r.pose.center.x < bounds.min.x);
+            r.opacity = 0.3;
+            r.size = 2.5;
+            r.locked = true;
+        }
+        // Locked: the view stays, and a new picture takes the plane's place.
+        app.place_reference(View::Top);
+        app.load_reference(&dir.join("sheet.png"));
+        let saved_pose = app.workspace.reference.as_ref().unwrap().pose;
+        assert_eq!(app.workspace.reference.as_ref().unwrap().view, View::Side);
+        app.load_spotlight(&dir.join("sheet.png"));
+        app.workspace.spotlight.as_mut().unwrap().place.angle = 0.25;
+        let path = dir.join("ref.klay");
+        app.project_path = path.to_string_lossy().into_owned();
+        app.save_project();
+        assert!(app.status.starts_with("Saved"), "{}", app.status);
+        // Another session opens it with both pictures.
+        let mut b = App::new(48, false, usize::MAX);
+        b.open_project(&path.to_string_lossy());
+        assert!(b.status.starts_with("Opened"), "{}", b.status);
+        let r = b.workspace.reference.as_ref().expect("the reference came back");
+        assert_eq!((r.name.as_str(), r.view, r.opacity, r.size, r.locked, r.shown), ("sheet.png", View::Side, 0.3, 2.5, true, true));
+        assert_eq!(r.pose, saved_pose);
+        assert_eq!((r.picture.width, r.picture.height, r.picture.rgba[0], r.picture.rgba[15]), (16, 8, [255, 0, 0, 255], [0, 0, 255, 255]));
+        let sp = b.workspace.spotlight.as_ref().expect("the Spotlight came back");
+        assert_eq!((sp.name.as_str(), sp.place.angle, sp.paint_through), ("sheet.png", 0.25, true));
+        assert_eq!(sp.picture.rgba[0], [255, 0, 0, 255]);
+        // A version 11 project has no pictures: opening it leaves none.
+        let packed = b.doc.pack_copy();
+        let old = project::write_version(Vec::new(), &[("Old", true, &packed)], 0, 11).unwrap();
+        std::fs::write(dir.join("old.klay"), old).unwrap();
+        b.open_project(&dir.join("old.klay").to_string_lossy());
+        assert!(b.status.starts_with("Opened"), "{}", b.status);
+        assert!(b.workspace.reference.is_none() && b.workspace.spotlight.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_matcap_is_a_material_by_name_that_shades_the_previews_and_can_be_removed() {
+        let _lock = matcap::test_lock();
+        let mut app = App::new(48, false, usize::MAX);
+        let dir = std::env::temp_dir().join(format!("klay-matcap-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 220, 40, 255])).save(dir.join("green ball.png")).unwrap();
+        let before = matcap::material_count();
+        app.load_matcap(&dir.join("green ball.png"), true);
+        let i = app.workspace.material;
+        assert_eq!((i, matcap::material_count()), (before, before + 1));
+        assert_eq!(workspace::material_name(i), "green ball");
+        assert!(app.status.contains("green ball"), "{}", app.status);
+        assert_eq!(matcap::material_named("green ball"), Some(i));
+        // The shader gets its layer index and a white unpainted colour.
+        assert_eq!(app.material_uniform(), [1.0, 1.0, 1.0, (i - matcap::FIRST) as f32]);
+        // Thumbnails are shaded with it: a green sphere.
+        let preview = brush_preview::image(None, i, false);
+        let c = preview.pixels[preview.size[1] / 2 * preview.size[0] + preview.size[0] / 2];
+        assert!(c.g() > 150 && c.r() < 80 && c.b() < 100, "{c:?}");
+        // The copy lives in this session's config folder, and Remove MatCap takes it away.
+        let copy = app.workspace.config_root.join("klay/matcaps/green ball.png");
+        assert!(copy.is_file());
+        app.remove_matcap(i - workspace::MATERIALS.len());
+        assert_eq!((matcap::material_count(), app.workspace.material), (before, 0));
+        assert!(!copy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

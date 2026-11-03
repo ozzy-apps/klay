@@ -937,6 +937,12 @@ pub struct Actions {
     pub panel_loops: bool,
     /// Spotlight › Load Image.
     pub spotlight_load: bool,
+    /// Material › Load MatCap; Remove MatCap (the loaded MatCap's index among the loaded ones).
+    pub matcap_load: bool,
+    pub matcap_remove: Option<usize>,
+    /// Document › Reference › Load Image; Front / Side / Top / Free places the plane again.
+    pub reference_load: bool,
+    pub reference_view: Option<crate::reference::View>,
     /// Geometry › FiberMesh › Accept.
     pub fiber_accept: bool,
     /// Geometry › Dynamics › Run Simulation.
@@ -976,6 +982,17 @@ pub struct Actions {
     pub bake: Option<crate::bake::Kind>,
 }
 
+/// The name of material `i`: from [`MATERIALS`], or a loaded MatCap's file name.
+pub fn material_name(i: usize) -> String {
+    crate::matcap::material_name(i)
+}
+
+/// The swatch colour of material `i`: its unpainted colour (white for a loaded MatCap,
+/// whose picture carries the colour).
+pub fn material_swatch(i: usize) -> Color32 {
+    MATERIALS.get(i).map_or(Color32::WHITE, |m| m.0)
+}
+
 /// Brush › Tablet Pressure: what pen pressure scales and through which curves.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TabletPressure {
@@ -986,7 +1003,8 @@ pub struct TabletPressure {
 }
 
 /// Materials: Klay's procedural clays, then the MatCaps from `matcap::FIRST` on (in
-/// `matcap::Look::ALL` order; the colour is each one's unpainted colour, sRGB).
+/// `matcap::Look::ALL` order; the colour is each one's unpainted colour, sRGB). Loaded
+/// MatCaps (Material › Load MatCap) come after the table: see [`material_name`].
 pub const MATERIALS: [(Color32, &str); 16] = [
     (Color32::from_rgb(199, 158, 128), "Warm clay"),
     (Color32::from_rgb(156, 163, 171), "Cool clay"),
@@ -1141,6 +1159,10 @@ pub struct Workspace {
     /// Spotlight: the picture over the canvas, and its texture once uploaded.
     pub spotlight: Option<crate::spotlight::Spotlight>,
     spotlight_texture: Option<(u64, egui::TextureHandle)>,
+    /// Document › Reference: the picture on a plane in the scene (the renderer draws it).
+    pub reference: Option<crate::reference::Reference>,
+    /// The config root (`$XDG_CONFIG_HOME`): loaded MatCaps are copied under `klay/` in it.
+    pub config_root: PathBuf,
     /// Document › Render settings, turntable frames, and the last render as a picture (a
     /// key, a caption, size and RGBA pixels), set by the app.
     pub bpr: crate::bpr::Settings,
@@ -1363,6 +1385,11 @@ impl Workspace {
             }
         }
         let saved = layout.encode();
+        // The MatCaps loaded in earlier sessions (Material › Load MatCap).
+        #[cfg(not(test))]
+        for e in crate::matcap::restore(&root) {
+            log::warn!("MatCap not loaded: {e}");
+        }
         let brush_ui=brush_ui::BrushUi::new(root.join("klay/brush-assets.v1"));
         let assets=brush_ui.settings();
         Self {
@@ -1414,6 +1441,8 @@ impl Workspace {
             bpr_texture: None,
             spotlight: None,
             spotlight_texture: None,
+            reference: None,
+            config_root: root.clone(),
             bpr: crate::bpr::Settings::default(),
             turntable_frames: 120,
             render_preview: None,
@@ -3249,6 +3278,43 @@ impl Workspace {
                         ws.spotlight = None;
                     }
                 });
+                self.sec(ui, h, id, "reference", "Reference", None, false, true, &mut |ws, ui| {
+                    let r = ui
+                        .add_sized([ui.available_width(), 20.0], egui::Button::new("Load Image"))
+                        .on_hover_text("Put a picture on a plane in the scene, behind the model, to model against; the view turns round it (ZBrush: Image Plane)");
+                    if r.shelf(ui, "cmd:reference").clicked() {
+                        a.reference_load = true;
+                    }
+                    let mut remove = false;
+                    if let Some(re) = ws.reference.as_mut() {
+                        ui.add(egui::Label::new(RichText::new(&re.name).size(12.0).color(FG2())).truncate());
+                        let views = crate::reference::View::ALL;
+                        let labels: Vec<&str> = views.iter().map(|v| v.label()).collect();
+                        ui.add_enabled_ui(!re.locked, |ui| {
+                            if let Some(i) = seg(ui, &labels, views.iter().position(|&v| v == re.view).unwrap_or(0), false) {
+                                a.reference_view = Some(views[i]);
+                            }
+                        });
+                        note(ui, "Front, Side and Top put the plane behind the model that way; Free puts it behind the model as you see it now, and it stays there");
+                        zslider(ui, "Opacity", &mut re.opacity, 0.05..=1.0, false, false, 2);
+                        ui.add_enabled_ui(!re.locked, |ui| {
+                            zslider(ui, "Size", &mut re.size, 0.1..=100.0, true, false, 2);
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut re.shown, "Show").on_hover_text("Draw the plane");
+                            ui.checkbox(&mut re.locked, "Lock").on_hover_text("Keep the plane where it is: the view and Size stay as they are, and a new picture takes its place");
+                        });
+                        remove = ui
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Remove").size(12.0)))
+                            .on_hover_text("Take the picture away")
+                            .clicked();
+                    } else {
+                        note(ui, "No picture · PNG, JPEG or BMP · saved with the project");
+                    }
+                    if remove {
+                        ws.reference = None;
+                    }
+                });
                 self.sec(ui, h, id, "render", "Render", None, false, true, &mut |ws, ui| {
                     ui.add_enabled_ui(!ws.rendering, |ui| {
                         ui.horizontal(|ui| {
@@ -3565,7 +3631,26 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         ws.material_swatches(ui);
-                        note(ui, MATERIALS[ws.material].1);
+                        note(ui, &material_name(ws.material));
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                            let r = ui
+                                .add_sized([w, 20.0], egui::Button::new("Load MatCap").truncate())
+                                .on_hover_text("Add a picture of a lit sphere (PNG, JPEG, BMP) as a MatCap; it is kept for the next start and listed by its file name (ZBrush: Material › Load)");
+                            if r.shelf(ui, "cmd:load-matcap").clicked() {
+                                a.matcap_load = true;
+                            }
+                            let loaded = ws.material.checked_sub(MATERIALS.len());
+                            ui.add_enabled_ui(loaded.is_some(), |ui| {
+                                if ui
+                                    .add_sized([w, 20.0], egui::Button::new("Remove MatCap").truncate())
+                                    .on_hover_text("Take the selected loaded MatCap away (the built-in ones stay)")
+                                    .clicked()
+                                {
+                                    a.matcap_remove = loaded;
+                                }
+                            });
+                        });
                     },
                 );
                 self.sec(
@@ -5321,7 +5406,8 @@ impl Workspace {
     fn material_swatches(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-            for (i, (_, name)) in MATERIALS.iter().enumerate() {
+            for i in 0..crate::matcap::material_count() {
+                let name = material_name(i);
                 let tex = self.material_texture(ui.ctx(), i);
                 let (r, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
                 let p = ui.painter();
@@ -5349,7 +5435,7 @@ impl Workspace {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
-                if resp.on_hover_text(*name).clicked() {
+                if resp.on_hover_text(name).clicked() {
                     self.material = i;
                     self.prerender_previews();
                 }
@@ -5807,6 +5893,16 @@ impl Workspace {
             self.textures.insert(key, handle);
         }
         self.textures[&key].id()
+    }
+
+    /// Drop the previews of material `from` and every material after it (a loaded MatCap
+    /// was removed, so those indices now mean other materials).
+    pub fn forget_materials_from(&mut self, from: usize) {
+        self.textures.retain(|k, _| k.1 < from);
+        if let Ok(mut c) = self.preview_cache.lock() {
+            c.retain(|k, _| k.1 < from);
+        }
+        self.prerendered = None;
     }
 
     fn material_texture(&mut self, ctx: &Context, material: usize) -> TextureId {

@@ -11,8 +11,7 @@ pub fn image(kind: Option<BrushKind>, material: usize, invert: bool) -> ColorIma
     } else {
         0.84f32
     };
-    let table = &crate::workspace::MATERIALS;
-    let c = table[material.min(table.len() - 1)].0;
+    let c = crate::workspace::material_swatch(material);
     let matcap = crate::matcap::of_material(material);
     let base = Vec3::new(c.r() as f32, c.g() as f32, c.b() as f32) / 255.0;
     let sign = if invert { -1.0 } else { 1.0 };
