@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.30.2 — 2026-11-03
+
+- Fixed a crash in Divide after ZRemesher (seen after ZModeler on a Plane, ZRemesher, polypaint, Divide): where the remesh left a vertex with only two neighbours between two quads, both quads were triangulated along the same diagonal, so that edge lay in four triangles and Loop subdivision panicked on it. Quads now never share a diagonal (nor take an edge as one), a face wound against the surface behind an open border goes, and the remesher refuses a result that is not two-manifold instead of handing it on.
+- Divide (and Dynamic Subdivision) now check the mesh first: one with an edge shared by more than two polygons, or a polygon with a repeated corner, is refused with a message instead of crashing.
+- Verification: 381 tests (new: planes with a polygon extruded, inset or deleted by ZModeler remesh two-manifold at two targets, take paint and divide; a mesh with an edge in three triangles or a degenerate triangle is refused by Divide).
+
 ## 0.30.1 — 2026-11-01
 
 - ZSpheres: the links between spheres are drawn as chains of overlapping link spheres that taper from one end to the other (and blend between a sphere and a cube), as ZBrush draws them, instead of thin tubes, so the armature shows the volume of the skin before it is made. Drawing on a link sphere inserts a ZSphere there, on the mirrored link too with X symmetry, sized by dragging; one undo step.

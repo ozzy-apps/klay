@@ -440,6 +440,19 @@ impl SculptMesh {
         })
     }
 
+    /// Why Loop subdivision could not take this mesh: a triangle with a repeated corner, or
+    /// an edge shared by more than two triangles (it needs a two-manifold mesh, open or
+    /// closed). `None` when it can.
+    pub fn subdivision_blocker(&self) -> Option<&'static str> {
+        if self.indices.par_chunks_exact(3).any(|t| t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) {
+            return Some("has polygons with a repeated corner");
+        }
+        if self.edges_over_two_triangles() {
+            return Some("has edges shared by more than two polygons");
+        }
+        None
+    }
+
     /// Owned ranges of every chunk: `[vert_start, vert_end, tri_start, tri_border, tri_end]`.
     /// With the positions and the index buffer this is all [`from_chunked`](Self::from_chunked)
     /// needs to rebuild the mesh exactly.

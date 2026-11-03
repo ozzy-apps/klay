@@ -67,6 +67,10 @@ fn has_border(mesh: &SculptMesh) -> bool {
 
 /// The model `mesh` divided as `s` says (fitted to [`MAX_TRIANGLES`] by the caller).
 pub fn build(mesh: &SculptMesh, s: &Settings) -> SculptMesh {
+    // Loop subdivision needs a two-manifold mesh; anything else is shown as it is.
+    if mesh.subdivision_blocker().is_some() {
+        return copy(mesh);
+    }
     let size = {
         let (lo, hi) = mesh.positions.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &p| (a.min(p), b.max(p)));
         (hi - lo).max_element().max(1e-6)

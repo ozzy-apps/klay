@@ -1910,10 +1910,16 @@ impl Multires {
         self.levels.iter().map(Level::bytes).sum()
     }
 
+    /// Why [`divide`](Self::divide) would refuse the top level: it is not a two-manifold
+    /// mesh (see [`SculptMesh::subdivision_blocker`]). `None` when it would divide.
+    pub fn divide_blocker(&self) -> Option<&'static str> {
+        self.levels[self.top()].mesh.subdivision_blocker()
+    }
+
     /// Subdivide the top level and make the new level active. Returns false when the
-    /// budget would be exceeded.
+    /// budget would be exceeded or the top level is not a two-manifold mesh.
     pub fn divide(&mut self) -> bool {
-        if !self.can_divide() {
+        if !self.can_divide() || self.divide_blocker().is_some() {
             return false;
         }
         let top = self.top();
@@ -3514,5 +3520,35 @@ mod tests {
         // The stand-in leaves hidden triangles out.
         let si = mr.stand_in(usize::MAX);
         assert_eq!(si.indices.len() / 3, n1 - mr.mesh().hidden_count());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// Divide refuses a mesh Loop subdivision cannot take, instead of panicking in it.
+    #[test]
+    fn divide_refuses_a_mesh_that_is_not_two_manifold() {
+        let p = vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z, -Vec3::Z];
+        // Three triangles on the edge 0-1.
+        let fin = SculptMesh::from_raw(p.clone(), vec![0, 1, 2, 0, 1, 3, 0, 1, 4]);
+        assert_eq!(fin.subdivision_blocker(), Some("has edges shared by more than two polygons"));
+        let mut doc = Multires::new(fin, usize::MAX);
+        assert_eq!(doc.divide_blocker(), Some("has edges shared by more than two polygons"));
+        assert!(!doc.divide());
+        assert_eq!(doc.count(), 1);
+        // A triangle with a repeated corner.
+        let bad = SculptMesh::from_raw(p.clone(), vec![0, 1, 2, 0, 2, 3, 1, 1, 2]);
+        assert_eq!(bad.subdivision_blocker(), Some("has polygons with a repeated corner"));
+        assert!(!Multires::new(bad, usize::MAX).divide());
+        // Dynamic Subdivision shows such a model as it is.
+        let fin = SculptMesh::from_raw(p.clone(), vec![0, 1, 2, 0, 1, 3, 0, 1, 4]);
+        let shown = crate::dynamic::build(&fin, &crate::dynamic::Settings { smooth: 2, ..Default::default() });
+        assert_eq!(shown.triangle_count(), 3);
+        // A plain open sheet divides.
+        let sheet = SculptMesh::from_raw(p, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(sheet.subdivision_blocker(), None);
+        assert!(Multires::new(sheet, usize::MAX).divide());
     }
 }

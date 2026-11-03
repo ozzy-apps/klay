@@ -6217,6 +6217,10 @@ impl App {
             ));
             return;
         }
+        if let Some(why) = self.doc.divide_blocker() {
+            self.workspace.notify(format!("Divide: the mesh {why}"));
+            return;
+        }
         let t = Instant::now();
         self.doc.divide();
         let ms = t.elapsed().as_secs_f32() * 1000.0;

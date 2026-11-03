@@ -667,6 +667,9 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         let quad = stats_quad(&out);
         crease_along(&mut out, &lines, quad);
     }
+    if let Some(why) = out.subdivision_blocker() {
+        return Err(format!("the result {why} · change Target Polygons Count"));
+    }
     Ok((out, stats))
 }
 
@@ -1187,6 +1190,43 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         }
     }
 
+    // A face wound against the surface where another face has the same two edges at a
+    // corner is the back of a border vertex (the walk round a short open border closes
+    // behind it): it goes. Two faces wound alike sharing a corner's edges (a vertex with
+    // two neighbours) are a valid corner, kept; the triangulation below keeps their quads
+    // off one diagonal.
+    {
+        let mut corners: Vec<((u32, u32, u32), usize)> = Vec::new();
+        for (fi, f) in faces.iter().enumerate() {
+            let n = f.len();
+            for k in 0..n {
+                let (p, v, q) = (f[(k + n - 1) % n], f[k], f[(k + 1) % n]);
+                corners.push(((v, p.min(q), p.max(q)), fi));
+            }
+        }
+        corners.sort_unstable();
+        let wound = |f: &[u32]| -> f32 {
+            let c = f.iter().map(|&v| vp[v as usize]).sum::<Vec3>() / f.len() as f32;
+            let n = f.iter().map(|&v| vn[v as usize]).sum::<Vec3>();
+            (0..f.len()).map(|k| (vp[f[k] as usize] - c).cross(vp[f[(k + 1) % f.len()] as usize] - c)).sum::<Vec3>().dot(n)
+        };
+        let mut gone = vec![false; faces.len()];
+        for w in corners.windows(2) {
+            let (f, g) = (w[0].1, w[1].1);
+            if w[0].0 != w[1].0 || f == g || gone[f] || gone[g] {
+                continue;
+            }
+            let (wf, wg) = (wound(&faces[f]), wound(&faces[g]));
+            if (wf < 0.0) != (wg < 0.0) {
+                gone[if wf < 0.0 { f } else { g }] = true;
+            }
+        }
+        if gone.contains(&true) {
+            faces = faces.into_iter().enumerate().filter(|(i, _)| !gone[*i]).map(|(_, f)| f).collect();
+            stats.odd_faces = faces.iter().filter(|f| f.len() != 4).count();
+        }
+    }
+
     // Split every face into quads through its middle.
     let mut out_p = vp.clone();
     let mut mids: HashMap<(u32, u32), u32> = HashMap::default();
@@ -1411,17 +1451,32 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         }
     }
 
-    // Triangles (each quad along its shorter diagonal).
+    // Triangles (each quad along its shorter diagonal, unless that is an edge or the
+    // diagonal of another quad: two quads on a vertex with two neighbours share three
+    // corners, and one diagonal between them would be an edge in four triangles).
     let mut indices = Vec::with_capacity(quads.len() * 6);
     let mut tri_groups = Vec::with_capacity(quads.len() * 2);
+    let mut taken: crate::fx::FxHashSet<(u32, u32)> = quads
+        .iter()
+        .flat_map(|q4| (0..4).map(move |k| (q4[k].min(q4[(k + 1) % 4]), q4[k].max(q4[(k + 1) % 4]))))
+        .collect();
     for (q4, &g) in quads.iter().zip(&quad_group) {
         let p = |v: u32| out_p[v as usize];
         if is_tri(q4) {
             indices.extend_from_slice(&[q4[0], q4[1], q4[2]]);
             tri_groups.push(g);
-        } else if p(q4[0]).distance_squared(p(q4[2])) <= p(q4[1]).distance_squared(p(q4[3])) {
+            continue;
+        }
+        let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        let mut first = p(q4[0]).distance_squared(p(q4[2])) <= p(q4[1]).distance_squared(p(q4[3]));
+        if taken.contains(&if first { key(q4[0], q4[2]) } else { key(q4[1], q4[3]) }) {
+            first = !first;
+        }
+        if first {
+            taken.insert(key(q4[0], q4[2]));
             indices.extend_from_slice(&[q4[0], q4[1], q4[2], q4[0], q4[2], q4[3]]);
         } else {
+            taken.insert(key(q4[1], q4[3]));
             indices.extend_from_slice(&[q4[0], q4[1], q4[3], q4[1], q4[2], q4[3]]);
         }
         tri_groups.extend_from_slice(&[g, g]);
@@ -1912,5 +1967,57 @@ mod tests {
         let m = SculptMesh::from_raw(p, i);
         let r = zremesh(&m, &Settings { target_k: 0.4, keep_groups: false, adaptive: 0.0, ..Settings::default() }, &[]);
         eprintln!("{:?}", r.map(|x| x.1));
+    }
+}
+
+#[cfg(test)]
+mod manifold_tests {
+    use super::*;
+
+    /// Every triangle has three distinct corners, every incident triangle holds its vertex,
+    /// and the neighbour lists match the triangles.
+    fn check(m: &SculptMesh, what: &str) {
+        assert_eq!(m.subdivision_blocker(), None, "{what}");
+        for v in 0..m.vertex_count() as u32 {
+            for &t in m.incident(v) {
+                let tri = &m.indices[3 * t as usize..3 * t as usize + 3];
+                assert!(tri.contains(&v), "{what}: vertex {v} incident to {t} {tri:?} which lacks it");
+                for &w in tri {
+                    assert!(w == v || m.neighbors(v).contains(&w), "{what}: {v} lacks neighbour {w}");
+                }
+            }
+        }
+    }
+
+    fn remesh_paint_divide(label: &str, m: SculptMesh) {
+        check(&m, &format!("{label}: input"));
+        for target_k in [0.5f32, 2.0] {
+            let s = Settings { target_k, ..Settings::default() };
+            let (out, _) = zremesh(&m, &s, &[]).unwrap();
+            check(&out, &format!("{label} k={target_k}: remeshed"));
+            let mut doc = crate::multires::Multires::new(out, usize::MAX);
+            crate::paint::ensure(doc.mesh_mut());
+            assert!(doc.divide(), "{label} k={target_k}: divide");
+            check(doc.mesh(), &format!("{label} k={target_k}: divided"));
+        }
+    }
+
+    /// A plane with a polygon pulled out by ZModeler has open borders that fold through
+    /// 90°; the remesh of it used to give a border vertex a face on its back too, and the
+    /// two quads on the same three vertices crashed Divide.
+    #[test]
+    fn zmodeled_planes_remesh_two_manifold_and_divide() {
+        for seg in [2u32, 8] {
+            let (p, i) = crate::primitive::Primitive::Plane.build(seg, 1.0);
+            let m = SculptMesh::from_raw(p.clone(), i.clone());
+            remesh_paint_divide(&format!("plane {seg}"), SculptMesh::from_raw(p, i));
+            let (pm, _) = crate::zmodeler::PolyMesh::from_mesh(&m);
+            let f = pm.faces.len() as u32 / 2;
+            let all: Vec<u32> = (0..pm.faces.len() as u32).collect();
+            for (name, poly) in [("extrude", pm.extrude(&[f], 0.3)), ("extrude all", pm.extrude(&all, 0.3)), ("inset", pm.inset(&[f], 0.3)), ("delete", pm.delete(&[f]))] {
+                let (m2, _, _) = poly.to_mesh();
+                remesh_paint_divide(&format!("plane {seg} {name}"), m2);
+            }
+        }
     }
 }
