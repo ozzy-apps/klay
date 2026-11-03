@@ -3090,7 +3090,7 @@ impl Workspace {
                         if let Some(i) = rows(ui, &names, at) {
                             ws.zm_point = PointAction::ALL[i];
                         }
-                        note(ui, "Hover a polygon, edge or point and press Space for its actions · the hint under the menu says whether to click or drag · Bridge and Stitch: click one, then the other · EdgeLoop widens Delete, Bevel, Crease, Slide, Move and Mask to the loop · Crease and Mask click again to undo");
+                        note(ui, "Hover a polygon, edge or point and press Space for its actions · the hint under the menu says whether to click or drag · Bridge and Stitch: click one, then the other · Transpose: click to put the gizmo there, then drag its handles · EdgeLoop widens Delete, Bevel, Crease, Slide, Move, Mask, Unweld and Transpose to the loop · Crease and Mask click again to undo");
                     });
                 }
                 if m.brush.kind.is_imm() {
