@@ -26,12 +26,41 @@ pub enum MaskOp {
     /// polygons).
     Grow,
     Shrink,
-    /// Mask By Cavity: mask the recessed surface, more where it is deeper; the value is
-    /// the sensitivity, 1..=100.
-    Cavity(u8),
+    /// Mask By Cavity: mask the recessed surface, more where it is deeper (or the raised
+    /// surface with a negative intensity).
+    Cavity(Cavity),
     /// Mask By Polygroups: mask the borders between polygroups, `width` rings wide (Invert
     /// masks the insides instead).
     GroupBorders(u8),
+}
+
+/// Mask By Cavity settings, as ZBrush's Masking › Mask By Cavity sliders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cavity {
+    /// -100..=100: how strongly a recess masks (100 masks even shallow ones, 10 only deep
+    /// creases); negative values mask the raised surface, ridges and corners, instead.
+    pub intensity: i8,
+    /// 1..=100: how wide a recess may be and still count. 1 finds only the creases between
+    /// neighbouring polygons (fine wrinkles, pores on a dense mesh); more smooths the
+    /// surface further out before comparing, so wide grooves and the folds of a form are
+    /// found too, as if seen at a lower subdivision level.
+    pub depth: u8,
+    /// 0..=100: softens the mask's edges, up to ten rings of polygons.
+    pub blur: u8,
+}
+
+impl Default for Cavity {
+    fn default() -> Self {
+        Self { intensity: 50, depth: 1, blur: 0 }
+    }
+}
+
+#[cfg(test)]
+impl Cavity {
+    /// The default settings at `intensity`.
+    pub fn with_intensity(intensity: i8) -> Self {
+        Self { intensity, ..Self::default() }
+    }
 }
 
 /// The mask `op` makes of the current one.
@@ -44,7 +73,7 @@ pub fn apply(mesh: &SculptMesh, op: MaskOp) -> Vec<u8> {
         MaskOp::Sharpen => sharpened(mesh, 1.0),
         MaskOp::Grow => spread(mesh, true),
         MaskOp::Shrink => spread(mesh, false),
-        MaskOp::Cavity(sensitivity) => cavity(mesh, sensitivity),
+        MaskOp::Cavity(settings) => cavity(mesh, settings),
         MaskOp::GroupBorders(width) => group_borders(mesh, width),
     }
 }
@@ -78,12 +107,34 @@ fn spread_values(mesh: &SculptMesh, m: &[u8], grow: bool) -> Vec<u8> {
         .collect()
 }
 
-/// Mask By Cavity: how far each vertex sits below its neighbours, along its normal and
-/// relative to their spacing, mapped through `sensitivity` (1..=100) and softened once.
-/// Hidden polygons keep their mask.
-pub fn cavity(mesh: &SculptMesh, sensitivity: u8) -> Vec<u8> {
-    let gain = sensitivity.clamp(1, 100) as f32 / 100.0 * 16.0;
-    let raw: Vec<f32> = (0..mesh.vertex_count() as u32)
+/// Mask By Cavity: how far each vertex sits below the surface smoothed `depth` rings out
+/// (its neighbours' mean at depth 1), along its normal and relative to the polygon spacing
+/// at that scale, mapped through the intensity (its sign choosing recesses or ridges),
+/// softened once and then `blur` more. Hidden polygons keep their mask.
+pub fn cavity(mesh: &SculptMesh, settings: Cavity) -> Vec<u8> {
+    let Cavity { intensity, depth, blur } = settings;
+    let intensity = intensity.clamp(-100, 100) as f32 / 100.0;
+    let gain = intensity.abs() * 16.0;
+    let sign = if intensity < 0.0 { -1.0 } else { 1.0 };
+    let depth = depth.clamp(1, 100) as usize;
+    let n = mesh.vertex_count() as u32;
+    // The surface smoothed `depth` times: each pass replaces a vertex by the mean of its
+    // neighbours, so the smoothing reaches about sqrt(depth) rings out.
+    let mut smooth = mesh.positions.clone();
+    for _ in 0..depth {
+        smooth = (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let nb = mesh.neighbors(v);
+                if nb.is_empty() {
+                    return smooth[v as usize];
+                }
+                nb.iter().map(|&m| smooth[m as usize]).sum::<Vec3>() / nb.len() as f32
+            })
+            .collect();
+    }
+    let scale = (depth as f32).sqrt();
+    let raw: Vec<f32> = (0..n)
         .into_par_iter()
         .map(|v| {
             let nb = mesh.neighbors(v);
@@ -91,21 +142,31 @@ pub fn cavity(mesh: &SculptMesh, sensitivity: u8) -> Vec<u8> {
                 return 0.0;
             }
             let p = mesh.positions[v as usize];
-            let mean = nb.iter().map(|&n| mesh.positions[n as usize]).sum::<Vec3>() / nb.len() as f32;
-            let spacing = nb.iter().map(|&n| mesh.positions[n as usize].distance(p)).sum::<f32>() / nb.len() as f32;
-            ((mean - p).dot(mesh.normal_at(v)) / spacing.max(1e-12) * gain).clamp(0.0, 1.0)
+            let spacing = nb.iter().map(|&m| mesh.positions[m as usize].distance(p)).sum::<f32>() / nb.len() as f32;
+            (sign * (smooth[v as usize] - p).dot(mesh.normal_at(v)) / (spacing * scale).max(1e-12) * gain).clamp(0.0, 1.0)
         })
         .collect();
+    let soften = |raw: &[f32]| -> Vec<f32> {
+        (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let nb = mesh.neighbors(v);
+                (raw[v as usize] + nb.iter().map(|&m| raw[m as usize]).sum::<f32>()) / (nb.len() + 1) as f32
+            })
+            .collect()
+    };
+    let mut soft = soften(&raw);
+    for _ in 0..(blur.min(100) as f32 / 10.0).round() as usize {
+        soft = soften(&soft);
+    }
     let old = &mesh.mask;
-    (0..mesh.vertex_count() as u32)
+    (0..n)
         .into_par_iter()
         .map(|v| {
             if !shown(mesh, v) {
                 return old.get(v as usize).copied().unwrap_or(0);
             }
-            let nb = mesh.neighbors(v);
-            let soft = (raw[v as usize] + nb.iter().map(|&n| raw[n as usize]).sum::<f32>()) / (nb.len() + 1) as f32;
-            (soft * 255.0).round() as u8
+            (soft[v as usize] * 255.0).round() as u8
         })
         .collect()
 }
@@ -519,13 +580,41 @@ mod mask_op_tests {
         // Chunking reorders vertices: look them up in the mesh.
         let p = &m.positions;
         let near = |y: f32| (0..p.len()).min_by(|&a, &b| (p[a].truncate() - glam::Vec2::new(0.0, y)).length().total_cmp(&(p[b].truncate() - glam::Vec2::new(0.0, y)).length())).unwrap();
-        let mask = apply(&m, MaskOp::Cavity(50));
+        let mask = apply(&m, MaskOp::Cavity(Cavity::with_intensity(50)));
         let (groove, ridge, flat) = (mask[near(-0.3)], mask[near(0.3)], mask[near(0.0)]);
         assert!(groove > 128 && ridge == 0 && flat < 8, "groove {groove} ridge {ridge} flat {flat}");
         // More sensitivity reaches the shallower sides of the groove.
-        let more = apply(&m, MaskOp::Cavity(100));
+        let more = apply(&m, MaskOp::Cavity(Cavity::with_intensity(100)));
         let side = near(-0.34);
         assert!(more[side] >= mask[side]);
+        // A negative intensity masks the ridge instead of the groove.
+        let ridges = apply(&m, MaskOp::Cavity(Cavity::with_intensity(-50)));
+        let (groove, ridge) = (ridges[near(-0.3)], ridges[near(0.3)]);
+        assert!(ridge > 128 && groove == 0, "groove {groove} ridge {ridge}");
+        // Blur spreads the mask onto the flat beside the groove without losing its middle.
+        let blurred = apply(&m, MaskOp::Cavity(Cavity { intensity: 50, depth: 1, blur: 100 }));
+        let beside = near(-0.2);
+        assert!(blurred[beside] > mask[beside] && blurred[near(-0.3)] > 64, "beside {} was {} · middle {}", blurred[beside], mask[beside], blurred[near(-0.3)]);
+    }
+
+    #[test]
+    fn cavity_depth_finds_wide_grooves_that_one_ring_misses() {
+        // A shallow groove fifty polygons wide (a fold, a grime channel on a dense mesh)
+        // and a ridge like it.
+        let (p, i) = Primitive::Plane.build(160, 1.0);
+        let p: Vec<Vec3> = p
+            .into_iter()
+            .map(|q| q + Vec3::Z * (0.03 * (-((q.y - 0.3) / 0.15).powi(2)).exp() - 0.03 * (-((q.y + 0.3) / 0.15).powi(2)).exp()))
+            .collect();
+        let m = SculptMesh::from_raw(p, i);
+        let p = &m.positions;
+        let near = |y: f32| (0..p.len()).min_by(|&a, &b| (p[a].truncate() - glam::Vec2::new(0.0, y)).length().total_cmp(&(p[b].truncate() - glam::Vec2::new(0.0, y)).length())).unwrap();
+        let shallow = apply(&m, MaskOp::Cavity(Cavity { intensity: 100, depth: 1, blur: 0 }));
+        let deep = apply(&m, MaskOp::Cavity(Cavity { intensity: 100, depth: 100, blur: 0 }));
+        let (s, d) = (shallow[near(-0.3)], deep[near(-0.3)]);
+        assert!(s < 40 && d > 60 && d > 3 * s, "one ring {s} · depth 100 {d}");
+        assert_eq!(deep[near(0.3)], 0, "the ridge stays free");
+        assert!(deep[near(0.0)] < 16, "the flat between stays free: {}", deep[near(0.0)]);
     }
 
     #[test]

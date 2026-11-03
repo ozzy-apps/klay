@@ -1166,9 +1166,12 @@ pub struct Workspace {
     /// Preferences › QuickSave: on, and every how many minutes.
     pub quicksave: bool,
     pub quicksave_minutes: f32,
-    /// Masking › Mask By Cavity sensitivity (1..=100) and Mask By Polygroups border width
-    /// (rings).
-    pub cavity_sensitivity: f32,
+    /// Masking › Mask By Cavity: Intensity (-100..=100, negative masks ridges), Depth
+    /// (1..=100, how wide a recess may be) and Blur (0..=100); and Mask By Polygroups
+    /// border width (rings).
+    pub cavity_intensity: f32,
+    pub cavity_depth: f32,
+    pub cavity_blur: f32,
     pub group_border_width: f32,
     /// Polygroups › Group By Normals: Max Angle Tolerance, degrees.
     pub normals_angle: f32,
@@ -1408,7 +1411,9 @@ impl Workspace {
             ambient: 1.0,
             layer_selected: 0,
             layer_drag: None,
-            cavity_sensitivity: 50.0,
+            cavity_intensity: 50.0,
+            cavity_depth: 1.0,
+            cavity_blur: 0.0,
             normals_angle: 20.0,
             group_border_width: 2.0,
             lazy_mouse: false,
@@ -3461,10 +3466,17 @@ impl Workspace {
                         let full = |ui: &mut Ui, label: &str, hint: &str| {
                             ui.add_sized([ui.available_width(), 20.0], egui::Button::new(label)).on_hover_text(hint).clicked()
                         };
-                        if full(ui, "Mask By Cavity", "Mask the recessed surface, more where it is deeper") {
-                            a.mask = Some(MaskOp::Cavity(ws.cavity_sensitivity.round() as u8));
+                        if full(ui, "Mask By Cavity", "Mask the recessed surface, more where it is deeper (grime, wear) · Intensity below 0 masks the raised surface instead") {
+                            a.mask = Some(MaskOp::Cavity(crate::mask::Cavity {
+                                intensity: ws.cavity_intensity.round() as i8,
+                                depth: ws.cavity_depth.round() as u8,
+                                blur: ws.cavity_blur.round() as u8,
+                            }));
                         }
-                        zslider(ui, "Cavity", &mut ws.cavity_sensitivity, 1.0..=100.0, false, false, 0);
+                        zslider(ui, "Intensity", &mut ws.cavity_intensity, -100.0..=100.0, false, false, 0);
+                        zslider(ui, "Depth", &mut ws.cavity_depth, 1.0..=100.0, false, false, 0);
+                        zslider(ui, "Blur", &mut ws.cavity_blur, 0.0..=100.0, false, false, 0);
+                        note(ui, "Intensity: high masks shallow recesses too, negative masks ridges · Depth: 1 creases only, more finds wide grooves · Blur softens");
                         if full(ui, "Mask By Polygroups", "Mask the borders between polygroups · Invert to mask their insides") {
                             a.mask = Some(MaskOp::GroupBorders(ws.group_border_width.round() as u8));
                         }

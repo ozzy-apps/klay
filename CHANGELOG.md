@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.0 — 2026-11-03
+
+- **Mask By Cavity** now has ZBrush's controls and one more. **Intensity** (−100..100) replaces the Cavity sensitivity: high masks even shallow recesses, low only deep creases, and a negative value masks the raised surface (ridges, corners) instead. **Depth** (1..100) sets how wide a recess may be and still count: 1 compares each vertex with its neighbours as before (creases, pores), more smooths the surface further out first, so the grooves and folds a dense mesh hides from a one-ring test are found too (for grime on a subdivided model). **Blur** (0..100) softens the mask's edges up to ten rings. Depth 100 takes 0.2 s on a million vertices.
+- Verification: 388 tests (new: a shallow groove fifty polygons wide barely masks at depth 1 and masks at depth 100 while the ridge and the flat stay free; a negative intensity masks the ridge and not the groove; Blur spreads the mask beside the groove without losing its middle).
+
 ## 0.32.0 — 2026-11-03
 
 - **ZModeler box-modelling actions.** Polygon **Bevel** (the polygon's border chamfered: a smaller polygon with a rim, Target applies), point **Bevel** (the corner cut off, a polygon in the gap) and edge **Bridge** (two open edges joined by a polygon, click one then the other, as polygon Bridge). Edge Bevel now chamfers one edge or, with **EdgeLoop**, the loop (it always took the loop before), and works on any polygons, not only quads; both bevels share one chamfer that keeps the mesh closed, polygons beside a slid corner gaining that point on their edge.

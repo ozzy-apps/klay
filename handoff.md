@@ -699,3 +699,10 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - Space with ZModeler over a target opens `Workspace::zm_menu` (`open_zm_menu`, `zm_menu_ui`), else the quick menu as before.
 - Brush previews: `Workspace::prerender_previews` draws all 88 (67 kinds, 21 with a subtract variant, the plain sphere) with rayon on a spawned thread into `preview_cache`; `texture` takes from it. Called at start-up after `--material`, on a material click, and lazily. Nothing in tests (`cfg!(test)`).
 - Version 0.32.0.
+
+## Step 80: Mask By Cavity with Intensity, Depth and Blur (2026-11-03, Claude Code)
+- User: Klay seemed to lack a cavity mask with a depth setting, for grime on textures. Mask By Cavity existed (Masking palette) with one sensitivity slider and a one-ring measure (a vertex against the mean of its neighbours), which finds only creases one polygon wide, nothing on a dense mesh.
+- ZBrush's Mask By Cavity has Intensity (negative inverts), Blur and a Cavity Profile curve; no depth or radius control (Brush › Auto Masking › CavityMask has the same intensity and curve). Klay: `mask::Cavity { intensity: i8, depth: u8, blur: u8 }` in `MaskOp::Cavity`. Depth = passes of neighbour averaging of the positions before comparing (reach about sqrt(depth) rings; the measure is divided by spacing × sqrt(depth), so depth 1 is exactly the old formula); Blur = up to ten extra softening passes of the mask. Workspace fields `cavity_intensity`, `cavity_depth`, `cavity_blur` (not saved). No profile curve: Intensity's gain and clamp cover the practical range.
+- Wider grooves than depth 100 reaches: mask at a lower Divide level, the mask follows the shown level.
+- Version 0.33.0.
+

@@ -784,9 +784,13 @@ Export STL, Send to Slicer and Check Mesh can go on a shelf (Send to Strata cann
   gaps. **LazyMouse** (`L`) makes the brush trail the cursor on a string of **LazyRadius**
   pixels, drawn on the canvas, for steady lines; drag brushes follow the cursor directly.
 - **Masking**: **Grow / Shrink** move the mask by one ring of polygons (never across hidden
-  ones); **Mask By Cavity** masks recessed surface, more where deeper (**Cavity**
-  sensitivity); **Mask By Polygroups** masks the borders between polygroups (**Border
-  width**; Invert to mask their insides instead).
+  ones); **Mask By Cavity** masks recessed surface, more where deeper, for grime and wear:
+  **Intensity** sets how shallow a recess still masks, and below 0 masks the raised surface
+  (ridges, corners) instead; **Depth** sets how wide a recess may be, 1 for the creases
+  between neighbouring polygons only (pores, wrinkles), more for the grooves and folds a dense
+  mesh hides; **Blur** softens the mask's edges. For grooves wider still, mask at a lower
+  Divide level, the mask follows the shown level. **Mask By Polygroups** masks the borders
+  between polygroups (**Border width**; Invert to mask their insides instead).
 - **Mesh › Visibility**: **Grow / Shrink** show one more ring of polygons or hide the outer
   ring. **Mesh › Polygroups**: **Auto Groups** gives each connected piece its own group;
   **Group By Normals** starts a new group wherever the surface turns by more than **Max
