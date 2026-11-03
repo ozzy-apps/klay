@@ -691,6 +691,7 @@ pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result
         return Err("the surface is smaller than one voxel · raise the resolution".into());
     }
 
+    crate::jobs::check()?;
     // 2–3. Cells, then corners turned inside until no face is ambiguous.
     let t = Instant::now();
     let mut field = Field {
@@ -730,6 +731,7 @@ pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result
     stats.cells = keys.len();
     stats.cells_ms = t.elapsed().as_secs_f32() * 1000.0;
 
+    crate::jobs::check()?;
     // 4. Vertices: one per patch per cell, at the mean of the patch's crossings.
     let t = Instant::now();
     let h = grid.h as f32;
@@ -916,6 +918,7 @@ pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result
     drop(field);
     stats.surface_ms = t.elapsed().as_secs_f32() * 1000.0;
 
+    crate::jobs::check()?;
     // 5. Blur and Project, then polygroup borders onto the old ones.
     let t = Instant::now();
     if s.project {

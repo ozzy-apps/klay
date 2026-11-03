@@ -665,6 +665,7 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     edges.dedup();
     let (lines, corners) = crate::crease::lines(mesh, &edges, 0.0);
     let features = Features { lines, corners };
+    crate::jobs::check()?;
     let (mut out, stats) = if s.symmetric { symmetric(mesh, s, guides, &features)? } else { remesh(mesh, s, guides, &[], &features, false)? };
     if !creased.is_empty() {
         let (lines, _) = crate::crease::lines(mesh, &creased, 0.0);
@@ -866,6 +867,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
 
     // Smoothing passes per level (more on the finest, which the quads come from).
     let sweeps = |l: usize| -> usize { if l == 0 { 12 } else { 8 } };
+    crate::jobs::check()?;
     // 2. Directions, coarse to fine.
     let top = levels.len() - 1;
     let mut q: Vec<Vec3> = levels[top]
@@ -910,6 +912,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         qs.push((0..g.len()).map(|k| (acc[k] - g.n[k] * acc[k].dot(g.n[k])).normalize_or(g.n[k].any_orthonormal_vector())).collect());
     }
 
+    crate::jobs::check()?;
     // 3. Lattice, coarse to fine.
     let mut o: Vec<Vec3> = levels[top].0.p.clone();
     for l in (0..=top).rev() {
@@ -928,6 +931,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let g = &levels[0].0;
     let q = &qs[0];
 
+    crate::jobs::check()?;
     // 4. Vertices and edges.
     let m = g.len();
     let mut uf: Vec<u32> = (0..m as u32).collect();

@@ -538,6 +538,7 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
             })
             .collect();
     }
+    crate::jobs::check()?;
     let (mut chart, count) = charts(&surface, s);
     let min = (n / 2000).clamp(4, 64);
     let grown = count;
@@ -637,6 +638,7 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
         })
         .collect();
 
+    crate::jobs::check()?;
     // Pack: tallest first, in shelves across a square about the size of all the boxes.
     let total: f64 = islands.iter().map(|i| (i.hi - i.lo).x * (i.hi - i.lo).y).sum();
     let margin = total.sqrt() * 0.008;

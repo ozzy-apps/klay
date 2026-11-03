@@ -21,6 +21,7 @@ mod file_dialog;
 mod strata_bridge;
 mod gizmo;
 mod insert_mesh;
+mod jobs;
 mod sculptris;
 mod spotlight;
 mod fx;
@@ -310,14 +311,35 @@ enum GeoOp {
     ProjectAll,
 }
 
-/// A decimation running on its own thread, and what it was started on: its result is
-/// dropped if the subtool changed meanwhile.
-struct DecimateJob {
-    rx: std::sync::mpsc::Receiver<Option<decimate::Decimated>>,
+/// A long geometry operation (ZRemesher, Decimation, UV Unwrap, Remesh, Make Boolean Mesh,
+/// ProjectAll) running on its own thread (`jobs`), and what it was started on: its result
+/// is dropped if the subtool changed meanwhile, or on Cancel. The model waits for it: the
+/// view still turns, but nothing edits the subtool under it.
+struct GeoJob {
+    rx: std::sync::mpsc::Receiver<jobs::Done<GeoDone>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    name: &'static str,
     tool: u64,
     edits: u64,
     level: usize,
     started: Instant,
+    /// Remesh from the Wedge toggle: turn Remesh on for the subtool when the result lands.
+    wedge_on: bool,
+}
+
+/// What a finished geometry job hands back, applied on the UI thread through the undo path
+/// the operation always used.
+enum GeoDone {
+    /// A new topology for the active subtool (ZRemesher, Decimation, Remesh): one undo step
+    /// that keeps the old stack; `detail` follows the triangle counts in the status.
+    Topology { mesh: SculptMesh, detail: String },
+    /// UV Unwrap: UVs for the lowest level.
+    Uvs(uv::Unwrap),
+    /// ProjectAll: where the shown level's vertices go, and their paint.
+    Projection(project_all::Projection),
+    /// Make Boolean Mesh: the result as a new subtool, and the ids of the subtools it came
+    /// from.
+    Boolean { mesh: SculptMesh, used: Vec<u64> },
 }
 
 /// The map a Texture Maps save dialog is for.
@@ -769,8 +791,12 @@ struct App {
     pending_vis: Option<VisOp>,
     /// Geometry operation (Wedge, Del Higher / Lower), run outside the egui pass.
     pending_geo: Option<GeoOp>,
-    /// Decimation running in the background (Geometry › Decimation).
-    decimation: Option<DecimateJob>,
+    /// A geometry operation running in the background (ZRemesher, Decimation, UV Unwrap,
+    /// Remesh, Make Boolean Mesh, ProjectAll).
+    geo: Option<GeoJob>,
+    /// Wait for every geometry job as soon as it starts (self-tests, snapshots, start-up
+    /// flags), so the steps after it see its result.
+    jobs_wait: bool,
     /// Texture-map bake running in the background, and where the last map was saved.
     bake_job: Option<BakeJob>,
     map_path: String,
@@ -976,7 +1002,8 @@ impl App {
             pending_level: None,
             pending_vis: None,
             pending_geo: None,
-            decimation: None,
+            geo: None,
+            jobs_wait: false,
             bake_job: None,
             map_path: String::new(),
             bake_on_start: Vec::new(),
@@ -1040,7 +1067,7 @@ impl App {
             || self.zm_drag.is_some()
             || self.zs_drag.is_some()
             || self.turntable.is_some()
-            || self.decimation.is_some()
+            || self.geo.is_some()
             || self.sim.is_some()
     }
 
@@ -1108,7 +1135,7 @@ impl App {
 
     /// Make subtool `i` the active one (SubTool list, or Alt + click on it).
     fn select_subtool(&mut self, i: usize) {
-        if i == self.active_tool || i >= self.subtools.len() || self.busy() {
+        if i == self.active_tool || i >= self.subtools.len() || self.job_blocks("Selecting a subtool") || self.busy() {
             return;
         }
         let park_ms = self.park_active();
@@ -1225,11 +1252,7 @@ impl App {
     /// kept packed, as for Remesh). `f` gives the new mesh, or `None` when there is nothing
     /// to do.
     fn topology_op(&mut self, what: &str, f: impl FnOnce(&SculptMesh) -> Option<SculptMesh>) {
-        if self.busy() || !self.without_levels(what) {
-            return;
-        }
-        if !self.doc.layers.list.is_empty() {
-            self.workspace.notify(format!("{what}: bake or delete the layers first · Mesh › Layers"));
+        if self.busy() || !self.topology_allowed(what) {
             return;
         }
         let Some(mesh) = f(self.doc.mesh()) else {
@@ -1237,6 +1260,203 @@ impl App {
             return;
         };
         self.replace_topology(what, mesh);
+    }
+
+    /// Whether the active subtool's topology may change now (no subdivision levels, no
+    /// layers), saying why not.
+    fn topology_allowed(&mut self, what: &str) -> bool {
+        if !self.without_levels(what) {
+            return false;
+        }
+        if !self.doc.layers.list.is_empty() {
+            self.workspace.notify(format!("{what}: bake or delete the layers first · Mesh › Layers"));
+            return false;
+        }
+        true
+    }
+
+    /// Whether a geometry job may start now: none running, no simulation, nothing under
+    /// way. Says what is in the way.
+    fn geo_free(&mut self, what: &str) -> bool {
+        if let Some(job) = &self.geo {
+            self.workspace.notify(format!("{what}: {} is still running · wait for it, or Cancel it", job.name));
+            return false;
+        }
+        if self.sim.is_some() {
+            self.workspace.notify(format!("{what}: the simulation is still running · Stop it first"));
+            return false;
+        }
+        !self.busy()
+    }
+
+    /// Whether a running geometry job stops `what` (an edit of the subtool under it), with
+    /// a notice when it does.
+    fn job_blocks(&mut self, what: &str) -> bool {
+        match &self.geo {
+            Some(job) => {
+                self.workspace.notify(format!("{what} waits for {} · Cancel it to go on", job.name));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Run `f` on a thread of its own as the geometry job `name`, shown with a Cancel in
+    /// the workspace; [`poll_geo`](Self::poll_geo) applies what it hands back. What `f`
+    /// reads was copied out of the subtool first. In an automated run (self-tests,
+    /// snapshots, start-up flags) the job is waited for at once.
+    fn start_geo(&mut self, name: &'static str, wedge_on: bool, f: impl FnOnce() -> jobs::Done<GeoDone> + Send + 'static) {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rx = jobs::spawn(cancel.clone(), f);
+        self.geo = Some(GeoJob {
+            rx,
+            cancel,
+            name,
+            tool: self.subtools[self.active_tool].id,
+            edits: self.history.edits(),
+            level: self.doc.active(),
+            started: Instant::now(),
+            wedge_on,
+        });
+        self.status = format!("{name}…");
+        self.update_job_notice();
+        if self.jobs_wait {
+            self.poll_geo(true);
+        }
+    }
+
+    /// Cancel the geometry job: the model stays as it is, and whatever the thread still
+    /// makes is dropped (the algorithms stop at their next phase).
+    fn cancel_geo(&mut self) {
+        let Some(job) = self.geo.take() else { return };
+        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.status = format!("{} cancelled after {:.1} s", job.name, job.started.elapsed().as_secs_f32());
+        self.workspace.notify(self.status.clone());
+        self.update_job_notice();
+    }
+
+    /// The workspace's progress line: the geometry job or simulation running, with Cancel
+    /// (Stop for the simulation, which keeps what it has reached). Each frame.
+    fn update_job_notice(&mut self) {
+        self.workspace.job = match (&self.geo, &self.sim) {
+            (Some(j), _) => Some(workspace::JobNotice { name: j.name.to_string(), secs: j.started.elapsed().as_secs_f32(), stop: false }),
+            (None, Some(s)) => Some(workspace::JobNotice { name: "Simulation".to_string(), secs: s.started.elapsed().as_secs_f32(), stop: true }),
+            (None, None) => None,
+        };
+    }
+
+    /// Apply a finished geometry job (waiting for it with `wait`). Each frame.
+    fn poll_geo(&mut self, wait: bool) {
+        let Some(job) = &self.geo else {
+            return;
+        };
+        let result = if wait {
+            job.rx.recv().unwrap_or_else(|_| Err("the thread stopped".into()))
+        } else {
+            match job.rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.status = format!("{}… {:.0} s", job.name, job.started.elapsed().as_secs_f32());
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the thread stopped".into()),
+            }
+        };
+        let job = self.geo.take().unwrap();
+        self.update_job_notice();
+        let (name, secs) = (job.name, job.started.elapsed().as_secs_f32());
+        let done = match result {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("{name}: {e}");
+                self.workspace.notify(self.status.clone());
+                return;
+            }
+        };
+        let same = self.subtools[self.active_tool].id == job.tool && self.history.edits() == job.edits && self.doc.active() == job.level;
+        if !same {
+            self.workspace.notify(format!("{name} dropped: the subtool changed while it ran · run it again"));
+            self.status.clear();
+            return;
+        }
+        match done {
+            GeoDone::Topology { mesh, detail } => {
+                let levels = self.doc.count() > 1;
+                let before = self.doc.mesh().triangle_count();
+                self.replace_topology(name, mesh);
+                let after = self.doc.mesh().triangle_count();
+                if job.wedge_on {
+                    self.subtools[self.active_tool].wedge = true;
+                }
+                self.status = format!("{name}: {} → {} triangles in {secs:.1} s{detail}", fmt_count(before), fmt_count(after));
+                log::info!("{}", self.status);
+                self.workspace.notify(self.status.clone());
+                if levels {
+                    self.workspace.notify(format!("{name} replaced the subdivision levels with its result · undo brings them back"));
+                }
+            }
+            GeoDone::Uvs(u) => {
+                let old = self.doc.swap_uvs(u.uvs);
+                self.history.push(UndoStep::Uvs(old));
+                self.history.name_last("UV Unwrap");
+                self.uv_stats = Some((self.uv_key(), u.stats.clone()));
+                let s = &u.stats;
+                self.status = format!("UV Unwrap: {} islands, {:.1} % distortion, {:.0} % coverage in {secs:.1} s", s.charts, s.distortion * 100.0, s.coverage * 100.0);
+                if self.doc.active() > 0 {
+                    self.workspace.notify("UVs are on the lowest level · show it to export them with OBJ");
+                }
+            }
+            GeoDone::Projection(r) => {
+                if r.moved == 0 {
+                    self.workspace.notify("ProjectAll: no surface within Dist · raise Dist, or check Inner and Outer");
+                    self.status.clear();
+                    return;
+                }
+                if r.positions.len() != self.doc.mesh().vertex_count() {
+                    self.workspace.notify("ProjectAll dropped: the subtool changed while it ran · run it again");
+                    return;
+                }
+                let level = self.doc.active();
+                let mesh = self.doc.mesh_mut();
+                let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
+                if r.colors.is_some() {
+                    paint::ensure(mesh);
+                }
+                let mut stroke = Stroke::begin(false, false, false);
+                stroke.snapshot_now(mesh, &all);
+                mesh.positions.copy_from_slice(&r.positions);
+                if let Some(c) = r.colors {
+                    mesh.colors = c;
+                    mesh.chunks.iter_mut().for_each(|ch| ch.dirty_color = true);
+                }
+                mesh.finish_edit(&all);
+                self.commit_stroke_named(stroke, level, "ProjectAll");
+                self.subtools[self.active_tool].bounds = self.doc.bounds();
+                self.update_hover();
+                let n = r.moved + r.missed;
+                self.status = format!("ProjectAll: {} of {} vertices moved in {secs:.1} s", fmt_count(r.moved), fmt_count(n));
+                if r.missed * 20 > n {
+                    self.workspace.notify(format!("ProjectAll: {} vertices found no surface within Dist and stayed", fmt_count(r.missed)));
+                }
+            }
+            GeoDone::Boolean { mesh, used } => {
+                let tris = mesh.triangle_count();
+                let n = self.subtools.iter().filter(|t| t.name.starts_with("Boolean")).count() + 1;
+                let bname = format!("Boolean {n}");
+                let budget = self.doc.budget;
+                let tool = self.parked_subtool(bname.clone(), true, Multires::new(mesh, budget));
+                self.subtools.push(tool);
+                self.select_subtool(self.subtools.len() - 1);
+                for tool in &mut self.subtools {
+                    if used.contains(&tool.id) {
+                        tool.visible = false;
+                    }
+                }
+                self.workspace.live_boolean = false;
+                self.status = format!("{bname}: {} triangles from {} subtools in {secs:.1} s", fmt_count(tris), used.len());
+                self.workspace.notify(format!("{} · the subtools it came from are hidden", self.status));
+            }
+        }
     }
 
     /// The active subtool's whole stack replaced by `mesh` (one level), as one undo step
@@ -1259,35 +1479,22 @@ impl App {
     }
 
     /// Geometry › UV Map › Unwrap (ZBrush: UV Master): UVs for the base level of the active
-    /// subtool, as one undo step.
-    fn uv_unwrap_now(&mut self) {
-        if self.busy() {
+    /// subtool, made on a thread of its own and put in as one undo step.
+    fn start_uv_unwrap(&mut self) {
+        if !self.geo_free("UV Unwrap") {
             return;
         }
         let settings = self.workspace.uv;
         let base = self.doc.base_mesh();
+        let (positions, indices) = (base.positions.clone(), base.indices.clone());
         let groups: Vec<u16> = (0..base.triangle_count() as u32).map(|t| base.group(t)).collect();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uv::unwrap(&base.positions, &base.indices, &groups, &settings)));
-        let u = match result {
-            Ok(Ok(u)) => u,
-            Ok(Err(e)) => {
-                self.workspace.notify(format!("UV Unwrap: {e}"));
-                return;
-            }
-            Err(_) => {
-                self.workspace.notify("UV Unwrap failed".to_string());
-                return;
-            }
-        };
-        let old = self.doc.swap_uvs(u.uvs);
-        self.history.push(UndoStep::Uvs(old));
-        self.history.name_last("UV Unwrap");
-        self.uv_stats = Some((self.uv_key(), u.stats.clone()));
-        let s = &u.stats;
-        self.status = format!("UV Unwrap: {} islands, {:.1} % distortion, {:.0} % coverage in {:.0} ms", s.charts, s.distortion * 100.0, s.coverage * 100.0, s.ms);
-        if self.doc.active() > 0 {
-            self.workspace.notify("UVs are on the lowest level · show it to export them with OBJ");
-        }
+        self.start_geo("UV Unwrap", false, move || Ok(GeoDone::Uvs(uv::unwrap(&positions, &indices, &groups, &settings)?)));
+    }
+
+    /// [`start_uv_unwrap`](Self::start_uv_unwrap), waited for (start-up flags and tests).
+    fn uv_unwrap_now(&mut self) {
+        self.start_uv_unwrap();
+        self.poll_geo(true);
     }
 
     /// Geometry › UV Map › Delete UVs, as one undo step.
@@ -1754,9 +1961,10 @@ impl App {
     }
 
     /// Geometry › Decimation: decimate the shown level of the active subtool on a thread of
-    /// its own; [`poll_decimation`](Self::poll_decimation) puts the result in.
+    /// its own; [`poll_geo`](Self::poll_geo) puts the result in (a subtool with levels
+    /// becomes the decimated mesh alone; undo brings them back).
     fn start_decimation(&mut self) {
-        if self.busy() {
+        if !self.geo_free("Decimation") {
             return;
         }
         if !self.doc.layers.list.is_empty() {
@@ -1765,142 +1973,74 @@ impl App {
         }
         let mesh = decimate::Raw::of(self.doc.mesh());
         let settings = self.workspace.decimation;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decimate::decimate_raw(&mesh, &settings))).unwrap_or(None);
-            let _ = tx.send(r);
+        self.start_geo("Decimation", false, move || {
+            let d = decimate::decimate_raw(&mesh, &settings).ok_or("nothing to decimate at this percentage")?;
+            Ok(GeoDone::Topology { mesh: d.mesh, detail: String::new() })
         });
-        self.decimation = Some(DecimateJob {
-            rx,
-            tool: self.subtools[self.active_tool].id,
-            edits: self.history.edits(),
-            level: self.doc.active(),
-            started: Instant::now(),
-        });
-        self.status = format!("Decimating {} triangles…", fmt_count(self.doc.mesh().triangle_count()));
-    }
-
-    /// Put a finished decimation in (waiting for it with `wait`). Each frame.
-    fn poll_decimation(&mut self, wait: bool) {
-        let Some(job) = &self.decimation else {
-            return;
-        };
-        let result = if wait {
-            job.rx.recv().ok()
-        } else {
-            match job.rx.try_recv() {
-                Ok(r) => Some(r),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.status = format!("Decimating… {:.0} s", job.started.elapsed().as_secs_f32());
-                    return;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-            }
-        };
-        let job = self.decimation.take().unwrap();
-        let secs = job.started.elapsed().as_secs_f32();
-        let Some(Some(d)) = result else {
-            self.workspace.notify("Decimation: nothing to decimate at this percentage");
-            self.status.clear();
-            return;
-        };
-        let same = self.subtools[self.active_tool].id == job.tool && self.history.edits() == job.edits && self.doc.active() == job.level;
-        if !same {
-            self.workspace.notify("Decimation dropped: the subtool changed while it ran · run it again");
-            return;
-        }
-        let levels = self.doc.count() > 1;
-        self.replace_topology("Decimation", d.mesh);
-        self.status = format!("Decimation: {} → {} triangles in {secs:.1} s", fmt_count(d.before), fmt_count(d.after));
-        if levels {
-            self.workspace.notify("Decimation replaced the subdivision levels with the decimated mesh · undo brings them back");
-        }
     }
 
     /// SubTool › Project › ProjectAll: the shown level of the active subtool moved onto
     /// the other visible subtools (their shown levels), taking their paint, as one stroke.
-    fn project_all_now(&mut self) {
-        if self.busy() {
+    /// The other subtools are unpacked and searched on a thread of its own.
+    fn start_project_all(&mut self) {
+        if !self.geo_free("ProjectAll") {
             return;
         }
-        let t = Instant::now();
-        let mut docs = Vec::new();
+        let mut packed = Vec::new();
         for (i, tool) in self.subtools.iter().enumerate() {
             if i == self.active_tool || !tool.visible {
                 continue;
             }
             if let Some(p) = &tool.parked {
-                match p.packed.clone().try_unpack() {
-                    Ok(doc) => docs.push(doc),
-                    Err(e) => {
-                        self.workspace.notify(format!("ProjectAll: {}: {e}", tool.name));
-                        return;
-                    }
-                }
+                packed.push((tool.name.clone(), p.packed.clone()));
             }
         }
-        if docs.is_empty() {
+        if packed.is_empty() {
             self.workspace.notify("ProjectAll: no other subtool is visible · show the one to project from");
             return;
         }
-        let meshes: Vec<&SculptMesh> = docs.iter().map(|d| d.mesh()).collect();
-        let sources = project_all::Sources::new(&meshes);
-        drop(meshes);
-        drop(docs);
+        let mesh = self.doc.mesh().clone();
         let settings = self.workspace.project;
-        let r = project_all::project(self.doc.mesh(), &sources, &settings);
-        drop(sources);
-        if r.moved == 0 {
-            self.workspace.notify("ProjectAll: no surface within Dist · raise Dist, or check Inner and Outer");
-            return;
-        }
-        let level = self.doc.active();
-        let mesh = self.doc.mesh_mut();
-        let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
-        if r.colors.is_some() {
-            paint::ensure(mesh);
-        }
-        let mut stroke = Stroke::begin(false, false, false);
-        stroke.snapshot_now(mesh, &all);
-        mesh.positions.copy_from_slice(&r.positions);
-        if let Some(c) = r.colors {
-            mesh.colors = c;
-            mesh.chunks.iter_mut().for_each(|ch| ch.dirty_color = true);
-        }
-        mesh.finish_edit(&all);
-        self.commit_stroke_named(stroke, level, "ProjectAll");
-        self.subtools[self.active_tool].bounds = self.doc.bounds();
-        self.update_hover();
-        let n = r.moved + r.missed;
-        self.status = format!("ProjectAll: {} of {} vertices moved in {:.0} ms", fmt_count(r.moved), fmt_count(n), t.elapsed().as_secs_f32() * 1000.0);
-        if r.missed * 20 > n {
-            self.workspace.notify(format!("ProjectAll: {} vertices found no surface within Dist and stayed", fmt_count(r.missed)));
-        }
+        self.start_geo("ProjectAll", false, move || {
+            let mut docs = Vec::with_capacity(packed.len());
+            for (name, p) in packed {
+                docs.push(p.try_unpack().map_err(|e| format!("{name}: {e}"))?);
+            }
+            let meshes: Vec<&SculptMesh> = docs.iter().map(|d| d.mesh()).collect();
+            let sources = project_all::Sources::new(&meshes);
+            drop(meshes);
+            drop(docs);
+            jobs::check()?;
+            Ok(GeoDone::Projection(project_all::project(&mesh, &sources, &settings)))
+        });
     }
 
-    /// Geometry › ZRemesher: the active subtool rebuilt as quads (one undo step).
-    fn zremesh_now(&mut self) {
-        if self.busy() || !self.without_levels("ZRemesher") {
+    /// [`start_project_all`](Self::start_project_all), waited for (start-up flags and tests).
+    fn project_all_now(&mut self) {
+        self.start_project_all();
+        self.poll_geo(true);
+    }
+
+    /// Geometry › ZRemesher: the active subtool rebuilt as quads on a thread of its own, put
+    /// in as one undo step.
+    fn start_zremesh(&mut self) {
+        if !self.geo_free("ZRemesher") || !self.topology_allowed("ZRemesher") {
             return;
         }
         let settings = zremesh::Settings { symmetric: self.workspace.symmetry, ..self.workspace.zremesh };
         let guides = guide_lines(&self.subtools[self.active_tool].guides);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zremesh::zremesh(self.doc.mesh(), &settings, &guides)));
-        let (mesh, stats) = match result {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                self.workspace.notify(format!("ZRemesher: {e}"));
-                return;
-            }
-            Err(_) => {
-                self.workspace.notify("ZRemesher failed".to_string());
-                return;
-            }
-        };
-        let mut mesh = Some(mesh);
-        self.topology_op("ZRemesher", |_| mesh.take());
-        self.status = format!("ZRemesher: {} quads in {:.0} ms", fmt_count(stats.quads), stats.ms);
-        log::info!("{} ({stats:?})", self.status);
+        let mesh = self.doc.mesh().clone();
+        self.start_geo("ZRemesher", false, move || {
+            let (out, stats) = zremesh::zremesh(&mesh, &settings, &guides)?;
+            log::info!("ZRemesher: {stats:?}");
+            Ok(GeoDone::Topology { mesh: out, detail: format!(" · {} quads", fmt_count(stats.quads)) })
+        });
+    }
+
+    /// [`start_zremesh`](Self::start_zremesh), waited for (start-up flags and tests).
+    fn zremesh_now(&mut self) {
+        self.start_zremesh();
+        self.poll_geo(true);
     }
 
     /// The active subtool becomes `mesh` (a new topology: undo history and its Morph Target
@@ -1956,70 +2096,43 @@ impl App {
     }
 
     /// SubTool › Boolean › Make Boolean Mesh: the boolean of every visible subtool (shown
-    /// levels, top to bottom) as a new subtool at the end, selected; the subtools it came
-    /// from are hidden and Live Boolean goes off. Not undoable (delete the new subtool).
-    fn make_boolean_mesh(&mut self) {
-        if self.busy() {
+    /// levels, top to bottom), built on a thread of its own, as a new subtool at the end,
+    /// selected; the subtools it came from are hidden and Live Boolean goes off. Not
+    /// undoable (delete the new subtool).
+    fn start_make_boolean(&mut self) {
+        if !self.geo_free("Make Boolean Mesh") {
             return;
         }
-        let t = Instant::now();
-        let mut unpacked: Vec<(usize, Multires)> = Vec::new();
+        // Each part in order: the active subtool as it is, the others packed.
+        let mut parts: Vec<(u64, String, Option<multires::Packed>, boolean::BoolOp)> = Vec::new();
         for (i, tool) in self.subtools.iter().enumerate() {
-            if i == self.active_tool || !tool.visible {
-                continue;
-            }
-            if let Some(p) = &tool.parked {
-                match p.packed.clone().try_unpack() {
-                    Ok(doc) => unpacked.push((i, doc)),
-                    Err(e) => {
-                        self.workspace.notify(format!("Make Boolean Mesh: {}: {e}", tool.name));
-                        return;
-                    }
-                }
+            if i == self.active_tool {
+                parts.push((tool.id, tool.name.clone(), None, tool.boolean));
+            } else if let Some(p) = tool.parked.as_ref().filter(|_| tool.visible) {
+                parts.push((tool.id, tool.name.clone(), Some(p.packed.clone()), tool.boolean));
             }
         }
-        let mut parts: Vec<(&SculptMesh, boolean::BoolOp)> = Vec::new();
-        let mut used = Vec::new();
-        for (i, tool) in self.subtools.iter().enumerate() {
-            let mesh = if i == self.active_tool {
-                Some(self.doc.mesh())
-            } else {
-                unpacked.iter().find(|(j, _)| *j == i).map(|(_, d)| d.mesh())
-            };
-            if let Some(mesh) = mesh {
-                parts.push((mesh, tool.boolean));
-                used.push(tool.id);
-            }
-        }
+        let active = self.doc.mesh().clone();
         let resolution = self.workspace.boolean_resolution.round() as u32;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| boolean::make_mesh(&parts, resolution)));
-        drop(parts);
-        let (mesh, _) = match result {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                self.workspace.notify(format!("Make Boolean Mesh: {e}"));
-                return;
+        self.start_geo("Make Boolean Mesh", false, move || {
+            let used: Vec<u64> = parts.iter().map(|p| p.0).collect();
+            let mut docs: Vec<Option<Multires>> = Vec::with_capacity(parts.len());
+            for (_, name, packed, _) in &parts {
+                docs.push(match packed {
+                    Some(p) => Some(p.clone().try_unpack().map_err(|e| format!("{name}: {e}"))?),
+                    None => None,
+                });
             }
-            Err(_) => {
-                self.workspace.notify("Make Boolean Mesh failed".to_string());
-                return;
-            }
-        };
-        let tris = mesh.triangle_count();
-        let n = self.subtools.iter().filter(|t| t.name.starts_with("Boolean")).count() + 1;
-        let name = format!("Boolean {n}");
-        let budget = self.doc.budget;
-        let tool = self.parked_subtool(name.clone(), true, Multires::new(mesh, budget));
-        self.subtools.push(tool);
-        self.select_subtool(self.subtools.len() - 1);
-        for tool in &mut self.subtools {
-            if used.contains(&tool.id) {
-                tool.visible = false;
-            }
-        }
-        self.workspace.live_boolean = false;
-        self.status = format!("{name}: {} triangles from {} subtools in {:.0} ms", fmt_count(tris), used.len(), t.elapsed().as_secs_f32() * 1000.0);
-        self.workspace.notify(format!("{} · the subtools it came from are hidden", self.status));
+            let meshes: Vec<(&SculptMesh, boolean::BoolOp)> = parts.iter().zip(&docs).map(|(p, d)| (d.as_ref().map_or(&active, |d| d.mesh()), p.3)).collect();
+            let (mesh, _) = boolean::make_mesh(&meshes, resolution)?;
+            Ok(GeoDone::Boolean { mesh, used })
+        });
+    }
+
+    /// [`start_make_boolean`](Self::start_make_boolean), waited for (self-tests and tests).
+    fn make_boolean_mesh(&mut self) {
+        self.start_make_boolean();
+        self.poll_geo(true);
     }
 
     /// SubTool › Split Hidden: the hidden polygons become a subtool of their own. Not undoable.
@@ -2217,7 +2330,7 @@ impl App {
             s.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        if self.busy() {
+        if !self.geo_free("Dynamics") {
             return;
         }
         if self.doc.zspheres.is_some() {
@@ -3862,7 +3975,7 @@ impl App {
     /// rebuilt and checked, one at a time, before the current model is let go; a file that
     /// fails leaves the current model as it was.
     fn open_project(&mut self, path: &str) {
-        if self.busy() {
+        if self.job_blocks("Open") || self.busy() {
             return;
         }
         let t = Instant::now();
@@ -3947,7 +4060,7 @@ impl App {
 
     /// Start over with one subtool made from the current primitive.
     fn new_project(&mut self) {
-        if self.busy() {
+        if self.job_blocks("New") || self.busy() {
             return;
         }
         if let Some(gfx) = self.gfx.as_mut() {
@@ -4490,13 +4603,11 @@ impl App {
                 if tool.wedge {
                     tool.wedge = false;
                     self.workspace.notify("Remesh off");
-                } else if self.wedge_now() {
-                    self.subtools[self.active_tool].wedge = true;
+                } else {
+                    self.start_wedge(true);
                 }
             }
-            Some(GeoOp::Wedge) => {
-                self.wedge_now();
-            }
+            Some(GeoOp::Wedge) => self.start_wedge(false),
             Some(GeoOp::DelHidden) => self.topology_op("Del Hidden", |m| {
                 if m.hidden.is_empty() { None } else { subtool_ops::part(m, |t| m.visible(t)) }
             }),
@@ -4506,8 +4617,8 @@ impl App {
                 self.topology_op("Panel Loops", |m| panel::panels(m, &s));
             }
             Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
-            Some(GeoOp::ZRemesh) => self.zremesh_now(),
-            Some(GeoOp::ProjectAll) => self.project_all_now(),
+            Some(GeoOp::ZRemesh) => self.start_zremesh(),
+            Some(GeoOp::ProjectAll) => self.start_project_all(),
             Some(GeoOp::DelHigher) => self.delete_levels(true),
             Some(GeoOp::DelLower) => self.delete_levels(false),
             None => {}
@@ -4682,51 +4793,28 @@ impl App {
         None
     }
 
-    /// Remesh the active subtool with the Wedge settings, undoably. Returns whether it ran.
-    fn wedge_now(&mut self) -> bool {
+    /// Remesh the active subtool with the Wedge settings on a thread of its own, put in as
+    /// one undo step; with `on`, Remesh stays on for the subtool once it lands.
+    fn start_wedge(&mut self, on: bool) {
+        if !self.geo_free("Remesh") {
+            return;
+        }
         if let Some(why) = self.wedge_refusal() {
             self.workspace.notify(why.clone());
             self.status = why;
-            return false;
+            return;
         }
-        let t = Instant::now();
-        // An internal inconsistency is reported, not allowed to take the model down.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wedge::remesh(self.doc.mesh(), &self.wedge)))
-            .unwrap_or_else(|_| Err("the remesh failed on this mesh (internal error)".into()));
-        let out = match result {
-            Ok(out) => out,
-            Err(e) => {
-                self.status = format!("Remesh: {e}");
-                self.workspace.notify(self.status.clone());
-                return false;
-            }
-        };
-        let remesh_ms = t.elapsed().as_secs_f32() * 1000.0;
-        let before = self.doc.mesh().vertex_count();
-        let t2 = Instant::now();
-        let mesh = SculptMesh::from_raw_painted(out.positions, out.indices, out.groups, out.colors);
-        let budget = self.doc.budget;
-        let old = std::mem::replace(&mut self.doc, Multires::new(mesh, budget));
-        self.doc.frozen = old.frozen.clone();
-        self.history.push(UndoStep::Replace(Box::new(old.pack())));
-        let build_ms = t2.elapsed().as_secs_f32() * 1000.0;
-        self.subtools[self.active_tool].bounds = self.doc.bounds();
-        self.show_active_level();
-        let st = &out.stats;
-        self.status = format!(
-            "Remeshed at {}: {} → {} vertices in {:.0} ms (remesh {remesh_ms:.0}, chunks {build_ms:.0}; grid {}×{}×{}, {} corners turned)",
-            self.wedge.resolution,
-            fmt_count(before),
-            fmt_count(self.mesh().vertex_count()),
-            t.elapsed().as_secs_f32() * 1000.0,
-            st.grid[0],
-            st.grid[1],
-            st.grid[2],
-            st.flips
-        );
-        log::info!("{}", self.status);
-        self.workspace.notify(self.status.clone());
-        true
+        let mesh = self.doc.mesh().clone();
+        let settings = self.wedge;
+        self.start_geo("Remesh", on, move || {
+            // An internal inconsistency is reported, not allowed to take the model down.
+            let out = wedge::remesh(&mesh, &settings).map_err(|e| format!("{e} (on this mesh)"))?;
+            drop(mesh);
+            let (grid, flips) = (out.stats.grid, out.stats.flips);
+            jobs::check()?;
+            let mesh = SculptMesh::from_raw_painted(out.positions, out.indices, out.groups, out.colors);
+            Ok(GeoDone::Topology { mesh, detail: format!(" · at {}, grid {}×{}×{}, {flips} corners turned", settings.resolution, grid[0], grid[1], grid[2]) })
+        });
     }
 
     /// Delete the levels above (`higher`) or below the shown one (ZBrush: Del Higher, Del
@@ -6216,7 +6304,7 @@ impl App {
 
     /// Add a subdivision level above the top one and show it (ZBrush: Ctrl + D).
     fn divide(&mut self) {
-        if self.busy() {
+        if self.job_blocks("Divide") || self.busy() {
             return;
         }
         if !self.doc.layers.list.is_empty() {
@@ -6871,7 +6959,7 @@ impl App {
     /// Undo (`by` < 0) or redo (`by` > 0) that many steps (Ctrl + Z / Ctrl + Shift + Z, or a
     /// click in Edit › History). Transforms go through the GPU map, as one step does.
     fn history_jump(&mut self, by: i64) {
-        if self.busy() || by == 0 {
+        if by == 0 || self.job_blocks(if by < 0 { "Undo" } else { "Redo" }) || self.busy() {
             return;
         }
         for _ in 0..by.unsigned_abs() {
@@ -8347,8 +8435,12 @@ impl App {
             // The press that closes a popup or menu does nothing else.
             return;
         }
-        if (self.decimation.is_some() || self.sim.is_some()) && !consumed && !over_ui && self.nav.is_none() {
-            // While decimating the model must not change: a press only turns the view.
+        if (self.geo.is_some() || self.sim.is_some()) && !consumed && !over_ui && self.nav.is_none() {
+            // While a geometry job runs the model must not change: a press only turns the
+            // view.
+            if let Some(job) = &self.geo {
+                self.workspace.notify(format!("{} is running · the model waits for it, or Cancel it", job.name));
+            }
             self.begin_nav(MouseButton::Left);
             return;
         }
@@ -8509,6 +8601,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Escape && self.geo.is_some() {
+            self.cancel_geo();
+            return;
+        }
         if key == KeyCode::Escape && self.sim.is_some() {
             if let Some(s) = &self.sim {
                 s.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8678,11 +8774,12 @@ impl App {
             (None, Some(e)) => e.clone(),
             (None, None) => String::new(),
         };
-        self.poll_decimation(false);
+        self.poll_geo(false);
         self.poll_bake(false);
         self.poll_render(false);
         self.update_bpr_view();
         self.poll_sim(false);
+        self.update_job_notice();
         self.workspace.curve_preview = self.curve_preview();
         self.update_uv_layout();
         self.workspace.guides_preview = self.guides_preview();
@@ -8763,6 +8860,13 @@ impl App {
         self.zsphere_roundness(round);
         if actions.simulate {
             self.simulate();
+        }
+        if actions.cancel_job {
+            if self.geo.is_some() {
+                self.cancel_geo();
+            } else if self.sim.is_some() {
+                self.simulate();
+            }
         }
         if actions.fiber_accept {
             self.fiber_accept_now();
@@ -8893,7 +8997,7 @@ impl App {
             self.subtools[self.active_tool].boolean = op;
         }
         if actions.make_boolean {
-            self.make_boolean_mesh();
+            self.start_make_boolean();
         }
         if actions.gizmo_center || actions.gizmo_reset {
             self.gizmo_pivot(actions.gizmo_center);
@@ -8902,7 +9006,7 @@ impl App {
             self.start_decimation();
         }
         if actions.uv_unwrap {
-            self.uv_unwrap_now();
+            self.start_uv_unwrap();
         }
         if actions.smart_resym {
             self.smart_resym_now();
@@ -10181,6 +10285,9 @@ fn main() {
     app.automated = args.iter().any(|a| {
         a.starts_with("--selftest") || matches!(a.as_str(), "--demo" | "--demo-brushes" | "--demo-stamp" | "--stress" | "--frames" | "--snapshot")
     });
+    // Self-tests and snapshots check a geometry operation's result the moment it is asked
+    // for: wait for each job as it starts.
+    app.jobs_wait = app.automated;
     // Look for a newer release only in a normal run (not self-tests, demos, snapshots).
     app.workspace.updates_allowed = !app.automated && !args.iter().any(|a| a == "--no-update-check");
     // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).
@@ -10315,7 +10422,7 @@ fn main() {
     if let Some(p) = flag("--decimate").and_then(|v| v.parse::<f32>().ok()) {
         app.workspace.decimation.keep_percent = p;
         app.start_decimation();
-        app.poll_decimation(true);
+        app.poll_geo(true);
         log::info!("{}", app.status);
     }
     // `--uv-unwrap`: UV Master's Unwrap at startup (after `--retopo-demo`, `--decimate`).
@@ -11050,7 +11157,7 @@ mod subtool_tests {
         app.workspace.decimation.keep_percent = 10.0;
         app.start_decimation();
         assert!(app.busy(), "nothing else starts while it runs");
-        app.poll_decimation(true);
+        app.poll_geo(true);
         assert!(!app.busy());
         let after = app.doc.mesh().triangle_count();
         assert!(after <= tris / 10 + tris / 500 && after > tris / 12, "{tris} → {after}");
@@ -11065,8 +11172,77 @@ mod subtool_tests {
         let edits = app.history.edits();
         app.history.push(UndoStep::Divide(None));
         assert_ne!(app.history.edits(), edits);
-        app.poll_decimation(true);
+        app.poll_geo(true);
         assert_eq!(app.doc.mesh().triangle_count(), tris, "dropped");
+    }
+
+    #[test]
+    fn a_geometry_job_runs_in_the_background_and_lands_as_one_undo_step() {
+        let mut app = App::new(40, false, usize::MAX);
+        let before = app.doc.mesh().positions.clone();
+        let edits = app.history.edits();
+        app.workspace.zremesh.target_k = 0.5;
+        app.start_zremesh();
+        assert!(app.busy() && app.geo.is_some(), "the job runs");
+        app.update_job_notice();
+        let notice = app.workspace.job.clone().expect("the workspace shows it");
+        assert_eq!((notice.name.as_str(), notice.stop), ("ZRemesher", false));
+        assert_eq!(app.doc.mesh().positions, before, "the model waits for it");
+        // A second job, an edit of the subtool under it and a simulation are refused.
+        app.start_decimation();
+        app.start_uv_unwrap();
+        app.simulate();
+        assert!(app.sim.is_none());
+        assert_eq!(app.geo.as_ref().map(|j| j.name), Some("ZRemesher"));
+        app.divide();
+        assert_eq!(app.doc.count(), 1, "Divide waits");
+        app.poll_geo(true);
+        assert!(!app.busy() && app.geo.is_none() && app.workspace.job.is_none());
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("ZRemesher"));
+        assert!(app.status.starts_with("ZRemesher: ") && app.status.contains(" quads"), "{}", app.status);
+        let quads = app.doc.mesh().triangle_count() / 2;
+        assert!((250..800).contains(&quads), "{quads} quads");
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().positions, before, "undo brings the old mesh back");
+        assert_eq!(app.history.edits(), edits + 2, "one step there, one back");
+        // A Remesh from the Wedge toggle turns Remesh on when it lands, not before.
+        app.pending_geo = Some(GeoOp::WedgeToggle);
+        app.run_pending_geo();
+        assert!(app.geo.is_some() && !app.subtools[0].wedge);
+        app.poll_geo(true);
+        assert!(app.subtools[0].wedge);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Remesh"));
+    }
+
+    #[test]
+    fn a_cancelled_job_leaves_the_mesh_unchanged_and_frees_the_slot() {
+        let mut app = App::new(40, false, usize::MAX);
+        let before = app.doc.mesh().positions.clone();
+        let edits = app.history.edits();
+        app.workspace.zremesh.target_k = 0.5;
+        app.start_zremesh();
+        let flag = app.geo.as_ref().unwrap().cancel.clone();
+        app.cancel_geo();
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the thread is told");
+        assert!(!app.busy() && app.geo.is_none() && app.workspace.job.is_none());
+        assert!(app.status.starts_with("ZRemesher cancelled"), "{}", app.status);
+        // Whatever the thread still makes never lands.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        app.poll_geo(false);
+        assert_eq!(app.doc.mesh().positions, before);
+        assert_eq!(app.history.edits(), edits);
+        assert_ne!(app.history.names().0.last().map(String::as_str), Some("ZRemesher"));
+        // Esc cancels too, and the slot is free for the next job.
+        app.start_decimation();
+        assert!(app.geo.is_some());
+        app.on_key(KeyCode::Escape);
+        assert!(app.geo.is_none());
+        app.workspace.decimation.keep_percent = 10.0;
+        app.start_decimation();
+        app.poll_geo(true);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Decimation"));
+        app.cancel_geo();
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("Decimation"), "nothing to cancel");
     }
 
     #[test]
@@ -11787,6 +11963,7 @@ mod subtool_tests {
     #[test]
     fn wedge_remeshes_rewedges_on_ctrl_drag_and_undoes() {
         let mut app = App::new(16, false, usize::MAX);
+        app.jobs_wait = true;
         app.wedge.resolution = 48;
         let original = app.doc.mesh().positions.clone();
         let corner = Vec2::new(8.0, 8.0);
@@ -11857,6 +12034,7 @@ mod subtool_tests {
     #[test]
     fn wedge_refuses_levels_and_open_surfaces_and_del_lower_makes_room() {
         let mut app = App::new(12, false, usize::MAX);
+        app.jobs_wait = true;
         app.wedge.resolution = 40;
         assert!(app.doc.divide());
         app.history.push(UndoStep::Divide(None));

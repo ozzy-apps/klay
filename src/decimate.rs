@@ -98,7 +98,10 @@ struct Vert {
 /// What a decimation made.
 pub struct Decimated {
     pub mesh: SculptMesh,
+    /// Triangles before and after (the app counts from the mesh; tests read these).
+    #[allow(dead_code)]
     pub before: usize,
+    #[allow(dead_code)]
     pub after: usize,
 }
 
@@ -396,6 +399,9 @@ pub fn decimate_raw(mesh: &Raw, s: &Settings) -> Option<Decimated> {
     let mut boost = 1.0f64;
     let mut samples: Vec<f64> = Vec::new();
     for sweep in 0..1000 {
+        if crate::jobs::cancelled() {
+            return None;
+        }
         let remaining = before - deleted;
         if remaining <= target {
             break;

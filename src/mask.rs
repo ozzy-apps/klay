@@ -32,7 +32,51 @@ pub enum MaskOp {
     /// Mask By Polygroups: mask the borders between polygroups, `width` rings wide (Invert
     /// masks the insides instead).
     GroupBorders(u8),
+    /// Mask By Smoothness: mask the smooth surface and leave the curvature changes (creases,
+    /// edges, the rim of a form) free, as the Transpose Smart mask does.
+    Smoothness(Smoothness),
+    /// Mask Ambient Occlusion: mask the surface other surface shuts in, more where more of
+    /// the sky above it is covered.
+    Occlusion(Occlusion),
 }
+
+/// Mask By Smoothness settings, as ZBrush's Masking › Mask By Smoothness sliders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Smoothness {
+    /// 1..=100: how many rings of polygons round a curvature change stay free.
+    pub range: u8,
+    /// 0..=100: how much of that range is a soft edge: 0 a hard edge `range` rings out,
+    /// 100 a ramp from the curvature change to full mask at `range`.
+    pub falloff: u8,
+}
+
+impl Default for Smoothness {
+    fn default() -> Self {
+        Self { range: 10, falloff: 50 }
+    }
+}
+
+/// Mask Ambient Occlusion settings, as ZBrush's Masking › Mask Ambient Occlusion sliders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Occlusion {
+    /// Occlusion Intensity, 0..=100: the mask a vertex gets when every ray is blocked.
+    pub intensity: u8,
+    /// AO ScanDist, 1..=100: how far a ray looks for a blocker, as a percentage of the
+    /// subtool's longest side.
+    pub scan_dist: u8,
+    /// AO Aperture, 1..=180: the angle of the cone of rays about the normal (180 the whole
+    /// hemisphere above the surface).
+    pub aperture: u8,
+}
+
+impl Default for Occlusion {
+    fn default() -> Self {
+        Self { intensity: 100, scan_dist: 50, aperture: 180 }
+    }
+}
+
+/// Rays per vertex of [`occlusion`].
+pub const AO_RAYS: usize = 16;
 
 /// Mask By Cavity settings, as ZBrush's Masking › Mask By Cavity sliders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +119,8 @@ pub fn apply(mesh: &SculptMesh, op: MaskOp) -> Vec<u8> {
         MaskOp::Shrink => spread(mesh, false),
         MaskOp::Cavity(settings) => cavity(mesh, settings),
         MaskOp::GroupBorders(width) => group_borders(mesh, width),
+        MaskOp::Smoothness(settings) => smoothness(mesh, settings),
+        MaskOp::Occlusion(settings) => occlusion(mesh, settings),
     }
 }
 
@@ -194,6 +240,121 @@ pub fn group_borders(mesh: &SculptMesh, width: u8) -> Vec<u8> {
         .into_par_iter()
         .enumerate()
         .map(|(v, m)| if shown(mesh, v as u32) { m } else { old.get(v).copied().unwrap_or(0) })
+        .collect()
+}
+
+/// Below this angle between a vertex's normal and a neighbour's the surface counts as
+/// smooth for [`smoothness`]; at [`EDGE_DEG`] and beyond it is a full curvature change.
+const SMOOTH_DEG: f32 = 8.0;
+const EDGE_DEG: f32 = 20.0;
+
+/// Mask By Smoothness: every shown vertex is free in proportion to the widest angle between
+/// its normal and a shown neighbour's (smooth below [`SMOOTH_DEG`], a full edge at
+/// [`EDGE_DEG`]), that freedom is spread `range` rings out, falling to nothing over the
+/// outer `falloff` share of them, and the mask is what is left. Hidden polygons neither
+/// spread nor take the mask; their vertices keep theirs.
+pub fn smoothness(mesh: &SculptMesh, settings: Smoothness) -> Vec<u8> {
+    let Smoothness { range, falloff } = settings;
+    let range = range.clamp(1, 100) as usize;
+    let falloff = falloff.min(100) as f32 / 100.0;
+    let n = mesh.vertex_count() as u32;
+    let normals: Vec<Vec3> = (0..n).into_par_iter().map(|v| mesh.normal_at(v)).collect();
+    let mut free: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|v| {
+            if !shown(mesh, v) {
+                return 0.0;
+            }
+            let nv = normals[v as usize];
+            let widest = mesh
+                .neighbors(v)
+                .iter()
+                .filter(|&&m| shown(mesh, m))
+                .map(|&m| nv.dot(normals[m as usize]).clamp(-1.0, 1.0).acos().to_degrees())
+                .fold(0.0, f32::max);
+            ((widest - SMOOTH_DEG) / (EDGE_DEG - SMOOTH_DEG)).clamp(0.0, 1.0)
+        })
+        .collect();
+    // Each ring out costs nothing over the plateau and a share of the ramp after it; taking
+    // the best neighbour less this ring's cost every pass gives each vertex the freedom of
+    // the nearest curvature change less the cost of the rings between.
+    let plateau = range as f32 * (1.0 - falloff);
+    let ramp = range as f32 * falloff;
+    let cost = |d: f32| if ramp > 0.0 { ((d - plateau) / ramp).clamp(0.0, 1.0) } else { 0.0 };
+    for k in 1..=range {
+        let step = cost(k as f32) - cost(k as f32 - 1.0);
+        if step >= 1.0 {
+            break;
+        }
+        free = (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let own = free[v as usize];
+                if !shown(mesh, v) {
+                    return own;
+                }
+                mesh.neighbors(v).iter().filter(|&&m| shown(mesh, m)).map(|&m| free[m as usize] - step).fold(own, f32::max)
+            })
+            .collect();
+    }
+    let old = &mesh.mask;
+    (0..n)
+        .into_par_iter()
+        .map(|v| {
+            if !shown(mesh, v) {
+                return old.get(v as usize).copied().unwrap_or(0);
+            }
+            ((1.0 - free[v as usize]) * 255.0).round() as u8
+        })
+        .collect()
+}
+
+/// Mask Ambient Occlusion: from each shown vertex, [`AO_RAYS`] rays leave just above the
+/// surface in a cone of `aperture` degrees about the normal (a Fibonacci spiral over the
+/// cone, turned by a different angle at every vertex), each looking `scan_dist` percent
+/// of the subtool's longest side for a shown triangle; the share of them that find one,
+/// weighted by how close to the normal they went, times the intensity, is the mask. Hidden
+/// polygons neither block rays nor take the mask; their vertices keep theirs.
+pub fn occlusion(mesh: &SculptMesh, settings: Occlusion) -> Vec<u8> {
+    let Occlusion { intensity, scan_dist, aperture } = settings;
+    let gain = intensity.min(100) as f32 / 100.0;
+    let bounds = mesh.bounds();
+    let size = (bounds.max - bounds.min).max_element();
+    let reach = size * scan_dist.clamp(1, 100) as f32 / 100.0;
+    let cos_min = (aperture.clamp(1, 180) as f32 / 2.0).to_radians().cos();
+    let scene = crate::project_all::Sources::new(&[mesh]);
+    let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+    let old = &mesh.mask;
+    (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| {
+            if !shown(mesh, v) {
+                return old.get(v as usize).copied().unwrap_or(0);
+            }
+            let p = mesh.positions[v as usize];
+            let nb = mesh.neighbors(v);
+            let normal = mesh.normal_at(v);
+            if nb.is_empty() || normal == Vec3::ZERO || reach <= 0.0 {
+                return 0;
+            }
+            let spacing = nb.iter().map(|&m| mesh.positions[m as usize].distance(p)).sum::<f32>() / nb.len() as f32;
+            let origin = p + normal * (spacing * 0.05);
+            let (tu, tv) = tangent(normal);
+            let phase = (v as f32 * 0.618_034).fract() * std::f32::consts::TAU;
+            let (mut blocked, mut total) = (0.0, 0.0);
+            for i in 0..AO_RAYS {
+                let cos_t = 1.0 - (i as f32 + 0.5) / AO_RAYS as f32 * (1.0 - cos_min);
+                let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+                let phi = phase + i as f32 * golden;
+                let d = normal * cos_t + tu * (sin_t * phi.cos()) + tv * (sin_t * phi.sin());
+                total += cos_t;
+                if scene.hit(origin, d, reach).is_some() {
+                    blocked += cos_t;
+                }
+            }
+            let occluded = if total > 0.0 { blocked / total } else { 0.0 };
+            (occluded * gain * 255.0).round().clamp(0.0, 255.0) as u8
+        })
         .collect()
 }
 
@@ -631,5 +792,77 @@ mod mask_op_tests {
         assert!(wider.iter().filter(|&&x| x == 255).count() > mask.iter().filter(|&&x| x == 255).count());
         // One group: no borders, no mask.
         assert!(apply(&sphere(), MaskOp::GroupBorders(2)).is_empty());
+    }
+
+    /// A plane with a steep bump in its middle, and the vertex nearest (x, y).
+    fn bumped_plane() -> (SculptMesh, impl Fn(&SculptMesh, f32, f32) -> usize) {
+        // Sixty polygons across one unit, so a ring of polygons is 1/60.
+        let (p, i) = Primitive::Plane.build(60, 0.5);
+        let p: Vec<Vec3> = p.into_iter().map(|q| q + Vec3::Z * (0.1 * (-(q.truncate().length() / 0.05).powi(2)).exp())).collect();
+        let near = |m: &SculptMesh, x: f32, y: f32| {
+            let p = &m.positions;
+            (0..p.len()).min_by(|&a, &b| (p[a].truncate() - glam::Vec2::new(x, y)).length().total_cmp(&(p[b].truncate() - glam::Vec2::new(x, y)).length())).unwrap()
+        };
+        (SculptMesh::from_raw(p, i), near)
+    }
+
+    #[test]
+    fn mask_by_smoothness_frees_the_bump_and_masks_the_flat() {
+        let (m, near) = bumped_plane();
+        let hard = apply(&m, MaskOp::Smoothness(Smoothness { range: 2, falloff: 0 }));
+        let (rim, flat, far) = (hard[near(&m, 0.04, 0.0)], hard[near(&m, 0.3, 0.0)], hard[near(&m, 0.0, 0.4)]);
+        assert!(rim < 128 && flat == 255 && far == 255, "rim {rim} flat {flat} far {far}");
+        // Range spreads the free band out from the bump, Falloff softens its edge.
+        let wide = apply(&m, MaskOp::Smoothness(Smoothness { range: 12, falloff: 0 }));
+        let beside = near(&m, 0.2, 0.0);
+        assert!(wide[beside] < 128 && hard[beside] == 255 && wide[near(&m, 0.4, 0.0)] == 255, "beside {}", wide[beside]);
+        let soft = apply(&m, MaskOp::Smoothness(Smoothness { range: 12, falloff: 100 }));
+        assert!(soft[beside] > wide[beside] && soft[beside] < 255, "soft {}", soft[beside]);
+        assert!(soft[near(&m, 0.12, 0.0)] < soft[beside], "the ramp rises outwards");
+        // Hidden polygons keep their mask and stop the spread.
+        let mut m = m;
+        m.mask = vec![7; m.vertex_count()];
+        let hidden: Vec<u8> = (0..m.triangle_count()).map(|t| (m.positions[m.indices[3 * t] as usize].x > 0.1) as u8).collect();
+        m.set_hidden(hidden);
+        let masked = apply(&m, MaskOp::Smoothness(Smoothness { range: 2, falloff: 0 }));
+        assert_eq!(masked[near(&m, 0.4, 0.0)], 7);
+        assert!(masked[near(&m, 0.04, 0.0)] < 128 && masked[near(&m, -0.3, 0.0)] == 255);
+        // A smooth sphere (under 8° between neighbouring normals) is masked all over.
+        let (p, i) = crate::mesh::cube_sphere(32, 1.0);
+        let round = SculptMesh::from_raw(p, i);
+        assert!(apply(&round, MaskOp::Smoothness(Smoothness::default())).iter().all(|&x| x == 255));
+    }
+
+    #[test]
+    fn mask_ambient_occlusion_masks_the_covered_plane_not_the_open_one() {
+        // Two planes a little apart: the lower one looks up at the upper.
+        let (p, i) = Primitive::Plane.build(20, 1.0);
+        let n = p.len() as u32;
+        let mut all = p.clone();
+        all.extend(p.iter().map(|q| *q + Vec3::Z * 0.05));
+        let mut idx = i.clone();
+        idx.extend(i.iter().map(|k| k + n));
+        let mut m = SculptMesh::from_raw(all, idx);
+        let centre = |m: &SculptMesh, z: f32| {
+            let p = &m.positions;
+            (0..p.len()).min_by(|&a, &b| (p[a] - Vec3::Z * z).length().total_cmp(&(p[b] - Vec3::Z * z).length())).unwrap()
+        };
+        let (lower, upper) = (centre(&m, 0.0), centre(&m, 0.05));
+        let mask = apply(&m, MaskOp::Occlusion(Occlusion::default()));
+        assert!(mask[lower] > 200 && mask[upper] == 0, "lower {} upper {}", mask[lower], mask[upper]);
+        // Half the intensity, half the mask; a scan too short to reach the cover finds nothing.
+        let half = apply(&m, MaskOp::Occlusion(Occlusion { intensity: 50, ..Occlusion::default() }));
+        assert!((half[lower] as i32 - mask[lower] as i32 / 2).abs() <= 1);
+        let short = apply(&m, MaskOp::Occlusion(Occlusion { scan_dist: 1, ..Occlusion::default() }));
+        assert_eq!(short[lower], 0);
+        // Hide the upper plane: it no longer blocks, and its vertices keep their mask.
+        m.mask = mask.clone();
+        let hidden: Vec<u8> = (0..m.triangle_count()).map(|t| (m.positions[m.indices[3 * t] as usize].z > 0.01) as u8).collect();
+        m.set_hidden(hidden);
+        let open = apply(&m, MaskOp::Occlusion(Occlusion::default()));
+        assert_eq!(open[lower], 0);
+        assert_eq!(open[upper], mask[upper]);
+        // An open sphere is nowhere occluded.
+        assert!(apply(&sphere(), MaskOp::Occlusion(Occlusion::default())).iter().all(|&x| x == 0));
     }
 }

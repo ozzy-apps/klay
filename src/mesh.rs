@@ -54,6 +54,7 @@ impl Aabb {
     }
 }
 
+#[derive(Clone)]
 pub struct Chunk {
     /// Owned vertex range `[vert_start, vert_end)`.
     pub vert_start: u32,
@@ -192,6 +193,8 @@ pub struct Extent {
 }
 
 
+/// Cloned to hand a copy to a job thread (ZRemesher, Remesh and the others in `jobs`).
+#[derive(Clone)]
 pub struct SculptMesh {
     pub positions: Vec<Vec3>,
     /// Three indices per triangle.

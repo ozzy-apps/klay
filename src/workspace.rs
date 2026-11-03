@@ -733,6 +733,15 @@ impl DockLayout {
     }
 }
 
+/// A long operation under way, for the progress line over the canvas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobNotice {
+    pub name: String,
+    pub secs: f32,
+    /// The button stops the operation keeping what it has (Dynamics) instead of cancelling.
+    pub stop: bool,
+}
+
 // ---------------------------------------------------------------- app interface
 pub struct Model<'a> {
     pub brush: &'a mut Brush,
@@ -932,6 +941,8 @@ pub struct Actions {
     pub fiber_accept: bool,
     /// Geometry › Dynamics › Run Simulation.
     pub simulate: bool,
+    /// Cancel on the progress line: drop the geometry job (or stop the simulation).
+    pub cancel_job: bool,
     /// Right shelf › BPR: render the view now and show it on the canvas.
     pub bpr: bool,
     /// Document › Render › Render, Turntable.
@@ -1152,6 +1163,9 @@ pub struct Workspace {
     bake_texture: Option<(u64, egui::TextureHandle)>,
     /// Set by the app while a bake runs.
     pub baking: bool,
+    /// The geometry job or simulation running, shown over the canvas with Cancel; set by
+    /// the app each frame.
+    pub job: Option<JobNotice>,
     /// Gizmo 3D instead of the action line in Move / Scale / Rotate (Y).
     pub gizmo: bool,
     /// Light palette: where the key light is, as a point on the front of a sphere seen from
@@ -1173,6 +1187,14 @@ pub struct Workspace {
     pub cavity_depth: f32,
     pub cavity_blur: f32,
     pub group_border_width: f32,
+    /// Masking › Mask By Smoothness: Range (1..=100 rings) and Falloff (0..=100).
+    pub smooth_range: f32,
+    pub smooth_falloff: f32,
+    /// Masking › Mask Ambient Occlusion: Occlusion Intensity (0..=100), AO ScanDist
+    /// (1..=100 percent of the subtool's longest side) and AO Aperture (1..=180 degrees).
+    pub ao_intensity: f32,
+    pub ao_scan_dist: f32,
+    pub ao_aperture: f32,
     /// Polygroups › Group By Normals: Max Angle Tolerance, degrees.
     pub normals_angle: f32,
     pub lazy_mouse: bool,
@@ -1403,6 +1425,7 @@ impl Workspace {
             bake_preview: None,
             bake_texture: None,
             baking: false,
+            job: None,
             quicksave: true,
             quicksave_minutes: 10.0,
             gizmo: false,
@@ -1414,6 +1437,11 @@ impl Workspace {
             cavity_intensity: 50.0,
             cavity_depth: 1.0,
             cavity_blur: 0.0,
+            smooth_range: 10.0,
+            smooth_falloff: 50.0,
+            ao_intensity: 100.0,
+            ao_scan_dist: 50.0,
+            ao_aperture: 180.0,
             normals_angle: 20.0,
             group_border_width: 2.0,
             lazy_mouse: false,
@@ -3477,6 +3505,24 @@ impl Workspace {
                         zslider(ui, "Depth", &mut ws.cavity_depth, 1.0..=100.0, false, false, 0);
                         zslider(ui, "Blur", &mut ws.cavity_blur, 0.0..=100.0, false, false, 0);
                         note(ui, "Intensity: high masks shallow recesses too, negative masks ridges · Depth: 1 creases only, more finds wide grooves · Blur softens");
+                        if full(ui, "Mask By Smoothness", "Mask the smooth surface and leave creases, edges and the rim of a form free, as the Transpose Smart mask does · Range: how many rings of polygons round a curvature change stay free · Falloff: how soft that edge is") {
+                            a.mask = Some(MaskOp::Smoothness(crate::mask::Smoothness {
+                                range: ws.smooth_range.round() as u8,
+                                falloff: ws.smooth_falloff.round() as u8,
+                            }));
+                        }
+                        zslider(ui, "Range", &mut ws.smooth_range, 1.0..=100.0, false, false, 0);
+                        zslider(ui, "Falloff", &mut ws.smooth_falloff, 0.0..=100.0, false, false, 0);
+                        if full(ui, "Mask Ambient Occlusion", &format!("Mask the surface other surface shuts in, more where more of the sky above it is covered ({} rays from every vertex) · Occlusion Intensity: the mask where every ray is blocked · AO ScanDist: how far a ray looks, as a percentage of the subtool's longest side · AO Aperture: the cone of rays about the normal, 180 the whole hemisphere", crate::mask::AO_RAYS)) {
+                            a.mask = Some(MaskOp::Occlusion(crate::mask::Occlusion {
+                                intensity: ws.ao_intensity.round() as u8,
+                                scan_dist: ws.ao_scan_dist.round() as u8,
+                                aperture: ws.ao_aperture.round() as u8,
+                            }));
+                        }
+                        zslider(ui, "Occlusion Intensity", &mut ws.ao_intensity, 0.0..=100.0, false, false, 0);
+                        zslider(ui, "AO ScanDist", &mut ws.ao_scan_dist, 1.0..=100.0, false, false, 0);
+                        zslider(ui, "AO Aperture", &mut ws.ao_aperture, 1.0..=180.0, false, false, 0);
                         if full(ui, "Mask By Polygroups", "Mask the borders between polygroups · Invert to mask their insides") {
                             a.mask = Some(MaskOp::GroupBorders(ws.group_border_width.round() as u8));
                         }
@@ -5512,6 +5558,35 @@ impl Workspace {
                         });
                 });
             });
+        if let Some(job) = self.job.clone() {
+            // A long operation says so where you look, with the way out; the model waits
+            // for it (the view still turns).
+            let y = if self.customize && !self.focus { 48.0 } else { 8.0 };
+            egui::Area::new(Id::unique("job-banner"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(canvas.center().x, canvas.top() + y))
+                .pivot(Align2::CENTER_TOP)
+                .show(&ctx, |ui| {
+                    popup_frame().inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.add(egui::Spinner::new().size(14.0).color(ACC()));
+                            ui.label(RichText::new(format!("{}…", job.name)).font(font(13.0, Weight::SemiBold)).color(ACC_TEXT()));
+                            let what = if job.stop { "the model shows each step" } else { "the model waits for it · the view still turns" };
+                            ui.label(RichText::new(format!("{:.0} s · {what}", job.secs)).font(font(12.5, Weight::Regular)).color(FG2()));
+                            let (label, hint) = if job.stop {
+                                ("Stop", "End the simulation here, keeping what it has reached as one undo step (Esc)")
+                            } else {
+                                ("Cancel", "Drop the operation: the model stays as it is (Esc)")
+                            };
+                            if ui.add(egui::Button::new(label).min_size(vec2(64.0, CONTROL_H))).on_hover_text(hint).clicked() {
+                                a.cancel_job = true;
+                            }
+                        });
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                });
+        }
         if self.customize && !self.focus {
             // Customize mode says so where you look, with the way out.
             egui::Area::new(Id::unique("customize-banner"))
@@ -7204,6 +7279,40 @@ mod tests {
         click(&mut workspace, &ctx, size, text_position(&output, "Freehand") + vec2(6.0, 4.0));
         assert!(!workspace.curve_kinds.contains(&BrushKind::Draw));
         assert!(workspace.curve_kinds.contains(&BrushKind::Zipper));
+    }
+
+    #[test]
+    fn the_job_banner_names_the_operation_and_its_button_raises_cancel() {
+        let (mut workspace, ctx) = test_workspace("job-banner");
+        let size = vec2(1600.0, 1000.0);
+        let subtools = [row("Sphere 1", true)];
+        let mut primitive = crate::primitive::Settings::default();
+        let mut run = |ws: &mut Workspace, events: Vec<egui::Event>| frame_full(ws, &ctx, size, events, &subtools, &mut primitive);
+        let (output, _) = run(&mut workspace, vec![]);
+        let cancels = text_count(&output, "Cancel");
+        assert_eq!(text_count(&output, "ZRemesher…"), 0);
+        workspace.job = Some(JobNotice { name: "ZRemesher".into(), secs: 2.4, stop: false });
+        // A new egui area spends its first frame in an invisible sizing pass.
+        run(&mut workspace, vec![]);
+        let (output, _) = run(&mut workspace, vec![]);
+        assert_eq!(text_count(&output, "ZRemesher…"), 1);
+        assert_eq!(text_count(&output, "Cancel"), cancels + 1);
+        let pos = text_position(&output, "Cancel");
+        assert!(workspace.canvas.contains(pos) && pos.y < workspace.canvas.top() + 60.0, "over the top of the canvas at {pos:?}");
+        run(&mut workspace, vec![egui::Event::PointerMoved(pos)]);
+        run(&mut workspace, vec![pointer(pos, true)]);
+        let (_, actions) = run(&mut workspace, vec![pointer(pos, false)]);
+        assert!(actions.cancel_job, "the button raises Cancel");
+        // A simulation shows Stop instead, and the line goes with the job.
+        workspace.job = Some(JobNotice { name: "Simulation".into(), secs: 0.5, stop: true });
+        run(&mut workspace, vec![]);
+        let (output, _) = run(&mut workspace, vec![]);
+        assert_eq!(text_count(&output, "Simulation…"), 1);
+        assert_eq!(text_count(&output, "Cancel"), cancels);
+        assert!(text_count(&output, "Stop") >= 1);
+        workspace.job = None;
+        let (output, _) = run(&mut workspace, vec![]);
+        assert_eq!(text_count(&output, "Simulation…"), 0);
     }
 
     #[test]

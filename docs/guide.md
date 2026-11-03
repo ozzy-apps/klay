@@ -335,6 +335,7 @@ overlap with the result of the ones above it.
   at the Boolean **Resolution** (Remesh voxels across two units, default 400), with sharp
   edges where the subtools meet, polygroups and polypaint kept. The subtools it came from
   are hidden and Live Boolean goes off. Not undoable: delete the new subtool to go back.
+  It is built in the background with a progress line and Cancel (see Long operations).
 - Projects (format version 6) save each subtool's operation; versions 1–5 still open.
 
 ### ZRemesher (0.18)
@@ -347,7 +348,8 @@ even size, keeping about the target count. With **KeepGroups** edge loops run al
 borders, and vertices on a border are put exactly on it, so a polygrouped hard-surface
 part keeps crisp edges and corners. Holes in a closed surface are closed; the result is
 all quads (a few three- and five-sided poles where the surface needs them). One undo
-step; it needs a subtool without subdivision levels. A million-vertex sculpt goes to 5k
+step; it needs a subtool without subdivision levels, and runs in the background with a
+progress line and Cancel (see Long operations). A million-vertex sculpt goes to 5k
 quads in under a second, to 30k in about two. **Alt + ZRemesher** lays the loops out
 differently (ZBrush's Alt runs its other algorithm); Ctrl and Shift do nothing here, as
 ZBrush documents nothing for them. The result remembers its quads, so PolyF and ZModeler
@@ -423,7 +425,8 @@ Geometry › **UV Map** (ZBrush: UV Master) lays the subtool out flat in UV spac
 textures and maps. Press **Unwrap**: the lowest level is cut into islands that each lie
 flat with little stretch, scaled to the same texel density and packed into the unit square.
 The section shows the layout, the number of islands, the **Distortion** (how much angles
-are bent, 0 % for none) and the **Coverage** of the square. One undo step.
+are bent, 0 % for none) and the **Coverage** of the square. One undo step, made in the
+background (see Long operations).
 
 - Seams fall where the surface turns: **Max angle** (20–90°, default 60) is how far it may
   turn within one island; larger gives fewer islands and more stretch. Fine detail
@@ -521,8 +524,9 @@ The same settings always give the same fibres.
 Geometry › **Dynamics › Run Simulation** simulates the shown level as cloth: it falls under
 **Gravity**, drapes over the other visible subtools, and settles on the **Floor** (the floor
 grid, or under the lowest visible subtool). Masked vertices stay pinned, so mask a collar or
-an edge to hang cloth from it. The model updates as it settles; **Stop** or Esc ends it early,
-and the whole run is one undo step.
+an edge to hang cloth from it. The model updates as it settles; **Stop** (in the section
+or on the progress line over the canvas) or Esc ends it early, and the whole run is one
+undo step.
 
 - **Steps**: how long it runs. **Stiffness**: how firmly edges keep their length. **Bend**:
   how firmly the surface resists folding. **Friction**: how much contacts stop sliding.
@@ -565,6 +569,22 @@ last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-norm
 `--open`), unwrapping first if needed. Shelf commands `cmd:bake-normal`,
 `cmd:bake-displacement` and `cmd:bake-color`.
 
+### Long operations
+
+ZRemesher, Decimation, UV Unwrap, Remesh (the Wedge button and Ctrl + drag on the
+background), Make Boolean Mesh and ProjectAll run on a thread of their own, as the
+texture-map bakes, Render and Turntable do, so the window keeps drawing and the view still
+turns while they work. A line over the canvas names the operation, counts the seconds and
+has **Cancel** (Esc does the same): the model stays as it was, and whatever the thread
+still makes is dropped (the algorithms stop at their next phase). While one runs the model
+waits for it: strokes, Undo and Redo, Divide, selecting another subtool, New, Open and a
+second operation are refused with a notice, so the result lands on the mesh it was made
+from (if the subtool changed anyway, the result is dropped with a notice). The result goes
+in as the undo step it always made: ZRemesher, Decimation and Remesh keep the old mesh for
+undo, Unwrap the old UVs, ProjectAll is one stroke. Dynamics shows the same line with
+**Stop**, which keeps what the cloth has reached. `--zremesh`, `--decimate`, `--uv-unwrap`,
+the self-tests and snapshots wait for each operation before going on.
+
 ### Decimation
 
 Geometry › **Decimation** (ZBrush: Decimation Master) cuts the triangle count a long way
@@ -575,9 +595,9 @@ usually holds up well down to a few percent. **Keep Borders** keeps open borders
 **Keep Groups** keeps polygroup borders, **Keep Polypaint** carries the colours over. The
 result stays closed and manifold where the model was.
 
-It runs in the background (about 1 s per million triangles here): the status bar counts the
-seconds, and a drag on the canvas still turns the view, but nothing else changes the model
-until it is done. It decimates the shown level; a subtool with subdivision levels becomes
+It runs in the background (about 1 s per million triangles here) with the progress line
+and Cancel of every long operation (see Long operations): a drag on the canvas still turns
+the view, but nothing else changes the model until it is done. It decimates the shown level; a subtool with subdivision levels becomes
 the decimated mesh alone, and **undo** brings the levels back. If the subtool is edited or
 switched while it runs, the result is dropped. The result is triangles: ZRemesher it if you
 need quads.
@@ -598,8 +618,8 @@ Every vertex looks along its normal, outward and inward, for the nearest surface
 same way count, so a vertex does not jump to the far side of a thin part. **Outer** and
 **Inner** limit the search to one side; **Paint** takes the polypaint too; **PA Blur**
 (0–10 passes) smooths the moves where the result is noisy. Masked vertices stay (partly
-masked ones move part of the way) and hidden ones are left alone. One undo step. Vertices
-that find no surface stay where they are; raise Dist if many do. A 540k-vertex level takes
+masked ones move part of the way) and hidden ones are left alone. One undo step, made in
+the background (see Long operations). Vertices that find no surface stay where they are; raise Dist if many do. A 540k-vertex level takes
 under 0.1 s against a 1.9M-triangle sculpt, plus about 0.25 s to index the sculpt.
 
 ### ZModeler (0.19)
@@ -794,8 +814,17 @@ Export STL, Send to Slicer and Check Mesh can go on a shelf (Send to Strata cann
   (ridges, corners) instead; **Depth** sets how wide a recess may be, 1 for the creases
   between neighbouring polygons only (pores, wrinkles), more for the grooves and folds a dense
   mesh hides; **Blur** softens the mask's edges. For grooves wider still, mask at a lower
-  Divide level, the mask follows the shown level. **Mask By Polygroups** masks the borders
-  between polygroups (**Border width**; Invert to mask their insides instead).
+  Divide level, the mask follows the shown level. **Mask By Smoothness** masks the smooth
+  surface and leaves curvature changes (creases, edges, the rim of a form) free, as the
+  Transpose Smart mask does: **Range** sets how many rings of polygons round a change stay
+  free, **Falloff** how soft that edge is (0 a hard edge, 100 a ramp over the whole range).
+  **Mask Ambient Occlusion** masks surface that other surface shuts in, more where more of
+  the sky above it is covered, from 16 rays per vertex: **Occlusion Intensity** is the mask
+  where every ray is blocked, **AO ScanDist** how far a ray looks as a percentage of the
+  subtool's longest side, **AO Aperture** the cone of rays about the normal (180 the whole
+  hemisphere). Hidden polygons neither block rays nor take any of these masks. **Mask By
+  Polygroups** masks the borders between polygroups (**Border width**; Invert to mask their
+  insides instead).
 - **Mesh › Visibility**: **Grow / Shrink** show one more ring of polygons or hide the outer
   ring. **Mesh › Polygroups**: **Auto Groups** gives each connected piece its own group;
   **Group By Normals** starts a new group wherever the surface turns by more than **Max
@@ -1185,6 +1214,15 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   of every level run-length coded; parked subtools and project files keep them the same way,
   and stand-ins of parked subtools leave hidden triangles out. OBJ export writes polygroups
   as OBJ groups.
+- `jobs.rs`: the worker thread of the long geometry operations (`jobs::spawn` with a
+  `catch_unwind` and an mpsc channel) and their Cancel flag, a thread-local the algorithms
+  read between phases with `jobs::cancelled()` / `jobs::check()?` (always false off a job
+  thread, so a direct call never stops). In `main.rs`, `GeoJob` / `GeoDone` and
+  `start_geo`, `poll_geo` (each frame, or waited for), `cancel_geo` and `geo_free`; the
+  six operations copy what they read (`SculptMesh` is `Clone`, parked subtools go as
+  `Packed`), run on the thread and land through `replace_topology`, `swap_uvs`, a
+  ProjectAll stroke or a new subtool. `busy()` is true while one runs; `jobs_wait` makes
+  every job synchronous in automated runs.
 - `wedge.rs`: Remesh (Mesh › Remesh; called Wedge before 0.9), a DynaMesh-style remesher. Every triangle is rasterised onto the lines of
   a regular grid along x, y and z with exact, watertight edge tests (a shared edge is
   evaluated the same way from both sides, ties broken by one fixed rule), giving where each
