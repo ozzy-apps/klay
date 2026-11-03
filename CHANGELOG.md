@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.31.0 — 2026-11-03
+
+- **Quads are remembered.** A mesh now records which two triangles make each quad (`SculptMesh::quads`): the primitives, ZRemesher and ZModeler set it, Divide and Dynamic Subdivision carry it to every level, and Split, Merge, Mirror and projects keep it. PolyF and ZModeler use it instead of guessing quads from edge lengths, which showed big or skewed quads (a coarse ZRemesher result, a stretched plane) as pairs of triangles and stopped edge loops at them. Meshes from older files and from operations that rebuild triangles (booleans, decimation, Sculptris) still guess as before.
+- **Alt + ZRemesher** lays the edge loops out differently (the direction field starts a quarter turn round), as ZBrush's Alt runs its other algorithm. Ctrl and Shift have no documented ZRemesher meaning in ZBrush and none here.
+- Projects are now version 11 (quads); older projects still open.
+- Verification: 385 tests (new: every primitive is all quads and a half whose other half is gone turns lone; Divide pairs every child and a lone triangle's children stay lone, through a version 11 file, and a version 10 file opens without; ZRemesher's result knows its quads, big and skewed, ZModeler sees exactly them where the guess left a quarter as triangles, the symmetric result too, and Alt gives a different layout; a 4:1 plane guesses as triangles but is known as quads, and an inserted loop's quads are known).
+
 ## 0.30.2 — 2026-11-03
 
 - Fixed a crash in Divide after ZRemesher (seen after ZModeler on a Plane, ZRemesher, polypaint, Divide): where the remesh left a vertex with only two neighbours between two quads, both quads were triangulated along the same diagonal, so that edge lay in four triangles and Loop subdivision panicked on it. Quads now never share a diagonal (nor take an edge as one), a face wound against the surface behind an open border goes, and the remesher refuses a result that is not two-manifold instead of handing it on.

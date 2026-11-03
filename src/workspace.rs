@@ -946,8 +946,9 @@ pub struct Actions {
     /// SubTool › Boolean: the active subtool's operation; Make Boolean Mesh.
     pub boolean_op: Option<crate::boolean::BoolOp>,
     pub make_boolean: bool,
-    /// Geometry › ZRemesher.
+    /// Geometry › ZRemesher, and whether Alt was held (the alternate layout).
     pub zremesh: bool,
+    pub zremesh_alt: bool,
     /// Geometry › ZRemesher › Delete guides.
     pub delete_guides: bool,
     /// Geometry › Decimation › Decimate.
@@ -3993,13 +3994,14 @@ impl Workspace {
                     ui.add_enabled_ui(can, |ui| {
                         let r = ui
                             .add_sized([ui.available_width(), 20.0], egui::Button::new("ZRemesher"))
-                            .on_hover_text("Rebuild the subtool as clean quads whose edge loops follow its form · one undo step");
+                            .on_hover_text("Rebuild the subtool as clean quads whose edge loops follow its form · one undo step\nAlt + click: a different layout of the loops (ZBrush: its other algorithm)");
                         let r = match m.wedge_refusal {
                             Some(why) => r.on_disabled_hover_text(why),
                             None => r,
                         };
                         if r.shelf(ui, "cmd:zremesh").clicked() {
                             a.zremesh = true;
+                            a.zremesh_alt = ui.input(|i| i.modifiers.alt);
                         }
                     });
                     zslider(ui, "Target Polygons Count", &mut ws.zremesh.target_k, 0.1..=100.0, true, false, 1);

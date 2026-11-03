@@ -225,6 +225,11 @@ pub struct SculptMesh {
     pub creases: Vec<u8>,
     /// Bumped whenever `creases` change, so the crease lines are redrawn.
     pub crease_version: u32,
+    /// The quad each triangle is half of: the edge (0..2, from corner `k` to `k + 1`) it
+    /// shares with the other half, or [`LONE`] for a triangle on its own. Set by what knows
+    /// its quads (primitives, ZRemesher, ZModeler) and carried by Divide; empty when
+    /// unknown, and then PolyF and ZModeler guess the quads from edge lengths.
+    pub quads: Vec<u8>,
     /// Bumped whenever `hidden` / `groups` change, so the renderer knows to re-upload.
     pub vis_version: u32,
     pub group_version: u32,
@@ -294,14 +299,27 @@ impl SculptMesh {
 
     /// Repartition geometry and vertex paint together, preserving their correspondence.
     pub fn from_raw_painted(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> Self {
+        Self::from_raw_full(positions, indices, tri_groups, colors, Vec::new())
+    }
+
+    /// [`from_raw_painted`](Self::from_raw_painted) with the quads known: `quads` as
+    /// [`quads`](Self::quads), per input triangle (or empty).
+    pub fn from_raw_full(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>, quads: Vec<u8>) -> Self {
         // 1. Partition vertices into spatial chunks by recursive median split.
         let groups = partition_vertices(&positions);
-        Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new())
+        Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new(), quads)
+    }
+
+    /// [`from_raw_with_groups`](Self::from_raw_with_groups) for triangles that come in
+    /// pairs (`2i`, `2i + 1`), each pair a quad (as the primitives make them).
+    pub fn from_raw_paired(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>) -> Self {
+        let quads = paired(&indices);
+        Self::from_raw_full(positions, indices, tri_groups, Vec::new(), quads)
     }
 
     /// [`from_raw_painted`](Self::from_raw_painted), also returning where each input vertex
     /// went (its new number) and which input triangle each triangle of the mesh is.
-    pub fn from_raw_tracked(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>) -> (Self, Vec<u32>, Vec<u32>) {
+    pub fn from_raw_tracked(positions: Vec<Vec3>, indices: Vec<u32>, tri_groups: Vec<u16>, colors: Vec<[u8; 4]>, quads: Vec<u8>) -> (Self, Vec<u32>, Vec<u32>) {
         let groups = partition_vertices(&positions);
         let mut remap = vec![0u32; positions.len()];
         let mut k = 0u32;
@@ -312,7 +330,7 @@ impl SculptMesh {
             }
         }
         let old_tris: Vec<[u32; 3]> = indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]].map(|v| remap[v as usize])).collect();
-        let mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new());
+        let mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new(), quads);
         // Triangles keep their corners in order, rotated at most: key by the sorted corners.
         let key = |t: [u32; 3]| {
             let mut k = t;
@@ -333,7 +351,7 @@ impl SculptMesh {
         let t = indices.len() / 3;
         let groups = partition_vertices(&positions);
         // The tags ride along as the hidden flags, then are taken back out.
-        let mut mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), tags);
+        let mut mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), tags, Vec::new());
         let mut tags = std::mem::take(&mut mesh.hidden);
         mesh.set_hidden(Vec::new());
         if tags.is_empty() {
@@ -371,11 +389,12 @@ impl SculptMesh {
                 groups.push(m);
             }
         }
-        Self::from_partition(groups, positions, indices, tri_groups, colors, mask, hidden)
+        Self::from_partition(groups, positions, indices, tri_groups, colors, mask, hidden, Vec::new())
     }
 
     /// The shared tail of the constructors: `groups` lists every vertex once, chunk by
     /// chunk.
+    #[allow(clippy::too_many_arguments)]
     fn from_partition(
         groups: Vec<Vec<u32>>,
         positions: Vec<Vec3>,
@@ -384,10 +403,12 @@ impl SculptMesh {
         colors: Vec<[u8; 4]>,
         mask: Vec<u8>,
         mut hidden: Vec<u8>,
+        quads: Vec<u8>,
     ) -> Self {
         let n = positions.len();
         assert!(colors.is_empty() || colors.len() == n);
         assert!(mask.is_empty() || mask.len() == n);
+        let mut quads = checked_quads(&indices, quads);
 
         // 2. Reorder vertices so each chunk is contiguous.
         let mut remap = vec![0u32; n];
@@ -411,7 +432,7 @@ impl SculptMesh {
         let indices: Vec<u32> = indices.into_par_iter().map(|i| remap[i as usize]).collect();
 
         // 3. Group the triangles by the chunk owning their first vertex, border ones first.
-        let indices = group_triangles(indices, &mut chunks, &mut tri_groups, &mut hidden);
+        let indices = group_triangles(indices, &mut chunks, &mut tri_groups, &mut hidden, &mut quads);
 
         let (adj_offsets, adj_verts, vt_offsets, vt_tris) = build_csr(n, &indices);
         let mut mesh = Self::assemble(positions, indices, chunks, vert_chunk, adj_offsets, adj_verts, vt_offsets, vt_tris);
@@ -423,6 +444,7 @@ impl SculptMesh {
         if !hidden.is_empty() {
             mesh.set_hidden(hidden);
         }
+        mesh.quads = quads;
         mesh
     }
 
@@ -525,6 +547,7 @@ impl SculptMesh {
         mesh.colors = join(&self.colors, keep.verts, part.map(|p| &p.colors[..]), pv, [0; 4]);
         mesh.set_groups(join(&self.groups, keep.tris, part.map(|p| &p.groups[..]), pt, 0));
         mesh.set_hidden(join(&self.hidden, keep.tris, part.map(|p| &p.hidden[..]), pt, 0));
+        mesh.set_quads(join(&self.quads, keep.tris, part.map(|p| &p.quads[..]), pt, LONE));
         mesh
     }
 
@@ -547,6 +570,7 @@ impl SculptMesh {
         mesh.colors = if self.colors.is_empty() { Vec::new() } else { self.colors[keep.verts..].to_vec() };
         mesh.set_groups(if self.groups.is_empty() { Vec::new() } else { self.groups[keep.tris..].to_vec() });
         mesh.set_hidden(tail(&self.hidden, keep.tris));
+        mesh.set_quads(tail(&self.quads, keep.tris));
         Some(mesh)
     }
 
@@ -577,6 +601,8 @@ impl SculptMesh {
         hidden.truncate(kt);
         let mut creases = std::mem::take(&mut self.creases);
         creases.truncate(kt);
+        let mut quads = std::mem::take(&mut self.quads);
+        quads.truncate(kt);
         if let Some(p) = part {
             let (v, t, c) = (kv as u32, kt as u32, kc as u32);
             let (pv, pt) = (p.vertex_count(), p.triangle_count());
@@ -616,10 +642,12 @@ impl SculptMesh {
             extend(&mut groups, kt, &p.groups, pt, 0);
             extend(&mut hidden, kt, &p.hidden, pt, 0);
             extend(&mut creases, kt, &p.creases, pt, 0);
+            extend(&mut quads, kt, &p.quads, pt, LONE);
         }
         self.set_groups(groups);
         self.set_hidden(hidden);
         self.set_creases(creases);
+        self.set_quads(quads);
         old
     }
 
@@ -757,6 +785,7 @@ impl SculptMesh {
             shown: Vec::new(),
             creases: Vec::new(),
             crease_version: 0,
+            quads: Vec::new(),
             vis_version: 0,
             group_version: 0,
             group_count: 1,
@@ -1131,6 +1160,37 @@ impl SculptMesh {
         self.crease_version = self.crease_version.wrapping_add(1);
     }
 
+    /// Replace the quad halves (one byte per triangle, see [`quads`](Self::quads), or
+    /// empty for unknown). Only every triangle lone is stored as empty.
+    pub fn set_quads(&mut self, mut quads: Vec<u8>) {
+        debug_assert!(quads.is_empty() || quads.len() == self.triangle_count());
+        if quads.par_iter().all(|&q| q == LONE) {
+            quads = Vec::new();
+        }
+        self.quads = quads;
+        self.group_version = self.group_version.wrapping_add(1);
+    }
+
+    /// The other half of the quad triangle `t` is half of, by [`quads`](Self::quads):
+    /// the triangle across its diagonal whose own diagonal is that edge. `None` for a lone
+    /// triangle or while the quads are unknown.
+    pub fn quad_partner(&self, t: u32) -> Option<u32> {
+        let d = *self.quads.get(t as usize)?;
+        if d >= LONE {
+            return None;
+        }
+        let tri = &self.indices[3 * t as usize..3 * t as usize + 3];
+        let (a, b) = (tri[d as usize], tri[(d as usize + 1) % 3]);
+        self.incident(a).iter().copied().find(|&o| {
+            if o == t || self.quads[o as usize] >= LONE {
+                return false;
+            }
+            let ot = &self.indices[3 * o as usize..3 * o as usize + 3];
+            let k = self.quads[o as usize] as usize;
+            ot[k] == b && ot[(k + 1) % 3] == a
+        })
+    }
+
     /// The creased edges, each once as `(low, high)` vertex ids, sorted.
     pub fn crease_edges(&self) -> Vec<(u32, u32)> {
         if self.creases.is_empty() {
@@ -1218,12 +1278,13 @@ impl SculptMesh {
         )
     }
 
-    /// Polygroup of every drawn (visible) triangle in draw order, two per word.
+    /// Polygroup (13 bits) and quad half (3 bits: the diagonal edge, [`LONE`], or 4 while
+    /// the quads are unknown) of every drawn (visible) triangle in draw order, two per word.
     pub fn drawn_groups_packed(&self) -> Vec<u32> {
         let drawn: Vec<u16> = (0..self.triangle_count() as u32)
             .into_par_iter()
             .filter(|&t| self.visible(t))
-            .map(|t| self.group(t))
+            .map(|t| (self.group(t) & 0x1fff) | (self.quads.get(t as usize).map_or(4, |&q| q as u16) << 13))
             .collect();
         drawn
             .par_chunks(2)
@@ -1347,7 +1408,57 @@ pub(crate) fn crosses_chunk(tri: &[u32], vert_start: u32, vert_end: u32) -> bool
 /// contiguous range with the ones that cross into another chunk first, keeping the input
 /// order within each part, and record the ranges in `chunks[c]`. `groups` (one per
 /// triangle, or empty) is reordered the same way.
-fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16>, hidden: &mut Vec<u8>) -> Vec<u32> {
+/// A triangle that is not half of a quad, in [`SculptMesh::quads`].
+pub const LONE: u8 = 3;
+
+/// The edge of `tri` (0..2, from corner `k` to `k + 1`) that `other` also has, if one.
+pub fn shared_edge(tri: &[u32], other: &[u32]) -> Option<u8> {
+    (0..3u8).find(|&k| other.contains(&tri[k as usize]) && other.contains(&tri[(k as usize + 1) % 3]))
+}
+
+/// Quad halves for triangles that come in pairs (`2i`, `2i + 1`): the two of a pair that
+/// share an edge are the halves of one quad; any other triangle is [`LONE`].
+pub fn paired(indices: &[u32]) -> Vec<u8> {
+    let t = indices.len() / 3;
+    let mut out = vec![LONE; t];
+    for i in (0..t).step_by(2) {
+        if i + 1 < t {
+            let (a, b) = (&indices[3 * i..3 * i + 3], &indices[3 * i + 3..3 * i + 6]);
+            if let (Some(da), Some(db)) = (shared_edge(a, b), shared_edge(b, a)) {
+                out[i] = da;
+                out[i + 1] = db;
+            }
+        }
+    }
+    out
+}
+
+/// `quads` with every half whose other half is not there (dropped, or pointing elsewhere)
+/// made [`LONE`]; empty stays empty, and a wrong length is dropped.
+pub fn checked_quads(indices: &[u32], mut quads: Vec<u8>) -> Vec<u8> {
+    let t = indices.len() / 3;
+    if quads.is_empty() {
+        return quads;
+    }
+    if quads.len() != t {
+        return Vec::new();
+    }
+    let diagonal = |i: usize, d: u8| -> Option<(u32, u32)> {
+        let d = d as usize;
+        (d < 3).then(|| (indices[3 * i + d], indices[3 * i + (d + 1) % 3]))
+    };
+    let set: crate::fx::FxHashSet<(u32, u32)> = quads.iter().enumerate().filter_map(|(i, &d)| diagonal(i, d)).collect();
+    for i in 0..t {
+        if let Some((a, b)) = diagonal(i, quads[i]) {
+            if a == b || !set.contains(&(b, a)) {
+                quads[i] = LONE;
+            }
+        }
+    }
+    quads
+}
+
+fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16>, hidden: &mut Vec<u8>, quads: &mut Vec<u8>) -> Vec<u32> {
     // Chunk and border flag per triangle, then counting sort by (chunk, !border).
     let owner: Vec<(u32, bool)> = indices
         .par_chunks_exact(3)
@@ -1368,6 +1479,7 @@ fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16
     let mut out = vec![0u32; indices.len()];
     let mut out_groups = vec![0u16; groups.len()];
     let mut out_hidden = vec![0u8; hidden.len()];
+    let mut out_quads = vec![LONE; quads.len()];
     for (t, (tri, &(c, border))) in indices.chunks_exact(3).zip(&owner).enumerate() {
         let slot = &mut fill[2 * c as usize + !border as usize];
         let at = 3 * *slot as usize;
@@ -1378,10 +1490,14 @@ fn group_triangles(indices: Vec<u32>, chunks: &mut [Chunk], groups: &mut Vec<u16
         if !hidden.is_empty() {
             out_hidden[*slot as usize] = hidden[t];
         }
+        if !quads.is_empty() {
+            out_quads[*slot as usize] = quads[t];
+        }
         *slot += 1;
     }
     *groups = out_groups;
     *hidden = out_hidden;
+    *quads = out_quads;
     for (c, ch) in chunks.iter_mut().enumerate() {
         ch.tri_start = start[2 * c];
         ch.tri_border = start[2 * c + 1];
@@ -1488,3 +1604,50 @@ pub(crate) fn partition_ids(ids: Vec<u32>, positions: &[Vec3]) -> Vec<Vec<u32>> 
     out
 }
 
+
+#[cfg(test)]
+pub mod quad_tests {
+    use super::*;
+
+    /// Every half of a quad finds its other half, and the halves are a matching pair.
+    pub fn all_paired(m: &SculptMesh) -> usize {
+        assert_eq!(m.quads.len(), m.triangle_count(), "quads known for every triangle");
+        let mut paired = 0;
+        for t in 0..m.triangle_count() as u32 {
+            if m.quads[t as usize] == LONE {
+                continue;
+            }
+            let o = m.quad_partner(t).unwrap_or_else(|| panic!("triangle {t} has a partner"));
+            assert_eq!(m.quad_partner(o), Some(t), "partners agree");
+            paired += 1;
+        }
+        paired
+    }
+
+    #[test]
+    fn primitives_know_their_quads_and_keep_them_through_rechunking() {
+        for prim in crate::primitive::Primitive::ALL {
+            let (p, i) = prim.build(4, 1.0);
+            let t = i.len() / 3;
+            let m = SculptMesh::from_raw_paired(p, i, prim.groups(4));
+            assert_eq!(all_paired(&m), t, "{prim:?}: every triangle is half a quad");
+        }
+        // Halves whose other half is gone become lone.
+        let (p, i) = crate::primitive::Primitive::Plane.build(2, 1.0);
+        let mut q = paired(&i);
+        assert!(q.iter().all(|&d| d < LONE));
+        q[1] = LONE;
+        let q = checked_quads(&i, q);
+        assert_eq!(q[0], LONE, "its partner went");
+        assert_eq!(q[2..].iter().filter(|&&d| d < LONE).count(), 6);
+        assert!(checked_quads(&i, vec![0; 3]).is_empty(), "a wrong length is dropped");
+        // The tail of a mesh keeps its quads; the drawn ids carry the halves.
+        let m = SculptMesh::from_raw_paired(p, i, Vec::new());
+        let packed = m.drawn_groups_packed();
+        assert_eq!(packed.len(), 4);
+        assert_eq!((packed[0] & 0xffff) >> 13, m.quads[0] as u32);
+        let unknown = SculptMesh::from_raw(m.positions.clone(), m.indices.clone());
+        assert!(unknown.quads.is_empty());
+        assert_eq!((unknown.drawn_groups_packed()[0] & 0xffff) >> 13, 4);
+    }
+}

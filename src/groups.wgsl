@@ -2,8 +2,9 @@
 // the GPU supports it: each drawn triangle takes its polygroup's colour (two 16-bit ids per
 // word, in draw order), and its edges are drawn as thin dark lines, the polyframe. The
 // edges come from the triangle's corners, fetched by primitive index and projected to the
-// screen; a quad's diagonal (a triangle's longest edge when clearly longer than the
-// others) is left out, and lines fade where triangles are only a few pixels across.
+// screen; a quad's diagonal (the edge the mesh marks as one, or while it marks none, a
+// triangle's longest edge when clearly longer than the others) is left out, and lines
+// fade where triangles are only a few pixels across.
 
 // Group 1 is the mask (shader.wgsl).
 @group(2) @binding(0) var<storage, read> drawn_groups: array<u32>;
@@ -84,7 +85,11 @@ fn fs_groups(in: VsOut, @builtin(primitive_index) prim: u32) -> @location(0) vec
 // Polygroup colour and the polyframe, shaded.
 fn group_surface(in: VsOut, prim: u32) -> vec4<f32> {
     let word = drawn_groups[prim >> 1u];
-    let g = (word >> ((prim & 1u) * 16u)) & 0xffffu;
+    let raw = (word >> ((prim & 1u) * 16u)) & 0xffffu;
+    // 13 bits of polygroup; then the diagonal edge (0..2), 3 for a lone triangle, 4 for
+    // unknown (see `SculptMesh::drawn_groups_packed`).
+    let g = raw & 0x1fffu;
+    let half = raw >> 13u;
     var color = shade(in, group_color(g));
     let wa = corner_world(prim, 0u);
     let wb = corner_world(prim, 1u);
@@ -100,12 +105,15 @@ fn group_surface(in: VsOut, prim: u32) -> vec4<f32> {
         let lca = length(wa - wc);
         let longest = max(lab, max(lbc, lca));
         let middle = lab + lbc + lca - longest - min(lab, min(lbc, lca));
-        let diagonal = longest > 1.1 * middle;
+        let guess = half == 4u && longest > 1.1 * middle;
+        let skip_ab = select(half == 0u, lab == longest, guess);
+        let skip_bc = select(half == 1u, lbc == longest, guess);
+        let skip_ca = select(half == 2u, lca == longest, guess);
         let p = in.clip.xy;
         var d = 1e9;
-        if (!(diagonal && lab == longest)) { d = min(d, segment_distance(p, a.xy, b.xy)); }
-        if (!(diagonal && lbc == longest)) { d = min(d, segment_distance(p, b.xy, c.xy)); }
-        if (!(diagonal && lca == longest)) { d = min(d, segment_distance(p, c.xy, a.xy)); }
+        if (!skip_ab) { d = min(d, segment_distance(p, a.xy, b.xy)); }
+        if (!skip_bc) { d = min(d, segment_distance(p, b.xy, c.xy)); }
+        if (!skip_ca) { d = min(d, segment_distance(p, c.xy, a.xy)); }
         // Lines are discreet: they darken the surface by about half.
         let px = min(length(b.xy - a.xy), min(length(c.xy - b.xy), length(a.xy - c.xy)));
         let crisp = (1.0 - smoothstep(0.4, 1.4, d)) * 0.55;

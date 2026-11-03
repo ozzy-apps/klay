@@ -109,7 +109,7 @@ pub fn build(mesh: &SculptMesh, s: &Settings) -> SculptMesh {
 
 /// A plain copy of `mesh` (positions, triangles, polygroups, creases).
 fn copy(mesh: &SculptMesh) -> SculptMesh {
-    let mut m = SculptMesh::from_raw_painted(mesh.positions.clone(), mesh.indices.clone(), mesh.groups.clone(), Vec::new());
+    let mut m = SculptMesh::from_raw_full(mesh.positions.clone(), mesh.indices.clone(), mesh.groups.clone(), Vec::new(), mesh.quads.clone());
     if !mesh.creases.is_empty() {
         m.set_creases(mesh.creases.clone());
     }
@@ -130,7 +130,7 @@ pub fn preview(mesh: &SculptMesh, s: &Settings) -> StandIn {
 /// **Apply**: the preview as the model's new topology, rebuilt as a fresh mesh.
 pub fn applied(mesh: &SculptMesh, s: &Settings) -> SculptMesh {
     let m = build(mesh, &s.fitted(mesh, MAX_TRIANGLES));
-    let mut out = SculptMesh::from_raw_painted(m.positions, m.indices, m.groups, Vec::new());
+    let mut out = SculptMesh::from_raw_full(m.positions, m.indices, m.groups, Vec::new(), m.quads);
     if !m.creases.is_empty() && m.creases.len() == out.triangle_count() {
         out.set_creases(m.creases);
     }

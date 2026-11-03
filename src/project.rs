@@ -41,9 +41,9 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
-/// 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and Morph Target; 4: vertex paint; 3:
-/// polygroups and hidden triangles; 2: mask. Every older version still opens.
-pub const VERSION: u32 = 10;
+/// 11: quads (which triangles pair); 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and
+/// Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2: mask. Every older version still opens.
+pub const VERSION: u32 = 11;
 
 /// One subtool as stored in a project.
 pub struct SavedTool {

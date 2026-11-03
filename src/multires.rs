@@ -263,6 +263,25 @@ fn child_crease(p: u8, k: u32) -> u8 {
     if k == 3 { 0 } else { bit(k) | bit(k + 2) << 2 }
 }
 
+/// The quad half of child `k` of a triangle whose diagonal is its edge `d` (see
+/// [`SculptMesh::quads`]): the corner children at the diagonal's ends keep its halves
+/// (their edge 0 or 2, as [`child_crease`] lays them out), the far corner child and the
+/// centre child pair with each other across the centre child's edge facing that corner,
+/// and the children of a lone triangle are lone.
+fn child_quad(d: u8, k: u32) -> u8 {
+    if d >= crate::mesh::LONE {
+        crate::mesh::LONE
+    } else if k == 3 {
+        (d + 1) % 3
+    } else if d as u32 == k {
+        0
+    } else if d as u32 == (k + 2) % 3 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
 pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
     subdivide_with(parent, None)
@@ -604,6 +623,8 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     let mut child_hidden = if parent.hidden.is_empty() { Vec::new() } else { vec![0u8; t_count] };
     // Creases go to the halves of each creased edge.
     let mut child_creases = if parent.creases.is_empty() { Vec::new() } else { vec![0u8; t_count] };
+    // Each quad becomes four, its halves' children paired as `child_quad` says.
+    let mut child_quads = if parent.quads.is_empty() { Vec::new() } else { vec![crate::mesh::LONE; t_count] };
     let borders: Vec<u32> = {
         let tri_ranges = chunk_tri
             .windows(2)
@@ -624,13 +645,18 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         } else {
             split_ranges(&mut child_creases, per_tri()).into_iter().map(Some).collect()
         };
+        let quad_out: Vec<Option<&mut [u8]>> = if child_quads.is_empty() {
+            (0..c_count).map(|_| None).collect()
+        } else {
+            split_ranges(&mut child_quads, per_tri()).into_iter().map(Some).collect()
+        };
         split_ranges(&mut indices, tri_ranges)
             .into_par_iter()
             .zip(owned.par_iter())
             .zip(ranges().collect::<Vec<_>>().into_par_iter())
             .zip(chunk_tri.par_iter())
-            .zip(group_out.into_par_iter().zip(hidden_out.into_par_iter()).zip(crease_out.into_par_iter()))
-            .map(|((((out, o), (s, e)), &start), ((mut group_out, mut hidden_out), mut crease_out))| {
+            .zip(group_out.into_par_iter().zip(hidden_out.into_par_iter()).zip(crease_out.into_par_iter().zip(quad_out.into_par_iter())))
+            .map(|((((out, o), (s, e)), &start), ((mut group_out, mut hidden_out), (mut crease_out, mut quad_out)))| {
                 // The children of one parent triangle share its remapped corners and edge
                 // midpoints, and are consecutive in the sorted list when one chunk owns
                 // several of them.
@@ -678,6 +704,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
                             }
                             if let Some(c) = crease_out.as_deref_mut() {
                                 c[n as usize] = child_crease(parent.creases[(nat / 4) as usize], nat % 4);
+                            }
+                            if let Some(q) = quad_out.as_deref_mut() {
+                                q[n as usize] = child_quad(parent.quads[(nat / 4) as usize], nat % 4);
                             }
                             n += 1;
                         }
@@ -792,6 +821,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     if !child_creases.is_empty() {
         mesh.set_creases(child_creases);
     }
+    if !child_quads.is_empty() {
+        mesh.set_quads(child_quads);
+    }
     debug_assert!(
         mesh.chunks
             .iter()
@@ -847,6 +879,9 @@ pub struct Packed {
     uvs: Vec<[glam::Vec2; 3]>,
     /// Creased edges of every level, base first (see [`crease_list`]); empty for none.
     creases: Vec<Vec<u32>>,
+    /// Quad halves of the base level's triangles (see [`SculptMesh::quads`]); the levels
+    /// above take theirs from the replay.
+    quads: Vec<u8>,
     /// The frozen stack (see [`Multires::frozen`]).
     frozen: Option<Box<Packed>>,
     /// The ZSphere tree (see [`Multires::zspheres`]).
@@ -1150,6 +1185,9 @@ impl Packed {
         if version >= 2 {
             out.slice(&self.mask)?;
         }
+        if version >= 11 {
+            out.slice(&self.quads)?;
+        }
         Ok(())
     }
 
@@ -1207,6 +1245,11 @@ impl Packed {
         if !mask.is_empty() && mask.len() != counts[active] {
             return Err("the stored mask does not match the shown level".into());
         }
+        // Version 11 files know their quads.
+        let quads: Vec<u8> = if version >= 11 { input.vec()? } else { Vec::new() };
+        if !quads.is_empty() && (quads.len() != indices.len() / 3 || quads.iter().any(|&q| q > crate::mesh::LONE)) {
+            return Err("the stored quads do not match the mesh".into());
+        }
         let marks = vec![Marks::default(); levels.len() + 1];
         Ok(Packed {
             positions,
@@ -1221,6 +1264,7 @@ impl Packed {
             colors: Vec::new(),
             uvs: Vec::new(),
             creases: Vec::new(),
+            quads,
             frozen: None,
             zspheres: None,
         })
@@ -1259,6 +1303,7 @@ impl Packed {
             mask,
             colors,
             creases,
+            quads,
             frozen,
             zspheres,
             ..
@@ -1267,6 +1312,8 @@ impl Packed {
         if levels[0].mesh.edges_over_two_triangles() {
             return Err("the stored mesh has edges shared by more than two triangles".into());
         }
+        let quads = crate::mesh::checked_quads(&levels[0].mesh.indices, quads);
+        levels[0].mesh.set_quads(quads);
         if !creases.is_empty() && creases.len() != packed.len() + 1 {
             return Err("creases are stored for a different number of levels".into());
         }
@@ -1596,7 +1643,7 @@ impl Multires {
         let pos: Vec<Vec3> = c.even.iter().map(|&v| old_base.positions[v as usize]).collect();
         let groups: Vec<u16> = if old_base.groups.is_empty() { Vec::new() } else { c.centre.iter().map(|&t| old_base.groups[t as usize]).collect() };
         let colors: Vec<[u8; 4]> = if old_base.colors.is_empty() { Vec::new() } else { c.even.iter().map(|&v| old_base.colors[v as usize]).collect() };
-        let (mut pm, vmap, tmap) = SculptMesh::from_raw_tracked(pos, c.indices.clone(), groups, colors);
+        let (mut pm, vmap, tmap) = SculptMesh::from_raw_tracked(pos, c.indices.clone(), groups, colors, Vec::new());
         if !old_base.hidden.is_empty() {
             let h: Vec<u8> = tmap.iter().map(|&t| old_base.hidden[c.centre[t as usize] as usize]).collect();
             pm.set_hidden(h);
@@ -2343,7 +2390,7 @@ impl Multires {
         let base = it.next().expect("a stack has a base level").mesh;
         let ranges = base.chunk_ranges();
         let SculptMesh {
-            positions, indices, ..
+            positions, indices, quads, ..
         } = base;
         let levels = it
             .map(|l| PackedLevel {
@@ -2364,6 +2411,7 @@ impl Multires {
             colors,
             uvs,
             creases,
+            quads,
             frozen,
             zspheres,
         }
@@ -2399,6 +2447,7 @@ impl Multires {
             colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
             uvs: self.uvs.clone(),
             creases: self.crease_lists(),
+            quads: base.quads.clone(),
             frozen: self.frozen.clone(),
             zspheres: self.zspheres.clone(),
         }
@@ -3550,5 +3599,45 @@ mod guard_tests {
         let sheet = SculptMesh::from_raw(p, vec![0, 1, 2, 0, 2, 3]);
         assert_eq!(sheet.subdivision_blocker(), None);
         assert!(Multires::new(sheet, usize::MAX).divide());
+    }
+}
+
+#[cfg(test)]
+mod quad_tests {
+    use super::*;
+
+    #[test]
+    fn divide_pairs_every_child_and_projects_keep_the_quads() {
+        let (p, i) = crate::primitive::Primitive::Cube.build(2, 1.0);
+        let t = i.len() / 3;
+        let mut doc = Multires::new(SculptMesh::from_raw_paired(p, i, Vec::new()), usize::MAX);
+        assert!(doc.divide() && doc.divide());
+        for l in 0..3 {
+            let m = doc.level_mesh(l);
+            assert_eq!(crate::mesh::quad_tests::all_paired(m), t * 4usize.pow(l as u32), "level {l}");
+        }
+        // A triangle's children pair with each other only where its parent had a half.
+        let (p, i) = crate::mesh::cube_sphere(2, 1.0);
+        let mut quads = crate::mesh::paired(&i);
+        quads[0] = crate::mesh::LONE;
+        quads[1] = crate::mesh::LONE;
+        let mut doc = Multires::new(SculptMesh::from_raw_full(p, i, Vec::new(), Vec::new(), quads), usize::MAX);
+        assert!(doc.divide());
+        let m = doc.mesh();
+        assert_eq!(crate::mesh::quad_tests::all_paired(m), m.triangle_count() - 8);
+        // Packed and unpacked, through a version 11 file; a version 10 file has none.
+        let packed = doc.pack_copy();
+        let bytes = crate::project::write_version(Vec::new(), &[("Q", true, &packed)], 0, crate::project::VERSION).unwrap();
+        let back = crate::project::read_from(&bytes[..], bytes.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+        assert_eq!(back.level_mesh(0).quads, doc.level_mesh(0).quads);
+        assert_eq!(back.mesh().quads, doc.mesh().quads);
+        let old = crate::project::write_version(Vec::new(), &[("Q", true, &packed)], 0, 10).unwrap();
+        let back = crate::project::read_from(&old[..], old.len() as u64).unwrap().tools.remove(0).packed.try_unpack().unwrap();
+        assert!(back.mesh().quads.is_empty());
+        // A mesh without quads divides to one without.
+        let (p, i) = crate::mesh::cube_sphere(2, 1.0);
+        let mut plain = Multires::new(SculptMesh::from_raw(p, i), usize::MAX);
+        assert!(plain.divide());
+        assert!(plain.mesh().quads.is_empty());
     }
 }

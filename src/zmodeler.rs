@@ -114,10 +114,15 @@ impl PolyMesh {
     pub fn from_mesh(mesh: &SculptMesh) -> (Self, Vec<u32>) {
         let t = mesh.triangle_count();
         let tri = |i: usize| [mesh.indices[3 * i], mesh.indices[3 * i + 1], mesh.indices[3 * i + 2]];
-        // Each triangle's diagonal: its longest edge when clearly the longest (as PolyF).
+        // Each triangle's diagonal: the edge the mesh marks, or while it marks none, its
+        // longest edge when clearly the longest (as PolyF).
         let diagonal: Vec<Option<(u32, u32)>> = (0..t)
             .map(|i| {
                 let v = tri(i);
+                if let Some(&q) = mesh.quads.get(i) {
+                    let k = q as usize;
+                    return (k < 3).then(|| (v[k], v[(k + 1) % 3]));
+                }
                 let mut e: Vec<(f32, u32, u32)> = (0..3).map(|k| (mesh.positions[v[k] as usize].distance(mesh.positions[v[(k + 1) % 3] as usize]), v[k], v[(k + 1) % 3])).collect();
                 e.sort_by(|a, b| a.0.total_cmp(&b.0));
                 (e[2].0 > 1.1 * e[1].0).then_some((e[2].1, e[2].2))
@@ -173,26 +178,32 @@ impl PolyMesh {
         }
         let mut indices = Vec::new();
         let mut groups = Vec::new();
+        let mut quads = Vec::new();
         let mut tri_face = Vec::new();
         for (fi, f) in self.faces.iter().enumerate() {
             let v: Vec<u32> = f.iter().map(|&x| used[x as usize]).collect();
             let p = |k: usize| pos[v[k] as usize];
             if v.len() == 4 {
+                // The quad along its shorter diagonal; both halves know it (see
+                // `SculptMesh::quads`).
                 if p(0).distance_squared(p(2)) <= p(1).distance_squared(p(3)) {
                     indices.extend_from_slice(&[v[0], v[1], v[2], v[0], v[2], v[3]]);
+                    quads.extend_from_slice(&[2, 0]);
                 } else {
                     indices.extend_from_slice(&[v[0], v[1], v[3], v[1], v[2], v[3]]);
+                    quads.extend_from_slice(&[1, 2]);
                 }
             } else {
                 for k in 1..v.len() - 1 {
                     indices.extend_from_slice(&[v[0], v[k], v[k + 1]]);
+                    quads.push(crate::mesh::LONE);
                 }
             }
             let n = if v.len() == 4 { 2 } else { v.len() - 2 };
             groups.extend(std::iter::repeat_n(self.groups[fi], n));
             tri_face.extend(std::iter::repeat_n(fi as u32, n));
         }
-        let (mesh, remap, tri_of_old) = SculptMesh::from_raw_tracked(pos, indices, groups, colors);
+        let (mesh, remap, tri_of_old) = SculptMesh::from_raw_tracked(pos, indices, groups, colors, quads);
         let mut face_of = vec![u32::MAX; mesh.triangle_count()];
         for (old, &new) in tri_of_old.iter().enumerate() {
             if new != u32::MAX {
@@ -823,5 +834,29 @@ mod tests {
         assert!(closed(&back));
         assert_eq!(back.faces.len(), 24);
         assert!(back.faces.iter().all(|f| f.len() == 4));
+    }
+}
+
+#[cfg(test)]
+mod quad_tests {
+    use super::*;
+
+    #[test]
+    fn zmodeler_keeps_quads_however_long_and_remembers_the_ones_it_makes() {
+        // A plane stretched 4:1: each quad's diagonal is barely longer than its long side,
+        // so edge lengths alone would not pair the triangles.
+        let (p, i) = crate::primitive::Primitive::Plane.build(2, 1.0);
+        let p: Vec<Vec3> = p.into_iter().map(|q| Vec3::new(q.x * 4.0, q.y, q.z)).collect();
+        let guessed = PolyMesh::from_mesh(&SculptMesh::from_raw(p.clone(), i.clone())).0;
+        assert_eq!(guessed.faces.len(), 8, "guessed: triangles");
+        let known = SculptMesh::from_raw_paired(p, i, Vec::new());
+        let (pm, _) = PolyMesh::from_mesh(&known);
+        assert_eq!(pm.faces.len(), 4, "known: quads");
+        // An edge loop through them: the new quads are known too, through to_mesh.
+        let f = &pm.faces[0];
+        let looped = pm.insert_loop(f[0], f[1], 0.5);
+        let (mesh, _, _) = looped.to_mesh();
+        assert_eq!(crate::mesh::quad_tests::all_paired(&mesh), mesh.triangle_count());
+        assert_eq!(PolyMesh::from_mesh(&mesh).0.faces.len(), looped.faces.len());
     }
 }

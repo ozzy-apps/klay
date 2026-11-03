@@ -348,7 +348,10 @@ borders, and vertices on a border are put exactly on it, so a polygrouped hard-s
 part keeps crisp edges and corners. Holes in a closed surface are closed; the result is
 all quads (a few three- and five-sided poles where the surface needs them). One undo
 step; it needs a subtool without subdivision levels. A million-vertex sculpt goes to 5k
-quads in under a second, to 30k in about two.
+quads in under a second, to 30k in about two. **Alt + ZRemesher** lays the loops out
+differently (ZBrush's Alt runs its other algorithm); Ctrl and Shift do nothing here, as
+ZBrush documents nothing for them. The result remembers its quads, so PolyF and ZModeler
+show and use every one of them however big or skewed (0.31).
 
 **Guide curves** steer the edge loops (ZBrush: the ZRemesherGuide brush, **B Z G**). Draw
 curves on the model with ZRemesherGuide: each stays on the subtool as an orange line (shown
@@ -615,8 +618,10 @@ ZModeler picks the actions, as ZBrush's Space menu does:
 With symmetry on (X, Y, Z or radial), every action also happens on the mirror images of
 its target, mirrored (a spin turns the other way in a mirror).
 
-Klay keeps triangles, so ZModeler pairs them into quads the way PolyF shows them and then
-remembers the pairing from one action to the next. Each action is one undo step; it needs
+Klay keeps triangles, and since 0.31 a mesh remembers which two make each quad (primitives,
+ZRemesher and ZModeler set it; Divide carries it), so ZModeler and PolyF use exactly those
+quads; a mesh from an older file or from an operation that rebuilds triangles (booleans,
+decimation, Sculptris) has them guessed from edge lengths, the way PolyF showed them before. Each action is one undo step; it needs
 a subtool without subdivision levels. Not yet: Crease, Slide, Spin Poly and the rest of
 ZBrush's long list.
 

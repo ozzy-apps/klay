@@ -845,7 +845,7 @@ impl App {
     fn with_primitive(settings: primitive::Settings, demo: bool, budget: usize) -> Self {
         let t = Instant::now();
         let (p, i, g) = settings.build(1.0);
-        let mesh = SculptMesh::from_raw_with_groups(p, i, g);
+        let mesh = SculptMesh::from_raw_paired(p, i, g);
         let build_ms = t.elapsed().as_secs_f32() * 1000.0;
         Self {
             #[cfg(feature = "strata")]
@@ -1142,7 +1142,7 @@ impl App {
             (bounds.min.z + bounds.max.z) * 0.5,
         );
         let p = p.into_iter().map(|q| q + center).collect();
-        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
+        self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), budget);
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
         self.subtools.push(SubTool { guides: Default::default(), dynamic: None,
@@ -3946,7 +3946,7 @@ impl App {
         {self.strata=Default::default();}
         let budget = self.doc.budget;
         let (p, i, g) = self.primitive.build(1.0);
-        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), budget);
+        self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
         self.subtools = vec![SubTool { guides: Default::default(), dynamic: None,
@@ -8441,7 +8441,7 @@ impl App {
         let size = ((b.max - b.min).max_element() * 0.5).max(1e-3);
         let (p, i, g) = self.primitive.build(size);
         let p = p.into_iter().map(|q| q + center).collect();
-        self.doc = Multires::new(SculptMesh::from_raw_with_groups(p, i, g), self.doc.budget);
+        self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), self.doc.budget);
         let tool = &mut self.subtools[self.active_tool];
         if let Some(rest) = auto_name_number(&tool.name) {
             tool.name = format!("{} {rest}", self.primitive.kind.short());
@@ -8883,6 +8883,9 @@ impl App {
         if actions.delete_guides {
             let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
             self.status = format!("ZRemesher: deleted {n} guide curves");
+        }
+        if actions.zremesh {
+            self.workspace.zremesh.alternate = actions.zremesh_alt;
         }
         for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.panel_loops, GeoOp::PanelLoops), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
             if on {

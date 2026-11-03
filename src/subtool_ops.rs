@@ -10,11 +10,14 @@ use glam::Vec3;
 /// paint kept), or `None` when it accepts none.
 pub fn part(mesh: &SculptMesh, keep: impl Fn(u32) -> bool) -> Option<SculptMesh> {
     let mut map = vec![u32::MAX; mesh.vertex_count()];
-    let (mut positions, mut colors, mut indices, mut groups) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut positions, mut colors, mut indices, mut groups, mut quads) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let painted = !mesh.colors.is_empty();
     for t in 0..mesh.triangle_count() as u32 {
         if !keep(t) {
             continue;
+        }
+        if let Some(&q) = mesh.quads.get(t as usize) {
+            quads.push(q);
         }
         for k in 0..3 {
             let v = mesh.indices[3 * t as usize + k] as usize;
@@ -29,7 +32,7 @@ pub fn part(mesh: &SculptMesh, keep: impl Fn(u32) -> bool) -> Option<SculptMesh>
         }
         groups.push(mesh.group(t));
     }
-    (!indices.is_empty()).then(|| SculptMesh::from_raw_painted(positions, indices, groups, colors))
+    (!indices.is_empty()).then(|| SculptMesh::from_raw_full(positions, indices, groups, colors, quads))
 }
 
 /// Two meshes as one (SubTool › Merge Down). `b`'s polygroups are renumbered after `a`'s so
@@ -51,7 +54,15 @@ pub fn merged(a: &SculptMesh, b: &SculptMesh) -> SculptMesh {
         c.extend(fill(b));
         c
     };
-    SculptMesh::from_raw_painted(positions, indices, groups, colors)
+    let quads = if a.quads.is_empty() && b.quads.is_empty() {
+        Vec::new()
+    } else {
+        let fill = |m: &SculptMesh| if m.quads.is_empty() { vec![crate::mesh::LONE; m.triangle_count()] } else { m.quads.clone() };
+        let mut q = fill(a);
+        q.extend(fill(b));
+        q
+    };
+    SculptMesh::from_raw_full(positions, indices, groups, colors, quads)
 }
 
 /// SubTool › Extract: the masked surface (triangles whose corners are masked on average) as a
@@ -275,6 +286,7 @@ pub fn mirrored(half: &SculptMesh) -> SculptMesh {
     let mut colors = half.colors.clone();
     let mut indices = half.indices.clone();
     let mut groups: Vec<u16> = (0..half.triangle_count() as u32).map(|t| half.group(t)).collect();
+    let mut quads = half.quads.clone();
     // The mirror image: vertices off the plane copied to −X, triangles turned round.
     let half = positions.len();
     let mut mirror = vec![0u32; half];
@@ -295,17 +307,26 @@ pub fn mirrored(half: &SculptMesh) -> SculptMesh {
         let (a, b, c) = (indices[k], indices[k + 1], indices[k + 2]);
         indices.extend_from_slice(&[mirror[a as usize], mirror[c as usize], mirror[b as usize]]);
         groups.push(groups[k / 3]);
+        // Turned round, edge 0 (a-b) becomes edge 2 (b-a) and edge 2 (c-a) edge 0 (a-c).
+        if !quads.is_empty() {
+            let q = quads[k / 3];
+            quads.push(if q < crate::mesh::LONE { 2 - q } else { q });
+        }
     }
     // Triangles lying in the plane would face both ways once mirrored: drop the degenerate.
     let mut out_i = Vec::with_capacity(indices.len());
     let mut out_g = Vec::with_capacity(groups.len());
+    let mut out_q = Vec::with_capacity(quads.len());
     for (k, t) in indices.chunks(3).enumerate() {
         if t[0] != t[1] && t[1] != t[2] && t[0] != t[2] {
             out_i.extend_from_slice(t);
             out_g.push(groups[k]);
+            if !quads.is_empty() {
+                out_q.push(quads[k]);
+            }
         }
     }
-    SculptMesh::from_raw_painted(positions, out_i, out_g, colors)
+    SculptMesh::from_raw_full(positions, out_i, out_g, colors, out_q)
 }
 
 #[cfg(test)]

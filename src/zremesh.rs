@@ -68,6 +68,10 @@ pub struct Settings {
     pub freeze_border: bool,
     /// Edge loops along creased edges, creased again (ZBrush: KeepCreases).
     pub keep_creases: bool,
+    /// Start the direction field a quarter turn (45°) round, for a different but equally
+    /// valid layout (ZBrush: Alt + ZRemesher runs its other algorithm). Set per click,
+    /// not a saved setting.
+    pub alternate: bool,
     /// Edge loops along sharp edges (ZBrush: Detect Edges).
     pub detect_edges: bool,
 }
@@ -91,7 +95,7 @@ impl Features {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false, freeze_border: false, keep_creases: true, detect_edges: false }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false, freeze_border: false, keep_creases: true, detect_edges: false, alternate: false }
     }
 }
 
@@ -757,7 +761,7 @@ fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &F
     }
     let groups: Vec<u16> = (0..out.triangle_count() as u32).map(|t| out.group(t)).collect();
     let grouped = out.group_count() > 1;
-    let snapped = SculptMesh::from_raw_with_groups(positions, out.indices.clone(), if grouped { groups } else { Vec::new() });
+    let snapped = SculptMesh::from_raw_full(positions, out.indices.clone(), if grouped { groups } else { Vec::new() }, Vec::new(), out.quads.clone());
     let full = crate::subtool_ops::mirrored(&snapped);
     stats.quads = full.triangle_count() / 2;
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
@@ -864,7 +868,15 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let sweeps = |l: usize| -> usize { if l == 0 { 12 } else { 8 } };
     // 2. Directions, coarse to fine.
     let top = levels.len() - 1;
-    let mut q: Vec<Vec3> = levels[top].0.n.iter().map(|n| n.any_orthonormal_vector()).collect();
+    let mut q: Vec<Vec3> = levels[top]
+        .0
+        .n
+        .iter()
+        .map(|n| {
+            let u = n.any_orthonormal_vector();
+            if s.alternate { (u + n.cross(u)).normalize() } else { u }
+        })
+        .collect();
     for l in (0..=top).rev() {
         let g = &levels[l].0;
         if l < top {
@@ -1456,6 +1468,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     // corners, and one diagonal between them would be an edge in four triangles).
     let mut indices = Vec::with_capacity(quads.len() * 6);
     let mut tri_groups = Vec::with_capacity(quads.len() * 2);
+    let mut halves = Vec::with_capacity(quads.len() * 2);
     let mut taken: crate::fx::FxHashSet<(u32, u32)> = quads
         .iter()
         .flat_map(|q4| (0..4).map(move |k| (q4[k].min(q4[(k + 1) % 4]), q4[k].max(q4[(k + 1) % 4]))))
@@ -1465,6 +1478,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         if is_tri(q4) {
             indices.extend_from_slice(&[q4[0], q4[1], q4[2]]);
             tri_groups.push(g);
+            halves.push(crate::mesh::LONE);
             continue;
         }
         let key = |a: u32, b: u32| (a.min(b), a.max(b));
@@ -1475,13 +1489,15 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         if first {
             taken.insert(key(q4[0], q4[2]));
             indices.extend_from_slice(&[q4[0], q4[1], q4[2], q4[0], q4[2], q4[3]]);
+            halves.extend_from_slice(&[2, 0]);
         } else {
             taken.insert(key(q4[1], q4[3]));
             indices.extend_from_slice(&[q4[0], q4[1], q4[3], q4[1], q4[2], q4[3]]);
+            halves.extend_from_slice(&[1, 2]);
         }
         tri_groups.extend_from_slice(&[g, g]);
     }
-    let out = SculptMesh::from_raw_with_groups(out_p, indices, if grouped { tri_groups } else { Vec::new() });
+    let out = SculptMesh::from_raw_full(out_p, indices, if grouped { tri_groups } else { Vec::new() }, Vec::new(), halves);
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
     Ok((out, stats))
 }
@@ -2019,5 +2035,41 @@ mod manifold_tests {
                 remesh_paint_divide(&format!("plane {seg} {name}"), m2);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quad_tests {
+    use super::*;
+
+    #[test]
+    fn the_result_knows_its_quads_whatever_their_shape_and_alt_lays_them_out_differently() {
+        let (p, i) = crate::mesh::cube_sphere(20, 1.0);
+        let m = SculptMesh::from_raw(p, i);
+        let s = Settings { target_k: 0.3, keep_groups: false, adaptive: 0.0, ..Settings::default() };
+        let (out, stats) = zremesh(&m, &s, &[]).unwrap();
+        let lone = out.quads.iter().filter(|&&q| q == crate::mesh::LONE).count();
+        assert_eq!(crate::mesh::quad_tests::all_paired(&out), out.triangle_count() - lone);
+        assert_eq!(out.triangle_count(), 2 * stats.quads + lone);
+        // ZModeler sees exactly those quads, big and skewed as they are (guessing from edge
+        // lengths misses some of them).
+        let (pm, _) = crate::zmodeler::PolyMesh::from_mesh(&out);
+        assert_eq!(pm.faces.len(), stats.quads + lone);
+        let guessed = crate::zmodeler::PolyMesh::from_mesh(&SculptMesh::from_raw(out.positions.clone(), out.indices.clone())).0;
+        eprintln!("{} quads; {} faces guessed from edge lengths", stats.quads, guessed.faces.len());
+        assert!(guessed.faces.len() > pm.faces.len(), "the guess leaves triangles");
+        // Symmetric: the mirrored half keeps its quads too.
+        let (sym, st) = zremesh(&m, &Settings { symmetric: true, ..s }, &[]).unwrap();
+        let lone = sym.quads.iter().filter(|&&q| q == crate::mesh::LONE).count();
+        assert_eq!(crate::mesh::quad_tests::all_paired(&sym), sym.triangle_count() - lone);
+        assert_eq!(crate::zmodeler::PolyMesh::from_mesh(&sym).0.faces.len(), st.quads + lone);
+        // Alt: another layout.
+        let (alt, _) = zremesh(&m, &Settings { alternate: true, ..s }, &[]).unwrap();
+        let key = |m: &SculptMesh| {
+            let mut k: Vec<[i64; 3]> = m.positions.iter().map(|p| (*p * 1e3).round().to_array().map(|c| c as i64)).collect();
+            k.sort_unstable();
+            k
+        };
+        assert_ne!(key(&alt), key(&out), "Alt lays the loops out differently");
     }
 }
