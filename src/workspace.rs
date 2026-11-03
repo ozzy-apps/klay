@@ -8012,7 +8012,8 @@ mod tests {
     fn initialize_picks_the_primitive_its_resolution_and_rebuilds() {
         use crate::primitive::{Primitive, Settings};
         let (mut workspace, ctx) = test_workspace("initialize");
-        let size = vec2(1600.0, 2800.0);
+        // Tall enough for every Document section above Initialize (Reference since 0.38.0).
+        let size = vec2(1600.0, 3600.0);
         let mut settings = Settings::default();
         let rows = [row("Sphere 1", true)];
         let (out, _) = frame_full(&mut workspace, &ctx, size, vec![], &rows, &mut settings);
