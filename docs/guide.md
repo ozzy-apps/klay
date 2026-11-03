@@ -612,17 +612,32 @@ ZModeler lists the same:
 
 - **Polygon**: **QMesh** / **Extrude** (drag to pull out or push in along the normal),
   **Inset** (drag to size the inner copy), **Bevel** (drag: the polygon's border chamfered
-  into a rim round a smaller polygon, 0.32), **Delete**, **Polygroup** (click), **Bridge**
-  (click one polygon, then another with as many sides: a tube joins them). Targets: **A
-  Single Poly**, **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest
-  the cursor).
+  into a rim round a smaller polygon), **Move** (drag in the view plane), **Scale** (drag
+  right to grow about the middle, left to shrink), **Inflate** (drag up to push the points
+  out along their normals, down to pull them in), **Split** (click: a point in the middle
+  and one on each edge, a quad per corner; the polygons beside it gain the edge points),
+  **Flip** (click: the normals turned round), **Delete**, **Polygroup** (click), **Crease**
+  and **Mask** (click; click again to uncrease or unmask), **Bridge** (click one polygon,
+  then another with as many sides: a tube joins them). Targets: **A Single Poly**,
+  **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest the cursor).
 - **Edge**: **Insert** an edge loop round the ring of quads through the edge (click where it
   goes, drag to slide it; a triangle at the end becomes a quad), **Delete** the edge or
-  its whole **EdgeLoop**, **Bevel** the edge (or with EdgeLoop the loop) into a flat chamfer
-  (drag for its width), **Spin** the edge one step round its two polygons (click), or
-  **Bridge** two open edges with a polygon (click one, then the other, 0.32).
-- **Point**: **Move** in the view plane, or **Bevel** the corner off (drag for its size: the
-  polygons round the point cut back and a polygon fills the gap, 0.32).
+  its whole **EdgeLoop**, **Bevel** the edge (or the loop) into a flat chamfer (drag for
+  its width), **Slide** the loop sideways along the edges that cross it (drag), **Move** the
+  edge or loop in the view plane (drag), **Extrude** an open edge out as a new polygon
+  (drag), **Collapse** the edge's two points into one at its middle (click), **Spin** the
+  edge one step round its two polygons (click), **Crease** and **Mask** the edge or loop
+  (click; again to undo), **Close Hole** (click an open edge: the hole it is on becomes
+  one polygon), or **Bridge** two open edges with a polygon (click one, then the other).
+  **EdgeLoop** widens Delete, Bevel, Crease, Slide, Move and Mask to the loop.
+- **Point**: **Move** in the view plane (drag), **Bevel** the corner off (drag for its size:
+  the polygons round the point cut back and a polygon fills the gap), **Slide** along the
+  edge that runs the way of the drag, **Delete** the point (click: the polygons round it
+  become one; on an open border they go), **Stitch** (click one point, then the one to weld
+  it to), **Crease** every edge at the point and **Mask** it (click; again to undo).
+
+The mask and the creases stay through every action, and a point made from a masked one
+(Extrude, Inset, Bevel, Split) is masked too.
 
 A bevel keeps the mesh closed: a polygon beside a chamfered edge slides its corner along
 its other edge, and the polygon on the far side of that edge gains the slid point.
@@ -634,8 +649,8 @@ Klay keeps triangles, and since 0.31 a mesh remembers which two make each quad (
 ZRemesher and ZModeler set it; Divide carries it), so ZModeler and PolyF use exactly those
 quads; a mesh from an older file or from an operation that rebuilds triangles (booleans,
 decimation, Sculptris) has them guessed from edge lengths, the way PolyF showed them before. Each action is one undo step; it needs
-a subtool without subdivision levels. Not yet: Crease, Slide, Spin Poly and the rest of
-ZBrush's long list.
+a subtool without subdivision levels. Not yet: Spin Poly, Align, Unweld, Equalize, Insert
+Point and Transpose.
 
 ### Brushes added in 0.23
 

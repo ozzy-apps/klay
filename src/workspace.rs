@@ -1901,7 +1901,7 @@ impl Workspace {
                                     chosen = true;
                                 }
                             }
-                            if matches!(self.zm_edge, EdgeAction::Delete | EdgeAction::Bevel) {
+                            if self.zm_edge.takes_loop() {
                                 ui.checkbox(&mut self.zm_edge_loop, "EdgeLoop").on_hover_text("The whole loop, not just the edge");
                             }
                         }
@@ -2989,14 +2989,22 @@ impl Workspace {
                 if m.brush.kind.is_zmodeler() {
                     self.sec(ui, h, id, "zmodeler", "ZModeler", None, true, true, &mut |ws, ui| {
                         use crate::zmodeler::{EdgeAction, PointAction, PolyAction, PolyTarget};
+                        // Rows of up to five actions; the chosen one lit in its row.
+                        let rows = |ui: &mut Ui, names: &[&str], at: usize| -> Option<usize> {
+                            let mut picked = None;
+                            for (row, chunk) in names.chunks(5).enumerate() {
+                                let lit = if at / 5 == row { at % 5 } else { usize::MAX };
+                                if let Some(i) = seg(ui, chunk, lit, false) {
+                                    picked = Some(row * 5 + i);
+                                }
+                            }
+                            picked
+                        };
                         ui.label(RichText::new("Polygon").size(12.0).color(FG2()));
                         let names: Vec<&str> = PolyAction::ALL.iter().map(|x| x.name()).collect();
                         let at = PolyAction::ALL.iter().position(|x| *x == ws.zm_poly).unwrap_or(0);
-                        if let Some(i) = seg(ui, &names[..4], at.min(3), false) {
+                        if let Some(i) = rows(ui, &names, at) {
                             ws.zm_poly = PolyAction::ALL[i];
-                        }
-                        if let Some(i) = seg(ui, &names[4..], at.saturating_sub(4).min(2), false) {
-                            ws.zm_poly = PolyAction::ALL[4 + i];
                         }
                         let targets: Vec<&str> = PolyTarget::ALL.iter().map(|x| x.name()).collect();
                         let at = PolyTarget::ALL.iter().position(|x| *x == ws.zm_target).unwrap_or(0);
@@ -3006,19 +3014,19 @@ impl Workspace {
                         ui.label(RichText::new("Edge").size(12.0).color(FG2()));
                         let names: Vec<&str> = EdgeAction::ALL.iter().map(|x| x.name()).collect();
                         let at = EdgeAction::ALL.iter().position(|x| *x == ws.zm_edge).unwrap_or(0);
-                        if let Some(i) = seg(ui, &names, at, false) {
+                        if let Some(i) = rows(ui, &names, at) {
                             ws.zm_edge = EdgeAction::ALL[i];
                         }
-                        if matches!(ws.zm_edge, EdgeAction::Delete | EdgeAction::Bevel) {
+                        if ws.zm_edge.takes_loop() {
                             ui.checkbox(&mut ws.zm_edge_loop, "EdgeLoop").on_hover_text("The whole loop, not just the edge");
                         }
                         ui.label(RichText::new("Point").size(12.0).color(FG2()));
                         let names: Vec<&str> = PointAction::ALL.iter().map(|x| x.name()).collect();
                         let at = PointAction::ALL.iter().position(|x| *x == ws.zm_point).unwrap_or(0);
-                        if let Some(i) = seg(ui, &names, at, false) {
+                        if let Some(i) = rows(ui, &names, at) {
                             ws.zm_point = PointAction::ALL[i];
                         }
-                        note(ui, "Hover a polygon, edge or point and press Space for its actions · QMesh and Extrude: drag out · Inset and Bevel: drag in · Insert: click where the loop goes, drag to slide it · Bridge: click one, then the other · points: drag to move, or Bevel to cut the corner off");
+                        note(ui, "Hover a polygon, edge or point and press Space for its actions · the hint under the menu says whether to click or drag · Bridge and Stitch: click one, then the other · EdgeLoop widens Delete, Bevel, Crease, Slide, Move and Mask to the loop · Crease and Mask click again to undo");
                     });
                 }
                 if m.brush.kind.is_imm() {
