@@ -627,6 +627,18 @@ the decimated mesh alone, and **undo** brings the levels back. If the subtool is
 switched while it runs, the result is dropped. The result is triangles: ZRemesher it if you
 need quads.
 
+### Transpose Master
+
+SubTool › **Transpose Master** (ZBrush: ZPlugin › Transpose Master) poses several subtools
+at once. **TPoseMesh** merges the lowest levels of the visible subtools into one new subtool,
+one polygroup per source, and hides the sources. Pose it: Transpose or the Gizmo with
+masks (Ctrl + Shift on a polygroup, or Mask By Polygroups, picks a part), the Move brushes,
+symmetry. **TPose → SubT** hands the pose back to every subtool's lowest level, with its
+subdivision detail riding along, deletes the TPoseMesh and shows the sources again; each
+subtool gets an undo step of its own. Do not change the TPoseMesh's polygons (Divide,
+ZRemesher, Sculptris): it is then refused, and deleting it frees the sources. Switching
+through big subtools takes a second or two each.
+
 ### ProjectAll
 
 SubTool › Project › **ProjectAll** moves the active subtool onto the other visible subtools,

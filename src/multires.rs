@@ -951,6 +951,17 @@ struct PackedLevel {
 }
 
 impl Packed {
+    /// A copy of the base level's mesh (positions and triangles only), without
+    /// rebuilding the stack: what Transpose Master merges.
+    pub fn base_copy(&self) -> SculptMesh {
+        SculptMesh::from_chunked(self.positions.clone(), self.indices.clone(), &self.ranges)
+    }
+
+    /// Whether the subtool is a ZSphere armature (its mesh is a preview skin).
+    pub fn has_zspheres(&self) -> bool {
+        self.zspheres.is_some()
+    }
+
     pub fn write_colors<W:std::io::Write>(&self,out:&mut crate::project::Out<W>)->std::io::Result<()> {
         out.u32(self.counts.len() as u32)?;
         for l in 0..self.counts.len() {out.slice(self.colors.get(l).map_or(&[][..],|c|c.as_slice()))?;}

@@ -355,6 +355,18 @@ fn bake_kind_of(ask: file_dialog::Ask) -> bake::Kind {
     }
 }
 
+/// Transpose Master (ZBrush: ZPlugin › Transpose Master): the visible subtools' lowest
+/// levels merged into one TPoseMesh to pose, and where each of its vertices came from, so
+/// the pose can be handed back.
+struct TPose {
+    /// The TPoseMesh subtool.
+    proxy: u64,
+    /// Per vertex of the TPoseMesh's mesh: the source subtool and its base-level vertex.
+    origin: Vec<(u64, u32)>,
+    /// The sources: id, whether it was visible, and its base-level vertex count.
+    sources: Vec<(u64, bool, usize)>,
+}
+
 /// A texture-map bake running on its own thread (Geometry › Texture Maps); it works on a
 /// copy, so the model may change meanwhile.
 struct BakeJob {
@@ -868,6 +880,8 @@ struct App {
     /// Wait for every geometry job as soon as it starts (self-tests, snapshots, start-up
     /// flags), so the steps after it see its result.
     jobs_wait: bool,
+    /// Transpose Master's TPoseMesh while one exists.
+    tpose: Option<TPose>,
     /// Texture-map bake running in the background, and where the last map was saved.
     bake_job: Option<BakeJob>,
     map_path: String,
@@ -1080,6 +1094,7 @@ impl App {
             pending_geo: None,
             geo: None,
             jobs_wait: false,
+            tpose: None,
             bake_job: None,
             map_path: String::new(),
             bake_on_start: Vec::new(),
@@ -2397,6 +2412,9 @@ impl App {
         self.history = History::new(32);
         let next = self.active_tool.min(self.subtools.len() - 1);
         self.activate(next);
+        if self.tpose.as_ref().is_some_and(|t| t.proxy == removed.id) {
+            self.tpose_forget();
+        }
         self.workspace.notify(format!("Deleted {}", removed.name));
     }
 
@@ -3973,6 +3991,176 @@ impl App {
     }
 
     /// A parked subtool holding `doc`, its stand-in uploaded.
+    /// SubTool › Transpose Master › TPoseMesh: the lowest levels of the visible subtools
+    /// merged into one new subtool to pose (one polygroup per source), the sources hidden
+    /// meanwhile.
+    fn tpose_mesh(&mut self) {
+        if self.busy() || self.job_blocks("TPoseMesh") {
+            return;
+        }
+        if self.tpose.is_some() {
+            self.workspace.notify("TPoseMesh: there is one already · TPose → SubT, or delete it");
+            return;
+        }
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut groups: Vec<u16> = Vec::new();
+        let mut origin: Vec<(u64, u32)> = Vec::new();
+        let mut sources: Vec<(u64, bool, usize)> = Vec::new();
+        for i in 0..self.subtools.len() {
+            let t = &self.subtools[i];
+            let base: Option<(Vec<Vec3>, Vec<u32>)> = if i == self.active_tool {
+                (self.doc.zspheres.is_none()).then(|| {
+                    let b = self.doc.base_mesh();
+                    (b.positions.clone(), b.indices.clone())
+                })
+            } else {
+                t.parked.as_ref().filter(|p| t.visible && !p.packed.has_zspheres()).map(|p| {
+                    let b = p.packed.base_copy();
+                    (b.positions, b.indices)
+                })
+            };
+            let Some((p, idx)) = base else { continue };
+            let shift = positions.len() as u32;
+            let n = p.len();
+            positions.extend(p);
+            indices.extend(idx.iter().map(|x| x + shift));
+            groups.extend(std::iter::repeat_n(sources.len() as u16, idx.len() / 3));
+            origin.extend((0..n as u32).map(|v| (t.id, v)));
+            sources.push((t.id, t.visible, n));
+        }
+        if sources.is_empty() {
+            self.workspace.notify("TPoseMesh: no visible subtool with a mesh");
+            return;
+        }
+        let t = Instant::now();
+        let (mesh, remap, _) = SculptMesh::from_raw_tracked(positions, indices, groups, Vec::new(), Vec::new());
+        let mut by_vertex = vec![(0u64, 0u32); origin.len()];
+        for (old, &new) in remap.iter().enumerate() {
+            by_vertex[new as usize] = origin[old];
+        }
+        let budget = self.doc.budget;
+        self.park_active();
+        for tool in &mut self.subtools {
+            if sources.iter().any(|s| s.0 == tool.id) {
+                tool.visible = false;
+            }
+        }
+        self.doc = Multires::new(mesh, budget);
+        self.history = History::new(32);
+        let id = self.new_tool_id();
+        self.subtools.push(SubTool {
+            guides: Default::default(),
+            dynamic: None,
+            boolean: Default::default(),
+            id,
+            name: "TPoseMesh".into(),
+            visible: true,
+            bounds: self.doc.bounds(),
+            wedge: false,
+            parked: None,
+        });
+        self.active_tool = self.subtools.len() - 1;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.clear_levels();
+        }
+        self.show_active_level();
+        self.tpose = Some(TPose { proxy: id, origin: by_vertex, sources });
+        self.status = format!(
+            "TPoseMesh: {} vertices from {} subtools in {:.0} ms · pose it, then TPose → SubT",
+            fmt_count(self.mesh().vertex_count()),
+            self.tpose.as_ref().map_or(0, |t| t.sources.len()),
+            t.elapsed().as_secs_f32() * 1000.0
+        );
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// The TPoseMesh is gone: the sources show again.
+    fn tpose_forget(&mut self) {
+        let Some(tp) = self.tpose.take() else { return };
+        for (id, visible, _) in tp.sources {
+            if let Some(t) = self.subtools.iter_mut().find(|t| t.id == id) {
+                t.visible = visible || t.parked.is_none();
+            }
+        }
+    }
+
+    /// SubTool › Transpose Master › TPose → SubT: every source subtool's lowest level takes
+    /// the TPoseMesh's vertices that came from it (its detail above rides along, as a
+    /// level-0 stroke with an undo step of its own), then the TPoseMesh goes and the
+    /// sources show again. Refused when the TPoseMesh's polygons changed.
+    fn tpose_to_subtools(&mut self) {
+        if self.busy() || self.job_blocks("TPose → SubT") {
+            return;
+        }
+        let Some(tp) = self.tpose.take() else {
+            self.workspace.notify("TPose → SubT: make a TPoseMesh first");
+            return;
+        };
+        let Some(pi) = self.subtools.iter().position(|t| t.id == tp.proxy) else {
+            self.tpose = Some(tp);
+            self.tpose_forget();
+            self.workspace.notify("TPose → SubT: the TPoseMesh is gone");
+            return;
+        };
+        if pi != self.active_tool {
+            self.park_active();
+            self.activate(pi);
+        }
+        let base = self.doc.base_mesh();
+        if self.doc.count() != 1 || base.vertex_count() != tp.origin.len() {
+            self.tpose = Some(tp);
+            self.workspace.notify("TPose → SubT: the TPoseMesh's polygons changed · pose it with Transpose, the Gizmo and the Move brushes only");
+            return;
+        }
+        let t = Instant::now();
+        let mut moved: std::collections::HashMap<u64, Vec<Vec3>> = tp.sources.iter().map(|&(id, _, n)| (id, vec![Vec3::NAN; n])).collect();
+        for (v, &(id, bv)) in tp.origin.iter().enumerate() {
+            moved.get_mut(&id).unwrap()[bv as usize] = base.positions[v];
+        }
+        let mut done = 0;
+        for &(id, _, _) in &tp.sources {
+            let Some(i) = self.subtools.iter().position(|t| t.id == id) else { continue };
+            let new = &moved[&id];
+            if i != self.active_tool {
+                self.park_active();
+                self.activate(i);
+            }
+            let shown = self.doc.active();
+            self.doc.set_active(0);
+            if self.doc.mesh().vertex_count() != new.len() {
+                self.doc.set_active(shown);
+                log::warn!("TPose → SubT: {} changed its lowest level, skipped", self.subtools[i].name);
+                continue;
+            }
+            self.reshape_shown("TPose → SubT", new);
+            self.doc.set_active(shown);
+            if let Some(gfx) = self.gfx.as_mut() {
+                gfx.clear_levels();
+            }
+            self.show_active_level();
+            self.subtools[i].bounds = self.doc.bounds();
+            done += 1;
+        }
+        // The TPoseMesh goes (it is parked now, unless no source took the pose).
+        if self.active_tool == pi {
+            self.tpose = Some(tp);
+            self.delete_subtool();
+        } else {
+            let removed = self.subtools.remove(pi);
+            if let Some(gfx) = self.gfx.as_mut() {
+                gfx.drop_stand_in(removed.id);
+            }
+            if self.active_tool > pi {
+                self.active_tool -= 1;
+            }
+            self.tpose = Some(tp);
+            self.tpose_forget();
+        }
+        self.status = format!("TPose → SubT: {done} subtools posed in {:.0} ms", t.elapsed().as_secs_f32() * 1000.0);
+        self.workspace.notify(self.status.clone());
+    }
+
     fn parked_subtool(&mut self, name: String, visible: bool, doc: Multires) -> SubTool {
         self.parked_subtool_with(name, visible, doc, None)
     }
@@ -9895,6 +10083,12 @@ impl App {
         if actions.zremesh {
             self.workspace.zremesh.alternate = actions.zremesh_alt;
         }
+        if actions.tpose_mesh {
+            self.tpose_mesh();
+        }
+        if actions.tpose_subt {
+            self.tpose_to_subtools();
+        }
         for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.panel_loops, GeoOp::PanelLoops), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
             if on {
                 self.pending_geo = Some(op);
@@ -12326,6 +12520,67 @@ mod subtool_tests {
         assert!(app.status.contains("Midlevel 0"), "{}", app.status);
         assert!(dir.join("d.exr").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transpose_master_poses_every_subtool_through_one_mesh_and_keeps_their_detail() {
+        let mut app = App::new(12, false, usize::MAX);
+        app.primitive.kind = Primitive::Cube;
+        app.append_primitive();
+        assert_eq!(app.active_tool, 1);
+        // The cube gets a level with a bump on it, so its detail must ride along.
+        assert!(app.doc.divide());
+        let n1 = app.doc.mesh().vertex_count();
+        let bumped = app.doc.mesh().positions.iter().map(|p| if p.y > 0.0 { *p + Vec3::Y * 0.05 } else { *p }).collect::<Vec<_>>();
+        app.reshape_shown("bump", &bumped);
+        let cube_before = app.doc.bounds();
+        let sphere_before = app.subtools[0].bounds;
+        let sphere_vertices = app.subtools[0].parked.as_ref().unwrap().packed.counts()[0];
+        // TPoseMesh: one subtool of both lowest levels, the sources hidden.
+        app.tpose_mesh();
+        assert_eq!(app.subtools.len(), 3);
+        assert_eq!(app.subtools[2].name, "TPoseMesh");
+        assert_eq!(app.active_tool, 2);
+        let cube_base = app.subtools[1].parked.as_ref().unwrap().packed.counts()[0];
+        assert_eq!(app.doc.mesh().vertex_count(), sphere_vertices + cube_base);
+        assert!(!app.subtools[0].visible && !app.subtools[1].visible);
+        assert_eq!(app.doc.mesh().groups.iter().copied().max(), Some(1), "one polygroup per source");
+        // Pose it: everything up by half a unit.
+        app.apply_transform(Affine::translation(Vec3::Y * 0.5));
+        // TPose → SubT: the pose lands on both, the TPoseMesh goes, the sources show.
+        app.tpose_to_subtools();
+        assert_eq!(app.subtools.len(), 2, "{}", app.status);
+        assert!(app.tpose.is_none() && app.subtools.iter().all(|t| t.visible));
+        assert!(app.status.starts_with("TPose → SubT: 2 subtools"), "{}", app.status);
+        let cube = app.subtools.iter().position(|t| t.name.starts_with("Cube")).unwrap();
+        let sphere = 1 - cube;
+        let cb = app.subtools[cube].bounds;
+        let sb = app.subtools[sphere].bounds;
+        assert!((cb.min.y - cube_before.min.y - 0.5).abs() < 1e-3 && (cb.max.y - cube_before.max.y - 0.5).abs() < 1e-3, "{cb:?} vs {cube_before:?}");
+        assert!((sb.min.y - sphere_before.min.y - 0.5).abs() < 1e-3, "{sb:?} vs {sphere_before:?}");
+        // The cube is the active one (posed last), still two levels, the bump on top.
+        if app.active_tool != cube {
+            app.select_subtool(cube);
+        }
+        assert_eq!(app.doc.count(), 2);
+        assert_eq!(app.doc.mesh().vertex_count(), n1);
+        let top: Vec<Vec3> = app.doc.mesh().positions.clone();
+        for (p, q) in top.iter().zip(&bumped) {
+            assert!((*p - *q - Vec3::Y * 0.5).length() < 1e-4, "{p:?} vs {q:?}");
+        }
+        // Its own undo step takes the pose off again.
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("TPose → SubT"));
+        app.history_jump(-1);
+        for (p, q) in app.doc.mesh().positions.iter().zip(&bumped) {
+            assert!((*p - *q).length() < 1e-4);
+        }
+        // A changed TPoseMesh is refused, and deleting it frees the sources.
+        app.tpose_mesh();
+        assert!(app.doc.divide());
+        app.tpose_to_subtools();
+        assert!(app.tpose.is_some() && app.subtools.len() == 3, "{}", app.status);
+        app.delete_subtool();
+        assert!(app.tpose.is_none() && app.subtools.len() == 2 && app.subtools.iter().all(|t| t.visible));
     }
 
     #[test]

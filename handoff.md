@@ -754,3 +754,11 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - `selftest_zmodeler_phase`: the three "GPU copy matches" checks moved to the start of the next phase (the release leaves dirty chunks for the frame's `upload_dirty`; checking in the same call read the GPU a frame early). `RUST_LOG=info env -u WAYLAND_DISPLAY target/release/klay --selftest-zmodeler`: all passed.
 - Guide: the ZModeler section lists the actions and the live-drag paragraph; "Not yet" is Mask with a target, Insert Polyloops, Insert NanoMesh, Do Nothing.
 - Version 0.40.0.
+
+## Step 88: Transpose Master; the status bar's frame time pinned (2026-11-03, Claude Code)
+- User: the fps digits made the status text jump; and "build the next parity closing part". Picked Transpose Master from the parity review (Catmull-Clark on quads still needs the user's decision, see Step 84's review in the session).
+- Status bar (`workspace.rs`): the frame-time text is painted right-aligned into a fixed 118-px box instead of a label, so the hint beside it keeps its place.
+- `main.rs`: `TPose { proxy, origin, sources }` in `App::tpose`. `tpose_mesh` reads each visible subtool's lowest level (the active one's `base_mesh`, a parked one's new `Packed::base_copy`, ZSphere subtools skipped), merges them with `from_raw_tracked` (the remap gives `origin` per proxy vertex), parks the active subtool, hides the sources and pushes the TPoseMesh as the active subtool. `tpose_to_subtools` activates the TPoseMesh, refuses it when its level count or vertex count changed, gathers each source's new base positions, then per source: park/activate, `set_active(0)`, `reshape_shown("TPose → SubT")` (a level-0 stroke with an undo step), `set_active(shown)` (the upper levels resync from their offsets), GPU levels cleared and shown again; then removes the TPoseMesh and restores visibility (`tpose_forget`, also run when the user deletes the TPoseMesh). Each source switch packs and unpacks a subtool, so a transfer over big subtools takes a second or two per subtool; it is not undoable as a whole (each subtool has its own step), like Merge Down.
+- Not done: ZBrush's Transpose Master options (Layer, ZSphere rig, TPose with symmetry across subtools), posing with a lower proxy resolution than level 0.
+- Version 0.41.0.
+

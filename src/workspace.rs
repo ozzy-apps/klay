@@ -873,6 +873,9 @@ pub struct Actions {
     pub extract: bool,
     /// SubTool › Project › ProjectAll.
     pub project_all: bool,
+    /// SubTool › Transpose Master › TPoseMesh and TPose → SubT.
+    pub tpose_mesh: bool,
+    pub tpose_subt: bool,
     pub delete: bool,
     /// Move the active subtool up (-1) or down (+1) in the list.
     pub move_subtool: i32,
@@ -2351,10 +2354,15 @@ impl Workspace {
                         ui.label(RichText::new(text).font(font(12.5, Weight::Regular)).color(FG2()));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{:.1} ms · {:.0} fps", m.frame_ms, m.fps))
-                                .font(font(12.5, Weight::Regular))
-                                .color(FG2()),
+                        // A fixed box, the text right-aligned in it, so the digits' changing
+                        // widths move nothing else along the bar.
+                        let (r, _) = ui.allocate_exact_size(vec2(118.0, ui.available_height()), Sense::hover());
+                        ui.painter().text(
+                            r.right_center(),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{:.1} ms · {:.0} fps", m.frame_ms, m.fps),
+                            font(12.5, Weight::Regular),
+                            FG2(),
                         );
                         ui.add(
                             egui::Label::new(
@@ -3829,6 +3837,29 @@ impl Workspace {
                         note(ui, "Alt + click a subtool to select it");
                     },
                 );
+                self.sec(ui, h, id, "tpose", "Transpose Master", None, false, true, &mut |_, ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                    let w = (r.width() - 4.0) * 0.5;
+                    for (k, (label, hint, cmd)) in [
+                        ("TPoseMesh", "Merge the lowest levels of the visible subtools into one TPoseMesh to pose; the subtools hide meanwhile", "cmd:tpose-mesh"),
+                        ("TPose → SubT", "Hand the TPoseMesh's pose back to every subtool, keeping their detail, and take it away · each subtool gets an undo step", "cmd:tpose-subt"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let cell = Rect::from_min_size(r.min + vec2(k as f32 * (w + 4.0), 0.0), vec2(w, 20.0));
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
+                        child.spacing_mut().button_padding = vec2(2.0, 1.0);
+                        if child.put(cell, egui::Button::new(RichText::new(label).size(12.0)).truncate()).on_hover_text(hint).shelf(&child, cmd).clicked() {
+                            if k == 0 {
+                                a.tpose_mesh = true;
+                            } else {
+                                a.tpose_subt = true;
+                            }
+                        }
+                    }
+                    note(ui, "Pose the TPoseMesh with Transpose, the Gizmo, masks and the Move brushes · do not change its polygons");
+                });
                 self.sec(ui, h, id, "project", "Project", None, false, true, &mut |ws, ui| {
                     let r = ui
                         .add_sized([ui.available_width(), 20.0], egui::Button::new("ProjectAll"))
