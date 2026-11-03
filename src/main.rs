@@ -3112,6 +3112,10 @@ impl App {
         if let Some(f) = first {
             outline(f);
         }
+        // Stitch's first point stays lit.
+        if let Some(v) = self.zm_bridge.as_ref().filter(|v| v.len() == 1).map(|v| v[0]).filter(|&v| (v as usize) < pm.pos.len()) {
+            painter.circle_stroke(to_pos(pm.pos[v as usize]), 6.0, stroke);
+        }
         match hover {
             zmodeler::Hover::Poly(f) => {
                 let at = self.canvas_cursor();
@@ -3139,14 +3143,20 @@ impl App {
                             painter.line_segment([to_pos((p(0) + p(1)) * 0.5), to_pos((p(2) + p(3)) * 0.5)], stroke);
                         }
                     }
-                    zmodeler::EdgeAction::Spin | zmodeler::EdgeAction::Bridge => {}
-                    zmodeler::EdgeAction::Delete | zmodeler::EdgeAction::Bevel => {
+                    zmodeler::EdgeAction::CloseHole => {
+                        // The hole to be filled.
+                        for (x, y) in pm.hole(a, b).unwrap_or_default() {
+                            painter.line_segment([to_pos(pm.pos[x as usize]), to_pos(pm.pos[y as usize])], wide);
+                        }
+                    }
+                    e if e.takes_loop() => {
                         let whole = self.workspace.zm_edge_loop;
                         let edges = if whole { pm.edge_loop(a, b) } else { vec![(a, b)] };
                         for (x, y) in edges {
                             painter.line_segment([to_pos(pm.pos[x as usize]), to_pos(pm.pos[y as usize])], wide);
                         }
                     }
+                    _ => {}
                 }
                 painter.line_segment([to_pos(pm.pos[a as usize]), to_pos(pm.pos[b as usize])], wide);
             }
@@ -7314,7 +7324,7 @@ impl App {
                 let normal = faces.iter().map(|&g| base.normal(g)).sum::<Vec3>().normalize_or(Vec3::Z);
                 (faces, base.centre(f), normal, format!("ZModeler {} {}", ws.0.name(), ws.1.name()))
             }
-            zmodeler::Hover::Edge(a, b) => (Vec::new(), (base.pos[a as usize] + base.pos[b as usize]) * 0.5, Vec3::Z, format!("ZModeler {} Edge{}", ws.2.name(), if ws.2 == zmodeler::EdgeAction::Delete && ws.3 { "Loop" } else { "" })),
+            zmodeler::Hover::Edge(a, b) => (Vec::new(), (base.pos[a as usize] + base.pos[b as usize]) * 0.5, Vec3::Z, format!("ZModeler {} Edge{}", ws.2.name(), if ws.2.takes_loop() && ws.3 { "Loop" } else { "" })),
             zmodeler::Hover::Point(v) => (Vec::new(), base.pos[v as usize], Vec3::Z, format!("ZModeler {} Point", ws.4.name())),
         };
         self.zm_drag = Some(ZDrag { hover, base, press: self.cursor, before, faces, anchor, normal, label, changed: false });
@@ -7342,7 +7352,8 @@ impl App {
 
     /// The action at the drag's current amount.
     fn zmodel_result(&self, d: &ZDrag) -> Option<zmodeler::PolyMesh> {
-        use zmodeler::{EdgeAction, Hover, PolyAction};
+        use std::collections::HashSet;
+        use zmodeler::{EdgeAction, Hover, PointAction, PolyAction};
         let view = self.view();
         let delta = self.cursor - d.press;
         let ws = &self.workspace;
@@ -7412,6 +7423,54 @@ impl App {
                         }
                         b.chamfer_edges(&b.border_edges(&faces), (delta.length() / 300.0).clamp(0.02, 0.45))
                     }
+                    PolyAction::Move => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
+                        let points = b.points_of(&d.faces);
+                        let mut done: HashSet<u32> = points.iter().copied().collect();
+                        let mut out = b.moved(&points, m.translate);
+                        for k in 1..images.len() {
+                            let copy: Vec<u32> = points.iter().filter_map(|&v| mirror(k, v)).filter(|&w| done.insert(w)).collect();
+                            out = out.moved(&copy, images.map(k, m.translate));
+                        }
+                        out
+                    }
+                    PolyAction::Scale => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        let factor = (1.0 + delta.x / 150.0).max(0.05);
+                        let points = b.points_of(&d.faces);
+                        let c = points.iter().map(|&v| b.pos[v as usize]).sum::<Vec3>() / points.len().max(1) as f32;
+                        let mut done: HashSet<u32> = points.iter().copied().collect();
+                        let mut out = b.scaled(&points, c, factor);
+                        for k in 1..images.len() {
+                            let copy: Vec<u32> = points.iter().filter_map(|&v| mirror(k, v)).filter(|&w| done.insert(w)).collect();
+                            out = out.scaled(&copy, images.map(k, c), factor);
+                        }
+                        out
+                    }
+                    PolyAction::Inflate => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        let px = self.camera.pixel_size_at(d.anchor, self.viewport().y);
+                        b.inflated(&b.points_of(&faces), -delta.y * px)
+                    }
+                    PolyAction::Split => b.split(&faces),
+                    PolyAction::Flip => b.flipped(&faces),
+                    PolyAction::Crease => {
+                        let e = b.edges_of(&faces);
+                        let on = !b.all_creased(&e);
+                        b.creased(&e, on)
+                    }
+                    PolyAction::Mask => {
+                        let p = b.points_of(&faces);
+                        let on = !b.all_masked(&p);
+                        b.masked(&p, on)
+                    }
                     PolyAction::Delete => b.delete(&faces),
                     PolyAction::Polygroup => b.regroup(&faces),
                     PolyAction::Bridge => {
@@ -7434,7 +7493,93 @@ impl App {
             }
             Hover::Edge(a0, b0) => {
                 let edges: Vec<((u32, u32), bool)> = copies(&[a0, b0]).into_iter().map(|(v, m)| ((v[0], v[1]), m)).collect();
+                // The same, each with the symmetry image it is (for moves, which mirror).
+                let ek = |e: (u32, u32)| (e.0.min(e.1), e.0.max(e.1));
+                let mut edges_k: Vec<((u32, u32), usize)> = vec![((a0, b0), 0)];
+                for k in 1..images.len() {
+                    if let (Some(x), Some(y)) = (mirror(k, a0), mirror(k, b0)) {
+                        if !edges_k.iter().any(|(e, _)| ek(*e) == ek((x, y))) {
+                            edges_k.push(((x, y), k));
+                        }
+                    }
+                }
+                // The edge, or its loop with EdgeLoop.
+                let widen = |x: u32, y: u32| if ws.zm_edge_loop { b.edge_loop(x, y) } else { vec![(x, y)] };
                 match ws.zm_edge {
+                    EdgeAction::Crease => {
+                        let mut all = Vec::new();
+                        for ((x, y), _) in edges {
+                            all.extend(widen(x, y));
+                        }
+                        let on = !b.all_creased(&all);
+                        b.creased(&all, on)
+                    }
+                    EdgeAction::Mask => {
+                        let mut pts: Vec<u32> = edges.iter().flat_map(|&((x, y), _)| widen(x, y)).flat_map(|(p, q)| [p, q]).collect();
+                        pts.sort_unstable();
+                        pts.dedup();
+                        let on = !b.all_masked(&pts);
+                        b.masked(&pts, on)
+                    }
+                    EdgeAction::Collapse => {
+                        let mut out = b.clone();
+                        for ((x, y), _) in edges {
+                            out = out.collapse(x, y);
+                        }
+                        out
+                    }
+                    EdgeAction::CloseHole => {
+                        let mut out = b.clone();
+                        for ((x, y), _) in edges {
+                            if let Some(o) = out.close_hole(x, y) {
+                                out = o;
+                            }
+                        }
+                        out
+                    }
+                    EdgeAction::Slide => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        // Across the loop: the drag measured along the rail on the left
+                        // of a → b on screen (the right one where there is no left).
+                        let [(left, right), _] = b.rails(a0, b0);
+                        let rail = left.or(right)?;
+                        let dir = view.project(b.pos[rail as usize]) - view.project(b.pos[a0 as usize]);
+                        let mut t = (delta.dot(dir) / dir.length_squared().max(1e-6)).clamp(-0.95, 0.95);
+                        if left.is_none() {
+                            t = -t;
+                        }
+                        let mut out = b.clone();
+                        for ((x, y), mirrored) in edges {
+                            out = out.slide_loop(&widen(x, y), if mirrored { -t } else { t });
+                        }
+                        out
+                    }
+                    EdgeAction::Extrude => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
+                        let mut out = b.clone();
+                        for ((x, y), k) in edges_k {
+                            out = out.extrude_edges(&[(x, y)], images.map(k, m.translate));
+                        }
+                        out
+                    }
+                    EdgeAction::Move => {
+                        if delta.length() < 1.0 {
+                            return None;
+                        }
+                        let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
+                        let mut done: HashSet<u32> = HashSet::new();
+                        let mut out = b.clone();
+                        for ((x, y), k) in edges_k {
+                            let pts: Vec<u32> = widen(x, y).into_iter().flat_map(|(p, q)| [p, q]).filter(|&v| done.insert(v)).collect();
+                            out = out.moved(&pts, images.map(k, m.translate));
+                        }
+                        out
+                    }
                     EdgeAction::Insert => {
                         let (pa, pb) = (view.project(b.pos[a0 as usize]), view.project(b.pos[b0 as usize]));
                         let at = self.canvas_cursor();
@@ -7499,29 +7644,80 @@ impl App {
                 }
             }
             Hover::Point(v) => {
-                if delta.length() < 1.0 {
-                    return None;
+                // The point and its symmetry images, each with the image it is.
+                let mut mirrors: Vec<(u32, usize)> = vec![(v, 0)];
+                for k in 1..images.len() {
+                    if let Some(w) = mirror(k, v) {
+                        if !mirrors.iter().any(|m| m.0 == w) {
+                            mirrors.push((w, k));
+                        }
+                    }
                 }
+                let drag = delta.length() >= 1.0;
                 let mut out = b.clone();
                 match ws.zm_point {
-                    zmodeler::PointAction::Move => {
+                    PointAction::Move => {
+                        if !drag {
+                            return None;
+                        }
                         let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
-                        out = out.moved(&[v], m.translate);
-                        for k in 1..images.len() {
-                            if let Some(w) = mirror(k, v) {
-                                if w != v {
-                                    out = out.moved(&[w], images.map(k, m.translate));
-                                }
+                        for &(w, k) in &mirrors {
+                            out = out.moved(&[w], images.map(k, m.translate));
+                        }
+                    }
+                    PointAction::Bevel => {
+                        if !drag {
+                            return None;
+                        }
+                        let t = (delta.length() / 300.0).clamp(0.02, 0.45);
+                        for &(w, _) in &mirrors {
+                            out = out.chamfer_point(w, t);
+                        }
+                    }
+                    PointAction::Slide => {
+                        if !drag {
+                            return None;
+                        }
+                        // Along the edge that runs the way of the drag on screen.
+                        let at = view.project(b.pos[v as usize]);
+                        let way = delta.normalize_or_zero();
+                        let (to, dir) = b
+                            .neighbours(v)
+                            .into_iter()
+                            .map(|n| (n, view.project(b.pos[n as usize]) - at))
+                            .max_by(|x, y| x.1.normalize_or_zero().dot(way).total_cmp(&y.1.normalize_or_zero().dot(way)))?;
+                        let t = (delta.dot(dir) / dir.length_squared().max(1e-6)).clamp(0.0, 0.95);
+                        for &(w, k) in &mirrors {
+                            if let Some(tw) = mirror(k, to) {
+                                out = out.slid_point(w, tw, t);
                             }
                         }
                     }
-                    zmodeler::PointAction::Bevel => {
-                        let t = (delta.length() / 300.0).clamp(0.02, 0.45);
-                        let mut points = vec![v];
-                        points.extend((1..images.len()).filter_map(|k| mirror(k, v)).filter(|&w| w != v));
-                        points.dedup();
-                        for w in points {
-                            out = out.chamfer_point(w, t);
+                    PointAction::Crease => {
+                        let e: Vec<(u32, u32)> = mirrors.iter().flat_map(|&(w, _)| b.neighbours(w).into_iter().map(move |n| (w, n))).collect();
+                        let on = !b.all_creased(&e);
+                        out = b.creased(&e, on);
+                    }
+                    PointAction::Mask => {
+                        let pts: Vec<u32> = mirrors.iter().map(|m| m.0).collect();
+                        let on = !b.all_masked(&pts);
+                        out = b.masked(&pts, on);
+                    }
+                    PointAction::Delete => {
+                        for &(w, _) in &mirrors {
+                            out = out.dissolve_point(w);
+                        }
+                    }
+                    PointAction::Stitch => {
+                        // The second click: the point picked first takes this one.
+                        let first = self.zm_bridge.as_ref().filter(|f| f.len() == 1)?[0];
+                        if first == v {
+                            return None;
+                        }
+                        for &(w, k) in &mirrors {
+                            if let Some(fw) = mirror(k, first) {
+                                out = out.welded(fw, w, b.pos[fw as usize]);
+                            }
                         }
                     }
                 }
@@ -7532,11 +7728,11 @@ impl App {
 
     /// Whether the ZModeler action on `hover` happens on release, without a drag.
     fn zmodel_click(&self, hover: zmodeler::Hover) -> bool {
-        use zmodeler::{EdgeAction, Hover, PolyAction};
+        use zmodeler::Hover;
         match hover {
-            Hover::Poly(_) => matches!(self.workspace.zm_poly, PolyAction::Delete | PolyAction::Polygroup | PolyAction::Bridge),
-            Hover::Edge(..) => matches!(self.workspace.zm_edge, EdgeAction::Delete | EdgeAction::Spin | EdgeAction::Bridge),
-            Hover::Point(_) => false,
+            Hover::Poly(_) => self.workspace.zm_poly.is_click(),
+            Hover::Edge(..) => self.workspace.zm_edge.is_click(),
+            Hover::Point(_) => self.workspace.zm_point.is_click(),
         }
     }
 
@@ -7565,6 +7761,12 @@ impl App {
         if let (zmodeler::Hover::Edge(a, b), zmodeler::EdgeAction::Bridge, None) = (d.hover, self.workspace.zm_edge, &self.zm_bridge) {
             self.zm_bridge = Some(vec![a, b]);
             self.workspace.notify("Bridge: click the open edge to join it to".to_string());
+            return;
+        }
+        // Stitch: the first click picks a point, the second welds onto it.
+        if let (zmodeler::Hover::Point(v), zmodeler::PointAction::Stitch, None) = (d.hover, self.workspace.zm_point, &self.zm_bridge) {
+            self.zm_bridge = Some(vec![v]);
+            self.workspace.notify("Stitch: click the point to weld it to".to_string());
             return;
         }
         let click = self.zmodel_click(d.hover);
@@ -10799,6 +11001,87 @@ mod subtool_tests {
         drag(&mut app, p2, p2);
         assert!(app.zm_bridge.is_none());
         assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), 24 - 2 + 4);
+    }
+
+    #[test]
+    fn zmodeler_masks_creases_stitches_and_slides_through_the_input_path() {
+        let mut app = App::new(4, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let (p, i) = Primitive::Cube.build(2, 1.0);
+        app.replace_active_mesh(SculptMesh::from_raw(p, i));
+        app.workspace.select_brush(&mut app.brush, BrushKind::ZModeler);
+        let drag = |app: &mut App, from: Vec2, to: Vec2| {
+            app.cursor_moved(from, false);
+            app.left_press(false, false);
+            for k in 1..=5 {
+                app.cursor_moved(from + (to - from) * (k as f32 / 5.0), false);
+            }
+            app.left_release();
+        };
+        let masked = |app: &App| app.doc.mesh().mask.iter().filter(|&&m| m == 255).count();
+        // Mask the front quad at (0.5, 0.5, 1): its four points.
+        app.workspace.zm_poly = zmodeler::PolyAction::Mask;
+        let c = app.project(Vec3::new(0.5, 0.5, 1.0));
+        app.cursor_moved(c, false);
+        drag(&mut app, c, c);
+        assert_eq!(masked(&app), 4);
+        assert_eq!(app.history.names().0.last().map(String::as_str), Some("ZModeler Mask A Single Poly"));
+        // Crease the edge from (0, 0, 1) to (1, 0, 1); the mask stays.
+        app.workspace.zm_edge = zmodeler::EdgeAction::Crease;
+        app.workspace.zm_edge_loop = false;
+        let e = app.project(Vec3::new(0.5, 0.0, 1.0));
+        app.cursor_moved(e, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Edge(..))), "{:?}", app.zm_hover);
+        drag(&mut app, e, e);
+        assert_eq!(app.doc.mesh().crease_edges().len(), 1);
+        assert_eq!(masked(&app), 4, "the mask survives the crease");
+        // Clicking again uncreases; undo brings the crease back.
+        drag(&mut app, e, e);
+        assert!(app.doc.mesh().crease_edges().is_empty());
+        app.history_jump(-1);
+        assert_eq!(app.doc.mesh().crease_edges().len(), 1);
+        // Stitch the corner (1, 1, 1) onto (0, 1, 1): a point fewer, the crease kept.
+        app.workspace.zm_point = zmodeler::PointAction::Stitch;
+        let (p1, p2) = (app.project(Vec3::new(0.0, 1.0, 1.0)), app.project(Vec3::new(1.0, 1.0, 1.0)));
+        app.cursor_moved(p1, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Point(_))), "{:?}", app.zm_hover);
+        drag(&mut app, p1, p1);
+        assert!(app.zm_bridge.as_ref().is_some_and(|v| v.len() == 1), "the first point is picked");
+        app.cursor_moved(p2, false);
+        drag(&mut app, p2, p2);
+        assert!(app.zm_bridge.is_none());
+        assert_eq!(app.doc.mesh().vertex_count(), 25);
+        assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.iter().filter(|f| f.len() == 3).count(), 2, "the two quads on the welded edge are triangles");
+        assert_eq!(app.doc.mesh().crease_edges().len(), 1);
+        assert!(app.history.names().0.last().unwrap().starts_with("ZModeler Stitch"));
+        // Slide the point (0, 0, 1) halfway along its edge towards (1, 0, 1).
+        app.workspace.zm_point = zmodeler::PointAction::Slide;
+        let (q0, q1) = (app.project(Vec3::new(0.0, 0.0, 1.0)), app.project(Vec3::new(1.0, 0.0, 1.0)));
+        app.cursor_moved(q0, false);
+        drag(&mut app, q0, q0 + (q1 - q0) * 0.5);
+        let slid = app.doc.mesh().positions.iter().filter(|p| (p.z - 1.0).abs() < 1e-3 && p.y.abs() < 1e-3 && p.x > 0.2 && p.x < 0.8).count();
+        assert_eq!(slid, 1, "the point slid along the edge");
+        // Close Hole: delete the front polygon (a triangle since the stitch: click inside
+        // it), then click one of the hole's edges.
+        app.history_jump(-1);
+        app.workspace.zm_poly = zmodeler::PolyAction::Delete;
+        let tris = app.doc.mesh().triangle_count();
+        let inside = app.project(Vec3::new(0.3, 0.3, 1.0));
+        app.cursor_moved(inside, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Poly(_))), "{:?}", app.zm_hover);
+        drag(&mut app, inside, inside);
+        let faces = app.zmodel.as_ref().unwrap().poly.faces.len();
+        assert_eq!(faces, 23);
+        app.workspace.zm_edge = zmodeler::EdgeAction::CloseHole;
+        // Just below the hole's bottom edge, on the quad under it (on the edge itself the
+        // ray slips through the hole).
+        let e2 = app.project(Vec3::new(0.5, -0.006, 1.0));
+        app.cursor_moved(e2, false);
+        assert!(matches!(app.zm_hover, Some(zmodeler::Hover::Edge(..))), "{:?}", app.zm_hover);
+        drag(&mut app, e2, e2);
+        assert_eq!(app.zmodel.as_ref().unwrap().poly.faces.len(), faces + 1);
+        assert_eq!(app.doc.mesh().triangle_count(), tris, "the hole is filled again");
     }
 
     #[test]
