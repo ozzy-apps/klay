@@ -22,6 +22,10 @@ pub enum Ask {
     ExportObj,
     /// Document › Export STL and 3D Print › Export STL.
     ExportStl,
+    /// Document › Export glTF: the visible subtools as one `.glb`.
+    ExportGltf,
+    /// SubTool › Export glTF: the active subtool alone.
+    ExportSubtoolGltf,
     /// Document › Import: OBJ or STL files (several at once).
     ImportMesh,
     /// Geometry › Texture Maps › Normal Map.
@@ -48,6 +52,8 @@ impl Ask {
             Ask::ExportSubtoolObj => "Export SubTool as OBJ",
             Ask::ExportObj => "Export OBJ",
             Ask::ExportStl => "Export STL",
+            Ask::ExportGltf => "Export glTF",
+            Ask::ExportSubtoolGltf => "Export SubTool as glTF",
             Ask::ImportMesh => "Import OBJ or STL",
             Ask::ExportNormalMap => "Save Normal Map",
             Ask::ExportDisplacementMap => "Save Displacement Map",
@@ -70,6 +76,7 @@ impl Ask {
             Ask::OpenProject | Ask::SaveProject | Ask::SaveSubtool | Ask::LoadSubtools => &["klay"],
             Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
             Ask::ExportStl => &["stl"],
+            Ask::ExportGltf | Ask::ExportSubtoolGltf => &["glb"],
             Ask::ImportMesh => &["obj", "stl"],
             Ask::ExportNormalMap | Ask::ExportColorMap | Ask::ExportRender => &["png"],
             Ask::ExportTurntable => &["mp4"],
@@ -84,6 +91,7 @@ impl Ask {
             ["klay"] => "Klay project",
             ["obj"] => "Wavefront OBJ",
             ["stl"] => "STL",
+            ["glb"] => "glTF binary",
             ["png"] => "PNG image",
             ["exr", "png"] => "OpenEXR or PNG image",
             ["mp4"] => "MP4 video",
@@ -95,7 +103,7 @@ impl Ask {
     pub fn saves(self) -> bool {
         matches!(
             self,
-            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap | Ask::ExportRender | Ask::ExportTurntable
+            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportGltf | Ask::ExportSubtoolGltf | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap | Ask::ExportRender | Ask::ExportTurntable
         )
     }
 
@@ -208,6 +216,8 @@ mod tests {
         assert_eq!(with_extension("/a/head".into(), Ask::ExportStl.extension()), PathBuf::from("/a/head.stl"));
         assert_eq!(Ask::ImportMesh.extensions(), ["obj", "stl"]);
         assert!(Ask::ExportStl.saves() && !Ask::ImportMesh.saves());
+        assert!(Ask::ExportGltf.saves() && Ask::ExportSubtoolGltf.saves());
+        assert_eq!(with_extension("/a/head".into(), Ask::ExportGltf.extension()), PathBuf::from("/a/head.glb"));
     }
 
     #[test]

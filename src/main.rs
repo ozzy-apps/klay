@@ -38,6 +38,7 @@ mod uv;
 mod zmodeler;
 mod layers;
 mod obj;
+mod gltf;
 mod panel;
 mod pressure;
 mod print;
@@ -250,6 +251,8 @@ enum DocOp {
     ImportMesh,
     /// Export STL: the visible subtools to `App::stl_path`.
     ExportStl,
+    /// Export glTF: the visible subtools (or the active one alone) to `App::gltf_path`.
+    ExportGltf { all: bool },
 }
 
 /// Mesh › Layers operations.
@@ -358,6 +361,22 @@ struct BakeJob {
     kind: bake::Kind,
     path: String,
     started: Instant,
+    /// The subtool it bakes, and whether a normal map is the tangent-space, green-up kind
+    /// glTF expects (see [`BakedMap`]).
+    subtool: u64,
+    gl_tangent: bool,
+}
+
+/// A map baked this session (the last of its kind per subtool), for Export glTF to embed.
+#[derive(Clone, Debug, PartialEq)]
+struct BakedMap {
+    kind: bake::Kind,
+    /// [`SubTool::id`] of the subtool it was baked from.
+    subtool: u64,
+    path: String,
+    /// For a normal map: tangent space with green up (OpenGL), what glTF wants. Object
+    /// space and Flip G maps are named in the status line but not embedded.
+    gl_tangent: bool,
 }
 
 /// A ZSphere being sized, moved or scaled with the mouse (Draw, Move, Scale mode), with the
@@ -658,6 +677,15 @@ struct App {
     import_path: String,
     /// Export STL (Document and 3D Print): where the STL goes.
     stl_path: String,
+    /// Export glTF (Document, SubTool): where the `.glb` goes.
+    gltf_path: String,
+    /// `--export-gltf PATH`: write it once the startup model is ready (after the bakes).
+    gltf_on_start: Option<String>,
+    /// `--level N`: show this subdivision level once the startup model is ready (after
+    /// the bakes, before `--export-gltf`).
+    level_on_start: Option<usize>,
+    /// The maps baked this session, one per kind and subtool (see [`BakedMap`]).
+    baked: Vec<BakedMap>,
     /// 3D Print › Check: the last result, and the model it was for (see `print_stamp`).
     print_report: Option<print::Report>,
     /// `--print-check`: run the check once the model is built.
@@ -922,6 +950,10 @@ impl App {
             subtool_path: "subtool.klay".to_string(),
             import_path: "model.obj".to_string(),
             stl_path: "klay_export.stl".to_string(),
+            gltf_path: "klay_export.glb".to_string(),
+            gltf_on_start: None,
+            level_on_start: None,
+            baked: Vec::new(),
             print_report: None,
             print_check_on_start: false,
             file_dialog: None,
@@ -1586,7 +1618,9 @@ impl App {
             .unwrap_or_else(|_| Err("the bake failed".to_string()));
             let _ = tx.send(r);
         });
-        self.bake_job = Some(BakeJob { rx, kind, path, started: t });
+        let subtool = self.subtools[self.active_tool].id;
+        let gl_tangent = settings.space == bake::Space::Tangent && !settings.flip_g;
+        self.bake_job = Some(BakeJob { rx, kind, path, started: t, subtool, gl_tangent });
         self.workspace.baking = true;
         self.status = format!("Baking the {}…", kind.name().to_lowercase());
     }
@@ -1626,6 +1660,8 @@ impl App {
                     d.bytes as f64 / 1e6
                 );
                 self.bake_count += 1;
+                self.baked.retain(|b| (b.kind, b.subtool) != (job.kind, job.subtool));
+                self.baked.push(BakedMap { kind: job.kind, subtool: job.subtool, path: job.path.clone(), gl_tangent: job.gl_tangent });
                 let what = format!("{} · {}² · {:.0} % of the square covered", job.kind.name(), d.size, d.coverage * 100.0);
                 self.workspace.bake_preview = Some((self.bake_count, what, 256, d.preview));
             }
@@ -1957,6 +1993,13 @@ impl App {
             }
             self.start_bake(kind, path);
             self.poll_bake(true);
+        }
+        if let Some(level) = self.level_on_start.take() {
+            self.set_level(level.min(self.doc.top()));
+        }
+        if let Some(path) = self.gltf_on_start.take() {
+            self.gltf_path = path;
+            self.export_gltf(true);
         }
     }
 
@@ -3416,6 +3459,8 @@ impl App {
                 Ask::ExportSubtoolObj => DocOp::ExportSubtool,
                 Ask::ImportMesh => DocOp::ImportMesh,
                 Ask::ExportStl => DocOp::ExportStl,
+                Ask::ExportGltf => DocOp::ExportGltf { all: true },
+                Ask::ExportSubtoolGltf => DocOp::ExportGltf { all: false },
                 Ask::ExportObj => {
                     self.pending_export = true;
                     return;
@@ -3456,6 +3501,9 @@ impl App {
             Ask::ExportObj => (&self.export_path, file_of(&self.export_path).unwrap_or_else(|| "export.obj".into())),
             Ask::ExportStl if self.project_has_file => (&self.stl_path, file_dialog::file_name(&project_stem, "stl")),
             Ask::ExportStl => (&self.stl_path, file_of(&self.stl_path).unwrap_or_else(|| "export.stl".into())),
+            Ask::ExportGltf if self.project_has_file => (&self.gltf_path, file_dialog::file_name(&project_stem, "glb")),
+            Ask::ExportGltf => (&self.gltf_path, file_of(&self.gltf_path).unwrap_or_else(|| "export.glb".into())),
+            Ask::ExportSubtoolGltf => (&self.gltf_path, file_dialog::file_name(&tool, "glb")),
             Ask::ImportMesh => (&self.import_path, String::new()),
             Ask::ExportNormalMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_normal"), "png")),
             Ask::ExportColorMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_color"), "png")),
@@ -3514,6 +3562,10 @@ impl App {
             Ask::ExportStl => {
                 self.stl_path = text(first);
                 self.export_stl();
+            }
+            Ask::ExportGltf | Ask::ExportSubtoolGltf => {
+                self.gltf_path = text(first);
+                self.export_gltf(ask == Ask::ExportGltf);
             }
             Ask::ImportMesh => {
                 for path in &paths {
@@ -4181,6 +4233,90 @@ impl App {
                 fmt_count(tris as usize),
                 t.elapsed().as_secs_f32()
             ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    /// The maps baked this session for the subtool `id`, as `(normal map PNG, colour map
+    /// PNG, notes for the status line)`: a displacement map, or a normal map glTF cannot
+    /// use, is named in the notes instead.
+    fn baked_textures(&self, id: u64, name: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>, Vec<String>) {
+        let (mut normal, mut color, mut notes) = (None, None, Vec::new());
+        for b in self.baked.iter().filter(|b| b.subtool == id) {
+            let png = b.path.to_lowercase().ends_with(".png");
+            match b.kind {
+                bake::Kind::Displacement => notes.push(format!("{name}: the displacement map stays at {} (glTF has no displacement)", b.path)),
+                bake::Kind::Normal if !b.gl_tangent => notes.push(format!("{name}: {} is not a tangent-space, green-up normal map, so it is not embedded", b.path)),
+                _ if !png => notes.push(format!("{name}: {} is not a PNG, so it is not embedded", b.path)),
+                kind => match std::fs::read(&b.path) {
+                    Ok(bytes) if kind == bake::Kind::Normal => normal = Some(bytes),
+                    Ok(bytes) => color = Some(bytes),
+                    Err(e) => notes.push(format!("{name}: {} not embedded: {e}", b.path)),
+                },
+            }
+        }
+        (normal, color, notes)
+    }
+
+    /// Every visible subtool at its shown level (or the active one alone) as one glTF
+    /// binary at `path`, in metres by the 3D Print scale, Y up, with the maps baked this
+    /// session as each subtool's material (see [`gltf`]). Parked subtools are rebuilt one at
+    /// a time, as for OBJ. Returns what was written and the notes about maps left out.
+    fn write_gltf(&self, path: &Path, all: bool) -> std::io::Result<(gltf::Summary, Vec<String>)> {
+        let opts = gltf::Options { scale: self.workspace.layout.print.scale / 1000.0, per_group: self.workspace.gltf_per_group };
+        let mut docs: Vec<(usize, Option<Multires>)> = Vec::new();
+        for (i, tool) in self.subtools.iter().enumerate() {
+            if i == self.active_tool {
+                docs.push((i, None));
+            } else if let (true, true, Some(p)) = (all, tool.visible, &tool.parked) {
+                docs.push((i, Some(p.packed.clone().unpack())));
+            }
+        }
+        let mut notes = Vec::new();
+        let nodes: Vec<gltf::Node> = docs
+            .iter()
+            .map(|(i, doc)| {
+                let tool = &self.subtools[*i];
+                let doc = doc.as_ref().unwrap_or(&self.doc);
+                let mut node = gltf::Node::from_mesh(&tool.name, doc.mesh(), shown_uvs(doc));
+                let (normal, color, more) = self.baked_textures(tool.id, &tool.name);
+                notes.extend(more);
+                if doc.active() != 0 && (normal.is_some() || color.is_some()) {
+                    notes.push(format!("{}: the maps need the lowest level's UVs, so they are not embedded at level {}", tool.name, doc.active()));
+                } else {
+                    (node.normal_map, node.color_map) = (normal, color);
+                }
+                node
+            })
+            .collect();
+        let file = std::fs::File::create(path)?;
+        let summary = gltf::write(std::io::BufWriter::with_capacity(8 << 20, file), &nodes, &opts)?;
+        Ok((summary, notes))
+    }
+
+    /// Export glTF (Document › Export, SubTool › Export glTF with `all` false): to
+    /// `gltf_path`, reporting the textures embedded and the maps left out.
+    fn export_gltf(&mut self, all: bool) {
+        let t = Instant::now();
+        let path = self.gltf_path.clone();
+        self.status = match self.write_gltf(Path::new(&path), all) {
+            Ok((s, notes)) => {
+                let textures = match s.textures {
+                    0 => String::new(),
+                    n => format!(" · {n} baked maps embedded"),
+                };
+                let notes = notes.iter().map(|n| format!(" · {n}")).collect::<String>();
+                format!(
+                    "Exported {} subtools ({} vertices, {} triangles) to {path} ({:.1} MB) in {:.1} s{textures}{notes}",
+                    s.nodes,
+                    fmt_count(s.vertices),
+                    fmt_count(s.triangles),
+                    s.bytes as f64 / 1e6,
+                    t.elapsed().as_secs_f32()
+                )
+            }
             Err(e) => format!("Export failed: {e}"),
         };
         log::info!("{}", self.status);
@@ -9124,6 +9260,12 @@ impl App {
         if actions.export_stl {
             self.ask_file(file_dialog::Ask::ExportStl);
         }
+        if actions.export_gltf {
+            self.ask_file(file_dialog::Ask::ExportGltf);
+        }
+        if actions.export_subtool_gltf {
+            self.ask_file(file_dialog::Ask::ExportSubtoolGltf);
+        }
         #[cfg(feature = "strata")]
         {
             if actions.send_strata {self.request_strata(false);}
@@ -9384,6 +9526,7 @@ impl App {
                 self.import_mesh(&path);
             }
             Some(DocOp::ExportStl) => self.export_stl(),
+            Some(DocOp::ExportGltf { all }) => self.export_gltf(all),
             None => {}
         }
         match self.pending_subtool.take() {
@@ -10694,6 +10837,12 @@ fn main() {
             app.bake_on_start.push((kind, path.clone()));
         }
     }
+    // `--export-gltf PATH`: write the visible subtools as a glTF binary once the startup
+    // model is ready, after those bakes (so their maps go in as textures).
+    app.gltf_on_start = flag("--export-gltf").cloned();
+    // `--level N`: show that subdivision level then (so `--divide 2 --bake-normal n.png
+    // --level 0 --export-gltf m.glb` writes the lowest level with its map).
+    app.level_on_start = flag("--level").and_then(|v| v.parse().ok());
     // `--zremesh K`: ZRemesher to K thousand quads at startup.
     if let Some(k) = flag("--zremesh").and_then(|v| v.parse::<f32>().ok()) {
         // With `--detect-edges` / `--freeze-border`, those ZRemesher options on.
@@ -11374,6 +11523,101 @@ mod subtool_tests {
         assert!(app.status.contains("Midlevel 0"), "{}", app.status);
         assert!(dir.join("d.exr").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_gltf_writes_the_visible_subtools_with_their_baked_maps() {
+        let dir = std::env::temp_dir().join(format!("klay-gltf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let mut app = App::new(12, false, usize::MAX);
+        app.primitive.kind = Primitive::Cube;
+        app.append_primitive();
+        assert_eq!(app.active_tool, 1);
+        // The cube: painted, unwrapped, divided, with all three maps baked.
+        let n = app.doc.mesh().vertex_count();
+        app.doc.mesh_mut().colors = vec![[200, 30, 30, 255]; n];
+        app.uv_unwrap_now();
+        assert!(app.doc.divide());
+        app.workspace.bake.size = 64;
+        for (kind, file) in [(bake::Kind::Normal, "n.png"), (bake::Kind::Color, "c.png"), (bake::Kind::Displacement, "d.exr")] {
+            app.map_path = at(file);
+            app.bake_ask(kind);
+            app.poll_bake(true);
+            assert!(app.status.contains("saved"), "{}", app.status);
+        }
+        assert_eq!(app.baked.len(), 3);
+        assert!(app.baked.iter().all(|b| b.subtool == app.subtools[1].id && b.gl_tangent));
+        // Shown at the lowest level: UVs and the two PNG maps go in; the EXR is named.
+        app.doc.set_active(0);
+        app.workspace.layout.print.scale = 10.0;
+        app.gltf_path = at("model.glb");
+        app.export_gltf(true);
+        assert!(app.status.starts_with("Exported 2 subtools"), "{}", app.status);
+        assert!(app.status.contains("2 baked maps embedded") && app.status.contains("displacement map stays at"), "{}", app.status);
+        let bytes = std::fs::read(&app.gltf_path).unwrap();
+        let (text, bin) = gltf::chunks(&bytes).unwrap();
+        let doc = gltf::json::parse(text).unwrap();
+        assert_eq!(doc.get("nodes").arr().len(), 2);
+        assert_eq!(doc.get("nodes").at(1).get("name").str(), app.subtools[1].name);
+        let cube = doc.get("meshes").at(1).get("primitives").at(0);
+        let sphere = doc.get("meshes").at(0).get("primitives").at(0);
+        assert!(!cube.get("attributes").get("TEXCOORD_0").is_null(), "UVs at level 0");
+        assert!(cube.get("attributes").get("COLOR_0").is_null(), "the colour map stands in for the polypaint");
+        assert!(sphere.get("attributes").get("TEXCOORD_0").is_null() && sphere.get("attributes").get("COLOR_0").is_null());
+        let m = doc.get("materials").at(cube.get("material").int());
+        let normal = doc.get("textures").at(m.get("normalTexture").get("index").int()).get("source").int();
+        let color = doc.get("textures").at(m.get("pbrMetallicRoughness").get("baseColorTexture").get("index").int()).get("source").int();
+        for (image, file) in [(normal, "n.png"), (color, "c.png")] {
+            let view = doc.get("bufferViews").at(doc.get("images").at(image).get("bufferView").int());
+            let (o, l) = (view.get("byteOffset").int(), view.get("byteLength").int());
+            assert_eq!(&bin[o..o + l], &std::fs::read(dir.join(file)).unwrap()[..], "{file} embedded as it is");
+        }
+        assert!(doc.get("materials").at(sphere.get("material").int()).get("normalTexture").is_null());
+        // Metres: 10 mm a unit, so the cube's bounds times 0.01.
+        let pos = doc.get("accessors").at(cube.get("attributes").get("POSITION").int());
+        let b = app.doc.bounds();
+        assert!((pos.get("max").at(0).num() - (b.max.x * 0.01) as f64).abs() < 1e-6 && (pos.get("min").at(1).num() - (b.min.y * 0.01) as f64).abs() < 1e-6, "{pos:?} vs {b:?}");
+        // At level 1 there are no UVs, so the maps stay out and the polypaint goes as colours.
+        app.doc.set_active(1);
+        app.export_gltf(true);
+        assert!(app.status.contains("not embedded at level 1") && !app.status.contains("maps embedded"), "{}", app.status);
+        let bytes = std::fs::read(&app.gltf_path).unwrap();
+        let doc = gltf::json::parse(gltf::chunks(&bytes).unwrap().0).unwrap();
+        let cube = doc.get("meshes").at(1).get("primitives").at(0);
+        assert!(cube.get("attributes").get("TEXCOORD_0").is_null() && !cube.get("attributes").get("COLOR_0").is_null());
+        assert!(doc.get("images").is_null());
+        // The active subtool alone; a hidden subtool is left out.
+        app.export_gltf(false);
+        assert!(app.status.starts_with("Exported 1 subtools"), "{}", app.status);
+        app.subtools[0].visible = false;
+        app.export_gltf(true);
+        assert!(app.status.starts_with("Exported 1 subtools"), "{}", app.status);
+        app.subtools[0].visible = true;
+        // Without a window the dialogs fall back to the stored path.
+        app.ask_file(file_dialog::Ask::ExportGltf);
+        assert!(matches!(app.pending_doc, Some(DocOp::ExportGltf { all: true })));
+        app.ask_file(file_dialog::Ask::ExportSubtoolGltf);
+        assert!(matches!(app.pending_doc, Some(DocOp::ExportGltf { all: false })));
+        app.pending_doc = None;
+        // `--export-gltf` runs after the start-up bakes and `--level`, so a fresh colour map
+        // goes in at the lowest level.
+        app.doc.set_active(1);
+        app.bake_on_start.push((bake::Kind::Color, at("c2.png")));
+        app.level_on_start = Some(0);
+        app.gltf_on_start = Some(at("start.glb"));
+        app.bake_at_start();
+        assert_eq!((app.gltf_path.as_str(), app.doc.active()), (at("start.glb").as_str(), 0));
+        assert!(app.status.contains("2 baked maps embedded"), "{}", app.status);
+        assert!(app.baked.iter().any(|b| b.kind == bake::Kind::Color && b.path == at("c2.png")));
+        // A map baked in object space is named, not embedded.
+        app.workspace.bake.space = bake::Space::Object;
+        app.map_path = at("o.png");
+        app.bake_ask(bake::Kind::Normal);
+        app.poll_bake(true);
+        app.export_gltf(true);
+        assert!(app.status.contains("1 baked maps embedded") && app.status.contains("not a tangent-space"), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

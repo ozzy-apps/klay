@@ -569,6 +569,29 @@ last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-norm
 `--open`), unwrapping first if needed. Shelf commands `cmd:bake-normal`,
 `cmd:bake-displacement` and `cmd:bake-color`.
 
+### Export glTF
+
+Document › Export › **Export glTF** (also the SubTool palette's **Export glTF**, for the
+active subtool alone; shelf command `cmd:export-gltf`) writes every visible subtool at its
+shown level as one glTF 2.0 binary (`.glb`): positions, normals, the UVs while the lowest
+level is shown (vertices are split at the seams, since glTF has one UV per vertex), the
+polypaint as vertex colours (`COLOR_0`, linear, over white), a mesh primitive per polygroup
+(**glTF: Polygroups**; off, one per subtool) and the subtool's name on its node. Klay and
+glTF are both Y up; positions go out in metres by the 3D Print scale (25 mm a unit by
+default, so a 2-unit sphere is 50 mm). Nothing new to write: no glTF crate, the JSON and the
+binary chunk are written by hand.
+
+The maps baked this session (Texture Maps) go in with the subtool they were baked from: the
+normal map as the material's `normalTexture` and the colour map as its `baseColorTexture`
+(white, metallic 0, roughness 1), embedded as PNG, so Blender, Godot, Unity and Unreal show
+the sculpt on the low-poly mesh with no material to assemble. With a colour map embedded
+the vertex colours stay out, since the two would multiply. The maps need the lowest level's
+UVs, so they go in only while it is shown; a displacement map has no place in glTF, and the
+status line names its file instead; an **Object Space** or **Flip G** normal map is named,
+not embedded. `--export-gltf PATH` writes the file at startup, after the `--bake-*` bakes
+and `--level N` (which shows that subdivision level then), so `--divide 2 --bake-normal
+n.png --bake-color c.png --level 0 --export-gltf model.glb` makes a ready low-poly model.
+
 ### Long operations
 
 ZRemesher, Decimation, UV Unwrap, Remesh (the Wedge button and Ctrl + drag on the
@@ -796,7 +819,7 @@ colours are kept with the workspace layout (Workspace › Reset leaves them alon
   Klay's Y up into the printer's Z up, so the model stands on the bed as it stands on
   screen. STL files are always in millimetres. Kept with the workspace.
 - **Export**: **Export STL** writes every visible subtool at its shown level as one binary
-  STL (also Document › Export). **Send to …** writes it to `~/.cache/klay/print/` and opens
+  STL (also Document › Export; Export glTF there uses the same scale, in metres). **Send to …** writes it to `~/.cache/klay/print/` and opens
   it in the slicer.
 - **Slicer**: the slicers found on this computer from their menu entries (packages,
   Flatpaks, Snaps, AppImages added to the menu) and `PATH`: PrusaSlicer, SuperSlicer,
@@ -1173,7 +1196,8 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   levels, as a one-subtool `.klay` that Document › Open also reads; the file dialog offers
   the subtool's name), **Load** (pick one or more `.klay` files; every subtool in them is
   added to the end of the list, parked, without changing the active one; a bad file adds
-  nothing) and **Export OBJ** (the active subtool at its shown level, to an `.obj` you pick); Deformation moves and sizes the active subtool exactly at every
+  nothing), **Export OBJ** (the active subtool at its shown level, to an `.obj` you pick) and
+  **Export glTF** (the same as a `.glb`, with its baked maps as the material); Deformation moves and sizes the active subtool exactly at every
   level, undoably.
 - `transform.rs`: moving, scaling and rotating a whole subtool, ZBrush Transpose style.
   The map is `p -> c + s R (p - c) + t` (rotation, uniform scale, translation). Loop weights
@@ -1269,6 +1293,13 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   subtool once to bake its stand-in and swaps the model only when all of them succeeded.
   Undo history is not saved. Export OBJ writes every visible subtool at its shown level as
   its own object, rebuilding parked ones one at a time.
+- `gltf.rs`: glTF 2.0 binary out. `Node` is a subtool's shown level (positions, normals,
+  indices, polygroups, per-corner UVs, premultiplied polypaint, optional normal and colour
+  map PNGs), `write` puts the nodes in one `.glb` with hand-written JSON and a BIN chunk:
+  one buffer, a 4-byte-aligned view per attribute, a primitive per polygroup or per node,
+  16-bit indices when they fit, vertices split at UV seams with V flipped (Klay's row 0 is
+  V 1), vertex colours composited over white and made linear, one PBR material per node
+  with the maps as embedded textures. A small JSON reader in the tests parses the files back.
 - `stl.rs`: STL in and out. `parse` reads binary (the size matches the header's count, even
   when the header starts with `solid`) or ASCII and welds corners by exact position (−0 as 0)
   into an indexed mesh, dropping flat and repeated triangles. `BinaryWriter` writes binary
