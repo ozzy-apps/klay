@@ -57,18 +57,32 @@ pub enum PolyAction {
     Polygroup,
     /// Join this polygon to a second one clicked next by a tube of quads.
     Bridge,
+    /// Chamfer the edges round the polygon: a smaller polygon with a rim.
+    Bevel,
 }
 
 impl PolyAction {
-    pub const ALL: [Self; 6] = [Self::QMesh, Self::Extrude, Self::Inset, Self::Delete, Self::Polygroup, Self::Bridge];
+    pub const ALL: [Self; 7] = [Self::QMesh, Self::Extrude, Self::Inset, Self::Bevel, Self::Delete, Self::Polygroup, Self::Bridge];
     pub fn name(self) -> &'static str {
         match self {
             Self::QMesh => "QMesh",
             Self::Extrude => "Extrude",
             Self::Inset => "Inset",
+            Self::Bevel => "Bevel",
             Self::Delete => "Delete",
             Self::Polygroup => "Polygroup",
             Self::Bridge => "Bridge",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::QMesh => "drag out or in",
+            Self::Extrude => "drag out or in",
+            Self::Inset => "drag in",
+            Self::Bevel => "drag for the width",
+            Self::Delete => "click",
+            Self::Polygroup => "click",
+            Self::Bridge => "click one, then the other",
         }
     }
 }
@@ -82,16 +96,53 @@ pub enum EdgeAction {
     Bevel,
     /// Turn the edge one step round its two polygons.
     Spin,
+    /// Join this open edge to a second one clicked next by a polygon.
+    Bridge,
 }
 
 impl EdgeAction {
-    pub const ALL: [Self; 4] = [Self::Insert, Self::Delete, Self::Bevel, Self::Spin];
+    pub const ALL: [Self; 5] = [Self::Insert, Self::Delete, Self::Bevel, Self::Spin, Self::Bridge];
     pub fn name(self) -> &'static str {
         match self {
             Self::Insert => "Insert",
             Self::Delete => "Delete",
             Self::Bevel => "Bevel",
             Self::Spin => "Spin",
+            Self::Bridge => "Bridge",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Insert => "click where the loop goes, drag to slide it",
+            Self::Delete => "click",
+            Self::Bevel => "drag for the width",
+            Self::Spin => "click",
+            Self::Bridge => "click one open edge, then the other",
+        }
+    }
+}
+
+/// What ZModeler does to a point (ZBrush: the point actions).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointAction {
+    #[default]
+    Move,
+    /// Chamfer the corner off: the polygons round the point cut back, a polygon in the gap.
+    Bevel,
+}
+
+impl PointAction {
+    pub const ALL: [Self; 2] = [Self::Move, Self::Bevel];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Move => "Move",
+            Self::Bevel => "Bevel",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Move => "drag",
+            Self::Bevel => "drag for the size",
         }
     }
 }
@@ -610,7 +661,9 @@ impl PolyMesh {
 
     /// Bevel: the edge loop through (a, b) chamfered: a loop is cut on each side of it,
     /// `t` of the way along the edges that leave it, and the loop itself dissolved, so a
-    /// flat strip of quads replaces the edge.
+    /// flat strip of quads replaces the edge. Superseded by [`chamfer_edges`](Self::chamfer_edges),
+    /// which its test compares against.
+    #[cfg(test)]
     pub fn bevel(&self, a: u32, b: u32, t: f32) -> PolyMesh {
         let t = t.clamp(0.02, 0.45);
         let lp = self.edge_loop(a, b);
@@ -692,6 +745,219 @@ impl PolyMesh {
             out.faces.push(vec![a[k], a[(k + 1) % n], b1, b0]);
             out.groups.push(wall);
         }
+        Some(out)
+    }
+
+    /// The edges round `faces` with another polygon on the far side: those of the faces
+    /// that no other of them shares, and not on an open border.
+    pub fn border_edges(&self, faces: &[u32]) -> Vec<(u32, u32)> {
+        let set: HashSet<u32> = faces.iter().copied().collect();
+        let edges = self.edges();
+        let mut out = Vec::new();
+        for &f in faces {
+            let fv = &self.faces[f as usize];
+            let n = fv.len();
+            for k in 0..n {
+                let (a, b) = (fv[k], fv[(k + 1) % n]);
+                let on = &edges[&key(a, b)];
+                if on.len() == 2 && !on.iter().any(|&(g, _)| g != f && set.contains(&g)) {
+                    out.push((a, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Polygons round point `v` in turn, as (polygon, slot of `v`), each reached from the
+    /// one before across the edge leaving `v` in it; `None` when the turn does not close
+    /// (an open border at `v`).
+    fn around(&self, v: u32, edges: &HashMap<(u32, u32), Vec<(u32, usize)>>, start: (u32, usize)) -> Option<Vec<(u32, usize)>> {
+        let mut out = vec![start];
+        let (mut f, mut k) = start;
+        for _ in 0..self.faces.len() {
+            let fv = &self.faces[f as usize];
+            let q = fv[(k + 1) % fv.len()];
+            let g = edges.get(&key(v, q))?.iter().find(|x| x.0 != f)?.0;
+            if g == start.0 {
+                return Some(out);
+            }
+            let j = self.faces[g as usize].iter().position(|&x| x == v)?;
+            out.push((g, j));
+            (f, k) = (g, j);
+        }
+        None
+    }
+
+    /// Bevel: `edges` (those between two polygons) chamfered off, `t` of the way along the
+    /// edges that leave them. Each polygon on a chamfered edge pulls its corners there
+    /// inward along its other edges (diagonally where both edges at a corner are
+    /// chamfered), a quad takes each edge's place, and where chamfers meet round a point a
+    /// polygon fills the gap; all new polygons in one new polygroup. A polygon's own
+    /// border gives a smaller polygon with a rim (ZBrush polygon Bevel), a loop a flat
+    /// strip (edge Bevel), one edge a single chamfer with a triangle at each end.
+    pub fn chamfer_edges(&self, edges: &[(u32, u32)], t: f32) -> PolyMesh {
+        let t = t.clamp(0.02, 0.45);
+        let all = self.edges();
+        let sel: HashSet<(u32, u32)> = edges.iter().map(|&(a, b)| key(a, b)).filter(|k| all.get(k).is_some_and(|on| on.len() == 2)).collect();
+        if sel.is_empty() {
+            return self.clone();
+        }
+        let mut out = PolyMesh { pos: self.pos.clone(), colors: self.colors.clone(), groups: self.groups.clone(), ..Default::default() };
+        let add = |out: &mut PolyMesh, v: u32, p: Vec3| -> u32 {
+            out.pos.push(p);
+            if !out.colors.is_empty() {
+                out.colors.push(self.colors[v as usize]);
+            }
+            (out.pos.len() - 1) as u32
+        };
+        // Each polygon's copy of each of its corners. A corner slid along an edge is shared
+        // by the two polygons on that edge, when both slide it; else the other polygon
+        // gains it as a point on that edge, below.
+        let mut along: HashMap<(u32, u32), u32> = HashMap::default();
+        let mut corner: HashMap<(u32, usize), u32> = HashMap::default();
+        for (fi, fv) in self.faces.iter().enumerate() {
+            let n = fv.len();
+            for k in 0..n {
+                let (p, v, q) = (fv[(k + n - 1) % n], fv[k], fv[(k + 1) % n]);
+                let (sp, sq) = (sel.contains(&key(p, v)), sel.contains(&key(v, q)));
+                let pv = self.pos[v as usize];
+                let id = match (sp, sq) {
+                    (false, false) => v,
+                    (true, false) => *along.entry((v, q)).or_insert_with(|| add(&mut out, v, pv.lerp(self.pos[q as usize], t))),
+                    (false, true) => *along.entry((v, p)).or_insert_with(|| add(&mut out, v, pv.lerp(self.pos[p as usize], t))),
+                    (true, true) => add(&mut out, v, pv + (self.pos[p as usize] - pv) * t + (self.pos[q as usize] - pv) * t),
+                };
+                corner.insert((fi as u32, k), id);
+            }
+        }
+        for (fi, fv) in self.faces.iter().enumerate() {
+            let n = fv.len();
+            let mut nf = Vec::with_capacity(n + 2);
+            for k in 0..n {
+                let (v, q) = (fv[k], fv[(k + 1) % n]);
+                let (cv, cq) = (corner[&(fi as u32, k)], corner[&(fi as u32, (k + 1) % n)]);
+                nf.push(cv);
+                if let Some(&c) = along.get(&(v, q)) {
+                    if c != cv {
+                        nf.push(c);
+                    }
+                }
+                if let Some(&c) = along.get(&(q, v)) {
+                    if c != cq {
+                        nf.push(c);
+                    }
+                }
+            }
+            out.faces.push(nf);
+        }
+        let rim = self.next_group();
+        // A quad where each edge was, wound against the polygons on it.
+        let mut chamfered: Vec<(u32, u32)> = sel.iter().copied().collect();
+        chamfered.sort_unstable();
+        for e in chamfered {
+            let on = &all[&e];
+            let ((f1, k1), (f2, k2)) = (on[0], on[1]);
+            let (n1, n2) = (self.faces[f1 as usize].len(), self.faces[f2 as usize].len());
+            let (x1, y1) = (corner[&(f1, k1)], corner[&(f1, (k1 + 1) % n1)]);
+            let (y2, x2) = (corner[&(f2, k2)], corner[&(f2, (k2 + 1) % n2)]);
+            out.faces.push(vec![y1, x1, x2, y2]);
+            out.groups.push(rim);
+        }
+        // Round each point of a chamfered edge: its corners in turn, a polygon when three
+        // or more differ (a point kept by some polygon counts as one of them).
+        let mut points: Vec<u32> = sel.iter().flat_map(|&(a, b)| [a, b]).collect();
+        points.sort_unstable();
+        points.dedup();
+        for v in points {
+            let Some(&(f0, _)) = all.iter().find_map(|(k, on)| (k.0 == v || k.1 == v).then_some(on)).and_then(|on| on.first()) else { continue };
+            let Some(k0) = self.faces[f0 as usize].iter().position(|&x| x == v) else { continue };
+            let Some(turn) = self.around(v, &all, (f0, k0)) else { continue };
+            let mut ring: Vec<u32> = turn.iter().map(|c| corner[c]).collect();
+            ring.dedup();
+            while ring.len() > 1 && ring.first() == ring.last() {
+                ring.pop();
+            }
+            if ring.len() >= 3 {
+                ring.reverse();
+                out.faces.push(ring);
+                out.groups.push(rim);
+            }
+        }
+        out
+    }
+
+    /// Bevel of a point: the corner at `v` cut off, `t` of the way along every edge from
+    /// it; each polygon round it gains a corner, and a polygon fills the gap (unless `v`
+    /// is on an open border).
+    pub fn chamfer_point(&self, v: u32, t: f32) -> PolyMesh {
+        let t = t.clamp(0.02, 0.45);
+        let all = self.edges();
+        let Some(&(f0, _)) = all.iter().find_map(|(k, on)| (k.0 == v || k.1 == v).then_some(on)).and_then(|on| on.first()) else { return self.clone() };
+        let Some(k0) = self.faces[f0 as usize].iter().position(|&x| x == v) else { return self.clone() };
+        let turn = self.around(v, &all, (f0, k0));
+        let mut out = PolyMesh { pos: self.pos.clone(), colors: self.colors.clone(), groups: self.groups.clone(), ..Default::default() };
+        let mut cut: HashMap<u32, u32> = HashMap::default();
+        let pv = self.pos[v as usize];
+        let mut m = |out: &mut PolyMesh, u: u32| -> u32 {
+            *cut.entry(u).or_insert_with(|| {
+                out.pos.push(pv.lerp(self.pos[u as usize], t));
+                if !out.colors.is_empty() {
+                    out.colors.push(self.colors[v as usize]);
+                }
+                (out.pos.len() - 1) as u32
+            })
+        };
+        for fv in &self.faces {
+            let n = fv.len();
+            let mut nf = Vec::with_capacity(n + 1);
+            for k in 0..n {
+                if fv[k] == v {
+                    nf.push(m(&mut out, fv[(k + n - 1) % n]));
+                    nf.push(m(&mut out, fv[(k + 1) % n]));
+                } else {
+                    nf.push(fv[k]);
+                }
+            }
+            out.faces.push(nf);
+        }
+        if let Some(turn) = turn {
+            // The gap, wound like the polygons round it (the turn runs the other way).
+            let mut ring: Vec<u32> = turn.iter().map(|&(f, k)| m(&mut out, self.faces[f as usize][(k + 1) % self.faces[f as usize].len()])).collect();
+            ring.reverse();
+            if ring.len() >= 3 {
+                out.faces.push(ring);
+                out.groups.push(self.next_group());
+            }
+        }
+        out
+    }
+
+    /// Bridge two open edges with a polygon (a quad, or a triangle when they share a
+    /// point), wound to fit the polygons they are on; `None` for an edge between two
+    /// polygons or the same edge twice.
+    pub fn bridge_edges(&self, first: (u32, u32), second: (u32, u32)) -> Option<PolyMesh> {
+        if key(first.0, first.1) == key(second.0, second.1) {
+            return None;
+        }
+        let run = |e: (u32, u32)| -> Option<(u32, u32)> {
+            let on = self.faces_on(e.0, e.1);
+            let [(f, k)] = on[..] else { return None };
+            let fv = &self.faces[f];
+            Some((fv[k], fv[(k + 1) % fv.len()]))
+        };
+        let ((x, y), (x2, y2)) = (run(first)?, run(second)?);
+        let mut quad = vec![y, x, y2, x2];
+        quad.dedup();
+        while quad.len() > 1 && quad.first() == quad.last() {
+            quad.pop();
+        }
+        if quad.len() < 3 {
+            return None;
+        }
+        let mut out = self.clone();
+        let g = out.next_group();
+        out.faces.push(quad);
+        out.groups.push(g);
         Some(out)
     }
 
@@ -811,6 +1077,103 @@ mod tests {
         assert!(closed(&tunnel));
         assert_eq!(tunnel.faces.len(), pm.faces.len() - 2 + 4);
         assert!(volume(&tunnel) < volume(&pm), "the tunnel goes through");
+    }
+
+    /// Every directed edge once, its reverse at most once (closed or with open borders).
+    fn manifold(pm: &PolyMesh) -> bool {
+        let mut count: HashMap<(u32, u32), i32> = HashMap::default();
+        for f in &pm.faces {
+            if f.len() < 3 {
+                return false;
+            }
+            for k in 0..f.len() {
+                *count.entry((f[k], f[(k + 1) % f.len()])).or_default() += 1;
+            }
+        }
+        count.iter().all(|(&(a, b), &c)| a != b && c == 1 && count.get(&(b, a)).is_none_or(|&r| r == 1))
+    }
+
+    #[test]
+    fn chamfers_bevel_polygons_edges_and_points_and_edges_bridge() {
+        let pm = cube();
+        let top = (0..pm.faces.len() as u32).find(|&f| pm.normal(f).y > 0.9).unwrap();
+        // The top polygon bevelled: four rim quads, nothing to fill at a cube's corners.
+        let rim = pm.border_edges(&[top]);
+        assert_eq!(rim.len(), 4);
+        let bev = pm.chamfer_edges(&rim, 0.25);
+        assert!(closed(&bev));
+        // Four rim quads, and a quad in the gap at each corner with four polygons round it
+        // (three of them; the cube's corner has three polygons and needs none).
+        assert_eq!(bev.faces.len(), 24 + 4 + 3);
+        assert!(bev.faces[24..].iter().all(|f| f.len() == 4), "rim and gap quads");
+        // A polygon beside a slid corner gains that point on its edge (the top polygon
+        // across from the bevelled one gains two).
+        assert_eq!(bev.faces[..24].iter().map(|f| f.len()).max(), Some(6));
+        assert!(volume(&bev) < volume(&pm) - 0.01);
+        // All four top polygons at once: their outer border only, the inner edges stay.
+        let tops: Vec<u32> = (0..pm.faces.len() as u32).filter(|&f| pm.normal(f).y > 0.9).collect();
+        assert_eq!(pm.border_edges(&tops).len(), 8);
+        let all = pm.chamfer_edges(&pm.border_edges(&tops), 0.25);
+        assert!(closed(&all));
+        assert_eq!(all.faces.len(), 24 + 8);
+        // One edge: a chamfer quad and a triangle at each end.
+        let one = pm.chamfer_edges(&rim[..1], 0.2);
+        assert!(closed(&one));
+        assert_eq!(one.faces.len(), 24 + 1 + 2);
+        assert_eq!(one.faces.iter().filter(|f| f.len() == 3).count(), 2);
+        // A closed loop: the same flat strip as the loop bevel.
+        let eq = (0..pm.faces.len())
+            .flat_map(|f| {
+                let fv = pm.faces[f].clone();
+                (0..4).map(move |k| (fv[k], fv[(k + 1) % 4]))
+            })
+            .find(|&(x, y)| pm.pos[x as usize].y.abs() < 1e-4 && pm.pos[y as usize].y.abs() < 1e-4)
+            .unwrap();
+        let band = pm.chamfer_edges(&pm.edge_loop(eq.0, eq.1), 0.3);
+        assert!(closed(&band));
+        assert_eq!(band.faces.len(), 32);
+        assert!(band.faces.iter().all(|f| f.len() == 4));
+        // A polygon in a flat grid: the rim and a quad in each corner gap.
+        let (p, i) = crate::primitive::Primitive::Plane.build(4, 1.0);
+        let plane = PolyMesh::from_mesh(&SculptMesh::from_raw(p, i)).0;
+        let mid = (0..plane.faces.len() as u32).find(|&f| plane.centre(f).length() < 0.4).unwrap();
+        let flat = plane.chamfer_edges(&plane.border_edges(&[mid]), 0.3);
+        assert!(manifold(&flat));
+        assert_eq!(flat.faces.len(), 16 + 4 + 4);
+        assert!(flat.faces[16..].iter().all(|f| f.len() == 4), "rim and gap quads");
+        // A cube corner chamfered: three polygons gain a corner, a triangle fills the gap.
+        let corner = (0..pm.pos.len() as u32).find(|&v| (pm.pos[v as usize] - Vec3::ONE).length() < 1e-4).unwrap();
+        let cut = pm.chamfer_point(corner, 0.3);
+        assert!(closed(&cut));
+        assert_eq!(cut.faces.len(), 25);
+        assert_eq!(cut.faces.iter().filter(|f| f.len() == 5).count(), 3);
+        let reach = cut.faces.iter().flatten().map(|&v| cut.pos[v as usize]).fold(0.0f32, |m, p| m.max(p.x + p.y + p.z));
+        assert!((reach - 2.7).abs() < 1e-4, "the corner is cut off: {reach}");
+        // A border point of the plane: no gap to fill, the two polygons cut back.
+        let edge_point = (0..plane.pos.len() as u32).find(|&v| (plane.pos[v as usize] - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-4).unwrap();
+        let notched = plane.chamfer_point(edge_point, 0.3);
+        assert!(manifold(&notched));
+        assert_eq!(notched.faces.len(), 16);
+        // Two opposite holes in the cube bridged edge by edge until it closes again.
+        let bottom = (0..pm.faces.len() as u32).find(|&f| pm.normal(f).y < -0.9 && (pm.centre(f) - pm.centre(top) * Vec3::new(1.0, -1.0, 1.0)).length() < 1e-4).unwrap();
+        let (tv, bv) = (pm.faces[top as usize].clone(), pm.faces[bottom as usize].clone());
+        let mut holed = pm.delete(&[top, bottom]);
+        assert!(holed.bridge_edges((tv[0], tv[1]), (tv[0], tv[1])).is_none(), "the same edge twice");
+        let inner = (0..holed.faces.len() as u32).find(|&f| holed.normal(f).y > 0.9).unwrap();
+        let iv = holed.faces[inner as usize].clone();
+        assert!(holed.bridge_edges((iv[0], iv[1]), (tv[0], tv[1])).is_none(), "an edge between two polygons");
+        // Each top edge to the bottom edge nearest it.
+        for k in 0..4 {
+            let (a, b) = (tv[k], tv[(k + 1) % 4]);
+            let (c, d) = (0..4).map(|j| (bv[j], bv[(j + 1) % 4])).min_by(|x, y| {
+                let near = |e: &(u32, u32)| (holed.pos[e.0 as usize] + holed.pos[e.1 as usize]).distance(holed.pos[a as usize] + holed.pos[b as usize]);
+                near(x).total_cmp(&near(y))
+            }).unwrap();
+            holed = holed.bridge_edges((a, b), (c, d)).expect("open edges bridge");
+            assert!(manifold(&holed));
+        }
+        assert!(closed(&holed), "four bridges close the tunnel");
+        assert_eq!(holed.faces.len(), 24 - 2 + 4);
     }
 
     #[test]

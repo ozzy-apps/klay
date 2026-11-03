@@ -3012,9 +3012,9 @@ impl App {
                             painter.line_segment([to_pos((p(0) + p(1)) * 0.5), to_pos((p(2) + p(3)) * 0.5)], stroke);
                         }
                     }
-                    zmodeler::EdgeAction::Spin => {}
+                    zmodeler::EdgeAction::Spin | zmodeler::EdgeAction::Bridge => {}
                     zmodeler::EdgeAction::Delete | zmodeler::EdgeAction::Bevel => {
-                        let whole = self.workspace.zm_edge == zmodeler::EdgeAction::Bevel || self.workspace.zm_edge_loop;
+                        let whole = self.workspace.zm_edge_loop;
                         let edges = if whole { pm.edge_loop(a, b) } else { vec![(a, b)] };
                         for (x, y) in edges {
                             painter.line_segment([to_pos(pm.pos[x as usize]), to_pos(pm.pos[y as usize])], wide);
@@ -7192,7 +7192,7 @@ impl App {
         let at = self.canvas_cursor();
         let view_size = self.viewport();
         let camera = self.camera.clone();
-        let ws = (self.workspace.zm_poly, self.workspace.zm_target, self.workspace.zm_edge, self.workspace.zm_edge_loop);
+        let ws = (self.workspace.zm_poly, self.workspace.zm_target, self.workspace.zm_edge, self.workspace.zm_edge_loop, self.workspace.zm_point);
         let base = self.zmodel_view().poly.clone();
         let (faces, anchor, normal, label) = match hover {
             zmodeler::Hover::Poly(f) => {
@@ -7213,7 +7213,7 @@ impl App {
                 (faces, base.centre(f), normal, format!("ZModeler {} {}", ws.0.name(), ws.1.name()))
             }
             zmodeler::Hover::Edge(a, b) => (Vec::new(), (base.pos[a as usize] + base.pos[b as usize]) * 0.5, Vec3::Z, format!("ZModeler {} Edge{}", ws.2.name(), if ws.2 == zmodeler::EdgeAction::Delete && ws.3 { "Loop" } else { "" })),
-            zmodeler::Hover::Point(v) => (Vec::new(), base.pos[v as usize], Vec3::Z, "ZModeler Move Point".to_string()),
+            zmodeler::Hover::Point(v) => (Vec::new(), base.pos[v as usize], Vec3::Z, format!("ZModeler {} Point", ws.4.name())),
         };
         self.zm_drag = Some(ZDrag { hover, base, press: self.cursor, before, faces, anchor, normal, label, changed: false });
         self.hover = None;
@@ -7304,6 +7304,12 @@ impl App {
                         }
                         b.inset(&faces, (delta.length() / 150.0).min(0.9))
                     }
+                    PolyAction::Bevel => {
+                        if delta.length() < 2.0 {
+                            return None;
+                        }
+                        b.chamfer_edges(&b.border_edges(&faces), (delta.length() / 300.0).clamp(0.02, 0.45))
+                    }
                     PolyAction::Delete => b.delete(&faces),
                     PolyAction::Polygroup => b.regroup(&faces),
                     PolyAction::Bridge => {
@@ -7361,14 +7367,23 @@ impl App {
                             return None;
                         }
                         let t = (delta.length() / 300.0).clamp(0.02, 0.45);
-                        let mut out = b.clone();
-                        let mut done: Vec<(u32, u32)> = Vec::new();
+                        let mut all = Vec::new();
                         for ((x, y), _) in edges {
-                            if done.iter().any(|&(p, q)| (p, q) == (x, y) || (p, q) == (y, x)) {
-                                continue;
+                            if ws.zm_edge_loop {
+                                all.extend(b.edge_loop(x, y));
+                            } else {
+                                all.push((x, y));
                             }
-                            done.extend(out.edge_loop(x, y));
-                            out = out.bevel(x, y, t);
+                        }
+                        b.chamfer_edges(&all, t)
+                    }
+                    EdgeAction::Bridge => {
+                        // The second click: from the open edge picked first to this one.
+                        let first = self.zm_bridge.as_ref().filter(|f| f.len() == 2)?;
+                        let mut out = b.clone();
+                        let pairs: Vec<(Vec<u32>, Vec<u32>)> = copies(first).into_iter().zip(copies(&[a0, b0])).map(|((x, _), (y, _))| (x, y)).collect();
+                        for (x, y) in pairs {
+                            out = out.bridge_edges((x[0], x[1]), (y[0], y[1]))?;
                         }
                         out
                     }
@@ -7385,13 +7400,26 @@ impl App {
                 if delta.length() < 1.0 {
                     return None;
                 }
-                let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
                 let mut out = b.clone();
-                out = out.moved(&[v], m.translate);
-                for k in 1..images.len() {
-                    if let Some(w) = mirror(k, v) {
-                        if w != v {
-                            out = out.moved(&[w], images.map(k, m.translate));
+                match ws.zm_point {
+                    zmodeler::PointAction::Move => {
+                        let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
+                        out = out.moved(&[v], m.translate);
+                        for k in 1..images.len() {
+                            if let Some(w) = mirror(k, v) {
+                                if w != v {
+                                    out = out.moved(&[w], images.map(k, m.translate));
+                                }
+                            }
+                        }
+                    }
+                    zmodeler::PointAction::Bevel => {
+                        let t = (delta.length() / 300.0).clamp(0.02, 0.45);
+                        let mut points = vec![v];
+                        points.extend((1..images.len()).filter_map(|k| mirror(k, v)).filter(|&w| w != v));
+                        points.dedup();
+                        for w in points {
+                            out = out.chamfer_point(w, t);
                         }
                     }
                 }
@@ -7405,7 +7433,7 @@ impl App {
         use zmodeler::{EdgeAction, Hover, PolyAction};
         match hover {
             Hover::Poly(_) => matches!(self.workspace.zm_poly, PolyAction::Delete | PolyAction::Polygroup | PolyAction::Bridge),
-            Hover::Edge(..) => matches!(self.workspace.zm_edge, EdgeAction::Delete | EdgeAction::Spin),
+            Hover::Edge(..) => matches!(self.workspace.zm_edge, EdgeAction::Delete | EdgeAction::Spin | EdgeAction::Bridge),
             Hover::Point(_) => false,
         }
     }
@@ -7430,6 +7458,11 @@ impl App {
         if let (zmodeler::Hover::Poly(f), zmodeler::PolyAction::Bridge, None) = (d.hover, self.workspace.zm_poly, &self.zm_bridge) {
             self.zm_bridge = Some(d.base.faces[f as usize].clone());
             self.workspace.notify("Bridge: click the polygon to join it to".to_string());
+            return;
+        }
+        if let (zmodeler::Hover::Edge(a, b), zmodeler::EdgeAction::Bridge, None) = (d.hover, self.workspace.zm_edge, &self.zm_bridge) {
+            self.zm_bridge = Some(vec![a, b]);
+            self.workspace.notify("Bridge: click the open edge to join it to".to_string());
             return;
         }
         let click = self.zmodel_click(d.hover);
@@ -9610,7 +9643,11 @@ impl ApplicationHandler for App {
                     // ZBrush quick menu: shown while Space is held.
                     match event.state {
                         ElementState::Pressed if !event.repeat && !typing => {
-                            self.workspace.open_quick_menu(self.cursor_pos(), true);
+                            // ZBrush: with ZModeler, Space over a target shows its actions.
+                            match self.zm_hover.filter(|_| self.brush.kind.is_zmodeler()) {
+                                Some(hover) => self.workspace.open_zm_menu(self.cursor_pos(), hover),
+                                None => self.workspace.open_quick_menu(self.cursor_pos(), true),
+                            }
                         }
                         ElementState::Released => {
                             if self.workspace.quick_menu.is_some_and(|(_, held)| held) {
@@ -10350,6 +10387,8 @@ fn main() {
             _ => eprintln!("unknown material {m}; one of: {}", workspace::MATERIALS.map(|(_, n)| n).join(", ")),
         }
     }
+    // The brush catalog's previews, drawn ahead so B opens at once.
+    app.workspace.prerender_previews();
     if args.iter().any(|a| a == "--selftest-clip") {
         app.selftest_clip = Some(20);
     }

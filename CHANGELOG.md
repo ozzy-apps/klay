@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.0 — 2026-11-03
+
+- **ZModeler box-modelling actions.** Polygon **Bevel** (the polygon's border chamfered: a smaller polygon with a rim, Target applies), point **Bevel** (the corner cut off, a polygon in the gap) and edge **Bridge** (two open edges joined by a polygon, click one then the other, as polygon Bridge). Edge Bevel now chamfers one edge or, with **EdgeLoop**, the loop (it always took the loop before), and works on any polygons, not only quads; both bevels share one chamfer that keeps the mesh closed, polygons beside a slid corner gaining that point on their edge.
+- **Space** over a polygon, edge or point with ZModeler opens its actions (and Target for polygons), as in ZBrush; elsewhere Space is still the quick menu. The Brush panel gains a Point row.
+- The brush catalog (B) opens at once the first time: its 88 previews are drawn ahead on another thread at start-up and when the material changes (they took about a second on the first open).
+- Verification: 387 tests (new: a cube's top polygon bevels closed into rim and gap quads with its neighbours gaining a point, four polygons bevel by their outer border only, one edge chamfers with a triangle at each end, a loop gives the flat strip, a polygon in a flat grid gets rim and gap quads, a cube corner chamfers into three five-sided polygons and a triangle, a border point cuts back without a gap, and two holes bridge edge by edge until the cube is closed again).
+
 ## 0.31.0 — 2026-11-03
 
 - **Quads are remembered.** A mesh now records which two triangles make each quad (`SculptMesh::quads`): the primitives, ZRemesher and ZModeler set it, Divide and Dynamic Subdivision carry it to every level, and Split, Merge, Mirror and projects keep it. PolyF and ZModeler use it instead of guessing quads from edge lengths, which showed big or skewed quads (a coarse ZRemesher result, a stretched plane) as pairs of triangles and stopped edge loops at them. Meshes from older files and from operations that rebuild triangles (booleans, decimation, Sculptris) still guess as before.

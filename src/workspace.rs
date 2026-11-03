@@ -1217,6 +1217,9 @@ pub struct Workspace {
     pub zm_target: crate::zmodeler::PolyTarget,
     pub zm_edge: crate::zmodeler::EdgeAction,
     pub zm_edge_loop: bool,
+    pub zm_point: crate::zmodeler::PointAction,
+    /// The ZModeler menu (Space over a target): where, and what it was over.
+    pub zm_menu: Option<(Pos2, crate::zmodeler::Hover)>,
     /// Shade the mask: Ctrl + H (ZBrush: View Mask).
     pub show_mask: bool,
     /// Draw only the active subtool (ZBrush: Solo).
@@ -1280,6 +1283,10 @@ pub struct Workspace {
     pending_move: Option<(PaletteId, Place, Option<PaletteId>)>,
     scroll_to: Option<PaletteId>,
     textures: HashMap<(usize, usize, bool), TextureHandle>,
+    /// Brush previews drawn ahead on another thread (see [`Self::prerender_previews`]),
+    /// by the key of `textures`, and the material they were drawn for.
+    preview_cache: std::sync::Arc<std::sync::Mutex<HashMap<(usize, usize, bool), egui::ColorImage>>>,
+    prerendered: Option<usize>,
     message: Option<(String, f64)>,
     /// Text queued by the app for the status bar; shown on the next frame.
     pub(crate) pending_notice: Option<String>,
@@ -1429,6 +1436,8 @@ impl Workspace {
             zm_target: Default::default(),
             zm_edge: Default::default(),
             zm_edge_loop: true,
+            zm_point: Default::default(),
+            zm_menu: None,
             show_mask: true,
             solo: false,
             polyframe: false,
@@ -1467,6 +1476,8 @@ impl Workspace {
             pending_move: None,
             scroll_to: None,
             textures: HashMap::new(),
+            preview_cache: Default::default(),
+            prerendered: None,
             message: None,
             pending_notice: None,
             saved,
@@ -1531,6 +1542,7 @@ impl Workspace {
         self.canvas_overlays(ui, m, &mut a);
         self.quick_popup(ui, m);
         self.quick_menu_ui(ui, m);
+        self.zm_menu_ui(ui);
         self.dropdown(ui, m, &mut a);
         self.brush_catalog_ui(ui,m);
         self.import_path_ui(ui);
@@ -1823,6 +1835,88 @@ impl Workspace {
     pub fn open_quick_menu(&mut self, pos: Pos2, held: bool) {
         self.popup = None;
         self.quick_menu = Some((pos, held));
+    }
+
+    /// Open the ZModeler menu at `pos` for what the cursor is over (ZBrush: Space).
+    pub fn open_zm_menu(&mut self, pos: Pos2, hover: crate::zmodeler::Hover) {
+        self.popup = None;
+        self.quick_menu = None;
+        self.zm_menu = Some((pos, hover));
+    }
+
+    /// The ZModeler menu: the actions for a polygon (and its target), an edge or a point;
+    /// a choice, Escape or a press outside closes it.
+    fn zm_menu_ui(&mut self, ui: &mut Ui) {
+        use crate::zmodeler::{EdgeAction, Hover, PointAction, PolyAction, PolyTarget};
+        let Some((pos, hover)) = self.zm_menu else { return };
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.zm_menu = None;
+            return;
+        }
+        let width = 150.0;
+        let mut chosen = false;
+        let area = egui::Area::new(Id::unique("zmodeler-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos - vec2(width * 0.5 + 4.0, 14.0))
+            .show(&ctx, |ui| {
+                popup_frame().show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let (what, hint) = match hover {
+                        Hover::Poly(_) => ("Polygon Actions", self.zm_poly.hint()),
+                        Hover::Edge(..) => ("Edge Actions", self.zm_edge.hint()),
+                        Hover::Point(_) => ("Point Actions", self.zm_point.hint()),
+                    };
+                    ui.label(RichText::new(what).size(12.0).color(FG2()));
+                    let row = |ui: &mut Ui, name: &str, hint: &str, on: bool| -> bool {
+                        ui.add_sized([width, CONTROL_H], egui::Button::new(name).selected(on)).on_hover_text(hint).clicked()
+                    };
+                    match hover {
+                        Hover::Poly(_) => {
+                            for a in PolyAction::ALL {
+                                if row(ui, a.name(), a.hint(), self.zm_poly == a) {
+                                    self.zm_poly = a;
+                                    chosen = true;
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Target").size(12.0).color(FG2()));
+                            for t in PolyTarget::ALL {
+                                if row(ui, t.name(), "What the action takes", self.zm_target == t) {
+                                    self.zm_target = t;
+                                    chosen = true;
+                                }
+                            }
+                        }
+                        Hover::Edge(..) => {
+                            for a in EdgeAction::ALL {
+                                if row(ui, a.name(), a.hint(), self.zm_edge == a) {
+                                    self.zm_edge = a;
+                                    chosen = true;
+                                }
+                            }
+                            if matches!(self.zm_edge, EdgeAction::Delete | EdgeAction::Bevel) {
+                                ui.checkbox(&mut self.zm_edge_loop, "EdgeLoop").on_hover_text("The whole loop, not just the edge");
+                            }
+                        }
+                        Hover::Point(_) => {
+                            for a in PointAction::ALL {
+                                if row(ui, a.name(), a.hint(), self.zm_point == a) {
+                                    self.zm_point = a;
+                                    chosen = true;
+                                }
+                            }
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(hint).size(11.0).color(FG2()));
+                });
+            });
+        let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.latest_pos().is_none_or(|p| !area.response.rect.contains(p)));
+        if chosen || outside {
+            self.zm_menu = None;
+        }
     }
 
     /// The brush row, Zadd/Zsub, the two live sliders and the mode row, like ZBrush's
@@ -2889,15 +2983,15 @@ impl Workspace {
                 });
                 if m.brush.kind.is_zmodeler() {
                     self.sec(ui, h, id, "zmodeler", "ZModeler", None, true, true, &mut |ws, ui| {
-                        use crate::zmodeler::{EdgeAction, PolyAction, PolyTarget};
+                        use crate::zmodeler::{EdgeAction, PointAction, PolyAction, PolyTarget};
                         ui.label(RichText::new("Polygon").size(12.0).color(FG2()));
                         let names: Vec<&str> = PolyAction::ALL.iter().map(|x| x.name()).collect();
                         let at = PolyAction::ALL.iter().position(|x| *x == ws.zm_poly).unwrap_or(0);
-                        if let Some(i) = seg(ui, &names[..3], at.min(2), false) {
+                        if let Some(i) = seg(ui, &names[..4], at.min(3), false) {
                             ws.zm_poly = PolyAction::ALL[i];
                         }
-                        if let Some(i) = seg(ui, &names[3..], at.saturating_sub(3).min(2), false) {
-                            ws.zm_poly = PolyAction::ALL[3 + i];
+                        if let Some(i) = seg(ui, &names[4..], at.saturating_sub(4).min(2), false) {
+                            ws.zm_poly = PolyAction::ALL[4 + i];
                         }
                         let targets: Vec<&str> = PolyTarget::ALL.iter().map(|x| x.name()).collect();
                         let at = PolyTarget::ALL.iter().position(|x| *x == ws.zm_target).unwrap_or(0);
@@ -2910,10 +3004,16 @@ impl Workspace {
                         if let Some(i) = seg(ui, &names, at, false) {
                             ws.zm_edge = EdgeAction::ALL[i];
                         }
-                        if ws.zm_edge == EdgeAction::Delete {
-                            ui.checkbox(&mut ws.zm_edge_loop, "EdgeLoop").on_hover_text("Delete the whole loop, not just the edge");
+                        if matches!(ws.zm_edge, EdgeAction::Delete | EdgeAction::Bevel) {
+                            ui.checkbox(&mut ws.zm_edge_loop, "EdgeLoop").on_hover_text("The whole loop, not just the edge");
                         }
-                        note(ui, "Hover a polygon, edge or point · QMesh and Extrude: drag out · Inset: drag in · Insert: click where the loop goes, drag to slide it · points: drag to move");
+                        ui.label(RichText::new("Point").size(12.0).color(FG2()));
+                        let names: Vec<&str> = PointAction::ALL.iter().map(|x| x.name()).collect();
+                        let at = PointAction::ALL.iter().position(|x| *x == ws.zm_point).unwrap_or(0);
+                        if let Some(i) = seg(ui, &names, at, false) {
+                            ws.zm_point = PointAction::ALL[i];
+                        }
+                        note(ui, "Hover a polygon, edge or point and press Space for its actions · QMesh and Extrude: drag out · Inset and Bevel: drag in · Insert: click where the loop goes, drag to slide it · Bridge: click one, then the other · points: drag to move, or Bevel to cut the corner off");
                     });
                 }
                 if m.brush.kind.is_imm() {
@@ -5177,6 +5277,7 @@ impl Workspace {
                 );
                 if resp.on_hover_text(*name).clicked() {
                     self.material = i;
+                    self.prerender_previews();
                 }
             }
         });
@@ -5557,23 +5658,52 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ previews
+    /// Whether `kind`'s preview differs when subtracting (the stroke goes in).
+    fn preview_flips(kind: Option<BrushKind>) -> bool {
+        matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate | BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Blob | BrushKind::Layer | BrushKind::Nudge | BrushKind::Sharpen | BrushKind::FormSoft | BrushKind::FormHard | BrushKind::Zipper | BrushKind::Stitch | BrushKind::Rake | BrushKind::ClayTubes | BrushKind::InflateBalloon | BrushKind::Magnify | BrushKind::OrbCracks | BrushKind::MalletFast))
+    }
+
+    /// Draw every brush's preview in the current material on another thread, so the brush
+    /// catalog opens at once the first time (all of them take about a second on one core).
+    /// Once per material; nothing in tests.
+    pub fn prerender_previews(&mut self) {
+        if self.prerendered == Some(self.material) || cfg!(test) {
+            return;
+        }
+        self.prerendered = Some(self.material);
+        let material = self.material;
+        let cache = self.preview_cache.clone();
+        let mut keys: Vec<(usize, Option<BrushKind>, bool)> = vec![(usize::MAX, None, false)];
+        for (i, &k) in BrushKind::ALL.iter().enumerate() {
+            keys.push((i, Some(k), false));
+            if Self::preview_flips(Some(k)) {
+                keys.push((i, Some(k), true));
+            }
+        }
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let images: Vec<((usize, usize, bool), egui::ColorImage)> =
+                keys.into_par_iter().map(|(i, kind, sub)| ((i, material, sub), sphere_image(kind, material, sub))).collect();
+            if let Ok(mut c) = cache.lock() {
+                c.extend(images);
+            }
+        });
+    }
+
     fn texture(&mut self, ctx: &Context, kind: Option<BrushKind>, sub: bool) -> TextureId {
         let kind_index = kind
             .map(|k| BrushKind::ALL.iter().position(|x| *x == k).unwrap())
             .unwrap_or(usize::MAX);
-        let flips = matches!(kind, Some(BrushKind::Draw | BrushKind::Inflate | BrushKind::DamStandard | BrushKind::Pinch | BrushKind::Crease | BrushKind::Clay | BrushKind::ClayBuildup | BrushKind::Blob | BrushKind::Layer | BrushKind::Nudge | BrushKind::Sharpen | BrushKind::FormSoft | BrushKind::FormHard | BrushKind::Zipper | BrushKind::Stitch | BrushKind::Rake | BrushKind::ClayTubes | BrushKind::InflateBalloon | BrushKind::Magnify | BrushKind::OrbCracks | BrushKind::MalletFast));
+        let flips = Self::preview_flips(kind);
         let key = (kind_index, self.material, sub && flips);
         let material = self.material;
-        self.textures
-            .entry(key)
-            .or_insert_with(|| {
-                ctx.load_texture(
-                    format!("preview-{kind_index}-{material}-{}", sub && flips),
-                    sphere_image(kind, material, sub && flips),
-                    TextureOptions::LINEAR,
-                )
-            })
-            .id()
+        if !self.textures.contains_key(&key) {
+            self.prerender_previews();
+            let image = self.preview_cache.lock().ok().and_then(|mut c| c.remove(&key)).unwrap_or_else(|| sphere_image(kind, material, sub && flips));
+            let handle = ctx.load_texture(format!("preview-{kind_index}-{material}-{}", sub && flips), image, TextureOptions::LINEAR);
+            self.textures.insert(key, handle);
+        }
+        self.textures[&key].id()
     }
 
     fn material_texture(&mut self, ctx: &Context, material: usize) -> TextureId {
@@ -7076,6 +7206,43 @@ mod tests {
         workspace.open_quick_menu(pos2(800.0, 500.0), true);
         frame(&mut workspace, &ctx, size, vec![pointer(pos2(400.0, 900.0), true)]);
         assert!(workspace.quick_menu.is_some());
+    }
+
+    #[test]
+    fn zmodeler_menu_lists_the_actions_of_what_is_hovered_and_picks_one() {
+        use crate::zmodeler::{EdgeAction, Hover, PointAction, PolyAction};
+        let (mut workspace, ctx) = test_workspace("zm-menu");
+        let size = vec2(1600.0, 1000.0);
+        workspace.open_zm_menu(pos2(800.0, 500.0), Hover::Poly(0));
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&output, "Polygon Actions"), 1);
+        assert_eq!(text_count(&output, "Polyloop"), 1, "the targets too");
+        // A click on Bevel picks it and closes the menu.
+        let at = text_position(&output, "Bevel");
+        click(&mut workspace, &ctx, size, at);
+        assert_eq!(workspace.zm_poly, PolyAction::Bevel);
+        assert!(workspace.zm_menu.is_none());
+        // Edges and points list their own; a press elsewhere closes the menu.
+        workspace.open_zm_menu(pos2(800.0, 500.0), Hover::Edge(0, 1));
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&output, "Edge Actions"), 1);
+        let at = text_position(&output, "Bridge");
+        click(&mut workspace, &ctx, size, at);
+        assert_eq!(workspace.zm_edge, EdgeAction::Bridge);
+        workspace.open_zm_menu(pos2(800.0, 500.0), Hover::Point(0));
+        frame(&mut workspace, &ctx, size, vec![]);
+        let output = frame(&mut workspace, &ctx, size, vec![]);
+        assert_eq!(text_count(&output, "Point Actions"), 1);
+        let at = text_position(&output, "Bevel");
+        click(&mut workspace, &ctx, size, at);
+        assert_eq!(workspace.zm_point, PointAction::Bevel);
+        workspace.open_zm_menu(pos2(800.0, 500.0), Hover::Point(0));
+        frame(&mut workspace, &ctx, size, vec![]);
+        frame(&mut workspace, &ctx, size, vec![]);
+        click(&mut workspace, &ctx, size, pos2(400.0, 900.0));
+        assert!(workspace.zm_menu.is_none());
     }
 
     /// Centre of the ◉ dock button of the first palette in the left tray.

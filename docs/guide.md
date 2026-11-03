@@ -601,19 +601,26 @@ under 0.1 s against a 1.9M-triangle sculpt, plus about 0.25 s to index the sculp
 
 The **ZModeler** brush (B catalog › Insert) models with polygons instead of sculpting.
 Hover the model: the point, edge or polygon under the cursor lights up (a point within a
-few pixels, then an edge, else the polygon), and a click or drag acts on it. Brush ›
-ZModeler picks the actions, as ZBrush's Space menu does:
+few pixels, then an edge, else the polygon), and a click or drag acts on it. **Space** over
+it opens its actions (and Target for a polygon), as ZBrush's ZModeler menu does; Brush ›
+ZModeler lists the same:
 
 - **Polygon**: **QMesh** / **Extrude** (drag to pull out or push in along the normal),
-  **Inset** (drag to size the inner copy), **Delete**, **Polygroup** (click), **Bridge**
+  **Inset** (drag to size the inner copy), **Bevel** (drag: the polygon's border chamfered
+  into a rim round a smaller polygon, 0.32), **Delete**, **Polygroup** (click), **Bridge**
   (click one polygon, then another with as many sides: a tube joins them). Targets: **A
   Single Poly**, **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest
   the cursor).
 - **Edge**: **Insert** an edge loop round the ring of quads through the edge (click where it
   goes, drag to slide it; a triangle at the end becomes a quad), **Delete** the edge or
-  its whole **EdgeLoop**, **Bevel** the edge loop into a flat strip (drag for its width),
-  or **Spin** the edge one step round its two polygons (click).
-- **Point**: **Move** in the view plane.
+  its whole **EdgeLoop**, **Bevel** the edge (or with EdgeLoop the loop) into a flat chamfer
+  (drag for its width), **Spin** the edge one step round its two polygons (click), or
+  **Bridge** two open edges with a polygon (click one, then the other, 0.32).
+- **Point**: **Move** in the view plane, or **Bevel** the corner off (drag for its size: the
+  polygons round the point cut back and a polygon fills the gap, 0.32).
+
+A bevel keeps the mesh closed: a polygon beside a chamfered edge slides its corner along
+its other edge, and the polygon on the far side of that edge gains the slid point.
 
 With symmetry on (X, Y, Z or radial), every action also happens on the mirror images of
 its target, mirrored (a spin turns the other way in a mirror).
