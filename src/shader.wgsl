@@ -418,6 +418,42 @@ fn symmetric_distance(p: vec3<f32>, c: vec3<f32>) -> f32 {
     return d;
 }
 
+// --- Reference image (reference.rs) -----------------------------------------------------
+// A picture on a plane in the scene, drawn blended after the opaque surfaces: the model in
+// front of it hides it, and it shows through at its opacity where it lies in front.
+struct RefParams {
+    // World corners: top left, top right, bottom right, bottom left.
+    corners: array<vec4<f32>, 4>,
+    // x = opacity.
+    opacity: vec4<f32>,
+};
+@group(1) @binding(1) var<uniform> reference: RefParams;
+@group(1) @binding(2) var ref_picture: texture_2d<f32>;
+@group(1) @binding(3) var ref_sampler: sampler;
+
+struct RefOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_reference(@builtin(vertex_index) index: u32) -> RefOut {
+    var order = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    var uvs = array<vec2<f32>, 4>(vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0));
+    let k = order[index];
+    var out: RefOut;
+    out.clip = u.view_proj * vec4<f32>(reference.corners[k].xyz, 1.0);
+    out.uv = uvs[k];
+    return out;
+}
+
+@fragment
+fn fs_reference(in: RefOut) -> @location(0) vec4<f32> {
+    let c = textureSample(ref_picture, ref_sampler, in.uv);
+    // The picture is sampled linear (sRGB texture); the swapchain is non-sRGB.
+    return vec4<f32>(pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), c.a * reference.opacity.x);
+}
+
 // --- Point splats (splat.wgsl) resolved into the frame -----------------------------------
 // Drawn as a full-screen triangle right after the background: every pixel a point landed
 // in is shaded like a triangle's fragment, from the nearest vertex's own position, normal,

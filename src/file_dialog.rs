@@ -32,6 +32,10 @@ pub enum Ask {
     ExportColorMap,
     /// Spotlight › Load Image.
     OpenSpotlight,
+    /// Material › Load MatCap: a picture of a lit sphere.
+    OpenMatCap,
+    /// Document › Reference › Load Image.
+    OpenReference,
     /// Document › Render › Render.
     ExportRender,
     /// Document › Render › Turntable.
@@ -54,6 +58,8 @@ impl Ask {
             Ask::ExportColorMap => "Save Color Map",
             Ask::ExportRender => "Save Render",
             Ask::OpenSpotlight => "Spotlight Image",
+            Ask::OpenMatCap => "Load MatCap",
+            Ask::OpenReference => "Reference Image",
             Ask::ExportTurntable => "Save Turntable",
         }
     }
@@ -73,7 +79,7 @@ impl Ask {
             Ask::ImportMesh => &["obj", "stl"],
             Ask::ExportNormalMap | Ask::ExportColorMap | Ask::ExportRender => &["png"],
             Ask::ExportTurntable => &["mp4"],
-            Ask::OpenSpotlight => &["png", "jpg", "jpeg", "bmp"],
+            Ask::OpenSpotlight | Ask::OpenMatCap | Ask::OpenReference => &["png", "jpg", "jpeg", "bmp"],
             Ask::ExportDisplacementMap => &["exr", "png"],
         }
     }

@@ -5,10 +5,18 @@
 //!
 //! The renderer uploads every layer into one texture array (`gpu_layers`) and `shader.wgsl`
 //! samples it; brush and material thumbnails sample the same images on the CPU (`sample`).
+//!
+//! Material › Load MatCap adds the user's own pictures of a lit sphere ([`Look::User`]): the
+//! picture is the diffuse layer, there is no specular layer, and the unpainted colour is
+//! white, so polypaint tints the picture. They are listed after the built-in MatCaps, copied
+//! into the config folder (`klay/matcaps/`, with `klay/matcaps.list` for their order) and
+//! loaded again at the next start ([`restore`]).
 
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 /// Width and height of each MatCap image.
 pub const SIZE: usize = 256;
@@ -30,6 +38,8 @@ pub enum Look {
     Slate,
     RimDark,
     Normal,
+    /// A loaded MatCap (Material › Load MatCap), by its index in [`users`].
+    User(u16),
 }
 
 impl Look {
@@ -64,6 +74,7 @@ impl Look {
             Look::Slate => "MatCap Slate",
             Look::RimDark => "MatCap Rim Dark",
             Look::Normal => "MatCap Normal",
+            Look::User(_) => "MatCap",
         }
     }
 
@@ -81,7 +92,7 @@ impl Look {
             Look::CavityWhite => Vec3::new(0.86, 0.85, 0.83),
             Look::Slate => Vec3::new(0.30, 0.36, 0.44),
             Look::RimDark => Vec3::new(0.13, 0.13, 0.14),
-            Look::Normal => Vec3::ONE,
+            Look::Normal | Look::User(_) => Vec3::ONE,
         }
     }
 
@@ -187,6 +198,8 @@ impl Look {
                     + 0.30 * softbox(r, Vec3::new(-0.55, 0.55, 0.63), 0.22, 0.10);
                 (diffuse, Vec3::splat(spec))
             }
+            // Loaded MatCaps are pictures, not painted (`sample` reads them).
+            Look::User(_) => (Vec3::ONE, Vec3::ZERO),
         }
     }
 }
@@ -252,9 +265,217 @@ pub fn library() -> &'static [Images] {
     LIBRARY.get_or_init(|| Look::ALL.iter().map(|&l| paint(l)).collect())
 }
 
-/// The MatCap of material `material`, if it is one.
+/// The MatCap of material `material`, if it is one: a built-in one, or a loaded one after
+/// them.
 pub fn of_material(material: usize) -> Option<Look> {
-    material.checked_sub(FIRST).and_then(|i| Look::ALL.get(i).copied())
+    let i = material.checked_sub(FIRST)?;
+    if let Some(look) = Look::ALL.get(i) {
+        return Some(*look);
+    }
+    let k = i - Look::ALL.len();
+    (k < user_count()).then_some(Look::User(k as u16))
+}
+
+/// Number of materials: the clays, the built-in MatCaps and the loaded ones.
+pub fn material_count() -> usize {
+    FIRST + Look::ALL.len() + user_count()
+}
+
+// --- Loaded MatCaps (Material › Load MatCap) ----------------------------------------------
+
+/// A MatCap loaded from a picture: the picture resampled to [`SIZE`] as the diffuse layer.
+pub struct UserMatcap {
+    /// The picture's file name without its extension, as listed in the Material palette.
+    pub name: String,
+    /// The file it was loaded from (the copy in the config folder once stored), and the
+    /// file the user picked, so picking it again selects it instead of loading it twice.
+    pub path: PathBuf,
+    pub source: PathBuf,
+    pub diffuse: Vec<Vec3>,
+}
+
+fn users() -> &'static RwLock<Vec<UserMatcap>> {
+    static USERS: OnceLock<RwLock<Vec<UserMatcap>>> = OnceLock::new();
+    USERS.get_or_init(Default::default)
+}
+
+/// Counts up whenever the loaded MatCaps change, so the renderer knows to upload the
+/// texture array again.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+pub fn user_count() -> usize {
+    users().read().map_or(0, |u| u.len())
+}
+
+/// The name shown for material `material`: `MATERIALS` for the clays and built-in MatCaps,
+/// the file name for a loaded one.
+pub fn material_name(material: usize) -> String {
+    let table = &crate::workspace::MATERIALS;
+    if let Some((_, name)) = table.get(material) {
+        return (*name).to_string();
+    }
+    users().read().ok().and_then(|u| u.get(material - table.len()).map(|m| m.name.clone())).unwrap_or_default()
+}
+
+/// The material called `name` (case does not matter), or its number.
+pub fn material_named(name: &str) -> Option<usize> {
+    if let Some(i) = name.parse::<usize>().ok().filter(|&i| i < material_count()) {
+        return Some(i);
+    }
+    (0..material_count()).find(|&i| material_name(i).eq_ignore_ascii_case(name))
+}
+
+/// The picture at `path` as a MatCap: decoded, taken as sRGB and resampled to [`SIZE`]
+/// (bilinear), its alpha ignored.
+fn picture_matcap(path: &Path) -> Result<UserMatcap, String> {
+    let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.to_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Err(format!("{}: an empty picture", path.display()));
+    }
+    let px = img.as_raw();
+    let linear = |c: u8| (c as f32 / 255.0).powf(2.2);
+    let at = |x: i64, y: i64| {
+        let x = x.clamp(0, w as i64 - 1) as usize;
+        let y = y.clamp(0, h as i64 - 1) as usize;
+        let i = (y * w as usize + x) * 4;
+        Vec3::new(linear(px[i]), linear(px[i + 1]), linear(px[i + 2]))
+    };
+    let diffuse = (0..SIZE * SIZE)
+        .into_par_iter()
+        .map(|i| {
+            let u = ((i % SIZE) as f32 + 0.5) / SIZE as f32;
+            let v = ((i / SIZE) as f32 + 0.5) / SIZE as f32;
+            let (x, y) = (u * w as f32 - 0.5, v * h as f32 - 0.5);
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let (x0, y0) = (x0 as i64, y0 as i64);
+            let top = at(x0, y0).lerp(at(x0 + 1, y0), fx);
+            let bottom = at(x0, y0 + 1).lerp(at(x0 + 1, y0 + 1), fx);
+            top.lerp(bottom, fy)
+        })
+        .collect();
+    let name = path.file_stem().map_or_else(|| "MatCap".to_string(), |s| s.to_string_lossy().into_owned());
+    Ok(UserMatcap { name, path: path.to_path_buf(), source: path.to_path_buf(), diffuse })
+}
+
+/// Load the picture at `path` as a new MatCap after the others and return its material
+/// index. With `store` (the config root, `$XDG_CONFIG_HOME`), the picture is copied into
+/// `klay/matcaps/` and listed, so it is loaded again at the next start. A picture already
+/// loaded (same path) is selected, not loaded twice.
+pub fn load_user(path: &Path, store: Option<&Path>) -> Result<usize, String> {
+    if let Some(k) = users().read().ok().and_then(|u| u.iter().position(|m| m.path == path || m.source == path)) {
+        return Ok(FIRST + Look::ALL.len() + k);
+    }
+    let mut m = picture_matcap(path)?;
+    if let Some(root) = store {
+        m.path = store_copy(root, path)?;
+    }
+    let mut u = users().write().map_err(|_| "the MatCap list is poisoned")?;
+    u.push(m);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    let k = u.len() - 1;
+    drop(u);
+    if let Some(root) = store {
+        write_list(root);
+    }
+    Ok(FIRST + Look::ALL.len() + k)
+}
+
+/// Take loaded MatCap `k` away (its copy in the config folder too, when `store` is given).
+pub fn remove_user(k: usize, store: Option<&Path>) {
+    let removed = users().write().ok().filter(|u| k < u.len()).map(|mut u| u.remove(k));
+    let Some(removed) = removed else { return };
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(root) = store {
+        if removed.path.starts_with(folder(root)) {
+            let _ = std::fs::remove_file(&removed.path);
+        }
+        write_list(root);
+    }
+}
+
+/// `klay/matcaps/` under the config root.
+fn folder(root: &Path) -> PathBuf {
+    root.join("klay/matcaps")
+}
+
+/// Copy `path` into the config folder under its own name (a number added when another
+/// picture already has it) and return the copy's path.
+fn store_copy(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let dir = folder(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    let stem = path.file_stem().map_or_else(|| "matcap".to_string(), |s| s.to_string_lossy().into_owned());
+    let ext = path.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+    let candidates = std::iter::once(format!("{stem}{ext}")).chain((2..).map(|n| format!("{stem} {n}{ext}")));
+    let target = candidates.map(|n| dir.join(n)).find(|p| !p.exists()).unwrap();
+    std::fs::copy(path, &target).map_err(|e| format!("cannot copy {} into the config folder: {e}", path.display()))?;
+    Ok(target)
+}
+
+/// Write `klay/matcaps.list`: the stored copies' file names, in material order.
+fn write_list(root: &Path) {
+    let Ok(u) = users().read() else { return };
+    let mut text = String::from("# Klay matcaps v1\n");
+    for m in u.iter() {
+        if let Some(name) = m.path.file_name().filter(|_| m.path.starts_with(folder(root))) {
+            text.push_str(&name.to_string_lossy());
+            text.push('\n');
+        }
+    }
+    let path = root.join("klay/matcaps.list");
+    let _ = std::fs::create_dir_all(root.join("klay"));
+    let _ = std::fs::write(path, text);
+}
+
+/// Load the MatCaps stored under the config root `root` again, in their listed order (any
+/// picture in the folder that the list misses comes after, by name). Returns what could
+/// not be loaded.
+pub fn restore(root: &Path) -> Vec<String> {
+    let dir = folder(root);
+    let listed: Vec<String> = std::fs::read_to_string(root.join("klay/matcaps.list"))
+        .ok()
+        .filter(|t| t.starts_with("# Klay matcaps v1\n"))
+        .map(|t| t.lines().skip(1).filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut names = listed.clone();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut extra: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !listed.contains(n))
+            .collect();
+        extra.sort();
+        names.extend(extra);
+    }
+    let mut failed = Vec::new();
+    for n in names {
+        let path = dir.join(&n);
+        if !path.is_file() {
+            continue;
+        }
+        if let Err(e) = load_user(&path, None) {
+            failed.push(e);
+        }
+    }
+    failed
+}
+
+/// Tests that load or count MatCaps take this, since the loaded MatCaps are shared.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Loaded MatCap `k`'s picture, bilinear at a view-space normal.
+fn user_sample(k: usize, n: Vec3) -> Vec3 {
+    users().read().ok().and_then(|u| u.get(k).map(|m| bilinear(&m.diffuse, n))).unwrap_or(Vec3::ONE)
 }
 
 fn encode(c: f32) -> u8 {
@@ -262,12 +483,19 @@ fn encode(c: f32) -> u8 {
 }
 
 /// The images as sRGB RGBA8 texture array layers: diffuse then specular per MatCap, in
-/// [`Look::ALL`] order. The renderer samples them as `Rgba8UnormSrgb` (linear in the shader).
+/// [`Look::ALL`] order, then the loaded MatCaps (their picture, then a black specular
+/// layer). The renderer samples them as `Rgba8UnormSrgb` (linear in the shader).
 pub fn gpu_layers() -> Vec<u8> {
-    let mut out = Vec::with_capacity(library().len() * 2 * SIZE * SIZE * 4);
+    let mut out = Vec::with_capacity(layer_count() as usize * SIZE * SIZE * 4);
+    let push = |out: &mut Vec<u8>, layer: &[Vec3]| out.extend(layer.iter().flat_map(|c| [encode(c.x), encode(c.y), encode(c.z), 255]));
     for m in library() {
-        for layer in [&m.diffuse, &m.specular] {
-            out.extend(layer.iter().flat_map(|c| [encode(c.x), encode(c.y), encode(c.z), 255]));
+        push(&mut out, &m.diffuse);
+        push(&mut out, &m.specular);
+    }
+    if let Ok(u) = users().read() {
+        for m in u.iter() {
+            push(&mut out, &m.diffuse);
+            out.extend(std::iter::repeat_n([0, 0, 0, 255], SIZE * SIZE).flatten());
         }
     }
     out
@@ -275,26 +503,31 @@ pub fn gpu_layers() -> Vec<u8> {
 
 /// Number of texture array layers in [`gpu_layers`].
 pub fn layer_count() -> u32 {
-    (Look::ALL.len() * 2) as u32
+    ((Look::ALL.len() + user_count()) * 2) as u32
 }
 
-/// Bilinear diffuse and specular light of `look` for a view-space normal (thumbnails).
-pub fn sample(look: Look, n: Vec3) -> (Vec3, Vec3) {
-    let m = &library()[Look::ALL.iter().position(|&l| l == look).unwrap()];
+/// `img` (a [`SIZE`]-square image) bilinear at the view-space normal `n`.
+fn bilinear(img: &[Vec3], n: Vec3) -> Vec3 {
     let uv = uv_of(n) * SIZE as f32 - Vec2::splat(0.5);
     let (x0, y0) = (uv.x.floor(), uv.y.floor());
     let (fx, fy) = (uv.x - x0, uv.y - y0);
-    let at = |img: &[Vec3], x: f32, y: f32| {
+    let at = |x: f32, y: f32| {
         let x = (x as i32).clamp(0, SIZE as i32 - 1) as usize;
         let y = (y as i32).clamp(0, SIZE as i32 - 1) as usize;
         img[y * SIZE + x]
     };
-    let bilinear = |img: &[Vec3]| {
-        let top = at(img, x0, y0).lerp(at(img, x0 + 1.0, y0), fx);
-        let bottom = at(img, x0, y0 + 1.0).lerp(at(img, x0 + 1.0, y0 + 1.0), fx);
-        top.lerp(bottom, fy)
-    };
-    (bilinear(&m.diffuse), bilinear(&m.specular))
+    let top = at(x0, y0).lerp(at(x0 + 1.0, y0), fx);
+    let bottom = at(x0, y0 + 1.0).lerp(at(x0 + 1.0, y0 + 1.0), fx);
+    top.lerp(bottom, fy)
+}
+
+/// Bilinear diffuse and specular light of `look` for a view-space normal (thumbnails).
+pub fn sample(look: Look, n: Vec3) -> (Vec3, Vec3) {
+    if let Look::User(k) = look {
+        return (user_sample(k as usize, n), Vec3::ZERO);
+    }
+    let m = &library()[Look::ALL.iter().position(|&l| l == look).unwrap()];
+    (bilinear(&m.diffuse, n), bilinear(&m.specular, n))
 }
 
 /// The shaded colour of `base` under `look` for a view-space normal, linear.
@@ -357,6 +590,7 @@ mod tests {
 
     #[test]
     fn gpu_layers_hold_every_image_in_srgb() {
+        let _lock = test_lock();
         let bytes = gpu_layers();
         assert_eq!(bytes.len(), layer_count() as usize * SIZE * SIZE * 4);
         // The centre texel of Gray's diffuse layer encodes its linear value.
@@ -365,7 +599,69 @@ mod tests {
         assert_eq!(bytes[i], encode(c));
         assert_eq!(of_material(0), None);
         assert_eq!(of_material(FIRST), Some(Look::RedWax));
-        assert_eq!(of_material(FIRST + Look::ALL.len()), None);
+        assert_eq!(of_material(FIRST + Look::ALL.len() + user_count()), None);
+    }
+
+    #[test]
+    fn a_loaded_matcap_is_listed_after_the_built_in_ones_and_comes_back_from_the_config_folder() {
+        let _lock = test_lock();
+        let root = std::env::temp_dir().join(format!("klay-matcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pictures")).unwrap();
+        // Left half red, right half blue: a MatCap that colours by which way the surface faces.
+        let img = image::RgbaImage::from_fn(8, 8, |x, _| if x < 4 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        let path = root.join("pictures/sunset.png");
+        img.save(&path).unwrap();
+        let before = material_count();
+        let i = load_user(&path, Some(&root)).expect("loads");
+        assert_eq!((i, material_count()), (before, before + 1));
+        assert_eq!(material_name(i), "sunset");
+        let k = user_count() - 1;
+        assert_eq!(of_material(i), Some(Look::User(k as u16)));
+        assert_eq!(material_named("SUNSET"), Some(i));
+        assert_eq!(material_named(&i.to_string()), Some(i));
+        assert_eq!(material_named("MatCap Red Wax"), Some(FIRST));
+        assert_eq!(material_named("no such"), None);
+        // Facing right reads the blue half, left the red half; polypaint tints the picture.
+        let look = Look::User(k as u16);
+        let right = shade(look, look.base(), Vec3::new(0.8, 0.0, 0.6).normalize());
+        let left = shade(look, look.base(), Vec3::new(-0.8, 0.0, 0.6).normalize());
+        assert!(right.z > 0.9 && right.x < 0.05 && left.x > 0.9 && left.z < 0.05, "{right:?} {left:?}");
+        assert!(shade(look, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.8, 0.0, 0.6)).length() < 0.05, "red paint on blue");
+        // The texture array carries it: the last diffuse layer's right side is blue, its
+        // specular layer black.
+        let bytes = gpu_layers();
+        assert_eq!(bytes.len(), layer_count() as usize * SIZE * SIZE * 4);
+        let layer = (FIRST + Look::ALL.len() + k - FIRST) * 2;
+        let at = |l: usize, x: usize| {
+            let o = (l * SIZE * SIZE + SIZE / 2 * SIZE + x) * 4;
+            [bytes[o], bytes[o + 1], bytes[o + 2]]
+        };
+        assert_eq!(at(layer, SIZE - 10), [0, 0, 255]);
+        assert_eq!(at(layer, 10), [255, 0, 0]);
+        assert_eq!(at(layer + 1, 10), [0, 0, 0]);
+        // Loading the same picture again selects it instead of adding it.
+        assert_eq!(load_user(&path, Some(&root)).unwrap(), i);
+        assert_eq!(material_count(), before + 1);
+        // The picture was copied into the config folder and listed.
+        let copy = root.join("klay/matcaps/sunset.png");
+        assert!(copy.is_file());
+        assert_eq!(std::fs::read_to_string(root.join("klay/matcaps.list")).unwrap(), "# Klay matcaps v1\nsunset.png\n");
+        // The next start loads it again from there, in the same place in the list.
+        let g = generation();
+        remove_user(k, None);
+        assert_eq!((material_count(), generation()), (before, g + 1));
+        assert!(restore(&root).is_empty());
+        assert_eq!(material_count(), before + 1);
+        assert_eq!(material_name(before), "sunset");
+        assert!(users().read().unwrap()[k].path == copy);
+        // Removed for good: the copy and its line go, and nothing comes back.
+        remove_user(k, Some(&root));
+        assert!(!copy.exists() && material_count() == before);
+        assert!(restore(&root).is_empty() && material_count() == before);
+        // Nothing to load gives a message, not a MatCap.
+        assert!(load_user(&root.join("none.png"), None).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -576,7 +576,7 @@ impl Workspace {
             "thumb:texture" => self.asset_shelf(ui, true),
             "thumb:material" => {
                 let tex = self.texture(ui.ctx(), None, false);
-                let resp = thumb(ui, "Material", Thumb::Texture(tex), MATERIALS[self.material].1.trim_start_matches("MatCap "), false, false);
+                let resp = thumb(ui, "Material", Thumb::Texture(tex), crate::workspace::material_name(self.material).trim_start_matches("MatCap "), false, false);
                 egui::Popup::from_toggle_button_response(&resp)
                     .align(if horizontal { egui::RectAlign::BOTTOM_START } else { egui::RectAlign::RIGHT_START })
                     .gap(6.0)
