@@ -893,6 +893,10 @@ pub struct Actions {
     pub save_subtool: bool,
     pub load_subtools: bool,
     pub export_subtool: bool,
+    /// SubTool › Export glTF: the active subtool alone as a `.glb`.
+    pub export_subtool_gltf: bool,
+    /// Document › Export glTF: the visible subtools as one `.glb` with the baked maps.
+    pub export_gltf: bool,
     /// Document › Import OBJ or STL.
     pub import_mesh: bool,
     /// Export STL (Document, 3D Print); 3D Print › Send to the slicer, Check.
@@ -1209,6 +1213,8 @@ pub struct Workspace {
     pub cavity_depth: f32,
     pub cavity_blur: f32,
     pub group_border_width: f32,
+    /// Document › Export glTF: a mesh primitive per polygroup (else one per subtool).
+    pub gltf_per_group: bool,
     /// Masking › Mask By Smoothness: Range (1..=100 rings) and Falloff (0..=100).
     pub smooth_range: f32,
     pub smooth_falloff: f32,
@@ -1466,6 +1472,7 @@ impl Workspace {
             cavity_intensity: 50.0,
             cavity_depth: 1.0,
             cavity_blur: 0.0,
+            gltf_per_group: true,
             smooth_range: 10.0,
             smooth_falloff: 50.0,
             ao_intensity: 100.0,
@@ -3411,9 +3418,9 @@ impl Workspace {
                     None,
                     true,
                     true,
-                    &mut |_, ui| {
+                    &mut |ws, ui| {
                         ui.horizontal(|ui| {
-                            let w = (ui.available_width() - 4.0) * 0.5;
+                            let w = (ui.available_width() - 8.0) / 3.0;
                             a.export |= ui
                                 .add_sized([w, 20.0], egui::Button::new("Export OBJ").truncate())
                                 .on_hover_text("Every visible subtool at its shown level, one OBJ object each")
@@ -3422,7 +3429,14 @@ impl Workspace {
                                 .add_sized([w, 20.0], egui::Button::new("Export STL").truncate())
                                 .on_hover_text("Every visible subtool at its shown level as one binary STL, sized and turned by 3D Print")
                                 .clicked();
+                            a.export_gltf |= ui
+                                .add_sized([w, 20.0], egui::Button::new("Export glTF").truncate())
+                                .on_hover_text("Every visible subtool at its shown level as one glTF binary (.glb) with its polypaint and the maps baked this session, in metres by the 3D Print scale")
+                                .shelf(ui, "cmd:export-gltf")
+                                .clicked();
                         });
+                        ui.checkbox(&mut ws.gltf_per_group, "glTF: Polygroups")
+                            .on_hover_text("A mesh primitive per polygroup (sub-meshes, material slots), else one per subtool");
                         if m.status.is_empty() {
                             note(
                                 ui,
@@ -3775,17 +3789,19 @@ impl Workspace {
                         // Single subtools to and from files (ZBrush: Tool › Export, Append),
                         // picked in the desktop's file dialog.
                         ui.add_space(2.0);
-                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-                        let w = (r.width() - 6.0) / 3.0;
-                        for (col, (label, hint)) in [
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 43.0), Sense::hover());
+                        let w = (r.width() - 3.0) * 0.5;
+                        for (k, (label, hint)) in [
                             ("Save", "Save the active subtool alone, with its levels, to a file you pick"),
                             ("Load", "Pick saved subtool or project files and add their subtools to the list"),
                             ("Export OBJ", "The active subtool at its shown level, as an OBJ file you pick"),
+                            ("Export glTF", "The active subtool at its shown level, as a glTF binary (.glb) you pick, with its baked maps as the material"),
                         ]
                         .into_iter()
                         .enumerate()
                         {
-                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), 0.0), vec2(w, 20.0));
+                            let (col, row) = (k % 2, k / 2);
+                            let cell = Rect::from_min_size(r.min + vec2(col as f32 * (w + 3.0), row as f32 * 23.0), vec2(w, 20.0));
                             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
                             child.spacing_mut().button_padding = vec2(2.0, 1.0);
                             if child
@@ -3793,10 +3809,11 @@ impl Workspace {
                                 .on_hover_text(hint)
                                 .clicked()
                             {
-                                match col {
+                                match k {
                                     0 => a.save_subtool = true,
                                     1 => a.load_subtools = true,
-                                    _ => a.export_subtool = true,
+                                    2 => a.export_subtool = true,
+                                    _ => a.export_subtool_gltf = true,
                                 }
                             }
                         }
@@ -7228,6 +7245,45 @@ mod tests {
         frame(workspace, ctx, size, vec![egui::Event::PointerMoved(pos)]);
         frame(workspace, ctx, size, vec![pointer(pos, true)]);
         frame(workspace, ctx, size, vec![pointer(pos, false)])
+    }
+
+    #[test]
+    fn document_export_buttons_raise_their_actions() {
+        let (mut workspace, ctx) = test_workspace("document-export");
+        // Tall enough for the whole Document dropdown, Export near its foot included.
+        let size = vec2(1600.0, 1800.0);
+        let subtools = [row("Sphere 1", true)];
+        let mut primitive = crate::primitive::Settings::default();
+        let mut run = |ws: &mut Workspace, events: Vec<egui::Event>| frame_full(ws, &ctx, size, events, &subtools, &mut primitive);
+        // Click `label` in the Document dropdown (`docked` false), or in the SubTool section
+        // of the docked right panel, which shows the same labels further right.
+        let mut press = |ws: &mut Workspace, docked: bool, label: &str| -> Actions {
+            ws.open_menu("Document");
+            run(ws, vec![]);
+            let (out, _) = run(ws, vec![]);
+            let xs: Vec<Pos2> = out
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(t) if same_text(&t.galley.job.text, label) => Some(t.pos),
+                    _ => None,
+                })
+                .collect();
+            let pos = if docked { xs.iter().copied().max_by(|a, b| a.x.total_cmp(&b.x)) } else { xs.iter().copied().min_by(|a, b| a.x.total_cmp(&b.x)) };
+            let pos = pos.unwrap_or_else(|| panic!("text {label:?} was not rendered"));
+            run(ws, vec![egui::Event::PointerMoved(pos)]);
+            run(ws, vec![pointer(pos, true)]);
+            run(ws, vec![pointer(pos, false)]).1
+        };
+        assert!(press(&mut workspace, false, "Export glTF").export_gltf);
+        assert!(press(&mut workspace, false, "Export STL").export_stl);
+        assert!(press(&mut workspace, false, "Export OBJ").export);
+        assert!(workspace.gltf_per_group);
+        press(&mut workspace, false, "glTF: Polygroups");
+        assert!(!workspace.gltf_per_group);
+        let a = press(&mut workspace, true, "Export glTF");
+        assert!(a.export_subtool_gltf && !a.export_gltf);
+        assert!(press(&mut workspace, true, "Export OBJ").export_subtool);
     }
 
     #[test]

@@ -72,6 +72,7 @@ const ACTIONS: &[(&str, &str, &str)] = &[
     ("cmd:invert-visibility", "Invert", "Swap hidden and visible"),
     ("cmd:fullscreen", "Fullscreen", "F11"),
     ("cmd:export-stl", "Export STL", "The visible subtools as one STL, sized by 3D Print"),
+    ("cmd:export-gltf", "Export glTF", "The visible subtools as one glTF binary with the baked maps"),
     ("cmd:send-slicer", "Send to Slicer", "Open the visible subtools in the 3D Print slicer"),
     ("cmd:print-check", "Check Mesh", "Look for holes and non-manifold edges before printing"),
 ];
@@ -247,6 +248,7 @@ impl Workspace {
             "cmd:invert-visibility" => a.invert_visibility = true,
             "cmd:fullscreen" => a.fullscreen = true,
             "cmd:export-stl" => a.export_stl = true,
+            "cmd:export-gltf" => a.export_gltf = true,
             "cmd:send-slicer" => a.send_slicer = true,
             "cmd:print-check" => a.print_check = true,
             _ => {}
