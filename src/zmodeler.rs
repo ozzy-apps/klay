@@ -12,13 +12,21 @@
 //! **Polygroup**, **Crease**, **Mask** and **Bridge**; on edges **Insert** (an edge loop
 //! across a ring of quads), **Delete** (dissolve the edge or its loop), **Bevel**, **Spin**,
 //! **Crease**, **Collapse**, **Slide**, **Extrude**, **Close Hole**, **Move**, **Mask** and
-//! **Bridge**; on points **Move**, **Bevel**, **Crease**, **Delete**, **Slide**, **Stitch**
-//! and **Mask**. Polygon targets are A Single Poly, Polygroup All and Polyloop; edge
+//! **Bridge**, **Align**, **Insert Point**, **Unweld** and **Transpose**; on points
+//! **Move**, **Bevel**, **Crease**, **Delete**, **Slide**, **Stitch** and **Mask**; and on
+//! polygons also **Spin Edges**, **Align**, **Insert Point**, **Unweld**, **Equalize** and
+//! **Transpose**. Polygon targets are A Single Poly, Polygroup All and Polyloop; edge
 //! targets an edge or its loop. The polygon view carries the mask and the creases, so
 //! they survive every action.
+//!
+//! A drag does not rebuild the subtool at every step: an action that only moves points
+//! says where they go ([`PolyMesh::moved_points`] and its kin), and one that makes
+//! polygons is built once, after which its points move linearly with the drag's amount
+//! (every such action is a `lerp` in it), so the app updates positions in place.
 
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::mesh::SculptMesh;
+use crate::transform::Affine;
 use glam::Vec3;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -82,10 +90,22 @@ pub enum PolyAction {
     Crease,
     /// Mask the polygons' points, or unmask them when they all are.
     Mask,
+    /// Spin Edges: the polygons' border points move one slot round it.
+    Spin,
+    /// Flatten the polygons' points onto the clicked polygon's plane.
+    Align,
+    /// A point where the cursor is, joined to the polygon's corners.
+    InsertPoint,
+    /// Separate the polygons from their neighbours: the shared points duplicated.
+    Unweld,
+    /// Make the polygons regular and the same size about their middles.
+    Equalize,
+    /// Move, scale and turn the polygons with Gizmo 3D's handles.
+    Transpose,
 }
 
 impl PolyAction {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 20] = [
         Self::QMesh,
         Self::Extrude,
         Self::Inset,
@@ -93,8 +113,14 @@ impl PolyAction {
         Self::Move,
         Self::Scale,
         Self::Inflate,
+        Self::Transpose,
         Self::Split,
         Self::Flip,
+        Self::Spin,
+        Self::Align,
+        Self::Equalize,
+        Self::InsertPoint,
+        Self::Unweld,
         Self::Delete,
         Self::Polygroup,
         Self::Crease,
@@ -117,6 +143,12 @@ impl PolyAction {
             Self::Crease => "Crease",
             Self::Mask => "Mask",
             Self::Bridge => "Bridge",
+            Self::Spin => "Spin Edges",
+            Self::Align => "Align",
+            Self::InsertPoint => "Insert Point",
+            Self::Unweld => "Unweld",
+            Self::Equalize => "Equalize",
+            Self::Transpose => "Transpose",
         }
     }
     pub fn hint(self) -> &'static str {
@@ -135,11 +167,20 @@ impl PolyAction {
             Self::Crease => "click: crease every edge · click again to uncrease",
             Self::Mask => "click: mask the points · click again to unmask",
             Self::Bridge => "click one, then the other",
+            Self::Spin => "click: the points turn one slot round the polygon",
+            Self::Align => "click: the points flattened onto its plane",
+            Self::InsertPoint => "click where the point goes",
+            Self::Unweld => "click: the polygon comes apart from its neighbours",
+            Self::Equalize => "click: regular polygons of the same size",
+            Self::Transpose => "click to put the gizmo on it, then drag its handles",
         }
     }
     /// Whether the action happens on a click, without a drag.
     pub fn is_click(self) -> bool {
-        matches!(self, Self::Delete | Self::Polygroup | Self::Bridge | Self::Split | Self::Flip | Self::Crease | Self::Mask)
+        matches!(
+            self,
+            Self::Delete | Self::Polygroup | Self::Bridge | Self::Split | Self::Flip | Self::Crease | Self::Mask | Self::Spin | Self::Align | Self::InsertPoint | Self::Unweld | Self::Equalize | Self::Transpose
+        )
     }
 }
 
@@ -168,18 +209,30 @@ pub enum EdgeAction {
     Move,
     /// Mask the edge's points (or the loop's), or unmask when masked.
     Mask,
+    /// Straighten the loop through the edge (a closed loop is flattened).
+    Align,
+    /// A point on the edge where the cursor is, splitting it.
+    InsertPoint,
+    /// Cut the mesh along the edge (or its loop): the points on it duplicated.
+    Unweld,
+    /// Move, scale and turn the edge (or its loop) with Gizmo 3D's handles.
+    Transpose,
 }
 
 impl EdgeAction {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Insert,
         Self::Delete,
         Self::Bevel,
         Self::Slide,
         Self::Move,
+        Self::Transpose,
         Self::Extrude,
         Self::Collapse,
         Self::Spin,
+        Self::Align,
+        Self::InsertPoint,
+        Self::Unweld,
         Self::Crease,
         Self::Mask,
         Self::CloseHole,
@@ -199,6 +252,10 @@ impl EdgeAction {
             Self::CloseHole => "Close Hole",
             Self::Move => "Move",
             Self::Mask => "Mask",
+            Self::Align => "Align",
+            Self::InsertPoint => "Insert Point",
+            Self::Unweld => "Unweld",
+            Self::Transpose => "Transpose",
         }
     }
     pub fn hint(self) -> &'static str {
@@ -215,15 +272,19 @@ impl EdgeAction {
             Self::CloseHole => "click an open edge",
             Self::Move => "drag",
             Self::Mask => "click · click again to unmask",
+            Self::Align => "click: the loop through the edge straightened",
+            Self::InsertPoint => "click where the point goes on the edge",
+            Self::Unweld => "click: the mesh cut along the edge",
+            Self::Transpose => "click to put the gizmo on it, then drag its handles",
         }
     }
     /// Whether EdgeLoop widens the action from the edge to its loop.
     pub fn takes_loop(self) -> bool {
-        matches!(self, Self::Delete | Self::Bevel | Self::Crease | Self::Slide | Self::Move | Self::Mask)
+        matches!(self, Self::Delete | Self::Bevel | Self::Crease | Self::Slide | Self::Move | Self::Mask | Self::Unweld | Self::Transpose)
     }
     /// Whether the action happens on a click, without a drag.
     pub fn is_click(self) -> bool {
-        matches!(self, Self::Delete | Self::Spin | Self::Bridge | Self::Crease | Self::Collapse | Self::CloseHole | Self::Mask)
+        matches!(self, Self::Delete | Self::Spin | Self::Bridge | Self::Crease | Self::Collapse | Self::CloseHole | Self::Mask | Self::Align | Self::InsertPoint | Self::Unweld | Self::Transpose)
     }
 }
 
@@ -810,6 +871,11 @@ impl PolyMesh {
         out
     }
 
+    /// The polygons on edge (a, b).
+    pub fn faces_on_edge(&self, a: u32, b: u32) -> Vec<u32> {
+        self.faces_on(a, b).into_iter().map(|(f, _)| f as u32).collect()
+    }
+
     /// The polygon with exactly these vertices (in any turn), if any.
     pub fn face_with(&self, verts: &[u32]) -> Option<u32> {
         let mut want = verts.to_vec();
@@ -1149,6 +1215,7 @@ impl PolyMesh {
         out
     }
 
+    #[cfg(test)]
     /// Scale: `points` moved towards or away from `centre` by `factor`.
     pub fn scaled(&self, points: &[u32], centre: Vec3, factor: f32) -> PolyMesh {
         let mut out = self.clone();
@@ -1454,6 +1521,7 @@ impl PolyMesh {
         out
     }
 
+    #[cfg(test)]
     /// Slide a point: `v` moved `t` of the way along its edge to `to`.
     pub fn slid_point(&self, v: u32, to: u32, t: f32) -> PolyMesh {
         let mut out = self.clone();
@@ -1461,6 +1529,411 @@ impl PolyMesh {
         out
     }
 
+    /// This mesh with `points` where they are told to go.
+    pub fn with_points(&self, points: &[(u32, Vec3)]) -> PolyMesh {
+        let mut out = self.clone();
+        for &(v, p) in points {
+            out.pos[v as usize] = p;
+        }
+        out
+    }
+
+    /// Move: where `points` go, shifted by `delta`.
+    pub fn moved_points(&self, points: &[u32], delta: Vec3) -> Vec<(u32, Vec3)> {
+        points.iter().map(|&v| (v, self.pos[v as usize] + delta)).collect()
+    }
+
+    /// Scale: where `points` go, moved towards or away from `centre` by `factor`.
+    pub fn scaled_points(&self, points: &[u32], centre: Vec3, factor: f32) -> Vec<(u32, Vec3)> {
+        points.iter().map(|&v| (v, centre + (self.pos[v as usize] - centre) * factor)).collect()
+    }
+
+    #[cfg(test)]
+    /// Transpose: where `points` go under the map `m` (a Gizmo 3D drag).
+    pub fn mapped_points(&self, points: &[u32], m: &Affine) -> Vec<(u32, Vec3)> {
+        points.iter().map(|&v| (v, m.apply(self.pos[v as usize]))).collect()
+    }
+
+    /// Where the points of `faces` go under `m`, and under its mirror image in every
+    /// other image of a symmetry: a mirrored point `w` (image `k` of a point of the target)
+    /// goes to the image of where `m` takes its original.
+    pub fn mapped_points_mirrored(&self, points: &[u32], m: &Affine, images: &crate::symmetry::Images, mirror: impl Fn(usize, u32) -> Option<u32>) -> Vec<(u32, Vec3)> {
+        let mut done: HashSet<u32> = HashSet::default();
+        let mut out = Vec::new();
+        for &v in points {
+            if done.insert(v) {
+                out.push((v, m.apply(self.pos[v as usize])));
+            }
+        }
+        for k in 1..images.len() {
+            for &v in points {
+                if let Some(w) = mirror(k, v) {
+                    if done.insert(w) {
+                        out.push((w, images.map(k, m.apply(images.unmap(k, self.pos[w as usize])))));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Spin Edges: the points round the border of `faces` each take the place of the next
+    /// one round it with the polygons' winding (`forward`) or against it (the way a mirror
+    /// image of a forward spin turns); points inside the region stay. A single polygon's
+    /// corners turn one slot within its neighbours.
+    pub fn spun_faces(&self, faces: &[u32], forward: bool) -> PolyMesh {
+        let directed: HashSet<(u32, u32)> = faces
+            .iter()
+            .flat_map(|&f| {
+                let fv = &self.faces[f as usize];
+                (0..fv.len()).map(move |k| (fv[k], fv[(k + 1) % fv.len()]))
+            })
+            .collect();
+        let mut next: HashMap<u32, u32> = HashMap::default();
+        let mut border: Vec<(u32, u32)> = directed.iter().copied().filter(|&(a, b)| !directed.contains(&(b, a))).collect();
+        border.sort_unstable();
+        for (a, b) in border {
+            let (v, w) = if forward { (a, b) } else { (b, a) };
+            next.entry(v).or_insert(w);
+        }
+        let mut out = self.clone();
+        for (&v, &w) in &next {
+            out.pos[v as usize] = self.pos[w as usize];
+        }
+        out
+    }
+
+    /// Align: the points of `faces` flattened onto the plane through `at` with normal
+    /// `n` (the clicked polygon's).
+    pub fn aligned_faces(&self, faces: &[u32], at: Vec3, n: Vec3) -> PolyMesh {
+        let n = n.normalize_or(Vec3::Z);
+        let mut out = self.clone();
+        for v in self.points_of(faces) {
+            let p = self.pos[v as usize];
+            out.pos[v as usize] = p - n * (p - at).dot(n);
+        }
+        out
+    }
+
+    /// The points of a run of `edges` in order along it, and whether it closes.
+    fn chain(&self, edges: &[(u32, u32)]) -> (Vec<u32>, bool) {
+        let mut link: HashMap<u32, Vec<u32>> = HashMap::default();
+        for &(a, b) in edges {
+            if a == b {
+                continue;
+            }
+            let l = link.entry(a).or_default();
+            if !l.contains(&b) {
+                l.push(b);
+            }
+            let l = link.entry(b).or_default();
+            if !l.contains(&a) {
+                l.push(a);
+            }
+        }
+        if link.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut ends: Vec<u32> = link.iter().filter(|(_, l)| l.len() == 1).map(|(&v, _)| v).collect();
+        ends.sort_unstable();
+        let closed = ends.is_empty();
+        let start = ends.first().copied().unwrap_or_else(|| *link.keys().min().unwrap());
+        let mut order = vec![start];
+        let (mut prev, mut cur) = (start, link[&start][0]);
+        while cur != start && order.len() < link.len() {
+            order.push(cur);
+            let l = &link[&cur];
+            let Some(&next) = l.iter().find(|&&w| w != prev) else { break };
+            (prev, cur) = (cur, next);
+        }
+        (order, closed)
+    }
+
+    /// Align: the run of `edges` straightened: an open run's points onto the line through
+    /// its two ends, a closed loop's onto the plane that fits it best.
+    pub fn aligned_edges(&self, edges: &[(u32, u32)]) -> PolyMesh {
+        let (order, closed) = self.chain(edges);
+        let mut out = self.clone();
+        if order.len() < 3 {
+            return out;
+        }
+        if closed {
+            let c = order.iter().map(|&v| self.pos[v as usize]).sum::<Vec3>() / order.len() as f32;
+            let mut n = Vec3::ZERO;
+            for k in 0..order.len() {
+                n += self.pos[order[k] as usize].cross(self.pos[order[(k + 1) % order.len()] as usize]);
+            }
+            let n = n.normalize_or(Vec3::Y);
+            for &v in &order {
+                let p = self.pos[v as usize];
+                out.pos[v as usize] = p - n * (p - c).dot(n);
+            }
+        } else {
+            let (p, q) = (self.pos[order[0] as usize], self.pos[*order.last().unwrap() as usize]);
+            let d = (q - p).normalize_or_zero();
+            if d == Vec3::ZERO {
+                return out;
+            }
+            for &v in &order {
+                out.pos[v as usize] = p + d * (self.pos[v as usize] - p).dot(d);
+            }
+        }
+        out
+    }
+
+    /// Insert Point on a polygon: a point at `p` joined to every corner of `f`, which
+    /// becomes a fan of triangles (the first keeps its slot, the rest its polygroup).
+    pub fn point_in_face(&self, f: u32, p: Vec3) -> PolyMesh {
+        let fv = self.faces[f as usize].clone();
+        let n = fv.len();
+        let mut out = self.clone();
+        let m = out.push_point(p, fv[0]);
+        let g = self.groups[f as usize];
+        out.faces[f as usize] = vec![fv[0], fv[1], m];
+        for k in 1..n {
+            out.faces.push(vec![fv[k], fv[(k + 1) % n], m]);
+            out.groups.push(g);
+        }
+        out
+    }
+
+    /// Insert Point on an edge: a point `t` of the way from `a` to `b`, splitting the edge
+    /// in every polygon on it (a quad becomes five-sided); a crease on it covers both halves.
+    pub fn point_on_edge(&self, a: u32, b: u32, t: f32) -> PolyMesh {
+        let mut out = self.clone();
+        let m = out.push_point(self.pos[a as usize].lerp(self.pos[b as usize], t.clamp(0.0, 1.0)), a);
+        for (f, k) in self.faces_on(a, b) {
+            out.faces[f].insert(k + 1, m);
+        }
+        if out.creases.remove(&key(a, b)) {
+            out.creases.insert(key(a, m));
+            out.creases.insert(key(m, b));
+        }
+        out
+    }
+
+    /// Creases follow duplicated points: a creased edge is creased wherever it now runs,
+    /// between the originals or their duplicates, and nowhere it no longer does.
+    fn follow_creases(&mut self, dup: &HashMap<u32, Vec<u32>>) {
+        if self.creases.is_empty() || dup.is_empty() {
+            return;
+        }
+        let have: HashSet<(u32, u32)> = self.edges().into_keys().collect();
+        let choices = |v: u32| -> Vec<u32> {
+            let mut c = vec![v];
+            if let Some(d) = dup.get(&v) {
+                c.extend_from_slice(d);
+            }
+            c
+        };
+        let mut out: HashSet<(u32, u32)> = HashSet::default();
+        for &(a, b) in &self.creases {
+            for x in choices(a) {
+                for y in choices(b) {
+                    if have.contains(&key(x, y)) {
+                        out.insert(key(x, y));
+                    }
+                }
+            }
+        }
+        self.creases = out;
+    }
+
+    /// Unweld: `faces` come apart from the polygons round them: every point they share
+    /// with another polygon is duplicated for them, so they are a shell of their own in
+    /// the same place. Creases follow.
+    pub fn unwelded_faces(&self, faces: &[u32]) -> PolyMesh {
+        let set: HashSet<u32> = faces.iter().copied().collect();
+        let mut outside: HashSet<u32> = HashSet::default();
+        for (f, fv) in self.faces.iter().enumerate() {
+            if !set.contains(&(f as u32)) {
+                outside.extend(fv.iter().copied());
+            }
+        }
+        let mut out = self.clone();
+        let mut dup: HashMap<u32, Vec<u32>> = HashMap::default();
+        let mut sorted = faces.to_vec();
+        sorted.sort_unstable();
+        for f in sorted {
+            let fv = self.faces[f as usize].clone();
+            let nf: Vec<u32> = fv
+                .iter()
+                .map(|&v| {
+                    if !outside.contains(&v) {
+                        return v;
+                    }
+                    if let Some(d) = dup.get(&v) {
+                        return d[0];
+                    }
+                    let m = out.push_point(self.pos[v as usize], v);
+                    dup.insert(v, vec![m]);
+                    m
+                })
+                .collect();
+            out.faces[f as usize] = nf;
+        }
+        out.follow_creases(&dup);
+        out
+    }
+
+    /// Unweld: the mesh cut along the run of `edges` (an edge or a loop). At each point
+    /// on the run the polygons on one side of it get a duplicate of the point, so the two
+    /// sides come apart; at the run's ends only the polygon on that side of the last edge
+    /// does, and a run that reaches an open border opens it. Creases follow.
+    pub fn unwelded_edges(&self, edges: &[(u32, u32)]) -> PolyMesh {
+        let (order, closed) = self.chain(edges);
+        if order.len() < 2 {
+            return self.clone();
+        }
+        let path: HashSet<(u32, u32)> = (0..order.len() - if closed { 0 } else { 1 }).map(|k| key(order[k], order[(k + 1) % order.len()])).collect();
+        let all = self.edges();
+        // Each point of the run: the polygons on it, with its slot in each.
+        let on_run: HashSet<u32> = order.iter().copied().collect();
+        let mut at: HashMap<u32, Vec<(u32, usize)>> = HashMap::default();
+        for (f, fv) in self.faces.iter().enumerate() {
+            for (k, &v) in fv.iter().enumerate() {
+                if on_run.contains(&v) {
+                    at.entry(v).or_default().push((f as u32, k));
+                }
+            }
+        }
+        // The side that comes away: the second polygon on the first edge, then every
+        // polygon found on its side round each point along the run.
+        let mut side: HashSet<u32> = HashSet::default();
+        if let Some(l) = all.get(&key(order[0], order[1])) {
+            if let Some(&(g, _)) = l.get(1) {
+                side.insert(g);
+            } else if let Some(&(g, _)) = l.first() {
+                side.insert(g);
+            }
+        }
+        let mut out = self.clone();
+        let mut dup: HashMap<u32, Vec<u32>> = HashMap::default();
+        for (i, &v) in order.iter().enumerate() {
+            let Some(here) = at.get(&v) else { continue };
+            let endpoint = !closed && (i == 0 || i == order.len() - 1);
+            // The polygons round v in turn, from a border if there is one.
+            let open_start = here.iter().copied().find(|&(f, k)| {
+                let fv = &self.faces[f as usize];
+                let p = fv[(k + fv.len() - 1) % fv.len()];
+                all.get(&key(v, p)).is_some_and(|l| l.len() == 1)
+            });
+            let turn: Vec<(u32, usize)> = match open_start {
+                Some(start) => {
+                    let mut t = vec![start];
+                    let (mut f, mut k) = start;
+                    for _ in 0..here.len() {
+                        let fv = &self.faces[f as usize];
+                        let q = fv[(k + 1) % fv.len()];
+                        let Some(g) = all.get(&key(v, q)).and_then(|l| l.iter().find(|x| x.0 != f)).map(|x| x.0) else { break };
+                        let Some(j) = self.faces[g as usize].iter().position(|&x| x == v) else { break };
+                        t.push((g, j));
+                        (f, k) = (g, j);
+                    }
+                    t
+                }
+                None => match self.around(v, &all, here[0]) {
+                    Some(t) => t,
+                    None => continue,
+                },
+            };
+            let crossing = |i: usize| -> bool {
+                let (f, k) = turn[i];
+                let fv = &self.faces[f as usize];
+                path.contains(&key(v, fv[(k + 1) % fv.len()]))
+            };
+            let n = turn.len();
+            let open = open_start.is_some();
+            // Groups between crossings of the run; a closed turn starts after one.
+            let first = if open { 0 } else { (0..n).find(|&i| crossing((i + n - 1) % n)).unwrap_or(0) };
+            let mut groups: Vec<Vec<(u32, usize)>> = vec![Vec::new()];
+            for s in 0..n {
+                let i = (first + s) % n;
+                groups.last_mut().unwrap().push(turn[i]);
+                if s + 1 < n && crossing(i) {
+                    groups.push(Vec::new());
+                }
+            }
+            if endpoint || groups.len() < 2 {
+                // The run ends here: only the side's polygons on the last edge come away.
+                let take: Vec<(u32, usize)> = here.iter().copied().filter(|&(f, _)| side.contains(&f)).collect();
+                if !take.is_empty() {
+                    let m = out.push_point(self.pos[v as usize], v);
+                    for (f, k) in take {
+                        out.faces[f as usize][k] = m;
+                    }
+                    dup.entry(v).or_default().push(m);
+                }
+                continue;
+            }
+            for g in groups {
+                if !g.iter().any(|(f, _)| side.contains(f)) {
+                    continue;
+                }
+                let m = out.push_point(self.pos[v as usize], v);
+                for &(f, k) in &g {
+                    side.insert(f);
+                    out.faces[f as usize][k] = m;
+                }
+                dup.entry(v).or_default().push(m);
+            }
+        }
+        out.follow_creases(&dup);
+        out
+    }
+
+    /// Equalize: each of `faces` made regular, with equal edges and angles in its own
+    /// plane about its middle, turned to fit its corners best, all of them at the mean of
+    /// their areas; a point shared by several goes to the mean of where they put it.
+    pub fn equalized(&self, faces: &[u32]) -> PolyMesh {
+        use std::f32::consts::TAU;
+        let area = |f: u32| -> f32 {
+            let fv = &self.faces[f as usize];
+            let mut n = Vec3::ZERO;
+            for k in 0..fv.len() {
+                n += self.pos[fv[k] as usize].cross(self.pos[fv[(k + 1) % fv.len()] as usize]);
+            }
+            n.length() * 0.5
+        };
+        if faces.is_empty() {
+            return self.clone();
+        }
+        let mean = faces.iter().map(|&f| area(f)).sum::<f32>() / faces.len() as f32;
+        let mut want: HashMap<u32, (Vec3, f32)> = HashMap::default();
+        for &f in faces {
+            let fv = &self.faces[f as usize];
+            let n = fv.len();
+            let c = self.centre(f);
+            let nrm = self.normal(f);
+            let u = nrm.any_orthonormal_vector();
+            let w = nrm.cross(u);
+            // The turn that fits the corners best: the mean of their angles less the
+            // regular polygon's.
+            let (mut sx, mut sy) = (0.0f32, 0.0f32);
+            for (k, &v) in fv.iter().enumerate() {
+                let d = self.pos[v as usize] - c;
+                let th = d.dot(w).atan2(d.dot(u)) - TAU * k as f32 / n as f32;
+                sx += th.cos();
+                sy += th.sin();
+            }
+            let phi0 = sy.atan2(sx);
+            let r = (2.0 * mean / (n as f32 * (TAU / n as f32).sin())).sqrt();
+            for (k, &v) in fv.iter().enumerate() {
+                let phi = phi0 + TAU * k as f32 / n as f32;
+                let p = c + (u * phi.cos() + w * phi.sin()) * r;
+                let e = want.entry(v).or_insert((Vec3::ZERO, 0.0));
+                e.0 += p;
+                e.1 += 1.0;
+            }
+        }
+        let mut out = self.clone();
+        for (v, (sum, count)) in want {
+            out.pos[v as usize] = sum / count;
+        }
+        out
+    }
+
+    #[cfg(test)]
     /// Move points by `delta`.
     pub fn moved(&self, points: &[u32], delta: Vec3) -> PolyMesh {
         let mut out = self.clone();
@@ -1780,6 +2253,180 @@ mod tests {
         assert!(cr.dissolve_point(nb).creases.is_empty());
     }
 
+    /// Every drag action that makes polygons moves its points linearly with its amount,
+    /// which is what lets a drag show it without rebuilding: two samples predict a third.
+    #[test]
+    fn drag_actions_are_linear_in_their_amount() {
+        let c = cube();
+        let top = (0..24).find(|&f| c.normal(f).y > 0.9).unwrap();
+        let fv = c.faces[top as usize].clone();
+        let (fa, fb) = c
+            .faces
+            .iter()
+            .flat_map(|fv| (0..4).map(move |k| (fv[k], fv[(k + 1) % 4])))
+            .find(|&(x, y)| {
+                let on = c.faces_on(x, y);
+                on.len() == 2 && c.normal(on[0].0 as u32).dot(c.normal(on[1].0 as u32)) > 0.99
+            })
+            .unwrap();
+        let lp = c.edge_loop(fa, fb);
+        let corner = (0..26u32).find(|&v| c.neighbours(v).len() == 3).unwrap();
+        let actions: Vec<(&str, Box<dyn Fn(f32) -> PolyMesh>, [f32; 3])> = vec![
+            ("extrude", Box::new(|t| c.extrude(&[top], t)), [0.1, 0.4, -0.2]),
+            ("inset", Box::new(|t| c.inset(&[top], t)), [0.1, 0.5, 0.8]),
+            ("bevel", Box::new(|t| c.chamfer_edges(&c.border_edges(&[top]), t)), [0.05, 0.3, 0.4]),
+            ("inflate", Box::new(|t| c.inflated(&c.points_of(&[top]), t)), [0.1, 0.3, -0.2]),
+            ("insert", Box::new(|t| c.insert_loop(fv[0], fv[1], t)), [0.1, 0.5, 0.9]),
+            ("slide", Box::new(|t| c.slide_loop(&lp, t)), [0.1, 0.5, 0.9]),
+            ("edge bevel", Box::new(|t| c.chamfer_edges(&lp, t)), [0.05, 0.3, 0.4]),
+            ("point bevel", Box::new(|t| c.chamfer_point(corner, t)), [0.05, 0.3, 0.4]),
+        ];
+        for (name, act, [t1, t2, t3]) in actions {
+            let (p1, p2, p3) = (act(t1), act(t2), act(t3));
+            assert!(p1.faces == p2.faces && p2.faces == p3.faces, "{name}: one topology");
+            let k = (t3 - t1) / (t2 - t1);
+            let err = p1.pos.iter().zip(&p2.pos).zip(&p3.pos).map(|((a, b), c)| (*a + (*b - *a) * k).distance(*c)).fold(0.0f32, f32::max);
+            assert!(err < 1e-5, "{name}: predicted within {err}");
+        }
+    }
+
+    /// Connected pieces of polygons (sharing a point).
+    fn shells(pm: &PolyMesh) -> usize {
+        let mut owner: Vec<u32> = (0..pm.pos.len() as u32).collect();
+        fn find(owner: &mut [u32], v: u32) -> u32 {
+            let mut r = v;
+            while owner[r as usize] != r {
+                r = owner[r as usize];
+            }
+            let mut v = v;
+            while owner[v as usize] != r {
+                let n = owner[v as usize];
+                owner[v as usize] = r;
+                v = n;
+            }
+            r
+        }
+        for f in &pm.faces {
+            for k in 1..f.len() {
+                let (a, b) = (find(&mut owner, f[0]), find(&mut owner, f[k]));
+                owner[a as usize] = b;
+            }
+        }
+        let used: HashSet<u32> = pm.faces.iter().flatten().copied().collect();
+        let roots: HashSet<u32> = used.iter().map(|&v| find(&mut owner, v)).collect();
+        roots.len()
+    }
+
+    #[test]
+    fn spin_align_insert_point_unweld_equalize_and_transpose() {
+        let c = cube();
+        let top = (0..24).find(|&f| c.normal(f).y > 0.9).unwrap();
+        let fv = c.faces[top as usize].clone();
+        // Spin Edges: each corner takes the next one's place; against the winding the one
+        // before's, which brings them back.
+        let sp = c.spun_faces(&[top], true);
+        assert!(closed(&sp) && sp.faces == c.faces);
+        for k in 0..4 {
+            assert_eq!(sp.pos[fv[k] as usize], c.pos[fv[(k + 1) % 4] as usize]);
+        }
+        assert!(sp.spun_faces(&[top], false).pos == c.pos);
+        // Over a ring of quads only its two border loops move, one slot each.
+        let ring = c.target(top, PolyTarget::Loop, Some((fv[1], fv[2])));
+        assert_eq!(ring.len(), 8);
+        let spr = c.spun_faces(&ring, true);
+        let moved = (0..26u32).filter(|&v| spr.pos[v as usize] != c.pos[v as usize]).count();
+        assert_eq!(moved, 16, "every point on the ring's two borders");
+        // Align: a corner lifted off the top comes back into the polygon's plane.
+        let mut bent = c.clone();
+        bent.pos[fv[0] as usize].y += 0.3;
+        let al = bent.aligned_faces(&[top], bent.centre(top), bent.normal(top));
+        let p: Vec<Vec3> = fv.iter().map(|&v| al.pos[v as usize]).collect();
+        assert!((p[1] - p[0]).cross(p[2] - p[0]).dot(p[3] - p[0]).abs() < 1e-5);
+        assert!(al.pos[fv[0] as usize] != bent.pos[fv[0] as usize]);
+        // Align a loop: the equator loop with one point pushed out flattens back; an open
+        // run of two edges puts its middle point on the line through its ends.
+        let (fa, fb) = c
+            .faces
+            .iter()
+            .flat_map(|fv| (0..4).map(move |k| (fv[k], fv[(k + 1) % 4])))
+            .find(|&(x, y)| {
+                let on = c.faces_on(x, y);
+                on.len() == 2 && c.normal(on[0].0 as u32).dot(c.normal(on[1].0 as u32)) > 0.99
+            })
+            .unwrap();
+        let lp = c.edge_loop(fa, fb);
+        assert_eq!(lp.len(), 8);
+        let mut bl = c.clone();
+        let axis = (0..3).find(|&i| lp.iter().all(|&(x, y)| (c.pos[x as usize][i] - c.pos[y as usize][i]).abs() < 1e-6)).unwrap();
+        bl.pos[fa as usize][axis] += 0.2;
+        let la = bl.aligned_edges(&lp);
+        assert!(la.pos[fa as usize].distance(c.pos[fa as usize]) < 0.08, "{}", la.pos[fa as usize].distance(c.pos[fa as usize]));
+        assert!(lp.iter().all(|&(x, _)| la.pos[x as usize].distance(c.pos[x as usize]) < 0.08));
+        let (b, w) = (lp[1].0, lp[1].1);
+        assert_eq!(b, lp[0].1, "the loop runs on from the edge");
+        let mut bo = c.clone();
+        bo.pos[b as usize][axis] += 0.2;
+        let lo = bo.aligned_edges(&lp[..2]);
+        let (pa, pb, pw) = (lo.pos[lp[0].0 as usize], lo.pos[b as usize], lo.pos[w as usize]);
+        assert!((pb - pa).cross(pw - pa).length() < 1e-5 && pb != bo.pos[b as usize]);
+        // Insert Point: in the polygon, four triangles round it; on an edge, two five-sided
+        // polygons, and a crease on the edge covers both halves.
+        let ip = c.point_in_face(top, c.centre(top));
+        assert!(manifold(&ip) && ip.faces.len() == 27 && ip.pos.len() == 27);
+        assert!(ip.faces.iter().filter(|f| f.contains(&26)).count() == 4 && ip.faces.iter().filter(|f| f.contains(&26)).all(|f| f.len() == 3));
+        assert!((volume(&ip) - volume(&c)).abs() < 1e-5);
+        let (a, b2) = (fv[0], fv[1]);
+        let ep = c.creased(&[(a, b2)], true).point_on_edge(a, b2, 0.5);
+        assert!(manifold(&ep) && ep.faces.len() == 24 && ep.pos.len() == 27 && ep.faces.iter().filter(|f| f.len() == 5).count() == 2);
+        assert!(ep.creases.len() == 2 && ep.creases.contains(&key(a, 26)) && ep.creases.contains(&key(26, b2)));
+        assert!((ep.pos[26] - (c.pos[a as usize] + c.pos[b2 as usize]) * 0.5).length() < 1e-6);
+        // Unweld a polygon: it floats on four new points of its own, the rest open there.
+        let uw = c.unwelded_faces(&[top]);
+        assert!(manifold(&uw) && !closed(&uw) && uw.pos.len() == 30 && uw.faces[top as usize].iter().all(|&v| v >= 26));
+        assert!(uw.faces.iter().enumerate().filter(|(f, _)| *f != top as usize).all(|(_, f)| f.iter().all(|&v| v < 26)));
+        assert_eq!(shells(&uw), 2);
+        // Unweld the equator loop: the cube comes apart into two halves, creases on both
+        // sides of the cut; one edge alone: its two polygons no longer share it.
+        let ue = c.creased(&lp, true).unwelded_edges(&lp);
+        assert!(manifold(&ue) && ue.pos.len() == 34 && shells(&ue) == 2, "{} points, {} shells", ue.pos.len(), shells(&ue));
+        assert_eq!(ue.creases.len(), 16);
+        let u1 = c.unwelded_edges(&[(fa, fb)]);
+        assert_eq!(u1.pos.len(), 28);
+        assert_eq!(u1.faces.iter().filter(|f| f.contains(&26) && f.contains(&27)).count(), 1);
+        assert_eq!(u1.faces.iter().filter(|f| f.contains(&fa) && f.contains(&fb)).count(), 1);
+        assert!(manifold(&u1));
+        // Equalize: a skewed top becomes a square of the same area; over the whole cube
+        // (squares already) nothing moves.
+        let mut sk = c.clone();
+        let (u, v) = ((c.pos[fv[1] as usize] - c.pos[fv[0] as usize]) * 0.3, (c.pos[fv[3] as usize] - c.pos[fv[0] as usize]) * 0.2);
+        sk.pos[fv[0] as usize] += u + v;
+        let area = |pm: &PolyMesh, f: u32| {
+            let fv = &pm.faces[f as usize];
+            (0..4).map(|k| pm.pos[fv[k] as usize].cross(pm.pos[fv[(k + 1) % 4] as usize])).sum::<Vec3>().length() * 0.5
+        };
+        let eq = sk.equalized(&[top]);
+        let edge = |k: usize| eq.pos[fv[k] as usize].distance(eq.pos[fv[(k + 1) % 4] as usize]);
+        assert!((0..4).all(|k| (edge(k) - edge(0)).abs() < 1e-4), "{:?}", (0..4).map(edge).collect::<Vec<_>>());
+        assert!((area(&eq, top) - area(&sk, top)).abs() < 1e-4);
+        assert!((eq.centre(top) - sk.centre(top)).length() < 1e-5);
+        let all: Vec<u32> = (0..24).collect();
+        let same = c.equalized(&all);
+        assert!(same.pos.iter().zip(&c.pos).all(|(a, b)| a.distance(*b) < 1e-4));
+        // Transpose: the points under a map, a mirror image under its mirror image.
+        let m = Affine::translation(Vec3::new(0.0, 0.5, 0.0));
+        let pts = c.mapped_points(&c.points_of(&[top]), &m);
+        assert!(pts.len() == 4 && pts.iter().all(|&(v, p)| (p - c.pos[v as usize] - Vec3::Y * 0.5).length() < 1e-6));
+        let images = crate::symmetry::Symmetry { x: true, ..Default::default() }.images();
+        let mirror = |k: usize, v: u32| -> Option<u32> {
+            let want = images.map(k, c.pos[v as usize]);
+            (0..26u32).find(|&w| c.pos[w as usize].distance(want) < 1e-5)
+        };
+        let side = (0..24).find(|&f| c.normal(f).x > 0.9).unwrap();
+        let mm = c.mapped_points_mirrored(&c.points_of(&[side]), &Affine::translation(Vec3::X * 0.5), &images, mirror);
+        assert_eq!(mm.len(), 8);
+        assert!(mm.iter().all(|&(v, p)| (p - c.pos[v as usize]).x.abs() > 0.49 && (p - c.pos[v as usize]).x.signum() == c.pos[v as usize].x.signum()));
+    }
+
     #[test]
     fn edge_loops_insert_round_the_cube_and_dissolve_away() {
         let pm = cube();
@@ -1827,3 +2474,4 @@ mod quad_tests {
         assert_eq!(PolyMesh::from_mesh(&mesh).0.faces.len(), looped.faces.len());
     }
 }
+

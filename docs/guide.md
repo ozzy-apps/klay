@@ -638,8 +638,17 @@ ZModeler lists the same:
   and one on each edge, a quad per corner; the polygons beside it gain the edge points),
   **Flip** (click: the normals turned round), **Delete**, **Polygroup** (click), **Crease**
   and **Mask** (click; click again to uncrease or unmask), **Bridge** (click one polygon,
-  then another with as many sides: a tube joins them). Targets: **A Single Poly**,
-  **Polygroup All**, **Polyloop** (the ring of quads across the edge nearest the cursor).
+  then another with as many sides: a tube joins them), **Spin Edges** (click: the points
+  round the polygons turn one slot, so a polygon turns within its neighbours), **Align**
+  (click: the points flattened onto the clicked polygon's plane), **Insert Point** (click
+  where it goes: a point joined to the polygon's corners, a triangle per edge), **Unweld**
+  (click: the polygons come apart from their neighbours on points of their own, in the
+  same place), **Equalize** (click: each polygon made regular, with equal edges and
+  angles about its middle, all of them the same size), and **Transpose** (click to put
+  Gizmo 3D on the polygons, then drag its arrows, boxes, rings and squares to move, scale
+  and turn them, as in Move mode; the gizmo stays on them for the next drag). Targets:
+  **A Single Poly**, **Polygroup All**, **Polyloop** (the ring of quads across the edge
+  nearest the cursor).
 - **Edge**: **Insert** an edge loop round the ring of quads through the edge (click where it
   goes, drag to slide it; a triangle at the end becomes a quad), **Delete** the edge or
   its whole **EdgeLoop**, **Bevel** the edge (or the loop) into a flat chamfer (drag for
@@ -648,8 +657,14 @@ ZModeler lists the same:
   (drag), **Collapse** the edge's two points into one at its middle (click), **Spin** the
   edge one step round its two polygons (click), **Crease** and **Mask** the edge or loop
   (click; again to undo), **Close Hole** (click an open edge: the hole it is on becomes
-  one polygon), or **Bridge** two open edges with a polygon (click one, then the other).
-  **EdgeLoop** widens Delete, Bevel, Crease, Slide, Move and Mask to the loop.
+  one polygon), **Bridge** two open edges with a polygon (click one, then the other),
+  **Align** the loop through the edge (click: an open run's points onto the line through
+  its ends, a closed loop onto its own plane), **Insert Point** on the edge where the
+  click is (the polygons on it gain a corner), **Unweld** (click: the mesh cut along the
+  edge or its loop, the points on it duplicated so the sides come apart; a cut that ends
+  inside the mesh leaves a slit) or **Transpose** the edge or loop with Gizmo 3D (click to
+  put it there, then drag its handles). **EdgeLoop** widens Delete, Bevel, Crease, Slide,
+  Move, Mask, Unweld and Transpose to the loop.
 - **Point**: **Move** in the view plane (drag), **Bevel** the corner off (drag for its size:
   the polygons round the point cut back and a polygon fills the gap), **Slide** along the
   edge that runs the way of the drag, **Delete** the point (click: the polygons round it
@@ -669,8 +684,13 @@ Klay keeps triangles, and since 0.31 a mesh remembers which two make each quad (
 ZRemesher and ZModeler set it; Divide carries it), so ZModeler and PolyF use exactly those
 quads; a mesh from an older file or from an operation that rebuilds triangles (booleans,
 decimation, Sculptris) has them guessed from edge lengths, the way PolyF showed them before. Each action is one undo step; it needs
-a subtool without subdivision levels. Not yet: Spin Poly, Align, Unweld, Equalize, Insert
-Point and Transpose.
+a subtool without subdivision levels.
+
+A drag is live on a dense mesh (0.38): the subtool is rebuilt at most once per drag, when
+the action first makes its polygons, and from then on only the points the action moves
+go to the GPU, as a brush stroke's do; on release the triangles are remade only if a quad
+now wants its other diagonal. Not yet: Mask with a target, Insert Polyloops, Insert
+NanoMesh and ZModeler's Do Nothing.
 
 ### Brushes added in 0.23
 
