@@ -4383,8 +4383,8 @@ impl Workspace {
                 });
                 self.sec(ui, h, id, "texturemaps", "Texture Maps", None, false, true, &mut |ws, ui| {
                     use crate::bake::{Kind, Space};
-                    let ready = ws.uv_info.is_some() && m.levels.len() > 1 && !ws.baking;
-                    ui.add_enabled_ui(ready, |ui| {
+                    let ready = ws.uv_info.is_some() && !ws.baking;
+                    ui.add_enabled_ui(ready && m.levels.len() > 1, |ui| {
                         let r = ui
                             .add_sized([ui.available_width(), 20.0], egui::Button::new("Normal Map"))
                             .on_hover_text("Bake the highest level's detail into a normal map over the lowest level's UVs, and save it as PNG (ZBrush: Tool › Normal Map)");
@@ -4396,6 +4396,14 @@ impl Workspace {
                             .on_hover_text("Bake how far the highest level stands out from the smoothly divided lowest level, and save it as EXR or PNG (ZBrush: Tool › Displacement Map)");
                         if r.shelf(ui, "cmd:bake-displacement").clicked() {
                             a.bake = Some(Kind::Displacement);
+                        }
+                    });
+                    ui.add_enabled_ui(ready, |ui| {
+                        let r = ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Color Map"))
+                            .on_hover_text("Bake the polypaint into a colour texture over the lowest level's UVs, white where nothing is painted, and save it as PNG (ZBrush: Texture Map › New From Polypaint)");
+                        if r.shelf(ui, "cmd:bake-color").clicked() {
+                            a.bake = Some(Kind::Color);
                         }
                     });
                     const SIZES: [usize; 4] = [1024, 2048, 4096, 8192];
@@ -4440,7 +4448,7 @@ impl Workspace {
                     } else if ws.uv_info.is_none() {
                         note(ui, "Needs UVs · Unwrap in UV Map first");
                     } else if m.levels.len() < 2 {
-                        note(ui, "Needs subdivision levels · Divide and sculpt the detail first");
+                        note(ui, "Normal and Displacement need subdivision levels · Divide and sculpt the detail first · Color Map bakes this level");
                     } else {
                         note(ui, "From the highest level onto the lowest level's UVs · runs in the background");
                     }

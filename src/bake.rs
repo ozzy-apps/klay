@@ -1,5 +1,6 @@
-//! Normal and displacement maps (ZBrush: Tool › Normal Map and Displacement Map): the detail
-//! of the highest subdivision level, put into textures over the base level's UVs.
+//! Normal, displacement and colour maps (ZBrush: Tool › Normal Map, Displacement Map and
+//! Texture Map › New From Polypaint): the detail and polypaint of the highest subdivision
+//! level, put into textures over the base level's UVs.
 //!
 //! Every triangle of the highest level lies inside one base triangle, at a place known from
 //! the subdivision itself ([`Place`]), so nothing is ray cast and nothing can miss. The
@@ -9,12 +10,13 @@
 //!   read tangent-space maps) or in object space;
 //! - for a displacement map, how far the highest level stands out from the base level
 //!   divided smoothly with nothing sculpted above it, along that smooth surface's normal:
-//!   what a renderer that subdivides the base and displaces it expects.
+//!   what a renderer that subdivides the base and displaces it expects;
+//! - for a colour map, the highest level's polypaint, over white where nothing is painted.
 //!
 //! Samples are averaged per texel, and the islands are padded outwards so that filtering
 //! and mipmaps do not pull the background in.
 
-use glam::{Mat3, Vec2, Vec3};
+use glam::{Mat3, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 
 /// Where a triangle of the highest level lies in the base level: the base triangle, and
@@ -40,6 +42,9 @@ pub struct Source {
     /// The base level divided smoothly, in the highest level's vertex order; only needed
     /// for a displacement map (empty otherwise).
     pub smooth: Vec<Vec3>,
+    /// The highest level's polypaint (premultiplied sRGB, alpha 0 where unpainted); only
+    /// for a colour map, and empty when nothing is painted.
+    pub colors: Vec<[u8; 4]>,
 }
 
 impl Source {
@@ -57,6 +62,7 @@ impl Source {
             indices: top.indices.clone(),
             places: doc.top_places(),
             smooth: if kind == Kind::Displacement { doc.smooth_top() } else { Vec::new() },
+            colors: if kind == Kind::Color { top.colors.clone() } else { Vec::new() },
         }
     }
 }
@@ -65,6 +71,8 @@ impl Source {
 pub enum Kind {
     Normal,
     Displacement,
+    /// The polypaint as a texture (ZBrush: Texture Map › New From Polypaint).
+    Color,
 }
 
 impl Kind {
@@ -72,7 +80,13 @@ impl Kind {
         match self {
             Kind::Normal => "Normal map",
             Kind::Displacement => "Displacement map",
+            Kind::Color => "Color map",
         }
+    }
+
+    /// Whether the bake needs subdivision levels (a colour map bakes a single level too).
+    pub fn needs_levels(self) -> bool {
+        self != Kind::Color
     }
 }
 
@@ -109,7 +123,8 @@ impl Default for Settings {
 }
 
 /// A baked map: `channels` floats per texel (3 for a normal map, its components in
-/// -1..1; 1 for a displacement map, in model units), row 0 at the top (V = 1).
+/// -1..1; 1 for a displacement map, in model units; 4 for a colour map, premultiplied
+/// sRGB in 0..1), row 0 at the top (V = 1).
 pub struct Map {
     pub kind: Kind,
     pub size: usize,
@@ -187,6 +202,8 @@ struct Corner {
     /// The base level's normal and tangent there (tangent-space normal maps).
     n: Vec3,
     t: Vec3,
+    /// The polypaint, premultiplied, in 0..1 (colour maps).
+    c: Vec4,
 }
 
 /// Bake a map of `kind` from `src`.
@@ -202,12 +219,20 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
     }
     let size = s.size.clamp(16, 16384);
     let ss = s.samples.clamp(1, 4) as usize;
-    let channels = if kind == Kind::Normal { 3 } else { 1 };
+    let channels = match kind {
+        Kind::Normal => 3,
+        Kind::Displacement => 1,
+        Kind::Color => 4,
+    };
     let tangent = kind == Kind::Normal && s.space == Space::Tangent;
+    if kind == Kind::Color && !src.colors.is_empty() && src.colors.len() != src.positions.len() {
+        return Err("the polypaint does not match the highest level".into());
+    }
 
     // Per-vertex values of the highest level.
     let high: Vec<Vec3> = match kind {
         Kind::Normal => vertex_normals(&src.positions, &src.indices),
+        Kind::Color => Vec::new(),
         Kind::Displacement => {
             let sn = vertex_normals(&src.smooth, &src.indices);
             src.positions
@@ -242,10 +267,18 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
             Vec2::new(uv.x * g, (1.0 - uv.y) * g)
         })
     };
+    let paint = |v: u32| -> Vec4 {
+        let c = src.colors.get(v as usize).copied().unwrap_or([0; 4]);
+        Vec4::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32) / 255.0
+    };
     let corners = |t: usize| -> [Corner; 3] {
         let pl = &src.places[t];
         std::array::from_fn(|k| {
-            let mut c = Corner { nh: high[src.indices[3 * t + k] as usize], ..Default::default() };
+            let v = src.indices[3 * t + k];
+            let mut c = Corner { nh: high.get(v as usize).copied().unwrap_or(Vec3::ZERO), ..Default::default() };
+            if kind == Kind::Color {
+                c.c = paint(v);
+            }
             if tangent {
                 let w = pl.w[k];
                 let b = [1.0 - w.x - w.y, w.x, w.y];
@@ -330,6 +363,12 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
                         let nh = c[0].nh * b0 + c[1].nh * b1 + c[2].nh * b2;
                         match kind {
                             Kind::Displacement => o[0] += nh.x,
+                            Kind::Color => {
+                                let c = c[0].c * b0 + c[1].c * b1 + c[2].c * b2;
+                                for (j, v) in c.to_array().into_iter().enumerate() {
+                                    o[j] += v;
+                                }
+                            }
                             Kind::Normal => {
                                 let nh = nh.normalize_or(Vec3::Z);
                                 let v = if tangent {
@@ -359,11 +398,11 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
             for (i, &n) in cnt.iter().enumerate() {
                 if n > 0 {
                     let o = &mut out[i * channels..i * channels + channels];
-                    if channels == 3 {
+                    if kind == Kind::Normal {
                         let v = Vec3::new(o[0], o[1], o[2]).normalize_or(Vec3::Z);
                         o.copy_from_slice(&v.to_array());
                     } else {
-                        o[0] /= n as f32;
+                        o.iter_mut().for_each(|v| *v /= n as f32);
                     }
                 }
             }
@@ -371,9 +410,14 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
     let covered = count.par_iter().filter(|&&n| n > 0).count();
     let mut known: Vec<bool> = count.par_iter().map(|&n| n > 0).collect();
     drop(count);
-    pad(&mut data, &mut known, size, channels, s.padding);
-    // The background: flat.
-    let empty: &[f32] = if channels == 3 { if kind == Kind::Normal && s.space == Space::Object { &[0.0, 0.0, 0.0] } else { &[0.0, 0.0, 1.0] } } else { &[0.0] };
+    pad(&mut data, &mut known, size, channels, kind == Kind::Normal, s.padding);
+    // The background: flat, or white.
+    let empty: &[f32] = match kind {
+        Kind::Normal if s.space == Space::Object => &[0.0, 0.0, 0.0],
+        Kind::Normal => &[0.0, 0.0, 1.0],
+        Kind::Displacement => &[0.0],
+        Kind::Color => &[1.0, 1.0, 1.0, 1.0],
+    };
     data.par_chunks_mut(channels).zip(known.par_iter()).for_each(|(o, &k)| {
         if !k {
             o.copy_from_slice(empty);
@@ -383,17 +427,17 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
 }
 
 /// Grow the known texels outwards `rounds` times: each unknown texel next to known ones
-/// takes their mean.
-fn pad(data: &mut [f32], known: &mut [bool], size: usize, channels: usize, rounds: usize) {
+/// takes their mean (of unit length again when `unit`).
+fn pad(data: &mut [f32], known: &mut [bool], size: usize, channels: usize, unit: bool, rounds: usize) {
     for _ in 0..rounds {
-        let grown: Vec<Option<[f32; 3]>> = (0..size * size)
+        let grown: Vec<Option<[f32; 4]>> = (0..size * size)
             .into_par_iter()
             .map(|i| {
                 if known[i] {
                     return None;
                 }
                 let (x, y) = ((i % size) as isize, (i / size) as isize);
-                let mut sum = [0f32; 3];
+                let mut sum = [0f32; 4];
                 let mut n = 0;
                 for dy in -1..=1isize {
                     for dx in -1..=1isize {
@@ -418,7 +462,7 @@ fn pad(data: &mut [f32], known: &mut [bool], size: usize, channels: usize, round
             if let Some(v) = g {
                 let o = &mut data[i * channels..i * channels + channels];
                 o.copy_from_slice(&v[..channels]);
-                if channels == 3 {
+                if unit {
                     let n = Vec3::from_slice(o).normalize_or(Vec3::Z);
                     o.copy_from_slice(&n.to_array());
                 }
@@ -434,12 +478,17 @@ fn pad(data: &mut [f32], known: &mut [bool], size: usize, channels: usize, round
 
 /// Write `map` to `path`: a normal map as an 8-bit RGB PNG; a displacement map as a 32-bit
 /// float OpenEXR (`.exr`) in model units, or a 16-bit grey PNG where mid grey is no
-/// displacement and white is `max_abs` out. Returns the bytes written.
+/// displacement and white is `max_abs` out; a colour map as an 8-bit RGB PNG, the paint
+/// over white. Returns the bytes written.
 pub fn write(map: &Map, path: &std::path::Path) -> Result<u64, String> {
     let exr = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exr"));
     let n = map.size as u32;
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     match (map.kind, exr) {
+        (Kind::Color, _) => {
+            let px: Vec<u8> = map.data.par_chunks_exact(4).flat_map_iter(|c| over_white(c).map(|v| (v * 255.0).round() as u8)).collect();
+            image::RgbImage::from_raw(n, n, px).expect("size matches").save(path).map_err(|e| fail(&e))?;
+        }
         (Kind::Normal, false) => {
             let px: Vec<u8> = map.data.par_iter().map(|&v| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8).collect();
             image::RgbImage::from_raw(n, n, px).expect("size matches").save(path).map_err(|e| fail(&e))?;
@@ -509,6 +558,12 @@ fn exr_bytes(size: usize, channels: usize, data: &[f32], names: &[&str], order: 
 }
 
 /// A small picture of `map`, `side` pixels square, RGBA (the Texture Maps preview).
+/// A premultiplied colour texel laid over white, as straight RGB in 0..1.
+fn over_white(c: &[f32]) -> [f32; 3] {
+    let gap = (1.0 - c[3]).clamp(0.0, 1.0);
+    [(c[0] + gap).clamp(0.0, 1.0), (c[1] + gap).clamp(0.0, 1.0), (c[2] + gap).clamp(0.0, 1.0)]
+}
+
 pub fn preview(map: &Map, side: usize) -> Vec<[u8; 4]> {
     let step = map.size as f32 / side as f32;
     let scale = map.max_abs.max(1e-12);
@@ -518,7 +573,17 @@ pub fn preview(map: &Map, side: usize) -> Vec<[u8; 4]> {
             let j = (y as usize).min(map.size - 1) * map.size + (x as usize).min(map.size - 1);
             let d = &map.data[j * map.channels..j * map.channels + map.channels];
             let b = |v: f32| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            if map.channels == 3 { [b(d[0]), b(d[1]), b(d[2]), 255] } else { let g = b(d[0] / scale); [g, g, g, 255] }
+            match map.channels {
+                4 => {
+                    let [r, g, bl] = over_white(d).map(|v| (v * 255.0).round() as u8);
+                    [r, g, bl, 255]
+                }
+                3 => [b(d[0]), b(d[1]), b(d[2]), 255],
+                _ => {
+                    let g = b(d[0] / scale);
+                    [g, g, g, 255]
+                }
+            }
         })
         .collect()
 }
@@ -651,6 +716,57 @@ mod tests {
         write(&n, &np).unwrap();
         let img = image::open(&np).unwrap().to_rgb8();
         assert_eq!(img.dimensions(), (128, 128));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn color_map_reads_the_polypaint_over_white_and_bakes_one_level_too() {
+        let mut doc = stack(|_| 0.0);
+        // The cap painted red, the rest left unpainted.
+        let n = doc.mesh().vertex_count();
+        let colors: Vec<[u8; 4]> = (0..n).map(|v| if doc.mesh().positions[v].y > 0.5 { [255, 0, 0, 255] } else { [0; 4] }).collect();
+        doc.mesh_mut().colors = colors;
+        let src = Source::of(&mut doc, Kind::Color);
+        assert_eq!(src.colors.len(), src.positions.len());
+        let m = bake(&src, Kind::Color, &settings()).unwrap();
+        assert_eq!(m.channels, 4);
+        let dir = std::env::temp_dir().join(format!("klay-bake-color-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("c.png");
+        write(&m, &png).unwrap();
+        let img = image::open(&png).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (128, 128));
+        let (mut red, mut white) = (0, 0);
+        for p in img.pixels() {
+            // Red over white: red stays full, green and blue match (the blend at the edge).
+            assert!(p[0] == 255 && p[1] == p[2], "{:?}", p);
+            if p[1] == 0 {
+                red += 1;
+            } else if p[1] == 255 {
+                white += 1;
+            }
+        }
+        assert!(red > 200 && white > 5000, "red {red} white {white}");
+        // Padding carries the paint past the island edge: the preview agrees with the file.
+        let pv = preview(&m, 128);
+        assert_eq!(pv.iter().filter(|c| c[1] == 0).count(), red);
+        // Nothing painted: all white; and a mesh without levels bakes too.
+        doc.mesh_mut().colors = Vec::new();
+        let src = Source::of(&mut doc, Kind::Color);
+        assert!(src.colors.is_empty());
+        let m = bake(&src, Kind::Color, &settings()).unwrap();
+        assert!(m.data.chunks_exact(4).all(|c| over_white(c) == [1.0, 1.0, 1.0]));
+        let (p, i) = crate::mesh::cube_sphere(6, 1.0);
+        let mesh = SculptMesh::from_raw(p, i);
+        let u = crate::uv::unwrap(&mesh.positions, &mesh.indices, &[], &crate::uv::Settings::default()).unwrap();
+        let mut one = Multires::new(mesh, usize::MAX);
+        one.set_uvs(u.uvs);
+        one.mesh_mut().colors = vec![[0, 0, 255, 255]; one.mesh().vertex_count()];
+        assert!(!Kind::Color.needs_levels() && one.count() == 1);
+        let src = Source::of(&mut one, Kind::Color);
+        let m = bake(&src, Kind::Color, &settings()).unwrap();
+        let blue = m.data.chunks_exact(4).filter(|c| over_white(c) == [0.0, 0.0, 1.0]).count();
+        assert!(blue > 3000 && m.coverage > 0.3, "blue {blue} · {}", m.coverage);
         std::fs::remove_dir_all(&dir).ok();
     }
 

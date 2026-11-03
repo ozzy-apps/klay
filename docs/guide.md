@@ -533,10 +533,11 @@ Denser cloth folds more finely; divide a plane a couple of times before draping 
 
 ### Texture Maps
 
-Geometry › **Texture Maps** (ZBrush: Tool › Normal Map and Displacement Map) bakes the
-detail of the highest level into an image over the lowest level's UVs, so the lowest level
-can stand in for the sculpt in another program: a game engine, Blender or a renderer. It
-needs UVs (Unwrap in UV Map) and subdivision levels with the detail on them.
+Geometry › **Texture Maps** (ZBrush: Tool › Normal Map, Displacement Map and Texture Map ›
+New From Polypaint) bakes the detail and the polypaint of the highest level into images
+over the lowest level's UVs, so the lowest level can stand in for the sculpt in another
+program: a game engine, Blender or a renderer. It needs UVs (Unwrap in UV Map) and, for the
+normal and displacement maps, subdivision levels with the detail on them.
 
 - **Normal Map** saves an 8-bit PNG. In tangent space (the default) blue is flat and the
   directions are relative to the lowest level's smooth surface and UV tangents, the way
@@ -549,6 +550,9 @@ needs UVs (Unwrap in UV Map) and subdivision levels with the detail on them.
   it saves a 16-bit grey PNG with mid grey for none; the status line gives the Scale to use
   (Midlevel 0.5). The displacement goes on the lowest level divided smoothly, as Blender's
   Subdivision Surface does.
+- **Color Map** saves the highest level's polypaint as an 8-bit PNG, white where nothing is
+  painted (ZBrush: Texture Map › New From Polypaint). It needs UVs but no subdivision levels,
+  so a painted model with one level bakes too.
 - **1K 2K 4K 8K** is the size. **Samples** (1–4, default 2) is how many samples each texel
   takes along each side, for smoother maps. **Padding** (default 8) grows each island by that
   many texels, so filtering at the seams does not pull in the background.
@@ -556,9 +560,10 @@ needs UVs (Unwrap in UV Map) and subdivision levels with the detail on them.
 Nothing is ray cast: Klay knows where every triangle of the highest level lies in the
 lowest one, so every texel gets its value and nothing misses or hits the wrong part. The
 bake runs in the background on a copy, so you can keep sculpting; the section shows the
-last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-normal PATH`
-and `--bake-displacement PATH` bake at startup (after `--demo` and `--open`), unwrapping
-first if needed. Shelf commands `cmd:bake-normal` and `cmd:bake-displacement`.
+last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-normal PATH`,
+`--bake-displacement PATH` and `--bake-color PATH` bake at startup (after `--demo` and
+`--open`), unwrapping first if needed. Shelf commands `cmd:bake-normal`,
+`cmd:bake-displacement` and `cmd:bake-color`.
 
 ### Decimation
 

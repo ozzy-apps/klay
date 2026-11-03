@@ -320,6 +320,15 @@ struct DecimateJob {
     started: Instant,
 }
 
+/// The map a Texture Maps save dialog is for.
+fn bake_kind_of(ask: file_dialog::Ask) -> bake::Kind {
+    match ask {
+        file_dialog::Ask::ExportNormalMap => bake::Kind::Normal,
+        file_dialog::Ask::ExportColorMap => bake::Kind::Color,
+        _ => bake::Kind::Displacement,
+    }
+}
+
 /// A texture-map bake running on its own thread (Geometry › Texture Maps); it works on a
 /// copy, so the model may change meanwhile.
 struct BakeJob {
@@ -1325,14 +1334,14 @@ impl App {
         self.workspace.uv_info = Some((self.doc.uvs().len(), stats));
     }
 
-    /// Geometry › Texture Maps › Normal Map / Displacement: check the subtool can be baked,
-    /// then ask where to save the map.
+    /// Geometry › Texture Maps › Normal Map / Displacement / Color Map: check the subtool
+    /// can be baked, then ask where to save the map.
     fn bake_ask(&mut self, kind: bake::Kind) {
         let why = if self.bake_job.is_some() {
             Some("a bake is already running")
         } else if self.doc.uvs().is_empty() {
             Some("needs UVs · Unwrap in Geometry › UV Map first")
-        } else if self.doc.count() < 2 {
+        } else if kind.needs_levels() && self.doc.count() < 2 {
             Some("needs subdivision levels · Divide and sculpt the detail first")
         } else {
             None
@@ -1341,13 +1350,17 @@ impl App {
             self.workspace.notify(format!("{}: {why}", kind.name()));
             return;
         }
-        self.ask_file(if kind == bake::Kind::Normal { file_dialog::Ask::ExportNormalMap } else { file_dialog::Ask::ExportDisplacementMap });
+        self.ask_file(match kind {
+            bake::Kind::Normal => file_dialog::Ask::ExportNormalMap,
+            bake::Kind::Displacement => file_dialog::Ask::ExportDisplacementMap,
+            bake::Kind::Color => file_dialog::Ask::ExportColorMap,
+        });
     }
 
     /// Bake a map of `kind` from the active subtool on a thread of its own and save it to
     /// `path`; [`poll_bake`](Self::poll_bake) reports it. What it reads is copied first.
     fn start_bake(&mut self, kind: bake::Kind, path: String) {
-        if self.bake_job.is_some() || self.doc.uvs().is_empty() || self.doc.count() < 2 {
+        if self.bake_job.is_some() || self.doc.uvs().is_empty() || (kind.needs_levels() && self.doc.count() < 2) {
             return;
         }
         let t = Instant::now();
@@ -1392,7 +1405,7 @@ impl App {
             Ok(d) => {
                 let exr = job.path.to_lowercase().ends_with(".exr");
                 let read = match job.kind {
-                    bake::Kind::Normal => String::new(),
+                    bake::Kind::Normal | bake::Kind::Color => String::new(),
                     bake::Kind::Displacement if exr => format!(" · up to {:.4} in or out · Blender: Midlevel 0, Scale 1", d.max_abs),
                     bake::Kind::Displacement => {
                         format!(" · white is {:.4} out · Blender: Midlevel 0.5, Scale {:.4}", d.max_abs, 2.0 * d.max_abs)
@@ -1717,7 +1730,8 @@ impl App {
         }
     }
 
-    /// Run the `--bake-normal` / `--bake-displacement` bakes, waiting for each.
+    /// Run the `--bake-normal` / `--bake-displacement` / `--bake-color` bakes, waiting for
+    /// each.
     fn bake_at_start(&mut self) {
         if let Some(path) = self.render_on_start.take() {
             self.start_render(path);
@@ -1727,7 +1741,7 @@ impl App {
             self.start_turntable(path, true);
         }
         for (kind, path) in std::mem::take(&mut self.bake_on_start) {
-            if self.doc.count() < 2 {
+            if kind.needs_levels() && self.doc.count() < 2 {
                 log::error!("{}: the active subtool has no subdivision levels", kind.name());
                 continue;
             }
@@ -3283,8 +3297,8 @@ impl App {
                     self.pending_export = true;
                     return;
                 }
-                Ask::ExportNormalMap | Ask::ExportDisplacementMap => {
-                    let kind = if ask == Ask::ExportNormalMap { bake::Kind::Normal } else { bake::Kind::Displacement };
+                Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap => {
+                    let kind = bake_kind_of(ask);
                     let path = self.map_path.clone();
                     self.start_bake(kind, path);
                     return;
@@ -3321,6 +3335,7 @@ impl App {
             Ask::ExportStl => (&self.stl_path, file_of(&self.stl_path).unwrap_or_else(|| "export.stl".into())),
             Ask::ImportMesh => (&self.import_path, String::new()),
             Ask::ExportNormalMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_normal"), "png")),
+            Ask::ExportColorMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_color"), "png")),
             Ask::ExportDisplacementMap => {
                 (&self.map_path, file_dialog::file_name(&format!("{tool}_displacement"), if self.workspace.bake.exr { "exr" } else { "png" }))
             }
@@ -3392,10 +3407,9 @@ impl App {
                 self.render_path = text(first);
                 self.start_turntable(text(first), false);
             }
-            Ask::ExportNormalMap | Ask::ExportDisplacementMap => {
+            Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap => {
                 self.map_path = text(first);
-                let kind = if ask == Ask::ExportNormalMap { bake::Kind::Normal } else { bake::Kind::Displacement };
-                self.start_bake(kind, text(first));
+                self.start_bake(bake_kind_of(ask), text(first));
             }
         }
     }
@@ -10363,10 +10377,10 @@ fn main() {
             ..Default::default()
         });
     }
-    // `--bake-normal PATH` / `--bake-displacement PATH`: bake that map of the active subtool
-    // once the startup model is ready (after `--demo` strokes and `--open`), unwrapping it
-    // first if needed.
-    for (f, kind) in [("--bake-normal", bake::Kind::Normal), ("--bake-displacement", bake::Kind::Displacement)] {
+    // `--bake-normal PATH` / `--bake-displacement PATH` / `--bake-color PATH`: bake that map
+    // of the active subtool once the startup model is ready (after `--demo` strokes and
+    // `--open`), unwrapping it first if needed.
+    for (f, kind) in [("--bake-normal", bake::Kind::Normal), ("--bake-displacement", bake::Kind::Displacement), ("--bake-color", bake::Kind::Color)] {
         if let Some(path) = flag(f) {
             app.bake_on_start.push((kind, path.clone()));
         }

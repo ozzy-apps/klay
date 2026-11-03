@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.0 — 2026-11-03
+
+- **Color Map** in Geometry › Texture Maps (ZBrush: Texture Map › New From Polypaint): the highest level's polypaint baked into an 8-bit PNG over the lowest level's UVs, white where nothing is painted, with the same size, samples and padding as the other maps. It needs UVs but no subdivision levels, so a painted single-level mesh bakes too. Shelf command `cmd:bake-color`; `--bake-color PATH` at startup; the file is named `<subtool>_color.png` next to the project.
+- Verification: 389 tests (new: a red-painted cap on an unwrapped sphere bakes as red over white with the blend only at the edge, the preview matches the file, an unpainted mesh gives an all-white map, and a single-level blue mesh bakes blue).
+
 ## 0.33.0 — 2026-11-03
 
 - **Mask By Cavity** now has ZBrush's controls and one more. **Intensity** (−100..100) replaces the Cavity sensitivity: high masks even shallow recesses, low only deep creases, and a negative value masks the raised surface (ridges, corners) instead. **Depth** (1..100) sets how wide a recess may be and still count: 1 compares each vertex with its neighbours as before (creases, pores), more smooths the surface further out first, so the grooves and folds a dense mesh hides from a one-ring test are found too (for grime on a subdivided model). **Blur** (0..100) softens the mask's edges up to ten rings. Depth 100 takes 0.2 s on a million vertices.

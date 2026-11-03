@@ -706,3 +706,8 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - Wider grooves than depth 100 reaches: mask at a lower Divide level, the mask follows the shown level.
 - Version 0.33.0.
 
+## Step 81: Color Map bake (2026-11-03, Claude Code)
+- User followed the retopology path (duplicate, ZRemesh, Unwrap, Divide and ProjectAll, delete the sculpt) and wanted the polypaint as a texture; Klay baked only normal and displacement maps.
+- `bake::Kind::Color`: `Source.colors` (the highest level's premultiplied polypaint, empty when unpainted), 4 float channels per texel averaged per sample and padded like the others, background white; `write` composites over white into an RGB PNG whatever the extension, `preview` too (`over_white`). `Kind::needs_levels` is false for Color, so `bake_ask`, `start_bake`, `bake_at_start` and the palette allow it on a single-level mesh. `file_dialog::Ask::ExportColorMap`, `cmd:bake-color`, `--bake-color PATH`, `bake_kind_of(ask)` in main.rs.
+- Version 0.34.0.
+

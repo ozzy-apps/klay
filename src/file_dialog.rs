@@ -28,6 +28,8 @@ pub enum Ask {
     ExportNormalMap,
     /// Geometry › Texture Maps › Displacement, as EXR or PNG.
     ExportDisplacementMap,
+    /// Geometry › Texture Maps › Color Map (the polypaint).
+    ExportColorMap,
     /// Spotlight › Load Image.
     OpenSpotlight,
     /// Document › Render › Render.
@@ -49,6 +51,7 @@ impl Ask {
             Ask::ImportMesh => "Import OBJ or STL",
             Ask::ExportNormalMap => "Save Normal Map",
             Ask::ExportDisplacementMap => "Save Displacement Map",
+            Ask::ExportColorMap => "Save Color Map",
             Ask::ExportRender => "Save Render",
             Ask::OpenSpotlight => "Spotlight Image",
             Ask::ExportTurntable => "Save Turntable",
@@ -68,7 +71,7 @@ impl Ask {
             Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
             Ask::ExportStl => &["stl"],
             Ask::ImportMesh => &["obj", "stl"],
-            Ask::ExportNormalMap | Ask::ExportRender => &["png"],
+            Ask::ExportNormalMap | Ask::ExportColorMap | Ask::ExportRender => &["png"],
             Ask::ExportTurntable => &["mp4"],
             Ask::OpenSpotlight => &["png", "jpg", "jpeg", "bmp"],
             Ask::ExportDisplacementMap => &["exr", "png"],
@@ -92,7 +95,7 @@ impl Ask {
     pub fn saves(self) -> bool {
         matches!(
             self,
-            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportRender | Ask::ExportTurntable
+            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap | Ask::ExportRender | Ask::ExportTurntable
         )
     }
 
