@@ -3,7 +3,11 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Current implementation — 0.6.0 (see Step 44; the summary below describes 0.4.0)
+## Latest implementation — 0.46.0
+
+See Step 97 for ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+
+## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
 - Space palette: left HSV picker; Draw Size → Z Intensity → Focal Shift → RGB Intensity → brushes. All values affect the real stroke.
 - Application version: `Cargo.toml` / `Cargo.lock` **0.4.0**. Project format **4**, backward readers for 1–3. Brush library format **v1**; workspace layout remains **v2**.
@@ -15,7 +19,7 @@ Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature release is **0.4.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature release is **0.46.0**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -762,3 +766,91 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - Not done: ZBrush's Transpose Master options (Layer, ZSphere rig, TPose with symmetry across subtools), posing with a lower proxy resolution than level 0.
 - Version 0.41.0.
 
+## Step 89: Fix the color picker gradient (2026-11-04)
+
+- Klay is a native Rust sculpting app built with egui, winit and wgpu. This patch is version 0.41.1.
+- The Space menu and customizable shelves both call `hsv_picker` in `src/workspace.rs`. Its rounded saturation and value field uses a bilinearly filtered 2×2 sRGB texture cached by egui for each picker. Saturation increases to the right and value decreases toward black at the bottom.
+- `PickerColor` stores the matching sRGB HSV coordinates. The marker, swatch, hex readout and polypaint share that selection. The hue strip uses the six HSV hue segments and color swaps retain both selections.
+- Verification: 416 tests passed and 13 were ignored. The Space menu interaction test checks that selecting green and clicking the center sets the paint color and hex readout to `#408040`. A native release snapshot confirmed both picker layouts. Sampled interior Space picker pixels matched the expected sRGB gradient within two channel levels out of 255. The README shows the Space menu under the Graphite Blue theme.
+- The picker fix is self-contained. Future color controls should reuse `PickerColor` and `hsv_picker` so their displayed and selected colors agree.
+
+## Step 90: Align sculpting and polypaint alphas on drag brushes (2026-11-04)
+
+- Klay is a native Rust sculpting app built with egui, winit and wgpu. This fix is version 0.41.2.
+- Grab's pickup in `src/sculpt.rs` projected sculpt and paint from opposite view directions and bypassed the alpha rotation calculation. It now uses one viewer-facing `StampProjection` for both channels and the same angle calculation as freehand dabs. The projection is set at pickup, so the vertex weights and paint stay tied to the original stamp throughout the pull.
+- The fix also covers Elastic, Snake Hook, Move Topological and Spiral through the shared pickup path. Follow uses the configured angle for a single pickup, where there is no direction between dabs.
+- Verification: the asymmetric alpha test failed before the fix. It now checks paint coverage and displacement against the same rotated stamp on mirrored Grab copies through the CPU and GPU-grab setup and finalization paths. The suite passed 417 tests with 13 ignored. The 0.41.2 release build also passed the native `--selftest-symmetry` and `--selftest-paint` GPU checks.
+- Future drag brushes should use the shared pickup and projection so paint and deformation sample the same alpha coordinates.
+
+## Step 91: Default to Random and speed up dense Z+RGB stamps (2026-11-04)
+
+- Klay 0.41.3 uses Random by default in the Alpha rotation control. Grab keeps one turn per pull. DragRect and DragDot seed their turn from the first preview hit so the pattern holds its orientation while the pointer moves.
+- `src/sculpt.rs` projects and samples the alpha and texture once per selected vertex for Z+RGB dabs and Grab pickup. It derives paint coverage and sculpt weights from those samples in one parallel pass and preserves each channel's own intensity and relief. Restamping restores only the preceding preview's position and paint chunks, while the undo record retains the originals across the stroke.
+- `src/main.rs` coalesces interactive DragRect and DragDot motion to one stamp per frame, remembers the event's brush pressure and applies any pending stamp on release. `src/render.rs` uploads contiguous dirty color chunks in runs.
+- Benchmark with `RAYON_NUM_THREADS=8 cargo test --release --offline --locked dense_alpha_drag_timings -- --ignored --nocapture`. With cached Pores on 2,160,002 vertices and about 344,000 under the brush, measured CPU times went from 11.55 to 9.07 ms per DragRect update and 8.47 to 5.93 ms per Grab pickup. This benchmark excludes rendering and first-use alpha baking.
+- Verification: 418 tests passed and 14 were ignored in the normal run. The sliding-stamp regression compares three preview positions with one stamp at the final position using the initial seed, checking that both paint and relief match. The release build passed the native `--selftest-paint` and `--selftest-symmetry` GPU checks.
+
+## Step 92: LightBox asset browser (2026-11-04)
+
+- Klay 0.42.0 is a native Rust sculpting app built with egui, winit and wgpu. The top-bar LightBox button and comma shortcut open a themed browser across the top of the workspace. The browser blocks canvas input while open.
+- `src/lightbox.rs` implements Klay and User libraries, seven categories, horizontal drag scrolling, one to four rows, history, folder navigation, thumbnail selection and double-click activation. Directory lists refresh on navigation or Refresh. The grid paints visible tiles and loads local image thumbnails through a bounded background queue.
+- `src/main.rs` routes scene and file selections through the existing loaders. Local alpha and texture choices reuse the brush asset library and go to Spotlight when it is shown. QuickSave loads as an unsaved recovery so Save asks for a path. The native Folder picker is in `src/file_dialog.rs`; the User folder is remembered in `klay/lightbox.folder` and the row count is in the workspace layout.
+- Verification: 420 tests passed and 14 were ignored. LightBox tests cover comma, canvas input isolation, single versus double-click activation, folder filtering and persistence, and QuickSave recovery. The native Alphas and Brushes views were checked at 100% and 150% UI scale. Capture the README screenshot with `--lightbox Alphas --theme "Graphite Blue" --snapshot FILE --snapshot-ui`.
+- Further parity work can build on the browser after adding native custom brush presets and LightCaps. Local project and tool tiles can use sidecar thumbnails. ZBrush-specific asset formats and multiple simultaneous LightBox panes are outside the current implementation.
+- [Maxon LightBox reference](https://help.maxon.net/zbr/en-us/Content/html/getting-started/basic-concepts/lightbox/lightbox.html)
+
+## Step 93: Model thumbnails in LightBox (2026-11-04)
+
+- Klay 0.42.1 moves QuickSave next to Projects. LightBox uses the saved geometry for thumbnails of existing or new QuickSaves, projects, saved tools, OBJ and STL files, and built-in primitives.
+- `src/model_thumbnail.rs` renders a framed, transparent clay preview with vertex paint on a background worker. It uses the existing model readers. `Packed::into_preview_geometry` uses a bounded subdivision level for dense projects and reads dense base triangles directly. STL previews use the same orientation as import.
+- LightBox keys its in-memory previews by file revision, keeps one model decode in flight, and refreshes the QuickSave listing after a successful rotation. A current sibling PNG still works as a custom preview. Existing model files need no conversion.
+- Verification: the release build and 421 tests passed, with 14 tests ignored. Native verification used five synthetic QuickSaves with distinct meshes and no sidecars, plus all five built-in primitives. The README screenshot shows the QuickSave tab.
+- Future refinements can use the saved view or a persistent thumbnail cache if needed. The current previews use a fixed three-quarter view and a reduced subdivision level for very dense stacks.
+
+## Step 94 — Custom brush presets (2026-11-04)
+
+- Klay 0.43.0 adds **Save Brush…** and **User Brushes** to the Brush palette in the native Rust, egui, winit and wgpu app. Save creates a named `.klaybrush` in the current LightBox User root's `Brushes` directory. Reusing a name requires a separate Replace click. The default root is `$XDG_DATA_HOME/klay/lightbox` or `~/.local/share/klay/lightbox`.
+- `src/brush_preset.rs` owns the version 1 format and validates a full preset before the workspace applies it. It records the live brush, colors, stroke, pressure curves, Sculptris, auto masking and tool options. Image stamps store the sampled RGBA pixels, dimensions and display name. The original file paths are optional on `BrushImage` and embedded stamps belong to their preset.
+- `src/brush_ui.rs` captures and applies the live settings. `src/lightbox.rs` lists presets under **User › Brushes**, uses the base brush for the tile preview, and loads the preset on activation. The project format stays at version 12.
+- Verification passed 422 release tests, with 14 ignored. The UI regression test saves a named Z+RGB DragRect preset, deletes the imported images, creates a fresh app, and double-clicks the preset in LightBox. The re-saved preset matches byte for byte. The test also checks duplicate names and truncated files. The README screenshot comes from the native User Brushes view with sample presets.
+- Further parity work can add authored InsertMesh geometry to the preset format, followed by thumbnails that render the saved stroke on a sample surface.
+
+## Step 95 — OBJ, subdivision, production layers and UV finishing (2026-11-04)
+
+- Klay 0.44.0 is the native Rust, egui, winit and wgpu sculpting app. This release implements roadmap items 2–5 after the LightBox preset release. Cargo and the lockfile use the same version. Project format 13 retains readers for earlier versions.
+- `src/obj.rs` keeps the imported face boundaries, named groups and corner UVs through chunk remapping. `src/mesh.rs` writes polygons where their corner and group data agree. **Document › Import › Update from OBJ…** matches the returned cage by vertex number and oriented triangles. The existing subdivision offsets survive a matching update. A topology change rebuilds the levels and uses ProjectAll. This runs as a cancelable geometry job and has a stack-level undo.
+- `src/quad_subdiv.rs` evaluates Catmull–Clark on all-quad meshes by using each quad’s triangulation diagonal slot for its face point. `src/multires.rs` records the geometry and UV rules on every link, including frozen stacks. Older links replay with Loop. Mixed cages use Loop. **Smt** and **Suv** apply to newly divided levels.
+- `src/layers.rs` records premultiplied paint and mask deltas alongside shape. Saved rounding and clipping residuals make intensity changes reversible. `src/selection_set.rs` stores named topology-bound snapshots. SubTool folders and sets persist in projects and standalone SubTools. Gizmo selection previews on the GPU and commits one undo entry per affected SubTool.
+- `src/uv.rs` stores manual seams in the base mesh layout, splits unwrap charts at marked edges, identifies UV islands by shared geometric edges and corner UVs, and supports packing existing coordinates. The checker uses a bounded draw-only cage preview. `src/bake.rs` writes signed RGB vector displacement in EXR. `src/bake_batch.rs` snapshots visible mapped SubTools and writes selected maps sequentially to a new folder.
+- Verification passed 429 release tests with 14 ignored. The added checks cover concave OBJ and mixed corner UVs, both cage-update paths and undo, analytic Catmull–Clark positions and saved rules, paint and mask layers after restart, folder and selection-set persistence, multi-SubTool transforms, seam cuts, checker geometry, signed vector displacement, and batch output. The native three-SubTool GPU picking and switching self-test also passed. The README includes native captures of the UV and map controls.
+- Remaining parity work includes authored IMM brushes and Catmull–Clark across mixed polygon cages. Multi-SubTool Gizmo edits currently undo independently on each SubTool.
+
+
+## Step 96 — Model import and SubTool editing (2026-11-04)
+
+- Klay 0.45.0 is the native Rust 2024, egui, winit and wgpu sculpting app. The version is in Cargo.toml and Cargo.lock. Project format 13 is used for these meshes and renamed SubTools.
+- `src/model_import.rs` dispatches OBJ, STL, GLB, glTF, FBX and GoZ from Document Import and LightBox. `src/model_import/gltf.rs` uses gltf-rs to read geometry and attributes, applies the node hierarchy and handles mirrored winding. It accepts embedded buffers and local buffers inside the model directory. `src/model_import/fbx.rs` uses ufbx for ASCII and binary FBX, applies object transforms and converts axes and units. The ufbx crate builds its C parser with the host compiler. `src/model_import/goz.rs` reads the GoZ SDK's mesh blocks, including per-vertex colors and masks.
+- The format readers feed the shared mesh builder in `src/obj.rs`, including polygon, corner UV and quad metadata where available. The app prepares the whole file before adding SubTools, fits multipart geometry with one transform, and leaves the last imported part active. `src/model_thumbnail.rs` uses the same readers for LightBox previews.
+- **Mesh › Deformation** selects X, Y or Z for Mirror Copy and Mirror And Weld. Mirror Copy inserts a reflected copy of the shown level directly below the source, with reversed winding and its paint, masks and UVs attached. Use SubTool › Merge Down to combine the two shells. Mirror And Weld clips and mirrors across the selected axis through the scene origin, then shares the seam vertices as one undoable operation.
+- **Fill Color** uses the active swatch in the Space menu and on the default left shelf. Saved shelves with the disabled Alternate slot resolve to Fill Color. The command blends with the vertex mask, skips hidden-only vertices and uses the existing multires paint history. Double-clicking a SubTool opens a focused rename dialog keyed by stable SubTool ID. Enter applies the name, Escape cancels, and project saves record the name.
+- The release build succeeded and 436 tests passed, with 14 ignored. Validation covers a multipart Klay GLB round trip, embedded and external glTF buffers, reflected winding, ASCII FBX instances and units, GoZ attributes and truncation, malformed import leaving the document intact, Mirror Copy and Merge Down, Z-axis weld, fill and undo, and renaming a parked SubTool through the UI. The README screenshot uses native LightBox with Blender binary FBX, Maya ASCII FBX, GLB, glTF and a synthetic GoZ sample.
+- For future format work, collect production GoZ and FBX exports to extend compatibility checks, then consider glTF compression extensions and a seam-stitching option for sculpt cages. Native ZBrush ZTools and projects require export from ZBrush. A future GoZ bridge would add live send and receive around the current mesh reader.
+- [Maxon GoZ SDK](https://developers.maxon.net/docs/zbrush/goz_sdk.pdf) · [Khronos glTF 2.0 specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html) · [ufbx](https://github.com/ufbx/ufbx)
+
+## Step 97 — ZRemesher guide editing, symmetry and clipping (2026-11-04)
+
+- Klay 0.46.0 is a native Rust 2024 app using egui, winit and wgpu. The version is in Cargo.toml and Cargo.lock. The project format remains 13.
+- ZRemesher guide strokes, Alt-click deletion and **Delete guides** add reversible spans to the active SubTool's history in `src/sculpt.rs`. A mirrored stroke stays one history entry. `src/main.rs` measures the pointer against the displayed line segments, even when the mesh ray misses. Whole-SubTool transforms and their inverses keep guides aligned. The guide list and its undo history are session data.
+- The **Symmetry** control in `src/workspace.rs` resolves to one plane. It can follow the brush mirror flags or explicitly select Off, Force X, Force Y or Force Z. **SubTool Center** sets the plane at the midpoint of the mesh bounds on the selected axis. `src/zremesh.rs` and `src/subtool_ops.rs` reuse the positive-half clip and weld along this plane, folding guide and crease influence across it.
+- Space is routed to an active clip gesture before the quick menu. `src/surface_tools.rs` tracks raw pointer motion separately from the snapped endpoint so a live line translates without rotating. Releasing Space restores endpoint control. Clip Rect shares Clip Line's solid cross-section query, with outline searches bounded by the two adjacent rectangle edges. This keeps flattened regions within the cut where a closed mesh crosses the edge.
+- The release build and native GPU surface self-test passed. The release suite passed 440 tests with 14 ignored. The regression tests cover guide draw, delete and clear undo, off-mesh hit testing, guide transforms, world X and local forced Y/Z symmetry, live Space translation with Shift snapping, and the Clip Rect flattened-limb case in both directions. The README capture shows the native ZRemesher controls and guide.
+- Follow-up geometry work can extend section-aware clipping to meshes with open or unwelded contours when a usable closed cut can be identified. Saving guide curves with a project would require a separate format change.
+- [Maxon Clip Brushes reference](https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/hard-surface/clip-brushes/clip-brushes.html)
+
+## Step 98 — Package Klay 0.46.0 for GitHub (2026-11-04)
+
+- The v0.46.0 release rolls up the work since the previous published tag, v0.41.0. The changelog retains the intermediate development versions. The release uses the main branch and an annotated v0.46.0 tag.
+- The three Linux x86-64 assets are `klay_0.46.0_amd64.deb`, `Klay-0.46.0-x86_64.flatpak` and `Klay-0.46.0-x86_64.AppImage`. The existing packaging scripts build the assets into the ignored dist directory. AppImage uses appimagetool and the standard type 2 runtime. Flatpak uses Freedesktop Platform 25.08.
+- The Debian package declares the glibc version required by the executable's ELF version table. The 0.46.0 Debian package and AppImage require glibc 2.39 or later. AppStream records the application version and release date.
+- The offline release suite passed 440 tests with 14 ignored. The extracted Debian and AppImage executables reported Klay 0.46.0. The Flatpak reported the same version from a temporary user installation inside its runtime.
+- For future releases, check the prior GitHub asset names, build the three packages from the release commit and smoke-test each one. Upload them to a draft for the pushed tag, verify the asset list, then publish.

@@ -268,6 +268,13 @@ impl Curve {
         self.pieces.extend(other.pieces.iter().map(|p| p.start + base..p.end + base));
     }
 
+    /// Move a guide along with its SubTool.
+    pub fn apply_affine(&mut self, map: &crate::transform::Affine) {
+        self.points.iter_mut().for_each(|p| *p = map.apply(*p));
+        self.normals.iter_mut().for_each(|n| *n = map.apply_vector(*n).normalize_or(*n));
+        self.tangents.iter_mut().for_each(|t| *t = map.apply_vector(*t).normalize_or(*t));
+    }
+
     /// The curve under an orthogonal map through the origin (a symmetry image).
     pub fn transformed(&self, map: &glam::Mat3) -> Curve {
         let m = |v: &Vec3| *map * *v;

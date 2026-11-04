@@ -54,7 +54,7 @@ const NONE: u32 = u32::MAX;
 
 /// The neighbour across each edge of every triangle (`NONE` at a border or where more than
 /// two triangles meet), in the same direction as the triangle's edge k → k + 1.
-fn neighbours(indices: &[u32]) -> Vec<[u32; 3]> {
+fn neighbours(indices: &[u32], seams: &[[u32; 2]]) -> Vec<[u32; 3]> {
     let n = indices.len() / 3;
     let mut edges: Vec<(u32, u32, u32, u8)> = (0..n as u32)
         .into_par_iter()
@@ -73,7 +73,7 @@ fn neighbours(indices: &[u32]) -> Vec<[u32; 3]> {
         while j < edges.len() && edges[j].0 == edges[i].0 && edges[j].1 == edges[i].1 {
             j += 1;
         }
-        if j - i == 2 {
+        if j - i == 2 && seams.binary_search(&[edges[i].0, edges[i].1]).is_err() {
             let (x, y) = (edges[i], edges[i + 1]);
             nb[x.2 as usize][x.3 as usize] = y.2;
             nb[y.2 as usize][y.3 as usize] = x.2;
@@ -498,7 +498,12 @@ fn flatten(p: &[Vec3], verts: &[u32], tris: &[[u32; 3]]) -> Vec<DVec2> {
 }
 
 /// Unwrap a mesh. `groups` (per triangle, may be empty) is used with `s.groups`.
+#[cfg(test)]
 pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings) -> Result<Unwrap, String> {
+    unwrap_with_seams(positions, indices, groups, s, &[])
+}
+
+pub fn unwrap_with_seams(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings, seams: &[[u32; 2]]) -> Result<Unwrap, String> {
     let start = std::time::Instant::now();
     let n = indices.len() / 3;
     if n == 0 {
@@ -506,7 +511,7 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
     }
     let mut surface = Surface {
         idx: indices,
-        nb: neighbours(indices),
+        nb: neighbours(indices, seams),
         normal: Vec::with_capacity(n),
         area: Vec::with_capacity(n),
         centre: Vec::with_capacity(n),
@@ -542,7 +547,21 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
     let (mut chart, count) = charts(&surface, s);
     let min = (n / 2000).clamp(4, 64);
     let grown = count;
-    let count = merge_small(&surface, &mut chart, count, min);
+    let mut count = merge_small(&surface, &mut chart, count, min);
+    if !seams.is_empty() {
+        // Extend incomplete cuts when both sides still belong to the same chart.
+        let full = neighbours(indices, &[]);
+        for (t, near) in full.iter().enumerate() {
+            for (edge, &other) in near.iter().enumerate() {
+                if other != NONE && (other as usize) > t && surface.nb[t][edge] == NONE
+                    && chart[t] == chart[other as usize]
+                {
+                    chart[other as usize] = count as u32;
+                    count += 1;
+                }
+            }
+        }
+    }
     let merged = count;
     let count = make_disks(&surface, &mut chart, count);
     log::debug!("uv charts: {grown} grown, {merged} merged, {count} disks");
@@ -640,33 +659,9 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
 
     crate::jobs::check()?;
     // Pack: tallest first, in shelves across a square about the size of all the boxes.
-    let total: f64 = islands.iter().map(|i| (i.hi - i.lo).x * (i.hi - i.lo).y).sum();
-    let margin = total.sqrt() * 0.008;
     islands.sort_by(|a, b| (b.hi - b.lo).y.total_cmp(&(a.hi - a.lo).y));
-    let widest = islands.iter().map(|i| (i.hi - i.lo).x).fold(0.0, f64::max);
-    // Shelves `width` wide: the offsets and the side of the square they need.
-    let shelves = |width: f64| -> (f64, Vec<DVec2>) {
-        let (mut x, mut y, mut row) = (margin, margin, 0.0f64);
-        let mut offsets = Vec::with_capacity(islands.len());
-        for i in &islands {
-            let size = i.hi - i.lo;
-            if x + size.x + margin > width && x > margin {
-                x = margin;
-                y += row + margin;
-                row = 0.0;
-            }
-            offsets.push(DVec2::new(x, y) - i.lo);
-            x += size.x + margin;
-            row = row.max(size.y);
-        }
-        (width.max(y + row + margin), offsets)
-    };
-    // The width that gives the smallest square, of a range of tries.
-    let (side, offsets) = (0..=24)
-        .map(|k| (total.sqrt() * (0.9 + k as f64 * 0.025)).max(widest + 2.0 * margin))
-        .map(shelves)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .unwrap();
+    let boxes: Vec<_> = islands.iter().map(|i| (i.lo, i.hi)).collect();
+    let (side, offsets) = pack_boxes(&boxes);
     let mut uvs = vec![[Vec2::ZERO; 3]; n];
     let mut stats = Stats { charts: islands.len(), ..Default::default() };
     let (mut weighted, mut area_sum, mut uv_area) = (0.0f64, 0.0f64, 0.0f64);
@@ -710,15 +705,112 @@ pub fn unwrap(positions: &[Vec3], indices: &[u32], groups: &[u16], s: &Settings)
     Ok(Unwrap { uvs, stats })
 }
 
+fn pack_boxes(boxes: &[(DVec2, DVec2)]) -> (f64, Vec<DVec2>) {
+    let total: f64 = boxes.iter().map(|(lo, hi)| (hi - lo).x * (hi - lo).y).sum::<f64>().max(1e-12);
+    let margin = total.sqrt() * 0.008;
+    let widest = boxes.iter().map(|(lo, hi)| (hi - lo).x).fold(0.0, f64::max);
+    // Shelves `width` wide: the offsets and the side of the square they need.
+    let shelves = |width: f64| -> (f64, Vec<DVec2>) {
+        let (mut x, mut y, mut row) = (margin, margin, 0.0f64);
+        let mut offsets = Vec::with_capacity(boxes.len());
+        for &(lo, hi) in boxes {
+            let size = hi - lo;
+            if x + size.x + margin > width && x > margin {
+                x = margin;
+                y += row + margin;
+                row = 0.0;
+            }
+            offsets.push(DVec2::new(x, y) - lo);
+            x += size.x + margin;
+            row = row.max(size.y);
+        }
+        (width.max(y + row + margin), offsets)
+    };
+    // The width that gives the smallest square, of a range of tries.
+    (0..=24)
+        .map(|k| (total.sqrt() * (0.9 + k as f64 * 0.025)).max(widest + 2.0 * margin))
+        .map(shelves)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .unwrap()
+}
+
+pub fn islands(indices: &[u32], uvs: &[[Vec2; 3]]) -> Vec<Vec<usize>> {
+    let key = |t: usize, k: usize| {
+        let q = uvs[t][k];
+        (indices[3 * t + k], q.x.to_bits(), q.y.to_bits())
+    };
+    let mut edges = crate::fx::FxHashMap::<_, (usize, usize)>::default();
+    let mut connected: Vec<[Option<usize>; 3]> = vec![[None; 3]; uvs.len()];
+    for t in 0..uvs.len() {
+        for k in 0..3 {
+            let (a, b) = (key(t, k), key(t, (k + 1) % 3));
+            if let Some((other, side)) = edges.remove(&(b, a)) {
+                connected[t][k] = Some(other);
+                connected[other][side] = Some(t);
+            } else {
+                edges.insert((a, b), (t, k));
+            }
+        }
+    }
+    let mut seen = vec![false; uvs.len()];
+    let mut out = Vec::new();
+    for t in 0..uvs.len() {
+        if seen[t] { continue; }
+        let mut island = vec![t];
+        seen[t] = true;
+        let mut i = 0;
+        while i < island.len() {
+            for &other in connected[island[i]].iter().flatten() {
+                if !std::mem::replace(&mut seen[other], true) { island.push(other); }
+            }
+            i += 1;
+        }
+        out.push(island);
+    }
+    out
+}
+
+pub fn hit(uvs: &[[Vec2; 3]], p: Vec2) -> Option<usize> {
+    uvs.iter().rposition(|q| {
+        let area = (q[1] - q[0]).perp_dot(q[2] - q[0]);
+        area.abs() > 1e-12 && (0..3).all(|i| (q[(i + 1) % 3] - q[i]).perp_dot(p - q[i]) * area.signum() >= -1e-7)
+    })
+}
+
+pub fn pack_existing(indices: &[u32], uvs: &mut [[Vec2; 3]]) {
+    let bounds = |island: &[usize]| island.iter().flat_map(|&t| uvs[t]).fold(
+        (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
+        |(lo, hi), q| (lo.min(q.as_dvec2()), hi.max(q.as_dvec2()))
+    );
+    let mut items: Vec<_> = islands(indices, uvs).into_iter().map(|i| {
+        let b = bounds(&i);
+        (i, b)
+    }).collect();
+    items.sort_by(|(_, a), (_, b)| (b.1 - b.0).y.total_cmp(&(a.1 - a.0).y));
+    let (side, offsets) = pack_boxes(&items.iter().map(|(_, b)| *b).collect::<Vec<_>>());
+    for ((island, _), offset) in items.into_iter().zip(offsets) {
+        for t in island { uvs[t] = uvs[t].map(|q| ((q.as_dvec2() + offset) / side).as_vec2()); }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Edit {
+    Move(Vec2),
+    Rotate,
+    Scale(f32),
+    Pack,
+}
+
 /// A picture of the layout, `size` pixels square, RGBA: islands filled, their triangle
 /// edges drawn lighter, on a dark square (the UV Map preview). V runs up, as in ZBrush.
-pub fn layout_image(uvs: &[[Vec2; 3]], size: usize) -> Vec<[u8; 4]> {
+pub fn layout_preview(uvs: &[[Vec2; 3]], size: usize, selection: &[usize], checker: bool) -> Vec<[u8; 4]> {
     let bg = [28u8, 30, 36, 255];
     let fill = [120u8, 96, 72, 255];
     let edge = [236u8, 196, 150, 255];
     let mut px = vec![bg; size * size];
     let s = size as f32;
-    for c in uvs {
+    for (i, c) in uvs.iter().enumerate() {
+        let selected = selection.binary_search(&i).is_ok();
         let q = c.map(|p| Vec2::new(p.x * s, (1.0 - p.y) * s));
         let area = (q[1] - q[0]).perp_dot(q[2] - q[0]);
         if area.abs() < 1e-9 {
@@ -744,8 +836,12 @@ pub fn layout_image(uvs: &[[Vec2; 3]], size: usize) -> Vec<[u8; 4]> {
                 let cell = &mut px[y * size + x];
                 if nearest < 0.6 {
                     *cell = edge;
-                } else if *cell == bg {
-                    *cell = fill;
+                } else if *cell == bg || selected {
+                    let base = if selected { [58, 126, 212, 255] } else { fill };
+                    let step = (size / 16).max(1);
+                    *cell = if checker && (x / step + y / step) % 2 == 0 {
+                        [base[0] / 2, base[1] / 2, base[2] / 2, 255]
+                    } else { base };
                 }
             }
         }
@@ -853,4 +949,152 @@ mod tests {
             eprintln!("{} triangles: {:?}", i.len() / 3, u.stats);
         }
     }
+}
+
+/// Per triangle, its three corner UVs and the UVs at its three edge midpoints.
+/// Smoothing runs on face-varying topology, with island borders held in place.
+pub(crate) fn subdivision_uvs(indices: &[u32], uvs: &[[Vec2; 3]], smooth: bool) -> Vec<[Vec2; 6]> {
+    if !smooth {
+        return uvs.iter().map(|q| [q[0], q[1], q[2], (q[0] + q[1]) * 0.5, (q[1] + q[2]) * 0.5, (q[2] + q[0]) * 0.5]).collect();
+    }
+    let mut vertices = crate::fx::FxHashMap::default();
+    let mut points = Vec::new();
+    let mut triangles = Vec::with_capacity(uvs.len());
+    for (tri, q) in indices.chunks_exact(3).zip(uvs) {
+        triangles.push(std::array::from_fn::<_, 3, _>(|k| {
+            *vertices.entry((tri[k], q[k].x.to_bits(), q[k].y.to_bits())).or_insert_with(|| {
+                points.push(q[k]);
+                points.len() - 1
+            })
+        }));
+    }
+    let key = |a: usize, b: usize| (a.min(b), a.max(b));
+    let mut edges = crate::fx::FxHashMap::<_, Vec<usize>>::default();
+    for t in &triangles {
+        for k in 0..3 {
+            edges.entry(key(t[k], t[(k + 1) % 3])).or_default().push(t[(k + 2) % 3]);
+        }
+    }
+    let mut ring = vec![(Vec2::ZERO, 0, false); points.len()];
+    for (&(a, b), opposite) in &edges {
+        for (v, w) in [(a, b), (b, a)] {
+            ring[v].0 += points[w];
+            ring[v].1 += 1;
+            ring[v].2 |= opposite.len() != 2;
+        }
+    }
+    triangles.iter().map(|t| {
+        let mut out = [Vec2::ZERO; 6];
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let (sum, n, border) = ring[a];
+            let beta = if border { 0.0 } else { crate::multires::loop_beta(n) };
+            out[k] = points[a] * (1.0 - n as f32 * beta) + sum * beta;
+            let across = &edges[&key(a, b)];
+            out[3 + k] = if across.len() == 2 {
+                (points[a] + points[b]) * 0.375 + (points[across[0]] + points[across[1]]) * 0.125
+            } else {
+                (points[a] + points[b]) * 0.5
+            };
+        }
+        out
+    }).collect()
+}
+
+/// A clipped checker grid on the cage. A separate preview mesh keeps UVs and colours
+/// per corner, including seams where the sculpting mesh shares its positions.
+pub(crate) fn checker_mesh(
+    mesh: &crate::mesh::SculptMesh,
+    uvs: &[[Vec2; 3]],
+    mapped: &[u8],
+) -> Option<crate::multires::StandIn> {
+    use crate::mesh::{pack_normal, unpack_normal};
+    const CELLS: f32 = 16.0;
+    const LIMIT: usize = 1_200_000;
+    if uvs.len() != mesh.triangle_count() || uvs.len() > LIMIT / 3 {
+        return None;
+    }
+    let normals = mesh.compute_all_normals();
+    let mut preview = crate::multires::StandIn {
+        positions: Vec::new(), normals: Vec::new(), colors: Vec::new(),
+        indices: Vec::new(), level: 0, bounds: mesh.bounds(),
+    };
+    let mut polygon = Vec::with_capacity(8);
+    let mut scratch = Vec::with_capacity(8);
+    let original = [Vec3::X, Vec3::Y, Vec3::Z];
+    for (t, (tri, uv)) in mesh.indices.chunks_exact(3).zip(uvs).enumerate() {
+        if mesh.hidden.get(t).copied().unwrap_or(0) != 0 { continue; }
+        let p = [tri[0], tri[1], tri[2]].map(|v| mesh.positions[v as usize]);
+        let n = [tri[0], tri[1], tri[2]].map(|v| unpack_normal(normals[v as usize]));
+        let q = uv.map(|q| q * CELLS);
+        let lo = q[0].min(q[1]).min(q[2]).floor();
+        let hi = q[0].max(q[1]).max(q[2]).ceil();
+        let mut emit = |polygon: &[Vec3], color: [u8; 4]| {
+            if polygon.len() < 3 { return; }
+            let start = preview.positions.len() as u32;
+            for &w in polygon {
+                preview.positions.push(p[0] * w.x + p[1] * w.y + p[2] * w.z);
+                preview.normals.push(pack_normal((n[0] * w.x + n[1] * w.y + n[2] * w.z).normalize_or(Vec3::Z)));
+                preview.colors.push(color);
+            }
+            for i in 1..(polygon.len() - 1) as u32 {
+                preview.indices.extend([start, start + i, start + i + 1]);
+            }
+        };
+        if mapped.get(t).is_some_and(|&bits| bits != 7) || (hi - lo).max_element() > 48.0
+            || (hi - lo).min_element() <= 0.0 || hi.abs().max_element() > 1e6
+        {
+            emit(&original, [0; 4]);
+            continue;
+        }
+        let uv_at = |w: Vec3| q[0] * w.x + q[1] * w.y + q[2] * w.z;
+        for y in lo.y as i32..hi.y as i32 {
+            for x in lo.x as i32..hi.x as i32 {
+                polygon.clear();
+                polygon.extend(original);
+                for (axis, edge, sign) in [(0, x, 1.0), (0, x + 1, -1.0), (1, y, 1.0), (1, y + 1, -1.0)] {
+                    scratch.clear();
+                    if polygon.is_empty() { break; }
+                    let distance = |w| (uv_at(w)[axis] - edge as f32) * sign;
+                    let mut previous = *polygon.last().unwrap();
+                    let mut before = distance(previous);
+                    for &current in &polygon {
+                        let after = distance(current);
+                        if (before < 0.0) != (after < 0.0) {
+                            scratch.push(previous.lerp(current, before / (before - after)));
+                        }
+                        if after >= 0.0 { scratch.push(current); }
+                        previous = current;
+                        before = after;
+                    }
+                    std::mem::swap(&mut polygon, &mut scratch);
+                }
+                let value = if (x + y) & 1 == 0 { 224 } else { 78 };
+                emit(&polygon, [value, value, value, 255]);
+            }
+        }
+        if preview.positions.len() > LIMIT { return None; }
+    }
+    (!preview.indices.is_empty()).then_some(preview)
+}
+
+#[cfg(test)]
+#[test]
+fn parity_manual_seam_island_pack_and_checker_preserve_corner_mapping() {
+    let p = [Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y];
+    let i = [0, 1, 2, 0, 2, 3];
+    let settings = Settings::default();
+    let merged = unwrap_with_seams(&p, &i, &[], &settings, &[]).unwrap();
+    assert_eq!(islands(&i, &merged.uvs).len(), 1);
+    let mut split = unwrap_with_seams(&p, &i, &[], &settings, &[[0, 2]]).unwrap().uvs;
+    assert_eq!(islands(&i, &split).len(), 2);
+    for q in &mut split[1] { *q += Vec2::splat(2.0); }
+    pack_existing(&i, &mut split);
+    assert_eq!(islands(&i, &split).len(), 2);
+    assert!(split.iter().flatten().all(|p| p.min_element() >= 0.0 && p.max_element() <= 1.0));
+    let doc = crate::obj::parse("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nf 1/1 2/2 3/3 4/4").unwrap().into_doc(20_000);
+    let preview = checker_mesh(doc.mesh(), doc.uvs(), &[]).unwrap();
+    assert!(preview.indices.len() > 100);
+    assert!(preview.colors.contains(&[224, 224, 224, 255]));
+    assert!(preview.colors.contains(&[78, 78, 78, 255]));
 }

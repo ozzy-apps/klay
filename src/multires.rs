@@ -40,9 +40,12 @@ type Stencil = [u32; 4];
 
 /// Chunk positions saved for undo: at level 0 these are positions, above it offsets.
 pub type ChunkData = Vec<(u32, Vec<Vec3>)>;
+pub type UvState = (Vec<[glam::Vec2; 3]>, Vec<u8>);
 
 /// Connection from a level to the one below it.
 pub struct Link {
+    scheme: Scheme,
+    quads: Option<crate::quad_subdiv::Rules>,
     /// Per child vertex.
     stencil: Vec<Stencil>,
     /// Parent chunk -> child chunks with at least one vertex whose stencil reads it.
@@ -51,6 +54,47 @@ pub struct Link {
     /// parent chunk (see [`subdivide_with`]). One byte per vertex; it is what lets a parked
     /// level be rebuilt with the same vertex order without keeping the level itself.
     labels: Vec<u8>,
+}
+
+/// The rule used by a saved link. Zero replays the original Loop stacks exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scheme {
+    pub flat: bool,
+    pub quad: bool,
+    pub smooth_uv: bool,
+}
+
+impl Scheme {
+    fn code(self) -> u8 {
+        self.flat as u8 | (self.quad as u8) << 1 | (self.smooth_uv as u8) << 2
+    }
+
+    fn read(code: u8) -> Result<Self, String> {
+        if code > 7 {
+            return Err("Unknown subdivision rule".into());
+        }
+        Ok(Self { flat: code & 1 != 0, quad: code & 2 != 0, smooth_uv: code & 4 != 0 })
+    }
+}
+
+impl Link {
+    fn position_from(&self, parent: &SculptMesh, p: &[Vec3], v: usize) -> Vec3 {
+        subdivision_position(parent, p, self.stencil[v], self.scheme, self.quads.as_ref())
+    }
+
+    fn position(&self, parent: &SculptMesh, v: usize) -> Vec3 {
+        self.position_from(parent, &parent.positions, v)
+    }
+}
+
+fn subdivision_position(parent: &SculptMesh, p: &[Vec3], s: Stencil, scheme: Scheme, quads: Option<&crate::quad_subdiv::Rules>) -> Vec3 {
+    if scheme.flat {
+        if s[1] == NONE { p[s[0] as usize] } else { (p[s[0] as usize] + p[s[1] as usize]) * 0.5 }
+    } else if let Some(quads) = quads {
+        quads.smooth(parent, p, s)
+    } else {
+        smooth_from(parent, p, s)
+    }
 }
 
 pub struct Level {
@@ -88,7 +132,7 @@ impl Level {
 }
 
 /// Loop's weight for the ring of an even vertex of valence `n`.
-fn loop_beta(n: usize) -> f32 {
+pub(crate) fn loop_beta(n: usize) -> f32 {
     static TABLE: LazyLock<[f32; 64]> = LazyLock::new(|| std::array::from_fn(loop_beta_exact));
     if n < 64 { TABLE[n] } else { loop_beta_exact(n) }
 }
@@ -284,14 +328,16 @@ fn child_quad(d: u8, k: u32) -> u8 {
 
 /// Loop-subdivide `parent` once. Returns the child mesh and its link to the parent.
 pub fn subdivide(parent: &SculptMesh) -> (SculptMesh, Link) {
-    subdivide_with(parent, None)
+    subdivide_with(parent, None, Scheme::default())
 }
 
 /// Loop subdivision of `parent`. With `replay`, the child chunks are formed from the given
 /// labels (from an earlier subdivision of the same topology) instead of a spatial split, so
 /// the result has exactly the vertex order and chunks of that earlier level, whatever the
 /// parent's positions are now.
-pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh, Link) {
+fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>, scheme: Scheme) -> (SculptMesh, Link) {
+    let quads = (scheme.quad && !scheme.flat).then(|| crate::quad_subdiv::Rules::new(parent)).flatten();
+    let position = |s| subdivision_position(parent, &parent.positions, s, scheme, quads.as_ref());
     let v_count = parent.vertex_count();
     let pc = &parent.chunks;
 
@@ -436,11 +482,11 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
         let (even, odd_pos) = pos_nat.split_at_mut(v_count);
         even.par_iter_mut()
             .enumerate()
-            .for_each(|(v, p)| *p = smooth(parent, even_stencil(v as u32)));
+            .for_each(|(v, p)| *p = position(even_stencil(v as u32)));
         odd_pos
             .par_iter_mut()
             .zip(odd.par_iter())
-            .for_each(|(p, s)| *p = smooth(parent, *s));
+            .for_each(|(p, s)| *p = position(*s));
     }
 
     // 4. Child chunks: each parent chunk's vertices and the midpoints of the edges it owns,
@@ -789,6 +835,9 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
             let mut out = Vec::new();
             for st in &stencil[s..e] {
                 stencil_chunks(parent, *st, &mut out);
+                if let Some(quads) = &quads {
+                    quads.dependencies(parent, *st, |v| out.push(parent.vert_chunk[v as usize]));
+                }
             }
             out.sort_unstable();
             out.dedup();
@@ -832,6 +881,8 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
     (
         mesh,
         Link {
+            scheme,
+            quads,
             stencil,
             dependants,
             labels,
@@ -843,16 +894,7 @@ pub fn subdivide_with(parent: &SculptMesh, replay: Option<&[u8]>) -> (SculptMesh
 /// the new vertices stay on the old triangles: corners in place, new ones at the edges'
 /// midpoints. Polygroups, hidden polygons and creases are carried.
 pub fn divided(mesh: &SculptMesh, flat: bool) -> SculptMesh {
-    let (mut child, link) = subdivide(mesh);
-    if flat {
-        let p = &mesh.positions;
-        child.positions = link
-            .stencil
-            .par_iter()
-            .map(|s| if s[1] == NONE { p[s[0] as usize] } else { (p[s[0] as usize] + p[s[1] as usize]) * 0.5 })
-            .collect();
-    }
-    child
+    subdivide_with(mesh, None, Scheme { flat, quad: true, smooth_uv: false }).0
 }
 
 /// Lossless compact form of a level stack, kept for a parked subtool: the base mesh in chunk
@@ -877,6 +919,7 @@ pub struct Packed {
     marks: Vec<Marks>,
     /// UVs of the base level's triangle corners, in its triangle order (empty for none).
     uvs: Vec<[glam::Vec2; 3]>,
+    obj_layout: crate::obj::Layout,
     /// Creased edges of every level, base first (see [`crease_list`]); empty for none.
     creases: Vec<Vec<u32>>,
     /// Quad halves of the base level's triangles (see [`SculptMesh::quads`]); the levels
@@ -946,11 +989,51 @@ impl Marks {
 
 #[derive(Clone)]
 struct PackedLevel {
+    scheme: Scheme,
     labels: Vec<u8>,
     offsets: Vec<Vec<Vec3>>,
 }
 
 impl Packed {
+    /// Rebuild at most a small prefix for LightBox. Dense base meshes can be rendered
+    /// directly from their packed triangles without allocating sculpting adjacency.
+    pub(crate) fn into_preview_geometry(mut self) -> Result<crate::model_thumbnail::Geometry, String> {
+        use crate::model_thumbnail::Geometry;
+
+        const PREVIEW_VERTICES: usize = 160_000;
+        let level = (0..=self.active)
+            .rev()
+            .find(|&l| self.counts[l] <= PREVIEW_VERTICES)
+            .unwrap_or(0);
+        if level == 0 {
+            let mut indices = self.indices;
+            if let Some(marks) = self.marks.first() {
+                let hidden = flags_of_runs(&marks.hidden, indices.len() / 3)?;
+                if !hidden.is_empty() {
+                    indices = indices.chunks_exact(3).zip(hidden)
+                        .filter(|(_, hidden)| *hidden == 0).flat_map(|(tri, _)| tri.iter().copied()).collect();
+                }
+            }
+            return Ok(Geometry {
+                positions: self.positions,
+                indices,
+                colors: self.colors.into_iter().next().unwrap_or_default(),
+            });
+        }
+        self.levels.truncate(level);
+        self.counts.truncate(level + 1);
+        self.marks.truncate(level + 1);
+        self.colors.truncate(level + 1);
+        self.creases.truncate(level + 1);
+        self.active = level;
+        self.mask.clear();
+        self.frozen = None;
+        let mut doc = self.try_unpack()?;
+        let mesh = doc.levels.pop().unwrap().mesh;
+        let indices = mesh.visible_indices().unwrap_or(mesh.indices);
+        Ok(Geometry { positions: mesh.positions, indices, colors: mesh.colors })
+    }
+
     /// A copy of the base level's mesh (positions and triangles only), without
     /// rebuilding the stack: what Transpose Master merges.
     pub fn base_copy(&self) -> SculptMesh {
@@ -1010,6 +1093,15 @@ impl Packed {
         out.slice(&self.uvs)
     }
 
+    pub fn write_obj_layout<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+        self.obj_layout.write(out)
+    }
+
+    pub fn read_obj_layout<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), String> {
+        self.obj_layout = crate::obj::Layout::read(input, &self.indices)?;
+        Ok(())
+    }
+
     /// Read what [`write_uvs`](Self::write_uvs) wrote.
     pub fn read_uvs<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
         let uvs: Vec<[glam::Vec2; 3]> = input.vec()?;
@@ -1025,30 +1117,33 @@ impl Packed {
 
     /// Serialise the frozen stack, if any (project version 9): a flag, then the stack as a
     /// subtool's is (version-9 layout, without layers or a frozen stack of its own).
-    pub fn write_frozen<W: std::io::Write>(&self, out: &mut crate::project::Out<W>) -> std::io::Result<()> {
+    pub fn write_frozen<W: std::io::Write>(&self, out: &mut crate::project::Out<W>, version: u32) -> std::io::Result<()> {
         match &self.frozen {
             None => out.u8(0),
             Some(f) => {
                 out.u8(1)?;
-                f.write_to(out, 9)?;
+                f.write_to(out, if version >= 13 { version } else { 9 })?;
                 f.write_marks(out)?;
                 f.write_colors(out)?;
                 f.write_uvs(out)?;
-                f.write_creases(out)
+                f.write_creases(out)?;
+                if version >= 13 { f.write_obj_layout(out)?; }
+                Ok(())
             }
         }
     }
 
     /// Read what [`write_frozen`](Self::write_frozen) wrote.
-    pub fn read_frozen<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>) -> Result<(), crate::project::Fail> {
+    pub fn read_frozen<R: std::io::Read>(&mut self, input: &mut crate::project::In<R>, version: u32) -> Result<(), crate::project::Fail> {
         if input.u8()? == 0 {
             return Ok(());
         }
-        let mut f = Packed::read_from(input, 9)?;
+        let mut f = Packed::read_from(input, if version >= 13 { version } else { 9 })?;
         f.read_marks(input)?;
         f.read_colors(input)?;
         f.read_uvs(input)?;
         f.read_creases(input)?;
+        if version >= 13 { f.read_obj_layout(input)?; }
         self.frozen = Some(Box::new(f));
         Ok(())
     }
@@ -1104,6 +1199,12 @@ impl Packed {
     }
 
     /// How many subdivision levels the stack had above its base (not counting the base).
+    pub fn has_uvs(&self) -> bool { !self.uvs.is_empty() }
+
+    pub fn top_vertices(&self) -> usize {
+        self.counts.last().copied().unwrap_or_default()
+    }
+
     pub fn level_count(&self) -> usize {
         self.levels.len()
     }
@@ -1180,6 +1281,7 @@ impl Packed {
         out.slice(&self.ranges)?;
         out.u32(self.levels.len() as u32)?;
         for l in &self.levels {
+            if version >= 13 { out.u8(l.scheme.code())?; }
             out.slice(&l.labels)?;
             out.u64(l.offsets.len() as u64)?;
             let ids: Vec<u32> = (0..l.offsets.len() as u32)
@@ -1220,6 +1322,7 @@ impl Packed {
         let mut levels = Vec::with_capacity(n_levels);
         let mut counts = vec![positions.len()];
         for _ in 0..n_levels {
+            let scheme = if version >= 13 { Scheme::read(input.u8()?)? } else { Scheme::default() };
             let labels: Vec<u8> = input.vec()?;
             let n_chunks = input.u64()?;
             if n_chunks > labels.len() as u64 {
@@ -1237,16 +1340,16 @@ impl Packed {
             let mut offsets = vec![Vec::new(); n_chunks as usize];
             for (&c, &n) in ids.iter().zip(&lens) {
                 // Read each chunk's block straight into its own vector.
-                let mut block = vec![Vec3::ZERO; n as usize];
                 let size = n as u64 * 12;
                 if size > input.left() {
                     return Err("the file ends early (truncated or not a Klay project)".into());
                 }
+                let mut block = vec![Vec3::ZERO; n as usize];
                 tmp_fill(input, bytemuck::cast_slice_mut(&mut block))?;
                 offsets[c as usize] = block;
             }
             counts.push(labels.len());
-            levels.push(PackedLevel { labels, offsets });
+            levels.push(PackedLevel { labels, offsets, scheme });
         }
         if active >= counts.len() {
             return Err("the shown level is not one of the stored levels".into());
@@ -1274,6 +1377,7 @@ impl Packed {
             mask,
             colors: Vec::new(),
             uvs: Vec::new(),
+            obj_layout: Default::default(),
             creases: Vec::new(),
             quads,
             frozen: None,
@@ -1310,6 +1414,7 @@ impl Packed {
             active,
             budget,
             uvs,
+            obj_layout,
             marks,
             mask,
             colors,
@@ -1334,7 +1439,7 @@ impl Packed {
         for (l, pl) in packed.into_iter().enumerate() {
             let parent = &levels.last().unwrap().mesh;
             check_labels(parent, &pl.labels)?;
-            let (mut mesh, link) = subdivide_with(parent, Some(&pl.labels));
+            let (mut mesh, link) = subdivide_with(parent, Some(&pl.labels), pl.scheme);
             if pl.offsets.len() != mesh.chunks.len()
                 || pl.offsets.iter().zip(&mesh.chunks).any(|(o, ch)| {
                     !o.is_empty() && o.len() != (ch.vert_end - ch.vert_start) as usize
@@ -1393,10 +1498,38 @@ impl Packed {
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
             uvs,
+            obj_layout,
+            uv_revision: 0,
             frozen,
             zspheres,
         })
     }
+}
+
+fn subdivision_triangle(parent: &SculptMesh, st: &[Stencil], tri: &[u32]) -> (usize, [Stencil; 3]) {
+    let s = [st[tri[0] as usize], st[tri[1] as usize], st[tri[2] as usize]];
+    let mut verts = [NONE; 6];
+    let mut n = 0;
+    for x in &s {
+        let ends: &[u32] = if x[1] == NONE { &x[..1] } else { &x[..2] };
+        for &v in ends {
+            if !verts[..n].contains(&v) {
+                verts[n] = v;
+                n += 1;
+            }
+        }
+    }
+    debug_assert_eq!(n, 3, "a child triangle spans one parent triangle");
+    let t = parent
+        .incident(verts[0])
+        .iter()
+        .copied()
+        .find(|&t| {
+            let p = &parent.indices[3 * t as usize..3 * t as usize + 3];
+            p.contains(&verts[1]) && p.contains(&verts[2])
+        })
+        .expect("the parent triangle of a child triangle");
+    (t as usize, s)
 }
 
 fn tmp_fill<R: std::io::Read>(input: &mut crate::project::In<R>, buf: &mut [u8]) -> Result<(), crate::project::Fail> {
@@ -1500,6 +1633,8 @@ pub struct Multires {
     /// UV Master: UVs of the base level's triangle corners, in its triangle order; empty
     /// for none. Dropped whenever the base level's triangles change.
     uvs: Vec<[glam::Vec2; 3]>,
+    pub obj_layout: crate::obj::Layout,
+    pub uv_revision: u64,
     /// Freeze SubDivision Levels: the whole stack as it was when frozen, kept while this one
     /// is edited at its lowest level (even its topology), to be brought back by Unfreeze.
     pub frozen: Option<Box<Packed>>,
@@ -1522,6 +1657,8 @@ impl Multires {
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
             uvs: Vec::new(),
+            obj_layout: Default::default(),
+            uv_revision: 0,
             frozen: None,
             zspheres: None,
         }
@@ -1542,6 +1679,7 @@ impl Multires {
         assert_eq!(self.levels.len(), 1, "parts are added to a stack without levels");
         // The base's triangles change: its UVs no longer fit.
         self.uvs.clear();
+        self.obj_layout = Default::default();
         let level = &mut self.levels[0];
         let old = level.mesh.swap_tail(keep, part);
         let n = level.mesh.chunks.len();
@@ -1595,6 +1733,7 @@ impl Multires {
         if ob.indices == base.indices && ob.vertex_count() == base.vertex_count() {
             // Same topology: the frozen levels over the lowest level as it is now.
             let shown = old.active;
+            let saved_mask = old.mesh().mask.clone();
             old.set_active(0);
             let all: Vec<u32> = (0..base.chunks.len() as u32).collect();
             let snap = old.levels[0].mesh.snapshot_chunks(&all);
@@ -1608,7 +1747,9 @@ impl Multires {
             m.finish_edit(&all);
             old.finish_stroke(0, snap);
             old.set_active(shown);
+            crate::mask::replace(old.mesh_mut(), saved_mask);
             old.uvs = self.uvs.clone();
+            old.obj_layout = self.obj_layout.clone();
             old.budget = self.budget;
             *self = old;
             self.generation = next_generation();
@@ -1616,11 +1757,13 @@ impl Multires {
         }
         // New topology: divide and project, level by level.
         let levels = old.top();
+        let schemes: Vec<_> = old.levels.iter().skip(1).map(|l| l.link.as_ref().unwrap().scheme).collect();
         old.set_active(levels);
         let sources = crate::project_all::Sources::new(&[old.mesh()]);
         drop(old);
-        for _ in 0..levels {
-            if !self.divide() {
+        for scheme in schemes {
+            crate::jobs::check()?;
+            if !self.divide_scheme(scheme) {
                 break;
             }
             let level = self.active;
@@ -1708,6 +1851,8 @@ impl Multires {
             generation: next_generation(),
             layers: crate::layers::Layers::default(),
             uvs: Vec::new(),
+            obj_layout: Default::default(),
+            uv_revision: 0,
             frozen: self.frozen.clone(),
             zspheres: self.zspheres.clone(),
         };
@@ -1716,7 +1861,8 @@ impl Multires {
         let mut map: Vec<u32> = Vec::new();
         for k in 0..=top {
             let parent = &out.levels[k].mesh;
-            let (mut mesh, link) = subdivide(parent);
+            let scheme = self.levels[k].link.as_ref().map_or(Scheme::default(), |link| link.scheme);
+            let (mut mesh, link) = subdivide_with(parent, None, scheme);
             let mut even_of = vec![NONE; parent.vertex_count()];
             let mut odd_of: crate::fx::FxHashMap<(u32, u32), u32> = Default::default();
             for (i, st) in link.stencil.iter().enumerate() {
@@ -1788,7 +1934,7 @@ impl Multires {
                 .par_iter()
                 .map(|ch| {
                     let (s, e) = ch.range();
-                    (s..e).map(|i| mesh.positions[i] - smooth(parent, link.stencil[i])).collect()
+                    (s..e).map(|i| mesh.positions[i] - link.position(parent, i)).collect()
                 })
                 .collect();
             let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
@@ -1819,18 +1965,33 @@ impl Multires {
         &self.uvs
     }
 
+    pub fn write_obj<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize, first_uv: usize) -> std::io::Result<usize> {
+        let base = self.active == 0;
+        let higher = if base { None } else { self.subdivided_uvs(self.active) };
+        let uvs = if base { &self.uvs[..] } else { higher.as_deref().unwrap_or_default() };
+        self.mesh().write_obj_layout(w, name, first, uvs, first_uv, base.then_some(&self.obj_layout))
+    }
+
     /// Set the base level's UVs (one triple per base triangle) or clear them (empty).
     #[cfg(test)]
     pub fn set_uvs(&mut self, uvs: Vec<[glam::Vec2; 3]>) {
         assert!(uvs.is_empty() || uvs.len() == self.levels[0].mesh.triangle_count(), "one UV triple per base triangle");
         self.uvs = uvs;
+        self.uv_revision = self.uv_revision.wrapping_add(1);
     }
 
     /// Put `uvs` in and return the ones there before (undo). UVs that no longer fit the
     /// base's triangles are left out.
     pub fn swap_uvs(&mut self, uvs: Vec<[glam::Vec2; 3]>) -> Vec<[glam::Vec2; 3]> {
         let fits = uvs.is_empty() || uvs.len() == self.levels[0].mesh.triangle_count();
+        self.uv_revision = self.uv_revision.wrapping_add(1);
         std::mem::replace(&mut self.uvs, if fits { uvs } else { Vec::new() })
+    }
+
+    pub fn swap_uv_state(&mut self, (uvs, mapped): UvState) -> UvState {
+        let previous = self.swap_uvs(uvs);
+        let mapped = if mapped.len() == self.uvs.len() { mapped } else { Vec::new() };
+        (previous, std::mem::replace(&mut self.obj_layout.mapped, mapped))
     }
 
     /// Baking (see [`crate::bake`]): where each triangle of the highest level lies in the
@@ -1851,30 +2012,9 @@ impl Multires {
                 .indices
                 .par_chunks_exact(3)
                 .map(|tri| {
-                    let s = [st[tri[0] as usize], st[tri[1] as usize], st[tri[2] as usize]];
-                    let mut verts = [NONE; 6];
-                    let mut n = 0;
-                    for x in &s {
-                        let ends: &[u32] = if x[1] == NONE { &x[..1] } else { &x[..2] };
-                        for &v in ends {
-                            if !verts[..n].contains(&v) {
-                                verts[n] = v;
-                                n += 1;
-                            }
-                        }
-                    }
-                    debug_assert_eq!(n, 3, "a child triangle spans one parent triangle");
-                    let t = parent
-                        .incident(verts[0])
-                        .iter()
-                        .copied()
-                        .find(|&t| {
-                            let p = &parent.indices[3 * t as usize..3 * t as usize + 3];
-                            p.contains(&verts[1]) && p.contains(&verts[2])
-                        })
-                        .expect("the parent triangle of a child triangle");
-                    let ptri = &parent.indices[3 * t as usize..3 * t as usize + 3];
-                    let pp = places[t as usize];
+                    let (t, s) = subdivision_triangle(parent, st, tri);
+                    let ptri = &parent.indices[3 * t..3 * t + 3];
+                    let pp = places[t];
                     let at = |v: u32| pp.w[ptri.iter().position(|&x| x == v).expect("a corner of the parent")];
                     Place {
                         tri: pp.tri,
@@ -1893,10 +2033,38 @@ impl Multires {
         let mut p = self.levels[0].mesh.positions.clone();
         for l in 1..self.levels.len() {
             let parent = &self.levels[l - 1].mesh;
-            let st = &self.levels[l].link.as_ref().expect("level above the base has a link").stencil;
-            p = st.par_iter().map(|&s| smooth_from(parent, &p, s)).collect();
+            let link = self.levels[l].link.as_ref().unwrap();
+            p = (0..link.stencil.len()).into_par_iter().map(|v| link.position_from(parent, &p, v)).collect();
         }
         p
+    }
+
+    /// UVs at a higher level when a link in its stack enables Suv.
+    pub fn subdivided_uvs(&self, level: usize) -> Option<Vec<[glam::Vec2; 3]>> {
+        if level == 0 || self.uvs.is_empty() || !self.levels[1..=level].iter().any(|l| l.link.as_ref().unwrap().scheme.smooth_uv) {
+            return None;
+        }
+        let mut uvs = self.uvs.clone();
+        for l in 1..=level {
+            let parent = &self.levels[l - 1].mesh;
+            let child = &self.levels[l];
+            let link = child.link.as_ref().unwrap();
+            let corners = crate::uv::subdivision_uvs(&parent.indices, &uvs, link.scheme.smooth_uv);
+            uvs = child.mesh.indices.par_chunks_exact(3).map(|tri| {
+                let (t, st) = subdivision_triangle(parent, &link.stencil, tri);
+                let p = &parent.indices[3 * t..3 * t + 3];
+                st.map(|s| {
+                    let a = p.iter().position(|&v| v == s[0]).unwrap();
+                    if s[1] == NONE {
+                        corners[t][a]
+                    } else {
+                        let b = p.iter().position(|&v| v == s[1]).unwrap();
+                        corners[t][3 + if (a + 1) % 3 == b { a } else { b }]
+                    }
+                })
+            }).collect();
+        }
+        Some(uvs)
     }
 
     /// The base level (the one UVs belong to).
@@ -1920,6 +2088,7 @@ impl Multires {
         self.active = 0;
         self.generation = next_generation();
         self.uvs.clear();
+        self.obj_layout = Default::default();
         n
     }
 
@@ -1977,12 +2146,20 @@ impl Multires {
     /// Subdivide the top level and make the new level active. Returns false when the
     /// budget would be exceeded or the top level is not a two-manifold mesh.
     pub fn divide(&mut self) -> bool {
+        self.divide_with(true, false)
+    }
+
+    pub fn divide_with(&mut self, smooth: bool, smooth_uv: bool) -> bool {
+        self.divide_scheme(Scheme { flat: !smooth, quad: true, smooth_uv })
+    }
+
+    fn divide_scheme(&mut self, scheme: Scheme) -> bool {
         if !self.can_divide() || self.divide_blocker().is_some() {
             return false;
         }
         let top = self.top();
         self.sync_to(top);
-        let (mut mesh, link) = subdivide(&self.levels[top].mesh);
+        let (mut mesh, link) = subdivide_with(&self.levels[top].mesh, None, scheme);
         if !self.levels[top].mesh.colors.is_empty() {
             mesh.colors=carry_up(&link,&self.levels[top].mesh.colors,|a,b|std::array::from_fn(|i|mid_u8(a[i],b[i])));
             for c in &mut mesh.chunks {c.dirty_color=true;}
@@ -2017,11 +2194,31 @@ impl Multires {
     /// Carry the mask from level `from` (where it is) to level `to`, one level at a time.
     /// Both meshes are marked for a mask upload: `to` gains it, `from` loses it.
     fn move_mask(&mut self, from: usize, to: usize) {
-        if from == to || self.levels[from].mesh.mask.is_empty() {
+        if from == to {
             return;
         }
+        let top = self.top();
+        if to == top && !self.layers.top_mask.is_empty() {
+            let top_mask = std::mem::take(&mut self.layers.top_mask);
+            let mut before = top_mask.clone();
+            for l in (from + 1..=top).rev() {
+                before = carry_down(self.levels[l].link.as_ref().unwrap(), &before, self.levels[l - 1].mesh.vertex_count());
+            }
+            let after = crate::mask::replace(&mut self.levels[from].mesh, Vec::new());
+            let mut delta: Vec<i16> = before.iter().enumerate().map(|(i, &b)| after.get(i).copied().unwrap_or(0) as i16 - b as i16).collect();
+            for l in from + 1..=top {
+                delta = carry_up(self.levels[l].link.as_ref().unwrap(), &delta, |a, b| (a + b) / 2);
+            }
+            let mask = top_mask.into_iter().zip(delta).map(|(m, d)| (m as i16 + d).clamp(0, 255) as u8).collect();
+            crate::mask::replace(&mut self.levels[to].mesh, mask);
+            return;
+        }
+        if self.levels[from].mesh.mask.is_empty() { return; }
         let t = std::time::Instant::now();
         let mut mask = crate::mask::replace(&mut self.levels[from].mesh, Vec::new());
+        if from == top && self.layers.has_mask() {
+            self.layers.top_mask = mask.clone();
+        }
         let mut l = from;
         while l < to {
             mask = carry_up(self.levels[l + 1].link.as_ref().unwrap(), &mask, mid_u8);
@@ -2174,7 +2371,7 @@ impl Multires {
             let s = chunks[t as usize].vert_start as usize;
             let off = &offsets[t as usize];
             for (i, p) in slice.iter_mut().enumerate() {
-                let base = smooth(pm, link.stencil[s + i]);
+                let base = link.position(pm, s + i);
                 *p = if off.is_empty() { base } else { base + off[i] };
             }
         });
@@ -2214,7 +2411,7 @@ impl Multires {
     pub fn freeze_layers(&mut self) {
         if self.active == self.top() {
             let mut layers = std::mem::take(&mut self.layers);
-            layers.freeze(&self.mesh().positions);
+            layers.freeze(self.mesh());
             self.layers = layers;
         }
     }
@@ -2225,36 +2422,35 @@ impl Multires {
     pub fn swap_layers(&mut self, target: crate::layers::Layers, reshape: bool) -> crate::layers::Layers {
         if reshape {
             let mut old = None;
+            let with_paint = self.layers.list.iter().chain(&target.list).any(|l| !l.paint.is_empty());
             self.reshape_top(|mesh, layers| old = Some(layers.swap(mesh, target)));
+            if with_paint {
+                for l in (1..=self.top()).rev() {
+                    let colors = carry_down(self.levels[l].link.as_ref().unwrap(), &self.levels[l].mesh.colors, self.levels[l - 1].mesh.vertex_count());
+                    let lower = &mut self.levels[l - 1].mesh;
+                    lower.colors = colors;
+                    lower.chunks.iter_mut().for_each(|c| c.dirty_color = true);
+                }
+            }
             return old.unwrap();
         }
         self.show_top();
         self.freeze_layers();
         let mut target = target;
         if let Some((_, base)) = target.rec.as_mut() {
-            *base = self.mesh().positions.clone();
+            *base = crate::layers::Recording::of(self.mesh());
         }
         std::mem::replace(&mut self.layers, target)
     }
 
     /// Set layer `index`'s intensity, the shape following; returns the old intensity.
     pub fn set_layer_intensity(&mut self, index: usize, intensity: f32) -> f32 {
-        let mut old = intensity;
-        self.reshape_top(|mesh, layers| {
-            layers.freeze(&mesh.positions);
-            let Some(layer) = layers.list.get_mut(index) else { return };
-            old = layer.intensity;
-            if layer.delta.len() == mesh.vertex_count() {
-                let k = if layer.visible { intensity - layer.intensity } else { 0.0 };
-                mesh.positions.par_iter_mut().zip(layer.delta.par_iter()).for_each(|(p, d)| *p += *d * k);
-            }
-            layer.intensity = intensity;
-            if let Some((_, base)) = layers.rec.as_mut() {
-                base.copy_from_slice(&mesh.positions);
-            }
-            let all: Vec<u32> = (0..mesh.chunks.len() as u32).collect();
-            mesh.finish_edit(&all);
-        });
+        self.freeze_layers();
+        let Some(layer) = self.layers.list.get(index) else { return intensity };
+        let old = layer.intensity;
+        let mut target = self.layers.clone();
+        target.list[index].intensity = intensity;
+        self.swap_layers(target, true);
         old
     }
 
@@ -2282,7 +2478,7 @@ impl Multires {
                 let (s, e) = mesh.chunks[*c as usize].range();
                 let mut now = Vec::with_capacity(e - s);
                 for i in 0..e - s {
-                    let base = smooth(parent, link.stencil[s + i]);
+                    let base = link.position(parent, s + i);
                     saved[i] -= base;
                     now.push(mesh.positions[s + i] - base);
                 }
@@ -2339,7 +2535,7 @@ impl Multires {
                     let s = chunks[c as usize].vert_start as usize;
                     let off = &offsets[c as usize];
                     for (i, p) in slice.iter_mut().enumerate() {
-                        *p = smooth(parent, link.stencil[s + i]) + off[i];
+                        *p = link.position(parent, s + i) + off[i];
                     }
                 });
             mesh.finish_edit(&ids);
@@ -2393,6 +2589,7 @@ impl Multires {
             active,
             budget,
             uvs,
+            obj_layout,
             frozen,
             zspheres,
             ..
@@ -2404,9 +2601,9 @@ impl Multires {
             positions, indices, quads, ..
         } = base;
         let levels = it
-            .map(|l| PackedLevel {
-                labels: l.link.expect("level above the base has a link").labels,
-                offsets: l.offsets,
+            .map(|l| {
+                let link = l.link.expect("level above the base has a link");
+                PackedLevel { scheme: link.scheme, labels: link.labels, offsets: l.offsets }
             })
             .collect();
         Packed {
@@ -2421,6 +2618,7 @@ impl Multires {
             mask,
             colors,
             uvs,
+            obj_layout,
             creases,
             quads,
             frozen,
@@ -2446,6 +2644,7 @@ impl Multires {
             levels: self.levels[1..]
                 .iter()
                 .map(|l| PackedLevel {
+                    scheme: l.link.as_ref().unwrap().scheme,
                     labels: l.link.as_ref().unwrap().labels.clone(),
                     offsets: l.offsets.clone(),
                 })
@@ -2457,6 +2656,7 @@ impl Multires {
             mask: self.mesh().mask.clone(),
             colors:self.levels.iter().map(|l|l.mesh.colors.clone()).collect(),
             uvs: self.uvs.clone(),
+            obj_layout: self.obj_layout.clone(),
             creases: self.crease_lists(),
             quads: base.quads.clone(),
             frozen: self.frozen.clone(),
@@ -2755,7 +2955,7 @@ impl Multires {
             let chunks = &lvl.mesh.chunks;
             lvl.offsets.par_iter_mut().enumerate().for_each(|(c, off)| {
                 let (s, e) = chunks[c].range();
-                let new: Vec<Vec3> = (s..e).map(|v| target[v] - smooth(parent, link.stencil[v])).collect();
+                let new: Vec<Vec3> = (s..e).map(|v| target[v] - link.position(parent, v)).collect();
                 // A chunk that was never sculpted and did not move keeps no offsets.
                 if !(off.is_empty() && new.iter().all(|d| *d == Vec3::ZERO)) {
                     *off = new;
@@ -2784,6 +2984,15 @@ impl Multires {
     /// commutes with the map: positions map and offsets turn and scale with its linear part,
     /// which keeps the stack exactly consistent, stale levels included.
     pub fn transform(&mut self, m: &Affine) {
+        self.freeze_layers();
+        if !m.is_translation() {
+            for layer in &mut self.layers.list {
+                layer.delta.par_iter_mut().for_each(|d| *d = m.apply_vector(*d));
+            }
+        }
+        if let Some((_, base)) = self.layers.rec.as_mut() {
+            base.positions.par_iter_mut().for_each(|p| *p = m.apply(*p));
+        }
         for lvl in &mut self.levels {
             lvl.mesh
                 .positions
@@ -2866,6 +3075,35 @@ mod tests {
     }
 
     /// A sphere divided three times with bumps sculpted on top.
+    #[test]
+    fn parity_catmull_clark_smt_suv_and_saved_rule_replay() {
+        let (p, i) = crate::primitive::box_surface([1; 3], |p| p);
+        let base = SculptMesh::from_raw_paired(p, i, Vec::new());
+        let radius = base.bounds().max.x;
+        let (smooth, _) = subdivide_with(&base, None, Scheme { quad: true, ..Scheme::default() });
+        let has = |p: Vec3| smooth.positions.iter().any(|q| q.distance(p * radius) < 1e-6);
+        assert!(has(Vec3::splat(5.0 / 9.0)));
+        assert!(has(Vec3::new(0.75, 0.75, 0.0)));
+        assert!(has(Vec3::X));
+        assert_eq!(smooth.quads.iter().filter(|&&d| d != crate::mesh::LONE).count(), 48);
+
+        let mut doc = Multires::new(base, usize::MAX);
+        let b = doc.base_mesh();
+        let mapped = crate::uv::unwrap(&b.positions, &b.indices, &[], &crate::uv::Settings::default()).unwrap();
+        doc.set_uvs(mapped.uvs);
+        assert!(doc.divide_with(false, true));
+        assert!(doc.mesh().positions.iter().all(|p| (p.abs().max_element() - radius).abs() < 1e-6));
+        assert_eq!(doc.subdivided_uvs(1).unwrap().len(), doc.mesh().triangle_count());
+        assert!(doc.divide_with(true, false));
+        let p = doc.pack_copy();
+        let data = crate::project::write_to(Vec::new(), &[("Cube", true, &p)], 0).unwrap();
+        let result = crate::project::read_from(data.as_slice(), data.len() as u64).unwrap();
+        let back = result.tools.into_iter().next().unwrap().packed.try_unpack().unwrap();
+        assert_eq!(back.mesh().positions, doc.mesh().positions);
+        assert_eq!(back.subdivided_uvs(2), doc.subdivided_uvs(2));
+        assert_eq!(back.smooth_top(), doc.smooth_top());
+    }
+
     fn bumpy_stack() -> Multires {
         let mut doc = Multires::new(sphere(5), 10_000_000);
         for _ in 0..3 {

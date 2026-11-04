@@ -1,8 +1,11 @@
 mod branding;
 mod brush_asset;
+mod brush_preset;
 mod asset_library;
 mod alpha_library;
 mod brush_preview;
+mod model_import;
+mod model_thumbnail;
 mod paint;
 mod camera;
 mod mask;
@@ -32,7 +35,9 @@ mod zremesh;
 mod crease;
 mod reconstruct;
 mod project_all;
+mod quad_subdiv;
 mod bake;
+mod bake_batch;
 mod decimate;
 mod dynamic;
 mod uv;
@@ -53,6 +58,7 @@ mod primitive;
 mod project;
 mod render;
 mod sculpt;
+mod selection_set;
 mod subtool;
 mod tablet;
 mod update;
@@ -248,8 +254,9 @@ enum DocOp {
     SaveSubtool,
     LoadSubtools,
     ExportSubtool,
-    /// Document › Import: the OBJ or STL at `App::import_path` as a new subtool.
+    /// Document › Import: append the meshes at `App::import_path` as new subtools.
     ImportMesh,
+    UpdateObj,
     /// Export STL: the visible subtools to `App::stl_path`.
     ExportStl,
     /// Export glTF: the visible subtools (or the active one alone) to `App::gltf_path`.
@@ -308,6 +315,7 @@ enum GeoOp {
     CloseHoles,
     /// Geometry › Panel Loops.
     PanelLoops,
+    MirrorCopy,
     MirrorWeld,
     /// Geometry › ZRemesher.
     ZRemesh,
@@ -339,6 +347,7 @@ enum GeoDone {
     Topology { mesh: SculptMesh, detail: String },
     /// UV Unwrap: UVs for the lowest level.
     Uvs(uv::Unwrap),
+    UpdatedObj { doc: Box<Multires>, exact: bool },
     /// ProjectAll: where the shown level's vertices go, and their paint.
     Projection(project_all::Projection),
     /// Make Boolean Mesh: the result as a new subtool, and the ids of the subtools it came
@@ -351,6 +360,7 @@ fn bake_kind_of(ask: file_dialog::Ask) -> bake::Kind {
     match ask {
         file_dialog::Ask::ExportNormalMap => bake::Kind::Normal,
         file_dialog::Ask::ExportColorMap => bake::Kind::Color,
+        file_dialog::Ask::ExportVectorMap => bake::Kind::VectorDisplacement,
         _ => bake::Kind::Displacement,
     }
 }
@@ -726,7 +736,7 @@ struct App {
     project_path: String,
     /// SubTool › Save / Load / Export OBJ: a file holding single subtools.
     subtool_path: String,
-    /// Document › Import: OBJ or STL file to import.
+    /// Document › Import: Model file to import.
     import_path: String,
     /// Export STL (Document and 3D Print): where the STL goes.
     stl_path: String,
@@ -884,6 +894,7 @@ struct App {
     tpose: Option<TPose>,
     /// Texture-map bake running in the background, and where the last map was saved.
     bake_job: Option<BakeJob>,
+    bake_batch: Option<bake_batch::Job>,
     map_path: String,
     /// `--bake-normal` / `--bake-displacement`: bakes to run once the startup project is open.
     bake_on_start: Vec<(bake::Kind, String)>,
@@ -908,6 +919,7 @@ struct App {
     dynamic_key: Option<(u64, u64, u64, dynamic::Settings)>,
     /// The stats of the last unwrap, with the UV key they belong to.
     uv_stats: Option<(u64, uv::Stats)>,
+    uv_selected: Option<(u64, usize)>,
     /// `--selftest-wedge`: `(phase, frames left)`, like the polygroup self-test.
     selftest_wedge: Option<(u8, u32)>,
     /// SubTool list operation from the interface, run outside the egui pass.
@@ -928,8 +940,8 @@ struct App {
     frame_ms: f32,
     fps: f32,
     stroke_ms: f32,
-    /// A grab update is waiting for the next frame (grab is applied once per frame).
-    stroke_pending: bool,
+    /// A grab or stamp preview waiting for the next frame, at the input event's pressure.
+    stroke_pending: Option<Brush>,
     /// Screen point (window pixels) the stroke has reached, and the LazyMouse brush point.
     stroke_from: Vec2,
     lazy_point: Option<Vec2>,
@@ -974,7 +986,7 @@ impl App {
             gfx: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            subtools: vec![SubTool { guides: Default::default(), dynamic: None,
+            subtools: vec![SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None,
             boolean: Default::default(),
                 id: 1,
                 name: format!("{} 1", settings.kind.short()),
@@ -1096,6 +1108,7 @@ impl App {
             jobs_wait: false,
             tpose: None,
             bake_job: None,
+            bake_batch: None,
             map_path: String::new(),
             bake_on_start: Vec::new(),
             bake_count: 0,
@@ -1111,6 +1124,7 @@ impl App {
             bpr_camera: None,
             local_pivot: None,
             uv_stats: None,
+            uv_selected: None,
             selftest_wedge: None,
             pending_subtool: None,
             measure: None,
@@ -1122,7 +1136,7 @@ impl App {
             frame_ms: 0.0,
             fps: 0.0,
             stroke_ms: 0.0,
-            stroke_pending: false,
+            stroke_pending: None,
             stroke_from: Vec2::ZERO,
             lazy_point: None,
             drag_stamp: None,
@@ -1272,7 +1286,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), budget);
         let id = self.new_tool_id();
         let name = format!("{} {id}", self.primitive.kind.short());
-        self.subtools.push(SubTool { guides: Default::default(), dynamic: None,
+        self.subtools.push(SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None,
             boolean: Default::default(),
             id,
             name: name.clone(),
@@ -1298,7 +1312,10 @@ impl App {
         if self.busy() {
             return;
         }
+        self.doc.freeze_layers();
         let packed = self.doc.pack_copy();
+        let mut layers = self.doc.layers.clone();
+        layers.rec = None;
         let stand_in = self.doc.stand_in(STAND_IN_VERTICES);
         let id = self.new_tool_id();
         let mut stand_in_vertices = stand_in.positions.len();
@@ -1308,11 +1325,15 @@ impl App {
             }
         }
         let name = format!("{} copy", self.subtools[self.active_tool].name);
-        let wedge = self.subtools[self.active_tool].wedge;
+        let source = &self.subtools[self.active_tool];
+        let wedge = source.wedge;
+        let folder = source.folder.clone();
+        let sets = source.sets.clone();
+        let dynamic = source.dynamic;
+        let boolean = source.boolean;
         self.subtools.insert(
             self.active_tool + 1,
-            SubTool { guides: Default::default(), dynamic: None,
-            boolean: Default::default(),
+            SubTool { folder, transpose_selected: false, sets, guides: Default::default(), dynamic, boolean,
                 id,
                 name: name.clone(),
                 visible: true,
@@ -1322,11 +1343,31 @@ impl App {
                     packed,
                     history: History::new(32),
                     stand_in_vertices,
-                    layers: Default::default(),
+                    layers,
                 })),
             },
         );
         self.workspace.notify(format!("Duplicated as {name}"));
+    }
+
+    /// Insert a reflected copy below the source so Merge Down can join the two.
+    fn mirror_copy(&mut self) {
+        if !self.geo_free("Mirror Copy") {
+            return;
+        }
+        if self.doc.zspheres.is_some() {
+            self.workspace.notify("Mirror Copy needs a polygon mesh · make an Adaptive Skin first");
+            return;
+        }
+        let axis = self.workspace.mirror_axis;
+        let source = &self.subtools[self.active_tool];
+        let name = format!("{} · Mirror {}", source.name, ["X", "Y", "Z"][axis]);
+        let folder = source.folder.clone();
+        let doc = subtool_ops::mirror_copy(&self.doc, axis);
+        let mut tool = self.parked_subtool(name, true, doc);
+        tool.folder = folder;
+        self.subtools.insert(self.active_tool + 1, tool);
+        self.frame_camera();
     }
 
     /// Whether the active subtool has no subdivision levels, as SubTool › Split and Merge
@@ -1486,8 +1527,13 @@ impl App {
                     self.workspace.notify(format!("{name} replaced the subdivision levels with its result · undo brings them back"));
                 }
             }
+            GeoDone::UpdatedObj { doc, exact } => {
+                let old = std::mem::replace(&mut self.doc, *doc);
+                self.replace_levels("Update from OBJ", old.pack());
+                self.workspace.notify(if exact { "Updated the cage and kept the sculpted levels" } else { "Updated topology and projected detail" });
+            }
             GeoDone::Uvs(u) => {
-                let old = self.doc.swap_uvs(u.uvs);
+                let old = self.doc.swap_uv_state((u.uvs, Vec::new()));
                 self.history.push(UndoStep::Uvs(old));
                 self.history.name_last("UV Unwrap");
                 self.uv_stats = Some((self.uv_key(), u.stats.clone()));
@@ -1579,7 +1625,8 @@ impl App {
         let base = self.doc.base_mesh();
         let (positions, indices) = (base.positions.clone(), base.indices.clone());
         let groups: Vec<u16> = (0..base.triangle_count() as u32).map(|t| base.group(t)).collect();
-        self.start_geo("UV Unwrap", false, move || Ok(GeoDone::Uvs(uv::unwrap(&positions, &indices, &groups, &settings)?)));
+        let seams = self.doc.obj_layout.seams.clone();
+        self.start_geo("UV Unwrap", false, move || Ok(GeoDone::Uvs(uv::unwrap_with_seams(&positions, &indices, &groups, &settings, &seams)?)));
     }
 
     /// [`start_uv_unwrap`](Self::start_uv_unwrap), waited for (start-up flags and tests).
@@ -1593,7 +1640,7 @@ impl App {
         if self.busy() || self.doc.uvs().is_empty() {
             return;
         }
-        let old = self.doc.swap_uvs(Vec::new());
+        let old = self.doc.swap_uv_state(Default::default());
         self.history.push(UndoStep::Uvs(old));
         self.history.name_last("Delete UVs");
         self.status = "UVs deleted".to_string();
@@ -1607,13 +1654,82 @@ impl App {
             return 0;
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (self.subtools[self.active_tool].id, self.doc.generation, uvs.len()).hash(&mut h);
-        for t in uvs.iter().step_by((uvs.len() / 512).max(1)) {
-            for q in t {
-                (q.x.to_bits(), q.y.to_bits()).hash(&mut h);
+        (self.subtools[self.active_tool].id, self.doc.generation, self.doc.uv_revision).hash(&mut h);
+        h.finish() | 1
+    }
+
+    fn select_uv_island(&mut self, at: Vec2) {
+        self.uv_selected = uv::hit(self.doc.uvs(), at).map(|t| (self.subtools[self.active_tool].id, t));
+    }
+
+    fn edit_uvs(&mut self, edit: uv::Edit) {
+        if self.busy() || self.doc.uvs().is_empty() { return; }
+        let mut uvs = self.doc.uvs().to_vec();
+        let indices = &self.doc.base_mesh().indices;
+        if matches!(edit, uv::Edit::Pack) {
+            uv::pack_existing(indices, &mut uvs);
+        } else {
+            let Some((_, tri)) = self.uv_selected.filter(|&(id, _)| id == self.subtools[self.active_tool].id) else { return };
+            let Some(island) = uv::islands(indices, &uvs).into_iter().find(|i| i.contains(&tri)) else { return };
+            let (lo, hi) = island.iter().flat_map(|&t| uvs[t]).fold(
+                (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+                |(lo, hi), p| (lo.min(p), hi.max(p))
+            );
+            let pivot = (lo + hi) * 0.5;
+            for t in island {
+                uvs[t] = uvs[t].map(|q| match edit {
+                    uv::Edit::Move(delta) => q + delta,
+                    uv::Edit::Rotate => pivot + (q - pivot).perp(),
+                    uv::Edit::Scale(scale) => pivot + (q - pivot) * scale,
+                    uv::Edit::Pack => unreachable!(),
+                });
             }
         }
-        h.finish() | 1
+        let old = self.doc.swap_uv_state((uvs, self.doc.obj_layout.mapped.clone()));
+        self.history.push(UndoStep::Uvs(old));
+        self.history.name_last(if matches!(edit, uv::Edit::Pack) { "Pack UV islands" } else { "Edit UV island" });
+    }
+
+    fn uv_seam_press(&mut self) -> bool {
+        let (o, d) = self.cursor_ray();
+        let Some(hit) = self.mesh().raycast(o, d) else { return false };
+        if self.doc.active() != 0 {
+            self.workspace.notify("Show the lowest subdivision level to mark seams");
+            return true;
+        }
+        let start = hit.tri as usize * 3;
+        let tri = &self.mesh().indices[start..start + 3];
+        let diagonals = self.mesh().quads.get(hit.tri as usize).copied();
+        let edge = (0..3).filter(|&k| diagonals != Some(k as u8)).min_by(|&a, &b| {
+            let distance = |i| {
+                let p = self.mesh().positions[tri[i] as usize];
+                let q = self.mesh().positions[tri[(i + 1) % 3] as usize];
+                let v = q - p;
+                (hit.point - p - v * ((hit.point - p).dot(v) / v.length_squared().max(1e-12)).clamp(0.0, 1.0)).length_squared()
+            };
+            distance(a).total_cmp(&distance(b))
+        }).unwrap();
+        let (a, b) = (tri[edge], tri[(edge + 1) % 3]);
+        let edge = [a.min(b), a.max(b)];
+        let seams = &mut self.doc.obj_layout.seams;
+        let before = seams.clone();
+        match seams.binary_search(&edge) {
+            Ok(i) => { seams.remove(i); }
+            Err(i) => seams.insert(i, edge),
+        }
+        self.history.push(UndoStep::UvSeams(before));
+        true
+    }
+
+    fn paint_uv_seams(&self, ctx: &egui::Context) {
+        if !self.workspace.uv_seam_mode || self.doc.active() != 0 { return; }
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("uv-seams"))).with_clip_rect(self.workspace.canvas);
+        for &[a, b] in &self.doc.obj_layout.seams {
+            let at = |v: u32| self.project_front(self.mesh().positions[v as usize]).map(|p| egui::pos2(p.x / self.scale, p.y / self.scale));
+            if let (Some(a), Some(b)) = (at(a), at(b)) {
+                painter.line_segment([a, b], egui::Stroke::new(2.0, egui::Color32::from_rgb(88, 165, 255)));
+            }
+        }
     }
 
     /// The UV Map section's picture and numbers, made again when the UVs change.
@@ -1624,9 +1740,14 @@ impl App {
             self.workspace.uv_info = None;
             return;
         }
-        if self.workspace.uv_layout.as_ref().is_none_or(|l| l.0 != key) {
+        let picked = self.uv_selected.filter(|&(id, _)| id == self.subtools[self.active_tool].id);
+        let image_key = key ^ picked.map_or(0, |(_, t)| (t as u64 + 1).rotate_left(32)) ^ ((self.workspace.uv_checker as u64) << 63);
+        self.workspace.uv_island_selected = picked.is_some();
+        if self.workspace.uv_layout.as_ref().is_none_or(|l| l.0 != image_key) {
             const SIZE: usize = 256;
-            self.workspace.uv_layout = Some((key, SIZE, uv::layout_image(self.doc.uvs(), SIZE)));
+            let mut island = picked.and_then(|(_, t)| uv::islands(&self.doc.base_mesh().indices, self.doc.uvs()).into_iter().find(|i| i.contains(&t))).unwrap_or_default();
+            island.sort_unstable();
+            self.workspace.uv_layout = Some((image_key, SIZE, uv::layout_preview(self.doc.uvs(), SIZE, &island, self.workspace.uv_checker)));
         }
         let stats = self.uv_stats.as_ref().filter(|s| s.0 == key).map(|s| s.1.clone());
         self.workspace.uv_info = Some((self.doc.uvs().len(), stats));
@@ -1635,7 +1756,7 @@ impl App {
     /// Geometry › Texture Maps › Normal Map / Displacement / Color Map: check the subtool
     /// can be baked, then ask where to save the map.
     fn bake_ask(&mut self, kind: bake::Kind) {
-        let why = if self.bake_job.is_some() {
+        let why = if self.bake_job.is_some() || self.bake_batch.is_some() {
             Some("a bake is already running")
         } else if self.doc.uvs().is_empty() {
             Some("needs UVs · Unwrap in Geometry › UV Map first")
@@ -1651,6 +1772,7 @@ impl App {
         self.ask_file(match kind {
             bake::Kind::Normal => file_dialog::Ask::ExportNormalMap,
             bake::Kind::Displacement => file_dialog::Ask::ExportDisplacementMap,
+            bake::Kind::VectorDisplacement => file_dialog::Ask::ExportVectorMap,
             bake::Kind::Color => file_dialog::Ask::ExportColorMap,
         });
     }
@@ -1658,7 +1780,7 @@ impl App {
     /// Bake a map of `kind` from the active subtool on a thread of its own and save it to
     /// `path`; [`poll_bake`](Self::poll_bake) reports it. What it reads is copied first.
     fn start_bake(&mut self, kind: bake::Kind, path: String) {
-        if self.bake_job.is_some() || self.doc.uvs().is_empty() || (kind.needs_levels() && self.doc.count() < 2) {
+        if self.bake_job.is_some() || self.bake_batch.is_some() || self.doc.uvs().is_empty() || (kind.needs_levels() && self.doc.count() < 2) {
             return;
         }
         let t = Instant::now();
@@ -1706,6 +1828,7 @@ impl App {
                 let exr = job.path.to_lowercase().ends_with(".exr");
                 let read = match job.kind {
                     bake::Kind::Normal | bake::Kind::Color => String::new(),
+                    bake::Kind::VectorDisplacement => format!(" · up to {:.4} in model units", d.max_abs),
                     bake::Kind::Displacement if exr => format!(" · up to {:.4} in or out · Blender: Midlevel 0, Scale 1", d.max_abs),
                     bake::Kind::Displacement => {
                         format!(" · white is {:.4} out · Blender: Midlevel 0.5, Scale {:.4}", d.max_abs, 2.0 * d.max_abs)
@@ -1727,6 +1850,40 @@ impl App {
             Err(e) => self.status = format!("{} not saved: {e}", job.kind.name()),
         }
         log::info!("{}", self.status);
+        self.workspace.notify(self.status.clone());
+    }
+
+    fn start_batch_maps(&mut self, folder: &Path) {
+        if self.bake_job.is_some() || self.bake_batch.is_some() { return; }
+        let active = self.doc.pack_copy();
+        let tools = self.subtools.iter().enumerate().filter_map(|(i, t)| {
+            let data = if i == self.active_tool { &active } else if t.visible { &t.parked.as_ref()?.packed } else { return None };
+            data.has_uvs().then(|| (t.name.clone(), data.clone()))
+        }).collect::<Vec<_>>();
+        if tools.is_empty() {
+            self.workspace.notify("No visible SubTools have UVs");
+            return;
+        }
+        let kinds: Vec<_> = bake_batch::KINDS.into_iter().zip(self.workspace.batch_kinds)
+            .filter_map(|(kind, enabled)| enabled.then_some(kind)).collect();
+        if kinds.is_empty() { return; }
+        self.bake_batch = Some(bake_batch::start(folder.to_path_buf(), tools, kinds, self.workspace.bake));
+        self.workspace.baking = true;
+        self.workspace.baking_batch = true;
+        self.status = "Exporting maps…".into();
+    }
+
+    fn poll_batch_maps(&mut self) {
+        let Some(batch) = &self.bake_batch else { return };
+        let result = match batch.result.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("The export stopped".into()),
+        };
+        self.bake_batch = None;
+        self.workspace.baking = false;
+        self.workspace.baking_batch = false;
+        self.status = result.unwrap_or_else(|e| format!("Map export failed: {e}"));
         self.workspace.notify(self.status.clone());
     }
 
@@ -1767,6 +1924,37 @@ impl App {
             }
         }
         scene
+    }
+
+    fn apply_lightbox(&mut self, action: workspace::lightbox::Action) {
+        use workspace::lightbox::Action;
+        if self.busy() || self.nav.is_some() {
+            self.workspace.notify("Finish the current operation before loading a LightBox asset");
+            return;
+        }
+        match action {
+            Action::ChooseFolder => self.ask_file(file_dialog::Ask::LightboxFolder),
+            Action::NewSphere => {
+                self.primitive.kind = primitive::Primitive::Sphere;
+                self.primitive.set_current(primitive::Primitive::Sphere.default_segments());
+                self.new_project();
+            }
+            Action::Primitive(kind) => {
+                self.primitive.kind = kind;
+                self.append_primitive();
+            }
+            Action::Project { path, recovery } => self.open_project_file(&path.to_string_lossy(), recovery),
+            Action::Tool(path) => {
+                self.subtool_path = path.to_string_lossy().into_owned();
+                self.load_subtools();
+            }
+            Action::Mesh(path) => {
+                self.import_path = path.to_string_lossy().into_owned();
+                self.import_mesh(&path);
+            }
+            Action::MatCap(path) => self.load_matcap(&path, true),
+            Action::Spotlight(path) => self.load_spotlight(&path),
+        }
     }
 
     /// Spotlight › Load Image: lay the picture at `path` over the canvas, shown, at its
@@ -2223,13 +2411,17 @@ impl App {
         if !self.geo_free("ZRemesher") || !self.topology_allowed("ZRemesher") {
             return;
         }
-        let settings = zremesh::Settings { symmetric: self.workspace.symmetry, ..self.workspace.zremesh };
-        let guides = guide_lines(&self.subtools[self.active_tool].guides);
         let mesh = self.doc.mesh().clone();
+        let settings = zremesh::Settings {
+            mirror: self.workspace.zremesh_plane(mesh.bounds()),
+            ..self.workspace.zremesh
+        };
+        let guides = guide_lines(&self.subtools[self.active_tool].guides);
         self.start_geo("ZRemesher", false, move || {
             let (out, stats) = zremesh::zremesh(&mesh, &settings, &guides)?;
             log::info!("ZRemesher: {stats:?}");
-            Ok(GeoDone::Topology { mesh: out, detail: format!(" · {} quads", fmt_count(stats.quads)) })
+            let mirror = settings.mirror.map_or(String::new(), |plane| format!(" · {} symmetry", plane.axis.name()));
+            Ok(GeoDone::Topology { mesh: out, detail: format!(" · {} quads{mirror}", fmt_count(stats.quads)) })
         });
     }
 
@@ -2478,6 +2670,18 @@ impl App {
     /// subdivision levels, and during a stroke on a model whose preview is large; a small
     /// preview follows the stroke live.
     fn update_dynamic(&mut self) {
+        if self.workspace.uv_checker && self.doc.active() == 0 && !self.doc.uvs().is_empty() && !self.busy() {
+            let tool = self.subtools[self.active_tool].id;
+            let key = Some((tool, self.doc.generation, self.uv_key() ^ self.history.edits().rotate_left(23), dynamic::Settings { smooth: 254, ..Default::default() }));
+            let Some(gfx) = self.gfx.as_mut() else { return };
+            if key != self.dynamic_key {
+                gfx.drop_stand_in(render::DYNAMIC_KEY);
+                gfx.dynamic = uv::checker_mesh(self.doc.mesh(), self.doc.uvs(), &self.doc.obj_layout.mapped)
+                    .is_some_and(|preview| gfx.upload_stand_in(render::DYNAMIC_KEY, &preview));
+                self.dynamic_key = key;
+            }
+            return;
+        }
         // ZSpheres with A: the skin in place of the spheres, made again after each edit.
         if self.doc.zspheres.is_some() {
             let tool = &self.subtools[self.active_tool];
@@ -2664,7 +2868,7 @@ impl App {
         self.doc = Multires::new(fibers, budget);
         let id = self.new_tool_id();
         let name = format!("Fibers_{source}");
-        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -2873,7 +3077,7 @@ impl App {
         self.doc = doc;
         let id = self.new_tool_id();
         let name = format!("ZSphere {id}");
-        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         self.zs_selected = 0;
         // It starts at the origin, where the model usually is: the others are hidden.
@@ -2909,7 +3113,7 @@ impl App {
         self.doc = Multires::new(skin, budget);
         let id = self.new_tool_id();
         let name = format!("Skin_{source}");
-        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.subtools.push(SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
         self.active_tool = self.subtools.len() - 1;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.clear_levels();
@@ -2997,15 +3201,48 @@ impl App {
         self.transform_doc(&map, |app| app.doc.transform(&map));
         // Guides ride along with the whole subtool.
         for g in &mut self.subtools[self.active_tool].guides {
-            g.points.iter_mut().for_each(|p| *p = map.apply(*p));
-            g.normals.iter_mut().for_each(|n| *n = map.apply_vector(*n).normalize_or(*n));
-            g.tangents.iter_mut().for_each(|t| *t = map.apply_vector(*t).normalize_or(*t));
+            g.apply_affine(&map);
         }
         // History entries hold what undoes them: the inverse map.
         self.history.push(UndoStep::Transform(map.inverse()));
         let ms = t.elapsed().as_secs_f32() * 1000.0;
         self.update_hover();
         ms
+    }
+
+    fn apply_gizmo_selection(&mut self, map: Affine) -> f32 {
+        let t = Instant::now();
+        self.apply_transform(map);
+        for i in self.drawn_parked().into_iter().map(|(_, i)| i) {
+            let tool = &mut self.subtools[i];
+            if !tool.transpose_selected {
+                continue;
+            }
+            let parked = tool.parked.as_mut().unwrap();
+            let mut doc = parked.packed.clone().unpack();
+            doc.layers = std::mem::take(&mut parked.layers);
+            doc.transform(&map);
+            parked.history.push(UndoStep::Transform(map.inverse()));
+            parked.history.name_last("Gizmo selection");
+            for guide in &mut tool.guides {
+                guide.apply_affine(&map);
+            }
+            let stand_in = match tool.dynamic {
+                Some(s) if doc.count() == 1 => dynamic::preview(doc.mesh(), &s),
+                _ => doc.stand_in(STAND_IN_VERTICES),
+            };
+            tool.bounds = stand_in.bounds;
+            parked.stand_in_vertices = stand_in.positions.len();
+            if let Some(gfx) = self.gfx.as_mut()
+                && !gfx.upload_stand_in(tool.id, &stand_in)
+            {
+                parked.stand_in_vertices = 0;
+            }
+            parked.layers = std::mem::take(&mut doc.layers);
+            parked.packed = doc.pack();
+        }
+        self.update_hover();
+        t.elapsed().as_secs_f32() * 1000.0
     }
 
     /// Run `f`, which maps every level of the active subtool by `map` on the CPU, and bring
@@ -3186,7 +3423,7 @@ impl App {
                 if self.gizmo_place.is_some() || map.rotation != glam::Quat::IDENTITY {
                     self.gizmo_place = Some((id, place.mapped(&map)));
                 }
-                let ms = self.apply_transform(map);
+                let ms = self.apply_gizmo_selection(map);
                 self.status = format!("Gizmo {handle:?} applied in {ms:.0} ms");
                 log::info!("{}", self.status);
                 Some(ms)
@@ -3589,6 +3826,8 @@ impl App {
             .subtools
             .iter()
             .map(|t| project::Extras {
+                folder: &t.folder,
+                sets: &t.sets,
                 layers: Some(match &t.parked {
                     Some(p) => &p.layers,
                     None => &self.doc.layers,
@@ -3654,6 +3893,7 @@ impl App {
                 Ask::LoadSubtools => DocOp::LoadSubtools,
                 Ask::ExportSubtoolObj => DocOp::ExportSubtool,
                 Ask::ImportMesh => DocOp::ImportMesh,
+                Ask::UpdateObj => DocOp::UpdateObj,
                 Ask::ExportStl => DocOp::ExportStl,
                 Ask::ExportGltf => DocOp::ExportGltf { all: true },
                 Ask::ExportSubtoolGltf => DocOp::ExportGltf { all: false },
@@ -3661,13 +3901,18 @@ impl App {
                     self.pending_export = true;
                     return;
                 }
-                Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap => {
+                Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportVectorMap | Ask::ExportColorMap => {
                     let kind = bake_kind_of(ask);
                     let path = self.map_path.clone();
                     self.start_bake(kind, path);
                     return;
                 }
-                Ask::OpenSpotlight | Ask::OpenMatCap | Ask::OpenReference => return,
+                Ask::BatchMapFolder => {
+                    let folder = Path::new(&self.map_path).parent().filter(|p| p.is_dir()).unwrap_or(Path::new(".")).to_path_buf();
+                    self.start_batch_maps(&folder);
+                    return;
+                }
+                Ask::OpenSpotlight | Ask::OpenMatCap | Ask::OpenReference | Ask::LightboxFolder => return,
                 Ask::ExportRender => {
                     let path = self.render_path.clone();
                     self.start_render(path);
@@ -3685,6 +3930,12 @@ impl App {
             self.workspace.notify("A file dialog is already open");
             return;
         }
+        if ask == Ask::LightboxFolder {
+            let folder = self.workspace.lightbox_folder();
+            let dir = if folder.is_dir() { folder.to_path_buf() } else { file_dialog::start_dir("", self.last_dir.as_deref()) };
+            self.file_dialog = Some(file_dialog::open(ask, &dir, "", self.window.as_deref()));
+            return;
+        }
         let file_of = |path: &str| Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned());
         let project_stem = Path::new(&self.project_path).file_stem().map_or_else(|| "untitled".into(), |s| s.to_string_lossy().into_owned());
         let tool = self.subtools[self.active_tool].name.clone();
@@ -3700,15 +3951,18 @@ impl App {
             Ask::ExportGltf if self.project_has_file => (&self.gltf_path, file_dialog::file_name(&project_stem, "glb")),
             Ask::ExportGltf => (&self.gltf_path, file_of(&self.gltf_path).unwrap_or_else(|| "export.glb".into())),
             Ask::ExportSubtoolGltf => (&self.gltf_path, file_dialog::file_name(&tool, "glb")),
-            Ask::ImportMesh => (&self.import_path, String::new()),
+            Ask::ImportMesh | Ask::UpdateObj => (&self.import_path, String::new()),
             Ask::ExportNormalMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_normal"), "png")),
             Ask::ExportColorMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_color"), "png")),
+            Ask::ExportVectorMap => (&self.map_path, file_dialog::file_name(&format!("{tool}_vector"), "exr")),
+            Ask::BatchMapFolder => (&self.map_path, String::new()),
             Ask::ExportDisplacementMap => {
                 (&self.map_path, file_dialog::file_name(&format!("{tool}_displacement"), if self.workspace.bake.exr { "exr" } else { "png" }))
             }
             Ask::ExportRender => (&self.render_path, file_dialog::file_name(&format!("{project_stem} render"), "png")),
             Ask::OpenSpotlight | Ask::OpenReference | Ask::OpenMatCap => (&self.import_path, String::new()),
             Ask::ExportTurntable => (&self.render_path, file_dialog::file_name(&format!("{project_stem} turntable"), "mp4")),
+            Ask::LightboxFolder => unreachable!(),
         };
         // A path nothing was picked into yet (`untitled.klay`) starts where the last file was.
         let dir = file_dialog::start_dir(near, self.last_dir.as_deref());
@@ -3763,10 +4017,11 @@ impl App {
                 self.gltf_path = text(first);
                 self.export_gltf(ask == Ask::ExportGltf);
             }
+            Ask::UpdateObj => self.update_obj(first),
             Ask::ImportMesh => {
                 for path in &paths {
                     self.import_path = text(path);
-                    self.import_mesh(&text(path));
+                    self.import_mesh(path);
                 }
             }
             Ask::ExportRender => {
@@ -3776,11 +4031,13 @@ impl App {
             Ask::OpenSpotlight => self.load_spotlight(first),
             Ask::OpenMatCap => self.load_matcap(first, true),
             Ask::OpenReference => self.load_reference(first),
+            Ask::LightboxFolder => self.workspace.set_lightbox_folder(first.clone()),
+            Ask::BatchMapFolder => self.start_batch_maps(first),
             Ask::ExportTurntable => {
                 self.render_path = text(first);
                 self.start_turntable(text(first), false);
             }
-            Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap => {
+            Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportVectorMap | Ask::ExportColorMap => {
                 self.map_path = text(first);
                 self.start_bake(bake_kind_of(ask), text(first));
             }
@@ -3901,7 +4158,10 @@ impl App {
         self.last_quicksave = Instant::now();
         self.quicksaved_at = (self.subtools[self.active_tool].id, self.history.edits());
         self.status = match result {
-            Ok(path) => format!("QuickSaved to {} in {:.1} s", path.display(), t.elapsed().as_secs_f32()),
+            Ok(path) => {
+                self.workspace.refresh_lightbox_quicksaves();
+                format!("QuickSaved to {} in {:.1} s", path.display(), t.elapsed().as_secs_f32())
+            }
             Err(e) => format!("QuickSave failed: {e}"),
         };
         log::info!("{}", self.status);
@@ -3931,6 +4191,8 @@ impl App {
         let packed = self.doc.pack_copy();
         self.doc.freeze_layers();
         let extras = [project::Extras {
+            folder: &self.subtools[self.active_tool].folder,
+            sets: &self.subtools[self.active_tool].sets,
             layers: Some(&self.doc.layers),
             morph: self.morph_targets.get(&self.subtools[self.active_tool].id).map(|(l, p)| (*l, p.as_slice())),
             boolean: self.subtools[self.active_tool].boolean,
@@ -3960,7 +4222,7 @@ impl App {
         let t = Instant::now();
         let path = self.subtool_path.clone();
         #[allow(clippy::type_complexity)]
-        let result = (|| -> Result<Vec<(String, bool, Multires, Option<(usize, std::sync::Arc<Vec<Vec3>>)>)>, String> {
+        let result = (|| -> Result<Vec<(String, String, Vec<selection_set::Set>, bool, Multires, Option<(usize, std::sync::Arc<Vec<Vec3>>)>)>, String> {
             let project = project::open(Path::new(&path))?;
             project
                 .tools
@@ -3968,15 +4230,17 @@ impl App {
                 .map(|saved| {
                     let mut doc = saved.packed.try_unpack().map_err(|e| format!("subtool {:?}: {e}", saved.name))?;
                     let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
-                    Ok((saved.name, saved.visible, doc, morph))
+                    Ok((saved.name, saved.folder, saved.sets, saved.visible, doc, morph))
                 })
                 .collect()
         })();
         self.status = match result {
             Ok(docs) => {
                 let count = docs.len();
-                for (name, visible, doc, morph) in docs {
-                    let tool = self.parked_subtool(name, visible, doc);
+                for (name, folder, sets, visible, doc, morph) in docs {
+                    let mut tool = self.parked_subtool(name, visible, doc);
+                    tool.folder = folder;
+                    tool.sets = sets;
                     if let Some(m) = morph {
                         self.morph_targets.insert(tool.id, m);
                     }
@@ -4050,6 +4314,9 @@ impl App {
         self.history = History::new(32);
         let id = self.new_tool_id();
         self.subtools.push(SubTool {
+            folder: String::new(),
+            transpose_selected: false,
+            sets: Vec::new(),
             guides: Default::default(),
             dynamic: None,
             boolean: Default::default(),
@@ -4178,7 +4445,7 @@ impl App {
                 stand_in_vertices = 0;
             }
         }
-        SubTool { guides: Default::default(), dynamic,
+        SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic,
             boolean: Default::default(),
             id,
             name,
@@ -4229,8 +4496,8 @@ impl App {
             LayerOp::New => {
                 let n = self.doc.mesh().vertex_count();
                 let number = (1..).find(|k| !target.list.iter().any(|l| l.name == format!("Layer {k}"))).unwrap();
-                target.list.push(layers::SculptLayer { name: format!("Layer {number}"), delta: vec![Vec3::ZERO; n], intensity: 1.0, visible: true });
-                target.rec = Some((target.list.len() - 1, Vec::new()));
+                target.list.push(layers::SculptLayer { name: format!("Layer {number}"), delta: vec![Vec3::ZERO; n], intensity: 1.0, visible: true, paint: Vec::new(), mask: Vec::new() });
+                target.rec = Some((target.list.len() - 1, layers::Recording::default()));
                 self.workspace.layer_selected = target.list.len() - 1;
                 (true, "New layer")
             }
@@ -4247,7 +4514,7 @@ impl App {
                 (false, "Bake all layers")
             }
             LayerOp::Rec(i) if valid(i) => {
-                target.rec = if target.rec.as_ref().is_some_and(|(r, _)| *r == i) { None } else { Some((i, Vec::new())) };
+                target.rec = if target.rec.as_ref().is_some_and(|(r, _)| *r == i) { None } else { Some((i, layers::Recording::default())) };
                 (true, "Record")
             }
             LayerOp::Eye(i) if valid(i) => {
@@ -4274,6 +4541,70 @@ impl App {
         *selected = (*selected).min(self.doc.layers.list.len().saturating_sub(1));
         self.subtools[self.active_tool].bounds = self.doc.bounds();
         self.show_active_level();
+    }
+
+    fn save_selection_set(&mut self, name: String) {
+        let name: String = name.trim().chars().take(80).collect();
+        if name.is_empty() || self.busy() { return; }
+        let tool = &mut self.subtools[self.active_tool];
+        let mesh = self.doc.mesh();
+        let set = selection_set::Set {
+            name,
+            level: self.doc.active(),
+            topology: selection_set::topology(&mesh.indices, mesh.vertex_count()),
+            mask: mesh.mask.clone(),
+            groups: mesh.groups.clone(),
+            uvs: self.doc.uvs().to_vec(),
+            uv_mapped: self.doc.obj_layout.mapped.clone(),
+            morph: self.morph_targets.get(&tool.id).map(|(l, p)| (*l, p.as_ref().clone())),
+        };
+        if let Some(old) = tool.sets.iter_mut().find(|s| s.name == set.name) {
+            *old = set;
+        } else if tool.sets.len() < 128 {
+            tool.sets.push(set);
+        } else {
+            self.workspace.notify("A SubTool can store up to 128 selection sets");
+        }
+    }
+
+    fn restore_selection_set(&mut self, index: usize, channel: selection_set::Channel) {
+        use selection_set::Channel;
+        if self.busy() { return; }
+        let tool = &self.subtools[self.active_tool];
+        let Some(set) = tool.sets.get(index) else { return };
+        let level = self.doc.active();
+        let mesh = self.doc.mesh();
+        if set.level != level || set.topology != selection_set::topology(&mesh.indices, mesh.vertex_count()) {
+            self.workspace.notify(format!("Selection set requires its original topology at SDiv {0}", set.level + 1));
+            return;
+        }
+        match channel {
+            Channel::Mask if set.mask.is_empty() || set.mask.len() == mesh.vertex_count() => {
+                let old = mask::replace(self.doc.mesh_mut(), set.mask.clone());
+                self.history.push(UndoStep::Mask { level, data: MaskData::Whole(old) });
+                self.history.name_last("Restore mask set");
+            }
+            Channel::Groups if set.groups.is_empty() || set.groups.len() == mesh.triangle_count() => {
+                self.apply_groups(set.groups.clone(), "Restore selection set");
+            }
+            Channel::Uvs if set.uvs.is_empty() || set.uvs.len() == self.doc.base_mesh().triangle_count() => {
+                let old = self.doc.swap_uv_state((set.uvs.clone(), set.uv_mapped.clone()));
+                self.history.push(UndoStep::Uvs(old));
+                self.history.name_last("Restore UV set");
+            }
+            Channel::Morph => {
+                if let Some((l, p)) = &set.morph {
+                    if self.doc.vertex_counts().get(*l) != Some(&p.len()) {
+                        self.workspace.notify("Morph target does not fit the subdivision stack");
+                        return;
+                    }
+                    self.morph_targets.insert(tool.id, (*l, std::sync::Arc::new(p.clone())));
+                } else {
+                    self.morph_targets.remove(&tool.id);
+                }
+            }
+            _ => self.workspace.notify("Selection set does not fit this mesh"),
+        }
     }
 
     /// Mesh › Morph Target › StoreMT: keep the shown level's shape (ZBrush: StoreMT).
@@ -4308,72 +4639,110 @@ impl App {
         self.workspace.notify("Switched with the Morph Target");
     }
 
-    /// Import the OBJ or STL at `path` (by its extension) as a new subtool after the others
-    /// and make it active (Document › Import; ZBrush: Tool › Import into a new SubTool).
-    /// STL corners are welded into shared vertices, and with 3D Print › Z Up on the file is
-    /// turned from Z up to Klay's Y up. With Fit on it is centred and scaled to the size of a
-    /// new primitive, so Draw Size suits it.
-    fn import_mesh(&mut self, path: &str) {
+    /// Add the file's meshes as SubTools, with a shared fit for multipart models.
+    fn import_mesh(&mut self, path: &Path) {
         if self.busy() {
             return;
         }
         let t = Instant::now();
-        let is_stl = Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("stl"));
-        let parsed = if is_stl {
-            let z_up = self.workspace.layout.print.z_up;
-            std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|bytes| stl::parse(&bytes)).map(|mut m| {
-                if z_up {
-                    for p in &mut m.positions {
-                        *p = Vec3::new(p.x, p.z, -p.y);
-                    }
-                }
-                m
-            })
-        } else {
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}")).and_then(|text| obj::parse(&text))
-        };
-        let mut m = match parsed {
-            Ok(m) => m,
+        let budget = self.doc.budget;
+        let z_up = self.workspace.layout.print.z_up;
+        let fit = self.workspace.import_fit;
+        // Prepare the full file before editing the document, including mesh partitioning.
+        let prepared = std::panic::catch_unwind(|| {
+            let mut parts = model_import::read(path, z_up)?;
+            let scale = fit.then(|| model_import::fit(&mut parts));
+            let (mut verts, mut tris, mut skipped) = (0, 0, 0);
+            let docs = parts.into_iter().map(|part| {
+                verts += part.mesh.positions.len();
+                tris += part.mesh.indices.len() / 3;
+                skipped += part.mesh.skipped;
+                (part.name, part.mesh.into_doc(budget))
+            }).collect::<Vec<_>>();
+            Ok::<_, String>((docs, scale, verts, tris, skipped))
+        }).unwrap_or_else(|_| Err("Invalid mesh data".into()));
+        let (mut docs, scale, verts, tris, skipped) = match prepared {
+            Ok(prepared) => prepared,
             Err(e) => {
-                self.status = format!("Import failed: {e}");
+                let file = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                self.status = format!("Import failed ({file}): {e}");
                 self.workspace.notify(self.status.clone());
                 return;
             }
         };
-        let scale = self.workspace.import_fit.then(|| obj::fit(&mut m.positions, 2.0));
-        let (verts, tris) = (m.positions.len(), m.indices.len() / 3);
-        let mesh = std::panic::catch_unwind(|| SculptMesh::from_raw_painted(m.positions, m.indices, m.groups, m.colors));
-        let Ok(mesh) = mesh else {
-            self.status = format!("Import failed: {path} is not a mesh Klay can sculpt");
-            self.workspace.notify(self.status.clone());
-            return;
-        };
-        let budget = self.doc.budget;
+        let count = docs.len();
+        let (name, doc) = docs.pop().expect("a successful import has at least one mesh");
         self.park_active();
-        self.doc = Multires::new(mesh, budget);
-        let id = self.new_tool_id();
-        let name = Path::new(path).file_stem().map_or_else(|| format!("Import {id}"), |s| s.to_string_lossy().to_string());
-        self.subtools.push(SubTool { guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
-        self.active_tool = self.subtools.len() - 1;
-        if let Some(gfx) = self.gfx.as_mut() {
-            gfx.clear_levels();
+        for (name, doc) in docs {
+            let tool = self.parked_subtool(name, true, doc);
+            self.subtools.push(tool);
         }
+        self.doc = doc;
+        let id = self.new_tool_id();
+        self.subtools.push(SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None, boolean: Default::default(), id, name: name.clone(), visible: true, bounds: self.doc.bounds(), wedge: false, parked: None });
+        self.active_tool = self.subtools.len() - 1;
         self.show_active_level();
         self.frame_camera();
+        let label = if count == 1 { name } else { format!("{count} SubTools") };
         self.status = format!(
-            "Imported {name}: {} vertices, {} triangles{}{} in {:.1} s",
+            "Imported {label}: {} vertices, {} triangles{}{} in {:.1} s",
             fmt_count(verts),
             fmt_count(tris),
             scale.map_or(String::new(), |s| format!(", scaled ×{s:.3} to fit")),
-            match (m.skipped, is_stl) {
-                (0, _) => String::new(),
-                (n, true) => format!(", {n} flat or repeated triangles left out"),
-                (n, false) => format!(", {n} bad faces left out"),
-            },
+            if skipped == 0 { String::new() } else { format!(", {skipped} faces skipped") },
             t.elapsed().as_secs_f32()
         );
         log::info!("{}", self.status);
         self.workspace.notify(self.status.clone());
+    }
+
+    fn update_obj(&mut self, path: &Path) {
+        if !self.geo_free("Update from OBJ") {
+            return;
+        }
+        if !self.doc.layers.list.is_empty() || self.doc.frozen.is_some() || self.doc.zspheres.is_some() {
+            self.workspace.notify("Update from OBJ requires a mesh with baked layers and no frozen levels");
+            return;
+        }
+        let path = path.to_path_buf();
+        let top = self.doc.top();
+        self.doc.sync_to(top);
+        let old = self.doc.pack_copy();
+        let budget = self.doc.budget;
+        let settings = self.workspace.project;
+        self.start_geo("Update from OBJ", false, move || {
+            let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let imported = obj::parse(&source)?;
+            let old_doc = old.clone().try_unpack()?;
+            let aligned = imported.align_to(old_doc.base_mesh());
+            let mut doc = match aligned {
+                Some(mut doc) => {
+                    doc.obj_layout.ends.clone_from(&old_doc.obj_layout.ends);
+                    doc.obj_layout.seams.clone_from(&old_doc.obj_layout.seams);
+                    doc.obj_layout.triangles.clone_from(&old_doc.obj_layout.triangles);
+                    doc.obj_layout.boundary.clone_from(&old_doc.obj_layout.boundary);
+                    if doc.uvs().is_empty() {
+                        doc.swap_uvs(old_doc.uvs().to_vec());
+                        doc.obj_layout.mapped.clone_from(&old_doc.obj_layout.mapped);
+                    }
+                    doc.budget = budget;
+                    doc
+                }
+                None => imported.into_doc(budget),
+            };
+            if doc.base_mesh().subdivision_blocker().is_some() {
+                return Err("The OBJ must have manifold edges".into());
+            }
+            let shown = old_doc.active();
+            drop(old_doc);
+            doc.frozen = Some(Box::new(old));
+            let exact = doc.unfreeze(&settings)?;
+            if doc.top() != top {
+                return Err("The updated topology exceeds the subdivision budget".into());
+            }
+            doc.set_active(shown);
+            Ok(GeoDone::UpdatedObj { doc: Box::new(doc), exact })
+        });
     }
 
     /// The active subtool at its shown level as an OBJ, next to `subtool_path` with an
@@ -4387,7 +4756,7 @@ impl App {
             let mut w = std::io::BufWriter::with_capacity(8 << 20, file);
             use std::io::Write;
             writeln!(w, "# Klay export: subtool {name}")?;
-            self.doc.mesh().write_obj_uv(&mut w, &name, 0, shown_uvs(&self.doc), 0)?;
+            self.doc.write_obj(&mut w, &name, 0, 0)?;
             w.flush()
         })();
         self.status = match result {
@@ -4407,14 +4776,18 @@ impl App {
     /// rebuilt and checked, one at a time, before the current model is let go; a file that
     /// fails leaves the current model as it was.
     fn open_project(&mut self, path: &str) {
+        self.open_project_file(path, false);
+    }
+
+    fn open_project_file(&mut self, path: &str, recovery: bool) {
         if self.job_blocks("Open") || self.busy() {
             return;
         }
         let t = Instant::now();
         match self.load_project(path) {
             Ok(()) => {
-                self.project_path = path.to_string();
-                self.project_has_file = true;
+                self.project_path = if recovery { "untitled.klay".into() } else { path.to_string() };
+                self.project_has_file = !recovery;
                 self.status = format!(
                     "Opened {path}: {} subtools in {:.2} s",
                     self.subtools.len(),
@@ -4446,7 +4819,7 @@ impl App {
             let morph = Self::attach_saved(&mut doc, saved.layers, saved.morph);
             if i == active {
                 let id = self.new_tool_id();
-                staged.push(SubTool { guides: Default::default(), dynamic: saved.dynamic,
+                staged.push(SubTool { folder: saved.folder, transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: saved.dynamic,
                     boolean: saved.boolean,
                     id,
                     name: saved.name,
@@ -4459,8 +4832,10 @@ impl App {
             } else {
                 let mut tool = self.parked_subtool_with(saved.name, saved.visible, doc, saved.dynamic);
                 tool.boolean = saved.boolean;
+                tool.folder = saved.folder;
                 staged.push(tool);
             }
+            staged.last_mut().unwrap().sets = saved.sets;
             if let Some(m) = morph {
                 morphs.push((staged.last().unwrap().id, m));
             }
@@ -4510,7 +4885,7 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
-        self.subtools = vec![SubTool { guides: Default::default(), dynamic: None,
+        self.subtools = vec![SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None,
             boolean: Default::default(),
             id,
             name: format!("{} {id}", self.primitive.kind.short()),
@@ -4541,11 +4916,11 @@ impl App {
             let (mut verts, mut count, mut uvs) = (0usize, 0usize, 0usize);
             for (i, tool) in self.subtools.iter().enumerate() {
                 if i == self.active_tool {
-                    uvs += self.doc.mesh().write_obj_uv(&mut w, &tool.name, verts, shown_uvs(&self.doc), uvs)?;
+                    uvs += self.doc.write_obj(&mut w, &tool.name, verts, uvs)?;
                     verts += self.doc.mesh().vertex_count();
                 } else if let (true, Some(p)) = (tool.visible, &tool.parked) {
                     let doc = p.packed.clone().unpack();
-                    uvs += doc.mesh().write_obj_uv(&mut w, &tool.name, verts, shown_uvs(&doc), uvs)?;
+                    uvs += doc.write_obj(&mut w, &tool.name, verts, uvs)?;
                     verts += doc.mesh().vertex_count();
                 } else {
                     continue;
@@ -4619,7 +4994,7 @@ impl App {
         for b in self.baked.iter().filter(|b| b.subtool == id) {
             let png = b.path.to_lowercase().ends_with(".png");
             match b.kind {
-                bake::Kind::Displacement => notes.push(format!("{name}: the displacement map stays at {} (glTF has no displacement)", b.path)),
+                bake::Kind::Displacement | bake::Kind::VectorDisplacement => notes.push(format!("{name}: the displacement map stays at {} (glTF has no displacement)", b.path)),
                 bake::Kind::Normal if !b.gl_tangent => notes.push(format!("{name}: {} is not a tangent-space, green-up normal map, so it is not embedded", b.path)),
                 _ if !png => notes.push(format!("{name}: {} is not a PNG, so it is not embedded", b.path)),
                 kind => match std::fs::read(&b.path) {
@@ -5135,7 +5510,11 @@ impl App {
                 let s = self.workspace.panel;
                 self.topology_op("Panel Loops", |m| panel::panels(m, &s));
             }
-            Some(GeoOp::MirrorWeld) => self.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded),
+            Some(GeoOp::MirrorCopy) => self.mirror_copy(),
+            Some(GeoOp::MirrorWeld) => {
+                let axis = self.workspace.mirror_axis;
+                self.topology_op("Mirror And Weld", |mesh| subtool_ops::mirrored_and_welded(mesh, axis));
+            }
             Some(GeoOp::ZRemesh) => self.start_zremesh(),
             Some(GeoOp::ProjectAll) => self.start_project_all(),
             Some(GeoOp::DelHigher) => self.delete_levels(true),
@@ -6845,7 +7224,7 @@ impl App {
             return;
         }
         let t = Instant::now();
-        self.doc.divide();
+        self.doc.divide_with(self.workspace.subdiv_smt, self.workspace.subdiv_suv);
         let ms = t.elapsed().as_secs_f32() * 1000.0;
         self.history.push(UndoStep::Divide(None));
         self.show_active_level();
@@ -7359,7 +7738,7 @@ impl App {
         let ray = self.cursor_ray();
         let fwd = self.camera.forward();
         // Pen pressure per dab (drag brushes keep what they picked up with).
-        let brush = self.at_pressure(self.stroke_brush);
+        let brush = self.stroke_pending.take().unwrap_or_else(|| self.at_pressure(self.stroke_brush));
         let Some(stroke) = self.stroke.as_mut() else {
             return;
         };
@@ -7437,8 +7816,7 @@ impl App {
     }
 
     fn end_stroke(&mut self) {
-        if self.stroke_pending {
-            self.stroke_pending = false;
+        if self.stroke_pending.is_some() {
             self.apply_stroke();
         }
         self.end_sculptris();
@@ -7452,6 +7830,21 @@ impl App {
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.end_gpu_grab();
         }
+    }
+
+    fn fill_color(&mut self) {
+        if self.busy() || self.job_blocks("Fill Color") {
+            return;
+        }
+        let level = self.doc.active();
+        let before = paint::fill(self.doc.mesh_mut(), self.brush.color);
+        if before.is_empty() {
+            return;
+        }
+        let step = self.doc.finish_paint(level, before);
+        self.history.push(UndoStep::Paint(step));
+        self.history.name_last("Fill Color");
+        self.workspace.notify("Filled the active SubTool");
     }
 
     /// One undo step for a finished stroke at `level`: its positions and its paint, named
@@ -7496,12 +7889,15 @@ impl App {
             if let (Some(m), Some((_, place))) = (map, self.gizmo_place.as_mut()) {
                 *place = place.mapped(&m);
             }
-            match (map, by < 0) {
-                (Some(map), true) => self.transform_doc(&map, |app| app.history.undo(&mut app.doc)),
-                (Some(map), false) => self.transform_doc(&map, |app| app.history.redo(&mut app.doc)),
-                (None, true) => self.history.undo(&mut self.doc),
-                (None, false) => self.history.redo(&mut self.doc),
+            let step = |app: &mut Self| {
+                let guides = &mut app.subtools[app.active_tool].guides;
+                app.history.step_with_guides(&mut app.doc, guides, by < 0);
             };
+            if let Some(map) = map {
+                self.transform_doc(&map, step);
+            } else {
+                step(self);
+            }
         }
         self.show_active_level();
         self.subtools[self.active_tool].bounds = self.doc.bounds();
@@ -7606,7 +8002,6 @@ impl App {
     fn begin_curve(&mut self) {
         let brush = self.effective_brush();
         if brush.kind.is_guide() && self.modifiers.alt_key() {
-            self.delete_guide_at_cursor();
             return;
         }
         if brush.kind.is_insert() {
@@ -7682,37 +8077,61 @@ impl App {
             guide.append(&curve.transformed(&images.0[k]));
         }
         let guides = &mut self.subtools[self.active_tool].guides;
+        let start = guides.len();
         guides.push(guide);
-        self.status = format!("ZRemesherGuide: {} guide curves · ZRemesher runs edge loops along them", guides.len());
+        self.history.push(UndoStep::Guides { start, remove: 1, insert: Vec::new() });
+        self.history.name_last("Draw ZRemesher guide");
+        self.status = format!("ZRemesherGuide: {} guide curves", guides.len());
     }
 
-    /// The guide of the active subtool nearest the cursor on screen, within reach of a grab.
+    fn projected_guide_point(&self, guide: &curve::Curve, i: usize, eye: Vec3) -> Option<Vec2> {
+        let p = guide.points[i];
+        (guide.normals[i].dot(eye - p) > 0.0).then(|| self.project_front(p)).flatten()
+    }
+
+    /// The guide with the closest visible line segment in screen space.
     fn guide_under_cursor(&self) -> Option<usize> {
         let eye = self.camera.eye();
         let mut best: Option<(f32, usize)> = None;
         for (k, g) in self.subtools[self.active_tool].guides.iter().enumerate() {
-            for (i, &p) in g.points.iter().enumerate() {
-                if g.normals[i].dot(eye - p) <= 0.0 {
-                    continue;
-                }
-                if let Some(q) = self.project_front(p) {
-                    let d = q.distance(self.cursor);
-                    if d <= CURVE_GRAB_PX * 1.5 && best.is_none_or(|b| d < b.0) {
-                        best = Some((d, k));
+            for piece in &g.pieces {
+                let mut previous = None;
+                for i in piece.clone() {
+                    let point = self.projected_guide_point(g, i, eye);
+                    if let (Some(a), Some(b)) = (previous, point) {
+                        let d = gizmo::segment_distance(self.cursor, a, b);
+                        if d <= CURVE_GRAB_PX * 1.5 * self.scale && best.is_none_or(|hit| d < hit.0) {
+                            best = Some((d, k));
+                        }
                     }
+                    previous = point;
                 }
             }
         }
         best.map(|b| b.1)
     }
 
-    /// Alt + click with ZRemesherGuide: delete the guide under the cursor.
-    fn delete_guide_at_cursor(&mut self) {
-        if let Some(k) = self.guide_under_cursor() {
-            let guides = &mut self.subtools[self.active_tool].guides;
-            guides.remove(k);
-            self.status = format!("ZRemesherGuide: deleted a guide · {} left", guides.len());
+    /// Alt + click with ZRemesherGuide deletes the guide under the cursor.
+    fn delete_guide_at_cursor(&mut self) -> bool {
+        let Some(start) = self.guide_under_cursor() else {
+            return false;
+        };
+        let guides = &mut self.subtools[self.active_tool].guides;
+        let guide = guides.remove(start);
+        self.history.push(UndoStep::Guides { start, remove: 0, insert: vec![guide] });
+        self.history.name_last("Delete ZRemesher guide");
+        self.status = format!("ZRemesherGuide: deleted a guide · {} left", guides.len());
+        true
+    }
+
+    fn clear_guides(&mut self) {
+        if self.busy() || self.subtools[self.active_tool].guides.is_empty() {
+            return;
         }
+        let insert = std::mem::take(&mut self.subtools[self.active_tool].guides);
+        self.status = format!("ZRemesherGuide: deleted {} guides", insert.len());
+        self.history.push(UndoStep::Guides { start: 0, remove: 0, insert });
+        self.history.name_last("Delete all ZRemesher guides");
     }
 
     /// The active subtool's guides on the canvas (logical pixels), in runs facing the
@@ -7729,9 +8148,7 @@ impl App {
             for piece in &g.pieces {
                 let mut run = Vec::new();
                 for i in piece.clone() {
-                    let p = g.points[i];
-                    let q = (g.normals[i].dot(eye - p) > 0.0).then(|| self.project_front(p)).flatten();
-                    match q {
+                    match self.projected_guide_point(g, i, eye) {
                         Some(q) => run.push(egui::pos2(q.x / scale, q.y / scale)),
                         None => {
                             if run.len() > 1 {
@@ -9219,6 +9636,17 @@ impl App {
         }
     }
 
+    /// Space moves a live clip guide with the pointer until released.
+    fn set_clip_positioning(&mut self, held: bool) -> bool {
+        let Some(g) = self.gesture.as_mut().filter(|g| {
+            matches!(g.kind, BrushKind::ClipLine | BrushKind::ClipRect | BrushKind::ClipCircle)
+        }) else {
+            return false;
+        };
+        g.positioning = held;
+        true
+    }
+
     fn end_gesture(&mut self)->bool {
         let Some(g)=self.gesture.take() else{return false;};
         self.workspace.gesture_preview=None;
@@ -9234,6 +9662,7 @@ impl App {
                 if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,symmetry) {
                     let chunks=self.doc.finish_stroke(level,before);
                     self.history.push(UndoStep::Stroke {level,chunks});
+                    self.history.name_last(g.kind.name());
                     self.subtools[self.active_tool].bounds=self.doc.bounds();
                 }
             }
@@ -9431,8 +9860,8 @@ impl App {
             // Re-applied once per frame.
             b.pending = true;
         } else if self.stroke.is_some() {
-            if self.stroke_brush.kind.is_drag() {
-                self.stroke_pending = true;
+            if self.stroke_brush.kind.is_drag() || (self.drag_stamp.is_some() && self.gfx.is_some()) {
+                self.stroke_pending = Some(self.at_pressure(self.stroke_brush));
             } else {
                 self.apply_stroke();
             }
@@ -9468,6 +9897,9 @@ impl App {
             self.begin_nav(MouseButton::Left);
             return;
         }
+        if free && !border && self.workspace.uv_seam_mode && self.modifiers.is_empty() && self.uv_seam_press() {
+            return;
+        }
         // ZBrush: Ctrl + Shift uses the Ctrl + Shift tool (the last Select, Clip, Trim, Slice
         // or Knife brush picked), Ctrl the mask brush, a plain drag the brush itself.
         let (ctrl, shift) = (self.modifiers.control_key(), self.modifiers.shift_key());
@@ -9495,6 +9927,12 @@ impl App {
                 self.select = Some(SelectDrag { start: self.cursor, hit });
                 self.hover = None;
             }
+            return;
+        }
+        if free && !border && !ctrl && !shift && tool.is_guide()
+            && self.workspace.mode == Mode::Draw && self.modifiers.alt_key()
+            && self.delete_guide_at_cursor()
+        {
             return;
         }
         let picked = if self.modifiers.alt_key() && !self.modifiers.control_key() && !border && self.subtools.len() > 1 && free {
@@ -9628,6 +10066,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode) {
+        let plain_comma = key == KeyCode::Comma && self.modifiers.is_empty();
+        if self.workspace.lightbox_open() {
+            if plain_comma {
+                self.workspace.toggle_lightbox();
+            }
+            return;
+        }
         if key == KeyCode::Escape && self.geo.is_some() {
             self.cancel_geo();
             return;
@@ -9652,6 +10097,10 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         match key {
+            KeyCode::Comma if plain_comma && !self.busy() && self.nav.is_none() => {
+                self.workspace.toggle_lightbox();
+                self.hover = None;
+            }
             KeyCode::Escape if self.workspace.popup.is_some() => self.workspace.popup = None,
             KeyCode::Escape if self.workspace.focus => self.workspace.focus = false,
             // Esc drops the curve being drawn, or lets go of the applied one (its result
@@ -9767,7 +10216,10 @@ impl App {
             .enumerate()
             .map(|(i, t)| match &t.parked {
                 None => SubToolRow {
+                    id: t.id,
                     name: t.name.clone(),
+                    folder: t.folder.clone(),
+                    transpose_selected: t.transpose_selected,
                     visible: true,
                     active: i == self.active_tool,
                     vertices,
@@ -9778,7 +10230,10 @@ impl App {
                     boolean: t.boolean,
                 },
                 Some(p) => SubToolRow {
+                    id: t.id,
                     name: t.name.clone(),
+                    folder: t.folder.clone(),
+                    transpose_selected: t.transpose_selected,
                     visible: t.visible,
                     active: false,
                     vertices: p.packed.counts()[p.packed.active()],
@@ -9803,6 +10258,7 @@ impl App {
         };
         self.poll_geo(false);
         self.poll_bake(false);
+        self.poll_batch_maps();
         self.poll_render(false);
         self.update_bpr_view();
         self.poll_sim(false);
@@ -9856,6 +10312,7 @@ impl App {
                     [Vec3::X, Vec3::Y, Vec3::Z].map(|v| [v.dot(r), v.dot(u), -v.dot(f)])
                 },
                 subtools: &rows,
+                selection_sets: &self.subtools[self.active_tool].sets,
                 parked_bytes,
                 stand_in_bytes,
                 project_path: &mut self.project_path,
@@ -9895,8 +10352,19 @@ impl App {
                 self.simulate();
             }
         }
+        if let Some((id, name)) = actions.rename_subtool
+            && let Some(tool) = self.subtools.iter_mut().find(|tool| tool.id == id)
+        {
+            tool.name = name;
+        }
+        if actions.fill_color {
+            self.fill_color();
+        }
         if actions.fiber_accept {
             self.fiber_accept_now();
+        }
+        if let Some(action) = actions.lightbox {
+            self.apply_lightbox(action);
         }
         if actions.spotlight_load {
             self.ask_file(file_dialog::Ask::OpenSpotlight);
@@ -9958,6 +10426,9 @@ impl App {
         if actions.import_mesh {
             self.ask_file(file_dialog::Ask::ImportMesh);
         }
+        if actions.update_obj {
+            self.ask_file(file_dialog::Ask::UpdateObj);
+        }
         if actions.export_stl {
             self.ask_file(file_dialog::Ask::ExportStl);
         }
@@ -10010,6 +10481,31 @@ impl App {
             Some(MorphOp::Switch) => self.switch_morph_target(),
             None => {}
         }
+        if let Some(name) = actions.save_selection_set { self.save_selection_set(name); }
+        if let Some((i, channel)) = actions.restore_selection_set { self.restore_selection_set(i, channel); }
+        if let Some(i) = actions.delete_selection_set {
+            let sets = &mut self.subtools[self.active_tool].sets;
+            if i < sets.len() { sets.remove(i); }
+        }
+        if let Some((i, name)) = actions.subtool_folder {
+            self.subtools[i].folder = name.trim().chars().take(80).collect();
+        }
+        if let Some(i) = actions.transpose_select {
+            self.subtools[i].transpose_selected ^= true;
+        }
+        if let Some(folder) = actions.transpose_folder {
+            for tool in &mut self.subtools {
+                tool.transpose_selected = tool.visible && tool.folder == folder;
+            }
+            if !self.subtools[self.active_tool].transpose_selected
+                && let Some(i) = self.subtools.iter().position(|t| t.transpose_selected)
+            {
+                self.select_subtool(i);
+            }
+        }
+        if actions.transpose_clear {
+            self.subtools.iter_mut().for_each(|tool| tool.transpose_selected = false);
+        }
         if let Some(i) = actions.select_subtool {
             self.pending_subtool = Some(SubToolOp::Select(i));
         }
@@ -10059,6 +10555,10 @@ impl App {
         if actions.dynamic_apply {
             self.dynamic_apply_now();
         }
+        if actions.batch_maps { self.ask_file(file_dialog::Ask::BatchMapFolder); }
+        if actions.cancel_batch_maps && let Some(batch) = &self.bake_batch {
+            batch.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(kind) = actions.bake {
             self.bake_ask(kind);
         }
@@ -10073,12 +10573,13 @@ impl App {
                 self.crease_now(op);
             }
         }
+        if let Some(at) = actions.uv_pick { self.select_uv_island(at); }
+        if let Some(edit) = actions.uv_edit { self.edit_uvs(edit); }
         if actions.uv_delete {
             self.uv_delete_now();
         }
         if actions.delete_guides {
-            let n = std::mem::take(&mut self.subtools[self.active_tool].guides).len();
-            self.status = format!("ZRemesher: deleted {n} guide curves");
+            self.clear_guides();
         }
         if actions.zremesh {
             self.workspace.zremesh.alternate = actions.zremesh_alt;
@@ -10089,7 +10590,7 @@ impl App {
         if actions.tpose_subt {
             self.tpose_to_subtools();
         }
-        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.panel_loops, GeoOp::PanelLoops), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
+        for (on, op) in [(actions.del_hidden, GeoOp::DelHidden), (actions.close_holes, GeoOp::CloseHoles), (actions.mirror_copy, GeoOp::MirrorCopy), (actions.mirror_weld, GeoOp::MirrorWeld), (actions.panel_loops, GeoOp::PanelLoops), (actions.zremesh, GeoOp::ZRemesh), (actions.project_all, GeoOp::ProjectAll)] {
             if on {
                 self.pending_geo = Some(op);
             }
@@ -10152,6 +10653,7 @@ impl App {
             self.paint_gizmo(ui.ctx());
         } else {
             self.paint_action_line(ui.ctx());
+            self.paint_uv_seams(ui.ctx());
         }
     }
 
@@ -10230,8 +10732,9 @@ impl App {
             Some(DocOp::ExportSubtool) => self.export_subtool_obj(),
             Some(DocOp::ImportMesh) => {
                 let path = self.import_path.clone();
-                self.import_mesh(&path);
+                self.import_mesh(Path::new(&path));
             }
+            Some(DocOp::UpdateObj) => self.update_obj(&std::path::PathBuf::from(&self.import_path)),
             Some(DocOp::ExportStl) => self.export_stl(),
             Some(DocOp::ExportGltf { all }) => self.export_gltf(all),
             None => {}
@@ -10281,7 +10784,7 @@ impl App {
                 let a = (TOTAL - left) as f32 * 0.1;
                 self.cursor =
                     c + Vec2::new(0.3 + 0.15 * a.cos(), -0.3 + 0.15 * a.sin()) * vp.y * 0.33;
-                self.stroke_pending = true;
+                self.stroke_pending = Some(self.stroke_brush);
             }
             self.stress = if left == 0 {
                 None
@@ -10289,8 +10792,7 @@ impl App {
                 Some((left - 1, frame_acc + dt * 1000.0, dab_acc + self.stroke_ms))
             };
         }
-        if self.stroke_pending {
-            self.stroke_pending = false;
+        if self.stroke_pending.is_some() {
             self.apply_stroke();
         }
         if self.curve.as_ref().is_some_and(|c| c.bend.as_ref().is_some_and(|b| b.pending)) {
@@ -10580,7 +11082,12 @@ impl App {
         let parked: Vec<(u64, u32)> = self
             .drawn_parked()
             .into_iter()
-            .map(|(key, i)| (key, slots.iter().find(|s| s.0 == i).map_or(1, |s| 1 + s.1 as u32)))
+            .map(|(key, i)| {
+                let slot = slots.iter().find(|s| s.0 == i).map_or(1, |s| 1 + s.1 as u32);
+                let preview = self.subtools[i].transpose_selected
+                    && matches!(self.transpose, Some(TransposeDrag::Gizmo { alone: false, .. }));
+                (key, slot | ((preview as u32) << 31))
+            })
             .collect();
         let Some(gfx) = self.gfx.as_mut() else { return };
         gfx.transparent_parked = self.workspace.transp;
@@ -10738,6 +11245,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Focused(false) => {
+                self.set_clip_positioning(false);
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
                 if self.gesture.is_some() {self.update_gesture();}
@@ -10810,7 +11320,16 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let typing = self.egui_ctx.egui_wants_keyboard_input() || self.workspace.modal_open() || self.workspace.brush_catalog_open();
-                if let PhysicalKey::Code(KeyCode::Space) = event.physical_key {
+                if event.physical_key == PhysicalKey::Code(KeyCode::Comma) {
+                    if event.state == ElementState::Pressed && !event.repeat
+                        && (!typing || self.workspace.lightbox_open())
+                    {
+                        self.on_key(KeyCode::Comma);
+                    }
+                } else if let PhysicalKey::Code(KeyCode::Space) = event.physical_key {
+                    if !event.repeat && self.set_clip_positioning(event.state == ElementState::Pressed) {
+                        return;
+                    }
                     // ZBrush quick menu: shown while Space is held.
                     match event.state {
                         ElementState::Pressed if !event.repeat && !typing => {
@@ -11410,6 +11929,10 @@ fn main() {
     // `--brush-catalog`: start with the B catalog open (for snapshots of it).
     if args.iter().any(|a| a == "--brush-catalog") {
         app.workspace.open_brush_catalog(egui::pos2(320.0, 140.0));
+    }
+    // `--lightbox CATEGORY`: open an asset category for UI snapshots.
+    if let Some(category) = flag("--lightbox") {
+        app.workspace.open_lightbox_category(category);
     }
     // `--gizmo`: start in Move mode with Gizmo 3D (Y).
     if args.iter().any(|a| a == "--gizmo") {
@@ -12856,6 +13379,39 @@ mod subtool_tests {
     }
 
     #[test]
+    fn zremesher_forces_an_axis_through_an_offset_subtool() {
+        use symmetry::Axis;
+        for axis in [Axis::Y, Axis::Z] {
+            let mut app = App::new(40, false, usize::MAX);
+            app.workspace.zremesh.target_k = 0.6;
+            app.workspace.zremesh.adaptive = 0.0;
+            app.workspace.zremesh_symmetry = workspace::RemeshSymmetry::Force(axis);
+            app.workspace.zremesh_local_plane = true;
+            assert!(!app.workspace.symmetry && !app.workspace.symmetry_y && !app.workspace.symmetry_z);
+            // Leave the negative half different and offset the whole mesh from the origin.
+            let positions: Vec<_> = app.mesh().positions.iter().map(|&p| {
+                let stretch = if p[axis as usize] < 0.0 { 1.2 } else { 1.0 };
+                p + axis.unit() * -4.0 + Vec3::X * p.x * (stretch - 1.0)
+            }).collect();
+            app.reshape_shown("Offset asymmetric mesh", &positions);
+            let plane = app.workspace.zremesh_plane(app.mesh().bounds()).unwrap();
+            assert_eq!(plane.at, -4.0);
+            app.zremesh_now();
+            assert!(app.status.contains(&format!("{} symmetry", axis.name())), "{}", app.status);
+            let mesh = app.mesh();
+            assert!(mesh.positions.iter().any(|&p| plane.distance(p) == 0.0));
+            assert!(mesh.positions.iter().all(|&p| {
+                let other = plane.reflect(p);
+                mesh.positions.iter().any(|&q| q.distance_squared(other) < 1e-10)
+            }));
+            assert!(print::check(&mesh.indices).watertight());
+            app.workspace.zremesh_symmetry = workspace::RemeshSymmetry::Off;
+            app.workspace.symmetry = true;
+            assert!(app.workspace.zremesh_plane(app.mesh().bounds()).is_none());
+        }
+    }
+
+    #[test]
     fn zremesher_rebuilds_the_subtool_in_quads_as_one_undo_step() {
         let mut app = App::new(40, false, usize::MAX);
         let before = app.doc.mesh().positions.clone();
@@ -13095,8 +13651,75 @@ mod subtool_tests {
         assert!(files.iter().all(|f| f.starts_with("QuickSave_") && f.ends_with(".klay")));
         let project = project::open(&dir.join("QuickSave_1.klay")).unwrap();
         assert_eq!(project.tools.len(), 2);
+        let thumbnail = model_thumbnail::from_file(&dir.join("QuickSave_1.klay"), false).unwrap();
+        assert!(thumbnail.pixels.iter().any(|p| p.a() != 0));
         assert_eq!(app.quicksaved_at.1, app.history.edits());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_multipart_glb_imports_through_lightbox_with_one_fit() {
+        let dir = std::env::temp_dir().join(format!("klay-glb-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Assembly.GLB");
+        let mesh = |x| SculptMesh::from_raw_painted(
+            [Vec3::ZERO, Vec3::X, Vec3::Y].map(|p| p + Vec3::X * x).to_vec(),
+            vec![0, 1, 2],
+            vec![],
+            vec![[64, 128, 192, 255]; 3],
+        );
+        let (a, b) = (mesh(0.0), mesh(3.0));
+        let uv = [[Vec2::ZERO, Vec2::X, Vec2::Y]];
+        gltf::write(std::fs::File::create(&path).unwrap(), &[
+            gltf::Node::from_mesh("Left", &a, &uv),
+            gltf::Node::from_mesh("Right", &b, &uv),
+        ], &gltf::Options { scale: 1.0, per_group: true }).unwrap();
+        let preview = model_thumbnail::from_file(&path, false).unwrap();
+        assert!(preview.pixels.iter().any(|p| p.a() != 0));
+        let mut app = App::new(8, false, 100_000);
+        app.apply_lightbox(workspace::lightbox::Action::Mesh(path.clone()));
+        assert_eq!((app.subtools.len(), app.active_tool), (3, 2), "{}", app.status);
+        assert_eq!((&*app.subtools[1].name, &*app.subtools[2].name), ("Left", "Right"));
+        assert_eq!(app.subtools[1].bounds.min.x, -1.0);
+        assert_eq!(app.doc.bounds().min.x, 0.5);
+        assert_eq!(app.doc.uvs(), &uv);
+        assert_eq!(app.doc.mesh().colors, [[64, 128, 192, 255]; 3]);
+        std::fs::write(&path, b"glTF truncated").unwrap();
+        app.import_mesh(&path);
+        assert_eq!((app.subtools.len(), app.active_tool), (3, 2));
+        app.import_mesh(&dir.join("Original.ZTL"));
+        assert!(app.status.contains("export FBX, OBJ or GoZ"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mirror_copy_can_merge_down_and_weld_uses_the_selected_axis() {
+        let mut app = App::new(8, false, 100_000);
+        let source = obj::parse("v 0 1 0 1 0 0\nv 1 1 0\nv 0 2 0\nvt 0.1 0.2\nvt 0.3 0.4\nvt 0.5 0.6\nf 1/1 2/2 3/3").unwrap();
+        app.doc = source.into_doc(100_000);
+        app.workspace.mirror_axis = 1;
+        app.pending_geo = Some(GeoOp::MirrorCopy);
+        app.run_pending_geo();
+        assert_eq!((app.subtools.len(), app.active_tool), (2, 0));
+        let copy = app.subtools[1].parked.as_ref().unwrap().packed.clone().unpack();
+        assert_eq!(copy.bounds().max.y, -1.0);
+        let [a, b, c] = app.doc.uvs()[0];
+        assert_eq!(copy.uvs(), &[[a, c, b]]);
+        assert_eq!(copy.mesh().colors, app.doc.mesh().colors);
+        app.merge_down();
+        assert_eq!(app.subtools.len(), 1);
+        assert_eq!(app.doc.bounds().min.y, -2.0);
+        assert_eq!(app.doc.mesh().triangle_count(), 2);
+
+        let mut app = App::new(8, false, 100_000);
+        app.workspace.mirror_axis = 2;
+        app.pending_geo = Some(GeoOp::MirrorWeld);
+        app.run_pending_geo();
+        let mesh = app.doc.mesh();
+        assert!(print::check(&mesh.indices).watertight());
+        assert!(mesh.positions.iter().all(|p| mesh.positions.iter().any(|q|
+            (*q - Vec3::new(p.x, p.y, -p.z)).length_squared() < 1e-10)));
+        assert!(app.history.can_undo());
     }
 
     #[test]
@@ -13110,7 +13733,7 @@ mod subtool_tests {
         app.subtool_path = dir.join("cube.klay").to_string_lossy().into_owned();
         app.export_subtool_obj();
         app.import_path = dir.join("cube.obj").to_string_lossy().into_owned();
-        app.import_mesh(&app.import_path.clone());
+        app.import_mesh(Path::new(&app.import_path.clone()));
         assert_eq!(app.subtools.len(), 3);
         assert_eq!(app.active_tool, 2);
         assert_eq!(app.subtools[2].name, "cube");
@@ -13120,7 +13743,7 @@ mod subtool_tests {
         let b = app.doc.bounds();
         assert!(((b.max - b.min).max_element() - 2.0).abs() < 1e-4);
         // A missing file adds nothing.
-        app.import_mesh("/nonexistent/x.obj");
+        app.import_mesh(Path::new("/nonexistent/x.obj"));
         assert_eq!(app.subtools.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13170,7 +13793,7 @@ mod subtool_tests {
         assert_eq!(std::fs::read(&copied).unwrap(), bytes);
         // Import without Fit: back in Klay's frame at print size, welded and closed.
         app.workspace.import_fit = false;
-        app.import_mesh(&app.stl_path.clone());
+        app.import_mesh(Path::new(&app.stl_path.clone()));
         assert_eq!((app.subtools.len(), app.active_tool), (3, 2));
         assert_eq!(app.subtools[2].name, "model");
         let b = app.doc.bounds();
@@ -13185,7 +13808,7 @@ mod subtool_tests {
         app.pending_doc = None;
         // A broken STL adds nothing.
         std::fs::write(dir.join("bad.stl"), b"solid nothing\nendsolid\n").unwrap();
-        app.import_mesh(&dir.join("bad.stl").to_string_lossy());
+        app.import_mesh(&dir.join("bad.stl"));
         assert_eq!(app.subtools.len(), 3);
         assert!(app.status.starts_with("Import failed"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -13254,7 +13877,7 @@ mod subtool_tests {
         app.history_jump(-2);
         assert_eq!(app.doc.mesh().triangle_count(), tris);
         // Mirror And Weld keeps a closed sphere closed; refused with subdivision levels.
-        app.topology_op("Mirror And Weld", subtool_ops::mirrored_and_welded);
+        app.topology_op("Mirror And Weld", |mesh| subtool_ops::mirrored_and_welded(mesh, 0));
         assert!(app.doc.mesh().triangle_count() >= tris);
         assert!(app.doc.divide());
         let n = app.history.names().0.len();
@@ -14418,6 +15041,44 @@ mod surface_input_tests {
         }
     }
     #[test]
+    fn space_moves_a_live_clip_line_without_changing_its_angle() {
+        let mut a = app();
+        let c = a.project(Vec3::ZERO);
+        let original = a.mesh().positions.clone();
+        a.workspace.select_brush(&mut a.brush, BrushKind::ClipLine);
+        let start = c + Vec2::new(-85.0, 300.0);
+        let cursor = c + Vec2::new(-60.0, -300.0);
+        a.cursor_moved(start, false);
+        a.left_press(false, false);
+        a.modifiers = ModifiersState::SHIFT;
+        a.cursor_moved(cursor, false);
+        let initial = a.gesture.clone().unwrap();
+        assert!((initial.end.x - initial.start.x).abs() < 1e-3);
+        assert!(a.set_clip_positioning(true));
+        let delta = Vec2::new(165.0, 35.0);
+        a.cursor_moved(cursor + delta, false);
+        let moved = a.gesture.clone().unwrap();
+        assert!(moved.start.distance(initial.start + delta) < 1e-4);
+        assert!(moved.end.distance(initial.end + delta) < 1e-4);
+        assert_eq!(a.mesh().positions, original);
+        assert!(a.workspace.quick_menu.is_none());
+        assert!(a.set_clip_positioning(false));
+        a.cursor_moved(cursor + delta + Vec2::new(0.0, -20.0), false);
+        let resized = a.gesture.clone().unwrap();
+        assert_eq!(resized.start, moved.start);
+        assert!((resized.end.x - moved.end.x).abs() < 1e-3);
+        assert!(resized.end.y < moved.end.y - 10.0);
+
+        let plane = a.surface_screen().plane(resized.start, resized.end).unwrap();
+        a.left_release();
+        assert!(a.mesh().positions.iter().all(|&p| plane.dot(p.extend(1.0)) < 1e-5));
+        assert_ne!(a.mesh().positions, original);
+        assert!(!a.set_clip_positioning(true));
+        a.history_jump(-1);
+        assert_eq!(a.mesh().positions, original);
+    }
+
+    #[test]
     fn clip_can_start_off_mesh_cancel_and_undo() {
         let mut a=app();let c=a.project(Vec3::ZERO);let original=a.mesh().positions.clone();
         a.workspace.select_brush(&mut a.brush,BrushKind::ClipLine);
@@ -14547,13 +15208,24 @@ mod curve_input_tests {
         let (positions, edits) = (a.mesh().positions.clone(), a.history.edits());
         let c = a.project(Vec3::ZERO) - Vec2::new(150.0, 0.0);
         drag(&mut a, c, 300.0, true);
-        // A guide on the front of the unit sphere; the model and its history are untouched.
+        // A guide on the front of the unit sphere changes history without changing geometry.
         assert_eq!(a.mesh().positions, positions);
-        assert_eq!(a.history.edits(), edits);
+        assert_eq!(a.history.edits(), edits + 1);
         let guides = &a.subtools[a.active_tool].guides;
         assert_eq!(guides.len(), 1);
         assert!(guides[0].points.len() > 20 && guides[0].points.iter().all(|p| (p.length() - 1.0).abs() < 0.03 && p.z > 0.0));
         assert!(!a.guides_preview().is_empty(), "drawn while the brush is ZRemesherGuide");
+        let line = super::guide_lines(&a.subtools[a.active_tool].guides);
+        a.history_jump(-1);
+        assert!(a.subtools[a.active_tool].guides.is_empty());
+        a.history_jump(1);
+        assert_eq!(super::guide_lines(&a.subtools[a.active_tool].guides), line);
+        // A whole-tool transform and its undo keep the guide on the mesh.
+        let offset = Vec3::X * 0.125;
+        a.apply_transform(Affine::translation(offset));
+        assert!(a.subtools[a.active_tool].guides[0].points[0].distance(line[0][0] + offset) < 1e-6);
+        a.history_jump(-1);
+        assert!(a.subtools[a.active_tool].guides[0].points[0].distance(line[0][0]) < 1e-6);
         // Alt + click on it deletes it.
         let mid = { let g = &a.subtools[a.active_tool].guides[0]; g.points[g.points.len() / 2] };
         a.modifiers = ModifiersState::ALT;
@@ -14562,9 +15234,17 @@ mod curve_input_tests {
         a.left_release();
         a.modifiers = ModifiersState::empty();
         assert!(a.subtools[a.active_tool].guides.is_empty());
-        assert_eq!(a.mesh().positions, positions);
-        // Draw it again: ZRemesher puts a loop on it and keeps it.
-        drag(&mut a, c, 300.0, true);
+        assert!(a.mesh().positions.iter().zip(&positions).all(|(p, q)| p.distance(*q) < 1e-6));
+        a.history_jump(-1);
+        assert_eq!(a.subtools[a.active_tool].guides.len(), 1);
+        a.history_jump(1);
+        assert!(a.subtools[a.active_tool].guides.is_empty());
+        a.history_jump(-1);
+        a.clear_guides();
+        assert!(a.subtools[a.active_tool].guides.is_empty());
+        a.history_jump(-1);
+        assert_eq!(a.subtools[a.active_tool].guides.len(), 1);
+        // ZRemesher puts a loop on the restored guide and keeps it.
         let line = super::guide_lines(&a.subtools[a.active_tool].guides);
         a.workspace.zremesh.target_k = 1.0;
         a.workspace.zremesh.curves_strength = 100.0;
@@ -14579,6 +15259,28 @@ mod curve_input_tests {
         let on = a.mesh().positions.iter().filter(|&&p| near(p) < 1e-4).count();
         assert!(on >= 6, "{on} vertices on the guide");
         assert_eq!(a.subtools[a.active_tool].guides.len(), 1, "guides stay after ZRemesher");
+    }
+
+    #[test]
+    fn alt_click_deletes_a_guide_segment_even_off_the_mesh() {
+        let mut a = app();
+        a.camera.distance = 4.5;
+        a.workspace.select_brush(&mut a.brush, BrushKind::ZRemesherGuide);
+        let start = Vec3::new(-0.6, 1.3, 0.0);
+        let end = Vec3::new(0.6, 1.3, 0.0);
+        let guide = curve::Curve::from_hits(&[Some((start, Vec3::Z)), Some((end, Vec3::Z))], 2.0);
+        assert_eq!(guide.points.len(), 2);
+        a.add_guide(guide);
+        a.modifiers = ModifiersState::ALT;
+        a.cursor_moved(a.project(start.lerp(end, 0.5)), false);
+        let (o, d) = a.cursor_ray();
+        assert!(a.mesh().raycast(o, d).is_none());
+        assert!(!a.in_canvas_border());
+        a.left_press(false, false);
+        a.left_release();
+        assert!(a.subtools[a.active_tool].guides.is_empty());
+        a.history_jump(-1);
+        assert_eq!(a.subtools[a.active_tool].guides.len(), 1);
     }
 
     #[test]
@@ -15021,6 +15723,100 @@ mod stroke_modifier_tests {
         let ops: Vec<boolean::BoolOp> = third.subtools.iter().map(|t| t.boolean).collect();
         assert_eq!(ops, [boolean::BoolOp::Intersect, boolean::BoolOp::Subtract]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parity_obj_update_keeps_the_subtool_and_subdivision_detail() {
+        use std::io::Write;
+        let mut app = app();
+        let path = std::env::temp_dir().join(format!("klay-update-cage-{}.obj", std::process::id()));
+        let before = app.subtools[0].id;
+        let mut obj = Vec::new();
+        app.doc.write_obj(&mut obj, "Cage", 0, 0).unwrap();
+        let source = String::from_utf8(obj).unwrap();
+        let mut edited = Vec::new();
+        let translation = Vec3::new(0.15, -0.10, 0.20);
+        for line in source.lines() {
+            if let Some(v) = line.strip_prefix("v ") {
+                let mut v = v.split_ascii_whitespace().map(|v| v.parse::<f32>().unwrap());
+                let p = Vec3::new(v.next().unwrap(), v.next().unwrap(), v.next().unwrap()) + translation;
+                writeln!(&mut edited, "v {} {} {}", p.x, p.y, p.z).unwrap();
+            } else {
+                writeln!(&mut edited, "{line}").unwrap();
+            }
+        }
+        std::fs::write(&path, edited).unwrap();
+        assert!(app.doc.divide());
+        let mut target = app.mesh().positions.clone();
+        target[0] += Vec3::Y * 0.25;
+        app.reshape_shown("Detail", &target);
+        app.update_obj(&path);
+        app.poll_geo(true);
+        assert_eq!(app.subtools.len(), 1);
+        assert_eq!(app.subtools[0].id, before);
+        assert_eq!(app.doc.active(), 1);
+        assert!(app.mesh().positions.iter().zip(&target).all(|(a, b)| a.distance(*b + translation) < 1e-5));
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.mesh().positions, target);
+
+        let (p, i) = cube_sphere(9, 1.0);
+        let different = SculptMesh::from_raw_paired(p, i, Vec::new());
+        let mut obj = Vec::new();
+        different.write_obj(&mut obj, "Retopology", 0).unwrap();
+        std::fs::write(&path, obj).unwrap();
+        app.update_obj(&path);
+        app.poll_geo(true);
+        assert_eq!(app.subtools[0].id, before);
+        assert_eq!(app.doc.base_mesh().vertex_count(), different.vertex_count());
+        assert_eq!(app.doc.top(), 1);
+        assert!(app.mesh().positions.iter().zip(app.doc.smooth_top()).any(|(a, b)| a.distance(b) > 1e-4));
+        app.history.undo(&mut app.doc);
+        assert_eq!(app.mesh().positions, target);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parity_layers_folders_selection_sets_and_gizmo_survive_their_normal_paths() {
+        let mut app = app();
+        app.divide();
+        let n = app.mesh().vertex_count();
+        app.layer_op(LayerOp::New);
+        app.doc.mesh_mut().colors = vec![[160, 90, 40, 180]; n];
+        let mut masked = vec![0; n];
+        masked[0] = 190;
+        mask::replace(app.doc.mesh_mut(), masked.clone());
+        app.layer_op(LayerOp::Rec(0));
+        app.subtools[0].folder = "Head".into();
+        app.save_selection_set("Face".into());
+        app.layer_op(LayerOp::Intensity(0, 2.0));
+        assert_eq!(app.mesh().mask[0], 255);
+        app.doc.set_active(0);
+        app.doc.set_active(1);
+        assert_eq!(app.mesh().mask[0], 255);
+        app.duplicate_subtool();
+        let other = app.subtools[1].bounds.min;
+        app.subtools[1].transpose_selected = true;
+        app.apply_gizmo_selection(Affine::translation(Vec3::X));
+        assert!(app.subtools[1].bounds.min.distance(other + Vec3::X) < 1e-5);
+        let path = std::env::temp_dir().join(format!("klay-production-layers-{}.klay", std::process::id()));
+        std::fs::write(&path, app.project_bytes()).unwrap();
+        let mut fresh = App::new(8, false, 200_000);
+        fresh.load_project(path.to_str().unwrap()).unwrap();
+        assert_eq!(fresh.subtools[0].folder, "Head");
+        assert_eq!(fresh.subtools[1].folder, "Head");
+        assert_eq!(fresh.subtools[0].sets[0].name, "Face");
+        fresh.layer_op(LayerOp::Eye(0));
+        assert!(fresh.mesh().colors.iter().all(|c| *c == [0; 4]));
+        assert!(fresh.mesh().mask.iter().all(|&m| m == 0));
+        fresh.layer_op(LayerOp::Eye(0));
+        assert_eq!(fresh.mesh().mask[0], 255);
+        fresh.layer_op(LayerOp::Intensity(0, 1.0));
+        assert_eq!(fresh.mesh().mask, masked);
+        assert_eq!(fresh.mesh().colors[0], [160, 90, 40, 180]);
+        mask::replace(fresh.doc.mesh_mut(), Vec::new());
+        fresh.restore_selection_set(0, selection_set::Channel::Mask);
+        assert_eq!(fresh.mesh().mask, masked);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

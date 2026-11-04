@@ -3,7 +3,7 @@
 //! polypaint come along; masks and hidden polygons do not (the vertices are reordered into
 //! new chunks).
 
-use crate::mesh::SculptMesh;
+use crate::{mesh::SculptMesh, symmetry::{Axis, MirrorPlane}};
 use glam::Vec3;
 
 /// The triangles of `mesh` that `keep` accepts, as a new mesh (vertices renumbered, groups and
@@ -38,7 +38,7 @@ pub fn part(mesh: &SculptMesh, keep: impl Fn(u32) -> bool) -> Option<SculptMesh>
 /// Two meshes as one (SubTool › Merge Down). `b`'s polygroups are renumbered after `a`'s so
 /// both keep their own; paint is kept where either has it.
 pub fn merged(a: &SculptMesh, b: &SculptMesh) -> SculptMesh {
-    let shift = a.groups.iter().copied().max().map_or(1, |g| g + 1);
+    let shift = a.groups.iter().copied().max().map_or(1, |g| g.saturating_add(1));
     let mut positions = a.positions.clone();
     positions.extend_from_slice(&b.positions);
     let base = a.vertex_count() as u32;
@@ -204,20 +204,74 @@ pub fn holes_closed(mesh: &SculptMesh) -> Option<SculptMesh> {
     (indices.len() > mesh.indices.len()).then(|| SculptMesh::from_raw_painted(positions, indices, groups, colors))
 }
 
-/// Deformation › Mirror And Weld: the +X half (cut cleanly at X = 0) mirrored onto −X and
-/// welded along the plane, so the mesh becomes exactly symmetric. `None` when nothing is on
-/// the +X side.
-pub fn mirrored_and_welded(mesh: &SculptMesh) -> Option<SculptMesh> {
-    plus_x_half(mesh).map(|half| mirrored(&half))
+/// Reflect a copy of the shown mesh. Swapping its last two corners fixes winding
+/// without changing vertex or triangle order, so paint, masks and UVs stay attached.
+pub fn mirror_copy(source: &crate::multires::Multires, axis: usize) -> crate::multires::Multires {
+    let mesh = source.mesh();
+    let positions = mesh.positions.iter().map(|&p| reflect(p, axis)).collect();
+    let mut indices = mesh.indices.clone();
+    for tri in indices.chunks_exact_mut(3) {
+        tri.swap(1, 2);
+    }
+    let mut copy = SculptMesh::from_chunked(positions, indices, &mesh.chunk_ranges());
+    copy.colors.clone_from(&mesh.colors);
+    copy.set_groups(mesh.groups.clone());
+    copy.set_hidden(mesh.hidden.clone());
+    crate::mask::replace(&mut copy, mesh.mask.clone());
+    copy.set_quads(mesh.quads.iter().map(|&q| if q < crate::mesh::LONE { 2 - q } else { q }).collect());
+    copy.set_creases(mesh.creases.iter().map(|&bits| swap_outer_bits(bits)).collect());
+
+    let level = source.active();
+    let mut doc = crate::multires::Multires::new(copy, source.budget);
+    let mut uvs = if level == 0 { source.uvs().to_vec() } else { source.subdivided_uvs(level).unwrap_or_default() };
+    for uv in &mut uvs {
+        uv.swap(1, 2);
+    }
+    doc.swap_uvs(uvs);
+    if level == 0 {
+        let mut layout = source.obj_layout.clone();
+        for corner in &mut layout.boundary {
+            let slot = *corner % 3;
+            if slot != 0 {
+                *corner = *corner - slot + (3 - slot);
+            }
+        }
+        let (mut start, mut prev) = (0, 0);
+        for &end in &layout.ends {
+            let count = (end - prev + 2) as usize;
+            layout.boundary[start..start + count].reverse();
+            start += count;
+            prev = end;
+        }
+        for bits in &mut layout.mapped {
+            *bits = (*bits & 1) | (*bits & 2) << 1 | (*bits & 4) >> 1;
+        }
+        doc.obj_layout = layout;
+    }
+    doc
 }
 
-/// The part of `mesh` with X ≥ 0, cut cleanly at X = 0: vertices on the plane have X
-/// exactly 0. `None` when nothing is on the +X side.
-pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
+fn reflect(mut p: Vec3, axis: usize) -> Vec3 {
+    p[axis] = -p[axis];
+    p
+}
+
+fn swap_outer_bits(bits: u8) -> u8 {
+    (bits & 1) << 2 | (bits & 2) | (bits & 4) >> 2
+}
+
+/// Keep the positive side of the selected axis, reflect it, and weld the plane.
+pub fn mirrored_and_welded(mesh: &SculptMesh, axis: usize) -> Option<SculptMesh> {
+    let plane = MirrorPlane { axis: Axis::ALL[axis], at: 0.0 };
+    positive_half(mesh, plane).map(|half| mirror_half(&half, plane))
+}
+
+/// Cut the mesh at the plane and keep its positive side.
+pub fn positive_half(mesh: &SculptMesh, plane: MirrorPlane) -> Option<SculptMesh> {
     use std::collections::HashMap;
     let eps = 1e-6;
-    let side = |p: Vec3| p.x > eps;
-    let on = |p: Vec3| p.x.abs() <= eps;
+    let side = |p: Vec3| plane.distance(p) > eps;
+    let on = |p: Vec3| plane.distance(p).abs() <= eps;
     let painted = !mesh.colors.is_empty();
     let mut positions: Vec<Vec3> = Vec::new();
     let mut colors: Vec<[u8; 4]> = Vec::new();
@@ -228,7 +282,7 @@ pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
         *kept.entry(v).or_insert_with(|| {
             let mut p = mesh.positions[v as usize];
             if on(p) {
-                p.x = 0.0;
+                p = plane.project(p);
             }
             positions.push(p);
             if painted {
@@ -243,7 +297,7 @@ pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
         if !tri.iter().any(|&v| side(mesh.positions[v as usize])) {
             continue;
         }
-        // Clip the triangle to x >= 0 (Sutherland–Hodgman), sharing cut points per edge.
+        // Clip the triangle to the positive half-space (Sutherland–Hodgman), sharing cut points per edge.
         let mut poly: Vec<u32> = Vec::with_capacity(4);
         for k in 0..3 {
             let (a, b) = (tri[k], tri[(k + 1) % 3]);
@@ -251,14 +305,14 @@ pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
             if inside(a) {
                 poly.push(keep(a, &mut positions, &mut colors));
             }
-            if (pa.x > eps && pb.x < -eps) || (pa.x < -eps && pb.x > eps) {
+            let (da, db) = (plane.distance(pa), plane.distance(pb));
+            if (da > eps && db < -eps) || (da < -eps && db > eps) {
                 let key = (a.min(b), a.max(b));
                 let cut = *cuts.entry(key).or_insert_with(|| {
                     let (lo, hi) = (mesh.positions[key.0 as usize], mesh.positions[key.1 as usize]);
-                    let f = lo.x / (lo.x - hi.x);
-                    let mut p = lo.lerp(hi, f);
-                    p.x = 0.0;
-                    positions.push(p);
+                    let (lo_dist, hi_dist) = (plane.distance(lo), plane.distance(hi));
+                    let f = lo_dist / (lo_dist - hi_dist);
+                    positions.push(plane.project(lo.lerp(hi, f)));
                     if painted {
                         let (c0, c1) = (mesh.colors[key.0 as usize], mesh.colors[key.1 as usize]);
                         colors.push(std::array::from_fn(|i| (c0[i] as f32 + (c1[i] as f32 - c0[i] as f32) * f).round() as u8));
@@ -279,23 +333,23 @@ pub fn plus_x_half(mesh: &SculptMesh) -> Option<SculptMesh> {
     Some(SculptMesh::from_raw_painted(positions, indices, groups, colors))
 }
 
-/// `half` (X ≥ 0) and its mirror image on −X, welded where X is exactly 0.
-pub fn mirrored(half: &SculptMesh) -> SculptMesh {
+/// Reflect the positive half and share its vertices on the mirror plane.
+pub fn mirror_half(half: &SculptMesh, plane: MirrorPlane) -> SculptMesh {
     let painted = !half.colors.is_empty();
     let mut positions = half.positions.clone();
     let mut colors = half.colors.clone();
     let mut indices = half.indices.clone();
     let mut groups: Vec<u16> = (0..half.triangle_count() as u32).map(|t| half.group(t)).collect();
     let mut quads = half.quads.clone();
-    // The mirror image: vertices off the plane copied to −X, triangles turned round.
+    // The mirror image: vertices off the plane reflected, triangles turned round.
     let half = positions.len();
     let mut mirror = vec![0u32; half];
     for (v, slot) in mirror.iter_mut().enumerate() {
         let p = positions[v];
-        *slot = if p.x == 0.0 {
+        *slot = if plane.distance(p) == 0.0 {
             v as u32
         } else {
-            positions.push(Vec3::new(-p.x, p.y, p.z));
+            positions.push(plane.reflect(p));
             if painted {
                 colors.push(colors[v]);
             }
@@ -414,7 +468,7 @@ mod tests {
         let (p, i) = crate::mesh::cube_sphere(10, 1.0);
         let p: Vec<Vec3> = p.into_iter().map(|q| if q.x > 0.0 { q + Vec3::new(q.x * 0.4, 0.0, 0.0) } else { q }).collect();
         let m = SculptMesh::from_raw(p, i);
-        let w = mirrored_and_welded(&m).unwrap();
+        let w = mirrored_and_welded(&m, 0).unwrap();
         assert!(edge_counts(&w).values().all(|&c| c == 2), "welded shut");
         assert!(volume(&w) > 0.0);
         // Every vertex has its mirror image.

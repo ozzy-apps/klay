@@ -678,7 +678,7 @@ mod brush_tool_tests {
         }
         assert!(pen.mask.iter().max()>soft.mask.iter().max());
         assert!(soft.mask.iter().any(|&m|m>0));assert_eq!(soft.positions,positions);
-        let image=crate::brush_asset::BrushImage{id:1234,name:"black".into(),source:"black.png".into(),width:2,height:2,rgba:vec![[0,0,0,255];4]};
+        let image=crate::brush_asset::BrushImage{id:1234,name:"black".into(),source:Some("black.png".into()),width:2,height:2,rgba:vec![[0,0,0,255];4]};
         let mut blocked=make();let mut stroke=MaskStroke::begin(false,false).with_brush(BrushKind::MaskPen,
             StampSettings{alpha:Pattern::Image(std::sync::Arc::new(image)),..StampSettings::default()});
         stroke.dab_normal(&mut blocked,&brush,Vec3::Z,Vec3::Z);

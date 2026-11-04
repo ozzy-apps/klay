@@ -106,7 +106,7 @@ pub fn axis_box(view: &View, g: &Place, a: usize) -> Vec2 {
     view.project(g.centre + g.axis(a) * AXIS_BOX_AT * pixel(view, g.centre))
 }
 
-fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+pub(crate) fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;
     let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
     p.distance(a + ab * t)

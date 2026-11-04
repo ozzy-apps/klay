@@ -95,7 +95,18 @@ pub fn parse(bytes: &[u8]) -> Result<Imported, String> {
         return Err("every triangle in the file is flat (corners at one point)".into());
     }
     let groups = vec![0; indices.len() / 3];
-    Ok(Imported { positions, indices, groups, colors: Vec::new(), skipped })
+    Ok(Imported { positions, indices, groups, skipped, ..Imported::default() })
+}
+
+/// Orient an imported STL in Klay's Y-up coordinates when the input uses Z up.
+pub fn parse_oriented(bytes: &[u8], z_up: bool) -> Result<Imported, String> {
+    let mut mesh = parse(bytes)?;
+    if z_up {
+        for p in &mut mesh.positions {
+            *p = Vec3::new(p.x, p.z, -p.y);
+        }
+    }
+    Ok(mesh)
 }
 
 /// Binary when the size matches the count in the header. Many binary files also start with

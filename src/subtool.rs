@@ -25,6 +25,9 @@ pub struct SubTool {
     /// Stable id, also the key of its stand-in on the GPU.
     pub id: u64,
     pub name: String,
+    pub folder: String,
+    pub transpose_selected: bool,
+    pub sets: Vec<crate::selection_set::Set>,
     pub visible: bool,
     /// Bounds of what is drawn for it.
     pub bounds: Aabb,

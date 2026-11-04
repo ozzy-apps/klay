@@ -177,6 +177,7 @@ accent marks what is on. Buttons that share a row clip their labels inside narro
   version, build language and GitHub repository link. Close it with **Close**, **Escape** or a
   click outside the dialog; canvas input and sculpting shortcuts are suspended while it is open.
 - **Menu bar**: click a palette name to drop it down. A dot marks palettes that are also docked.
+- **LightBox**: press **,** (comma) or click **LightBox** to browse assets across the top of the workspace.
 - **Dock button** (the ◉ at the left of every palette header): click for a menu (left, right, top
   or bottom tray, or menu only), or drag it onto a highlighted canvas edge or between palettes in
   a tray. Click a docked palette's title to collapse it; sub-palettes collapse on their own.
@@ -205,11 +206,7 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 - **Pointer**: over the model the brush is the cursor, as in ZBrush: the system pointer hides
   while the brush ring is on the model or a stroke is under way (a small dot marks the
   brush centre), and shows over the interface, the empty canvas and the border.
-- **Document › Import**: an OBJ or STL as a new subtool (OBJ: polygons of any size, `o` / `g`
-  names as polygroups, vertex colours as polypaint; STL: binary or ASCII, corners at the same
-  position welded into one closed mesh, flat and repeated triangles left out, turned from
-  Z up to Y up while **3D Print › Z Up** is on). **Fit** centres and scales it to a new
-  primitive's size, so Draw Size suits it. **Document › Export** writes OBJ or STL.
+- **Document › Import** adds editable SubTools from mesh files. See [Model import](#model-import).
 - **Mesh › Deformation**: besides Offset and Size, **Smooth, Polish** (keeps the volume),
   **Inflate, Spherize, Noise, Twist** and **Taper** (about Y). Drag and release; they reshape
   the shown level as one undo step and masks hold.
@@ -234,12 +231,12 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
   about them, the outer ring turns about the view axis, the white circle moves freely and the
   yellow square scales evenly (drag up-right to grow). Live preview, one undo step on
   release, masks respected, like Transpose.
-- **Mesh › Layers**: **New** adds a layer that records (**REC**) what you sculpt; the eye shows
+- **Mesh › Layers**: **New** adds a layer that records (**REC**) shape, polypaint and masking. The eye shows
   or hides it, **Intensity** (-1..2) scales it live, **Delete** removes it and its effect,
   **Bake** / **Bake All** keep the effect and remove the layer. Every change is an undo
   step. Layers live on the highest subdivision level: Divide and Del Higher wait until they
-  are baked, and the level cannot change while one records. They stay with a subtool when
-  you switch subtools; they are not saved in projects yet (the shape is).
+  are baked, and the level cannot change while one records. Layers stay with their SubTool
+  and are stored in projects.
 - **Brush › Tablet pressure curves**: a Size and an Intensity curve (presets Linear, Soft,
   Firm, S; drag points, click to add, double-click to remove) with the pen's live pressure
   marked on them.
@@ -253,10 +250,9 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
 ### ZBrush tools added in 0.13
 
 - **Mesh › Geometry › Del Hidden** deletes the hidden polygons; **Close Holes** caps every
-  open border with a fan (each cap a new polygroup). **Deformation › Mirror And Weld** cuts
-  the subtool at X = 0, mirrors the +X half onto −X and welds the seam, so it becomes exactly
-  symmetric. All three need a subtool without subdivision levels and without layers, and are
-  one undo step each.
+  open border with a fan (each cap a new polygroup). Both need a subtool without subdivision
+  levels and without layers, and are one undo step each. See [Mirroring and naming SubTools](#mirroring-and-naming-subtools)
+  for **Deformation › Mirror And Weld**.
 - **Light** palette: drag on the sphere to place the key light (it turns with the view, as in
   ZBrush), **Intensity** and **Ambient**. It lights the four clays; MatCaps carry their own
   light.
@@ -264,11 +260,94 @@ Local/Transp/Ghost toggles remain marked **Not connected**.
   hidden; a recording layer is saved as not recording) and its **Morph Target**. Versions
   1–4 still open.
 
+### LightBox
+
+Press **,** (comma) to show or hide LightBox, as in ZBrush. Pick **Klay** for built-in assets
+or **User** for local files and imported assets. Use **Folder…** to choose the User asset
+root. LightBox uses category subfolders such as `Projects`, `Tools`, `Brushes`, `Alphas`, `Textures`
+and `Materials` when present. Otherwise it filters the chosen folder directly.
+
+Drag across the thumbnails or use the horizontal scrollbar. Choose one to four rows and
+use the back and forward buttons to revisit categories and folders. Double-click a folder
+to enter it or a thumbnail to load it. You can also select a tile and press **Enter**.
+
+Projects open `.klay` files. Tools append saved `.klay` SubTools or built-in primitives and
+import all [supported model formats](#model-import). Materials load image-based MatCaps.
+Alphas and Textures use PNG, JPEG and BMP. Double-clicking a file-backed alpha or texture
+sends it to Spotlight when Spotlight is shown. LightBox generates thumbnails for projects,
+saved tools, imported models and built-in primitives as you browse. A current sibling PNG named after the
+full model file name, for example `head.klay.png`, can supply a custom preview.
+
+**QuickSave**, beside **Projects**, shows previews of the rotating recovery files and opens
+them as copies for Save As.
+
+### Model import
+
+Open **Document › Import › Import Models…** and select one or more files. You can also
+open a model from **LightBox › User › Tools**. Imported geometry becomes editable SubTools.
+
+| Format | Mesh data |
+| --- | --- |
+| OBJ | Polygon boundaries, per-corner UVs, named polygroups and vertex colors. |
+| STL | Binary and ASCII. Shared corners are welded. **3D Print › Z Up** turns Z-up files into Klay’s Y-up orientation. |
+| GLB and glTF 2.0 | One SubTool per mesh node, with hierarchy transforms, primitive polygroups, first UV set and vertex colors. External geometry buffers can be in the model folder or a subfolder. |
+| FBX | ASCII and binary. One SubTool per mesh object, with world transforms, source axes and units, polygon boundaries, the first UV set, material slots as polygroups and vertex colors. |
+| GoZ | One mesh with triangles or quads, UVs, polygroups, polypaint and masks when present. |
+
+**Fit** centers each file and scales its largest dimension to a new primitive's size. All
+meshes from that file share the same transform. Turn Fit off to preserve placement and
+scale. FBX and glTF are brought into Klay’s Y-up coordinate system in metres.
+
+GLB, glTF, FBX and GoZ import the static mesh. Texture maps, rigging, animation, morph
+targets and native subdivision histories are outside this import workflow. GLB and glTF
+retain the source vertex splits at UV and normal seams. Export compressed glTF as
+uncompressed GLB or glTF before importing it.
+
+For a ZBrush ZTool (`.ztl`) or project (`.zpr`), open it in ZBrush and export FBX, OBJ or
+GoZ, then import the export into Klay. [Maxon interoperability guide](https://www.maxon.net/en/zbrush/features/interoperability)
+
+### Mirroring and naming SubTools
+
+Choose **X**, **Y** or **Z** under **Mesh › Deformation › Mirror Axis**. The mirror plane
+passes through the scene origin. **Mirror Copy** places a reflected copy of the shown
+level directly below the source. Keep the source active and use **Mesh › SubTool › Merge
+Down** to combine their shells into one SubTool. Merge Down requires both SubTools to have
+one subdivision level. To translate a copy, use **Duplicate**, select the copy, then move
+it with **Offset X**, **Offset Y** or **Offset Z**.
+
+**Mirror And Weld** cuts the active mesh at the selected plane, reflects its positive
+half, and welds the seam. It requires a mesh with one subdivision level and no layers.
+You can undo it in one step.
+
+Double-click any SubTool row to rename it. Type over the selected name and press **Enter**
+or click **Rename**. Press **Esc** to cancel. The name is saved with the project.
+
+Click **Fill Color** below the color picker or in the **Space** menu to apply the
+picked color as polypaint at the shown subdivision level. Fully masked and hidden-only vertices retain their color.
+Partially masked vertices blend with the new color. The fill is one undo step.
+
+### Custom brush presets
+
+Set up your brush and choose **Brush › Save Brush…** in the Brushes section. Enter a name
+and click **Save**. If the name already exists, **Replace** writes the current setup over
+that preset.
+
+After restarting Klay, open **LightBox › User › Brushes** and double-click your preset.
+**Brush › User Brushes** opens the same tab directly. A preset restores the base brush, draw
+size, Z and RGB modes and intensities, focal shift, both colors, stroke, pressure curves,
+automatic masking and brush-specific options. It keeps the alpha's rotation mode and angle,
+and embeds any imported alpha or texture so the original image files can be moved or deleted.
+
+Klay saves presets as `.klaybrush` files in the `Brushes` subfolder of the User asset root.
+The default root is `$XDG_DATA_HOME/klay/lightbox` or `~/.local/share/klay/lightbox`. To
+transfer a preset, copy its file to the other installation's User `Brushes` folder.
+
 ### Alphas in 0.14
 
 - **Alpha rotation**, above the alphas (Alpha palette and the shelf's Alpha popup): **Fixed** (at **Angle**), **Follow** (the alpha
-  rolls with the stroke direction, ZBrush's Roll) or **Random** (a new turn every dab, as
-  ZBrush's spray-style texture painting does), for sculpting, painting and the mask pen.
+  rolls with the stroke direction, ZBrush's Roll) or **Random** (the default, with a new turn
+  for each dab), for sculpting, painting and the mask pen. DragRect and DragDot keep their
+  first random turn as you place the stamp.
 - Nine new detail alphas, painted by Klay as tileable images: **Pores, Wrinkles,
   Scales, Dry Cracks, Weave, Rock, Bark, Leather, Fibers**. As alphas they fade softly at the
   stamp's edge; as textures (Texture palette) they repeat seamlessly for texture painting.
@@ -364,9 +443,11 @@ loops around it to follow. **Curves Strength** (0–100, default 50) sets how cl
 the direction along a curve is held exactly and the loop's vertices are put on it; lower
 values let the form have more say. Draw a ring around an arm, a line down a seam or loops
 around the eyes and mouth. With symmetry on, a curve is mirrored and the copies are one
-guide. **Alt + click** a curve to delete it; **Delete guides** under ZRemesher clears them
-all. Guides stay after ZRemesher (draw once, remesh at several counts), move with the
-subtool when all of it is moved (Transpose, Deformation), and are not part of undo or saved in projects.
+guide. **Alt + click** any visible segment with ZRemesherGuide selected to delete that
+guide, including its symmetry copies. **Delete guides** clears them all. **Ctrl + Z** and
+**Ctrl + Shift + Z** undo and redo drawing, deletion and clearing. Guides stay available
+after remeshing and move with whole-SubTool transforms. Guide curves and their history
+belong to the current session.
 
 **Use Polypaint** lets paint set the density (ZBrush: Use Polypaint): paint **red** where you
 want more quads and **blue** where you want fewer; unpainted, white and grey stay as they
@@ -374,9 +455,16 @@ are. **ColorDensity** (1–4, default 2) is how many times more (red) or fewer (
 pure colour asks for; the total stays about the target, so painting one area red also thins
 the rest a little. It adds to AdaptiveSize.
 
-With **X symmetry** on, ZRemesher makes symmetric topology: the +X half is remeshed with an
-edge loop held on X = 0, then mirrored and welded, so every vertex has its mirror image and
-the middle loop runs straight down the plane. Guides drawn on −X count for both sides.
+Under **Mesh › ZRemesher › Symmetry**, choose **Force X**, **Force Y** or **Force Z** to
+mirror the remesh regardless of brush settings. **Brush symmetry** follows the first
+enabled brush mirror axis in X, Y, Z order. **Off** remeshes the entire shape. Turn on
+**SubTool Center** to use the midpoint of the SubTool's bounds on the selected axis.
+Clear it to use the scene origin.
+
+ZRemesher uses the positive side as the source, so differences on the negative side
+are replaced. The remesher holds a loop on the cut and welds it where the surface meets
+the plane. Guides on either side can steer the mirrored topology. If the positive half
+is empty, try **SubTool Center** or choose another axis.
 
 **KeepCreases** (on by default) runs an edge loop exactly along every creased edge (see
 Crease below) and creases the new edges there again, so the next Divide keeps them sharp.
@@ -421,6 +509,33 @@ The method is Instant Meshes (Jakob et al. 2015): a four-way direction field and
 lattice are smoothed over a graph of surface samples, the lattice points become vertices,
 and every face is split through its middle so the result is all quads.
 
+### OBJ round trips and subdivision
+
+**Document › Import** keeps OBJ polygons, named groups and UVs on the lowest level.
+Export that level as OBJ, edit it in your modeling app, then use **Update from OBJ…** to
+return it to the active SubTool. Keep vertex numbering for an exact cage update. If the
+topology changes, Klay rebuilds the subdivision stack and projects the old detail within
+the current Project distance. The import uses Klay scene coordinates. Bake layers and
+unfreeze levels before updating. Undo restores the original stack.
+
+In **Mesh › Geometry**, **Smt** controls position smoothing on the next Divide.
+All-quad cages use Catmull–Clark for both regular and Dynamic Subdivision. Mixed cages
+use Loop smoothing. **Suv** smooths the UVs inside islands and preserves their boundaries.
+Each level saves its own rule, so existing projects keep their original subdivision.
+
+### SubTool folders and selection sets
+
+In **Mesh › SubTool**, use **New Folder** to name a folder and add the active SubTool.
+Use the folder menu to move another SubTool into it. Ctrl-click a row to add it to the
+Gizmo selection, or use **Transpose Set** to select a folder's visible members. A Gizmo
+drag moves the active SubTool and the selected visible SubTools together. Each SubTool
+gets its own undo entry.
+
+In **Mesh › Selection Sets**, enter a name and press **Store Set**. Select it later and
+restore the **Mask**, **Groups**, **UVs** or **Morph** independently. Klay checks the saved
+subdivision level and topology before restoring. Folders and sets are stored with the
+project and individual saved SubTools.
+
 ### UV Map
 
 Geometry › **UV Map** (ZBrush: UV Master) lays the subtool out flat in UV space, for
@@ -436,8 +551,12 @@ background (see Long operations).
 - **Polygroups** makes the islands follow the polygroups instead (each connected part of a
   group is one island, split further only where it could not lie flat): group the parts
   you want as islands, then unwrap.
-- UVs live on the lowest level, as in ZBrush: Divide and sculpting keep them, Export OBJ
-  writes them (`vt`) while the lowest level is shown, and projects save them. Anything that
+- **Mark Seams** toggles seams by clicking edges on the lowest level. **Unwrap** respects
+  marked edges and can extend an incomplete cut. **Checker** shows a tiled preview on the cage.
+  Click an island in the UV layout to select it. Use the arrow buttons to move it, **Rotate**
+  to turn it 90°, **−** and **+** to resize it, or **Pack Islands** to repack the layout.
+- UVs live on the lowest level. Export OBJ writes them (`vt`) while the lowest level is
+  shown or when the shown level inherits a **Suv** subdivision. Projects save them. Anything that
   rebuilds the mesh (ZRemesher, Decimation, Remesh, Sculptris Pro, ZModeler, CurveTube) starts
   without UVs; undo brings back the mesh and its UVs together. **Delete UVs** removes them.
 
@@ -559,6 +678,8 @@ normal and displacement maps, subdivision levels with the detail on them.
 - **Color Map** saves the highest level's polypaint as an 8-bit PNG, white where nothing is
   painted (ZBrush: Texture Map › New From Polypaint). It needs UVs but no subdivision levels,
   so a painted model with one level bakes too.
+- **Vector Displacement** saves signed XYZ offsets as 32-bit RGB OpenEXR in model units.
+  **Object Space** uses the model axes. Tangent space uses the cage's UV frame.
 - **1K 2K 4K 8K** is the size. **Samples** (1–4, default 2) is how many samples each texel
   takes along each side, for smoother maps. **Padding** (default 8) grows each island by that
   many texels, so filtering at the seams does not pull in the background.
@@ -570,6 +691,11 @@ last map. A model of 4.9 million triangles bakes a 2K map in 0.7 s. `--bake-norm
 `--bake-displacement PATH` and `--bake-color PATH` bake at startup (after `--demo` and
 `--open`), unwrapping first if needed. Shelf commands `cmd:bake-normal`,
 `cmd:bake-displacement` and `cmd:bake-color`.
+
+In **Multi Map Exporter**, choose the map types and click **Export Visible Maps…**. Klay
+bakes one map at a time with the Texture Maps settings. It writes the files to a new
+`Klay Maps` folder in the location you choose. Only visible SubTools with UVs take part,
+and maps that require higher levels are skipped for single-level SubTools.
 
 ### Export glTF
 
@@ -737,6 +863,8 @@ NanoMesh and ZModeler's Do Nothing.
   uses; as the current brush a plain drag uses it too. Alt works on the other side.
   - **Select Rect / Select Lasso**: what the outline covers stays shown, the rest is hidden.
   - **Clip Rect / Clip Circle**: the model is pressed into the outline all the way through.
+    Hold **Space** during the drag to move the outline. Clip Rect on a closed mesh keeps
+    moved vertices in the cut's cross-section where the rectangle edge crosses the model.
   - **Trim Curve**: the arrow's side is cut away exactly along the line and closed flat.
   - **Trim Rect / Circle / Lasso**: only what is inside is kept, rebuilt as a closed surface by
     the boolean remesher (Mesh › Boolean's resolution), as ZBrush trims a DynaMesh.
@@ -971,8 +1099,10 @@ from their name (Zipper **Z I**, Clip Line **C C**). Clicking in the search box 
 - **Layer** builds a capped thickness per stroke. It is now in the compact Sculpt working
   set; release and start another stroke to add another layer.
 - **Clip Line**: choose it, drag a guide across the model and release to push one side onto
-  the line. It can start outside the model. **Alt** flips the clipped side, **Shift** snaps
-  the angle and **Escape** cancels. The arrow shows the side that will move. It preserves
+  the line. It can start outside the model. Keep the mouse or pen down and hold **Space**
+  while moving to reposition the whole line. Release Space to resume adjusting its endpoint.
+  **Alt** flips the clipped side, **Shift** snaps the angle and **Escape** cancels. The arrow
+  shows the side that will move. It preserves
   topology, vertex paint, masks and hidden regions. This is straight-line clipping; it does
   not cut polygons or add curve control points. Ctrl+Shift also draws the line when this
   tool is selected; other tools retain Ctrl+Shift visibility selection. With **X symmetry**
@@ -984,6 +1114,8 @@ from their name (Zipper **Z I**, Clip Line **C C**). Clicking in the search box 
   a built-in pattern or **Import Alpha… / Import Texture…**. PNG, JPEG and BMP are supported.
   Alpha luminance and transparency shape the stamp. Texture **Relief** modulates sculpting;
   **Tiling** controls repetition within the brush footprint.
+  **Alpha rotation › Random** turns each freehand dab. Drag brushes such as Grab pick one
+  rotation at the start of the pull and use it for both sculpting and paint.
 - **Z** sculpts, **RGB** paints color only and **Z+RGB** does both. Selecting Paint activates
   RGB mode. Choose color with the left HSV picker; RGB Intensity controls paint opacity.
   Textures supply their sampled color when painting, tinted by the chosen color. Masks,
@@ -1127,12 +1259,13 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | Ctrl + right / middle drag | Zoom |
 | Scroll | Zoom towards the cursor (Ctrl + scroll: brush radius) |
 | Space (hold) or right-click tap | Quick menu: left color picker; Draw Size, Z Intensity, Focal Shift, RGB Intensity, brushes, then mode buttons |
+| `,` | Show or hide LightBox |
 | `S` / `U` / `I` / `O` | Draw Size / Z Intensity / RGB Intensity / Focal Shift popup at the cursor |
 | `[` `]` | Brush radius |
 | `1`–`9` | Draw, Smooth, Grab, Flatten, Inflate, Dam Standard, Pinch, Clay, Clay Buildup |
 | `B` | Searchable brush catalog; Mask, Detail and Clip categories |
 | Selected Mask brush, left drag / Alt + left drag | Apply / erase the mask; Ctrl temporarily restores the last mask brush while sculpting |
-| Selected Clip Line, left drag | Push one side onto the guide on release; Alt flips, Shift snaps, Escape cancels |
+| Selected Clip Line, left drag | Push one side onto the guide on release. Space moves the line, Alt flips, Shift snaps, Escape cancels. |
 | `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode |
 | `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press (Shift snaps it to 45°) |
 | `W`, drag the line's middle circle | Move the active subtool in the view plane |

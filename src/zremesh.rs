@@ -36,7 +36,7 @@
 //! result welds back to whatever it was cut from: a strip of quads (and triangles where
 //! the counts differ) joins the old border to the new one.
 
-use crate::mesh::SculptMesh;
+use crate::{mesh::SculptMesh, symmetry::MirrorPlane};
 use crate::fx::FxHashMap as HashMap;
 use glam::Vec3;
 use rayon::prelude::*;
@@ -61,9 +61,8 @@ pub struct Settings {
     /// 1..=4: how many times more (red) or fewer (blue) quads polypaint asks for (ZBrush:
     /// ColorDensity).
     pub color_density: f32,
-    /// Symmetric across X (ZBrush: with X symmetry on): the +X half is remeshed and
-    /// mirrored, with an edge loop on X = 0.
-    pub symmetric: bool,
+    /// Remesh the positive half and mirror it across this plane.
+    pub mirror: Option<MirrorPlane>,
     /// Keep open borders exactly, vertex for vertex (ZBrush: FreezeBorder).
     pub freeze_border: bool,
     /// Edge loops along creased edges, creased again (ZBrush: KeepCreases).
@@ -87,17 +86,20 @@ struct Features {
 }
 
 impl Features {
-    fn folded(&self) -> Self {
-        let f = |p: &Vec3| Vec3::new(p.x.abs(), p.y, p.z);
+    fn folded(&self, plane: MirrorPlane) -> Self {
+        let f = |p: &Vec3| plane.fold(*p);
         Self { lines: self.lines.iter().map(|l| l.iter().map(f).collect()).collect(), corners: self.corners.iter().map(f).collect() }
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, symmetric: false, freeze_border: false, keep_creases: true, detect_edges: false, alternate: false }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, mirror: None, freeze_border: false, keep_creases: true, detect_edges: false, alternate: false }
     }
 }
+
+#[cfg(test)]
+const TEST_X_PLANE: MirrorPlane = MirrorPlane { axis: crate::symmetry::Axis::X, at: 0.0 };
 
 /// The density polypaint asks for at each vertex, as the log of the factor on the quad count:
 /// red up to `ln(color_density)`, blue down to minus that, unpainted and grey nothing.
@@ -666,11 +668,19 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     let (lines, corners) = crate::crease::lines(mesh, &edges, 0.0);
     let features = Features { lines, corners };
     crate::jobs::check()?;
-    let (mut out, stats) = if s.symmetric { symmetric(mesh, s, guides, &features)? } else { remesh(mesh, s, guides, &[], &features, false)? };
+    let (mut out, stats) = match s.mirror {
+        Some(plane) => symmetric(mesh, s, guides, &features, plane)?,
+        None => remesh(mesh, s, guides, &[], &features, None)?,
+    };
     if !creased.is_empty() {
-        let (lines, _) = crate::crease::lines(mesh, &creased, 0.0);
+        let (mut lines, _) = crate::crease::lines(mesh, &creased, 0.0);
+        if let Some(plane) = s.mirror {
+            for point in lines.iter_mut().flatten() {
+                *point = plane.fold(*point);
+            }
+        }
         let quad = stats_quad(&out);
-        crease_along(&mut out, &lines, quad);
+        crease_along(&mut out, &lines, quad, s.mirror);
     }
     if let Some(why) = out.subdivision_blocker() {
         return Err(format!("the result {why} · change Target Polygons Count"));
@@ -686,10 +696,11 @@ fn surface_area(mesh: &SculptMesh) -> f32 {
 }
 
 /// Crease the edges of `out` that lie on `lines` (KeepCreases).
-fn crease_along(out: &mut SculptMesh, lines: &[Vec<Vec3>], quad: f32) {
+fn crease_along(out: &mut SculptMesh, lines: &[Vec<Vec3>], quad: f32, mirror: Option<MirrorPlane>) {
     let g = Guides::new(lines, quad);
     let (on, mid) = (quad * 0.02, quad * 0.15);
-    let near: Vec<bool> = out.positions.par_iter().map(|&p| g.nearest(p, on).is_some()).collect();
+    let fold = |p| mirror.map_or(p, |plane| plane.fold(p));
+    let near: Vec<bool> = out.positions.par_iter().map(|&p| g.nearest(fold(p), on).is_some()).collect();
     let mut edges: Vec<(u32, u32)> = out
         .indices
         .par_chunks_exact(3)
@@ -697,7 +708,7 @@ fn crease_along(out: &mut SculptMesh, lines: &[Vec<Vec3>], quad: f32) {
             let (near, g, p) = (&near, &g, &out.positions);
             (0..3).filter_map(move |k| {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
-                (near[a as usize] && near[b as usize] && g.nearest((p[a as usize] + p[b as usize]) * 0.5, mid).is_some()).then_some((a.min(b), a.max(b)))
+                (near[a as usize] && near[b as usize] && g.nearest(fold((p[a as usize] + p[b as usize]) * 0.5), mid).is_some()).then_some((a.min(b), a.max(b)))
             })
         })
         .collect();
@@ -707,13 +718,13 @@ fn crease_along(out: &mut SculptMesh, lines: &[Vec<Vec3>], quad: f32) {
     out.set_creases(bits);
 }
 
-/// Symmetric across X: the +X half remeshed to half the target, with its cut edge on X = 0
-/// held as a full-strength guide so an edge loop runs on the plane, then mirrored and welded.
-/// Guides on −X are folded over to +X.
-fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &Features) -> Result<(SculptMesh, Stats), String> {
+/// Remesh the positive half to half the target, hold the cut at full strength, then
+/// reflect and weld along the plane.
+fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &Features, plane: MirrorPlane) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
-    let half = crate::subtool_ops::plus_x_half(mesh).ok_or("nothing on the +X side to mirror")?;
-    let folded: Vec<Vec<Vec3>> = guides.iter().map(|g| g.iter().map(|p| Vec3::new(p.x.abs(), p.y, p.z)).collect()).collect();
+    let half = crate::subtool_ops::positive_half(mesh, plane)
+        .ok_or_else(|| format!("No surface on the +{} side of the mirror plane · try SubTool Center or another axis", plane.axis.name()))?;
+    let folded: Vec<Vec<Vec3>> = guides.iter().map(|g| g.iter().map(|&p| plane.fold(p)).collect()).collect();
     // The cut edge: open edges with both ends on the plane.
     let mut count: HashMap<(u32, u32), u32> = HashMap::default();
     for t in half.indices.chunks_exact(3) {
@@ -724,11 +735,11 @@ fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &F
     }
     let seam: Vec<Vec<Vec3>> = count
         .iter()
-        .filter(|&(&(a, b), &c)| c == 1 && half.positions[a as usize].x == 0.0 && half.positions[b as usize].x == 0.0)
+        .filter(|&(&(a, b), &c)| c == 1 && plane.distance(half.positions[a as usize]) == 0.0 && plane.distance(half.positions[b as usize]) == 0.0)
         .map(|(&(a, b), _)| vec![half.positions[a as usize], half.positions[b as usize]])
         .collect();
-    let hs = Settings { target_k: s.target_k * 0.5, symmetric: false, ..*s };
-    let (out, mut stats) = remesh(&half, &hs, &folded, &seam, &features.folded(), true)?;
+    let hs = Settings { target_k: s.target_k * 0.5, mirror: None, ..*s };
+    let (out, mut stats) = remesh(&half, &hs, &folded, &seam, &features.folded(plane), Some(plane))?;
     // Frozen border vertices stay exactly where they are.
     let frozen: crate::fx::FxHashSet<[u32; 3]> = if s.freeze_border { half.positions.iter().map(|p| p.to_array().map(f32::to_bits)).collect() } else { Default::default() };
     // Its open border goes onto the plane; nothing else may reach it, or it would weld.
@@ -754,16 +765,17 @@ fn symmetric(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], features: &F
         if frozen.contains(&p.to_array().map(f32::to_bits)) {
             continue;
         }
-        if border[v] && p.x.abs() < reach {
-            p.x = 0.0;
-        } else if p.x <= 0.0 {
-            p.x = nudge;
+        let distance = plane.distance(*p);
+        if border[v] && distance.abs() < reach {
+            *p = plane.project(*p);
+        } else if distance <= 0.0 {
+            *p = plane.project(*p) + plane.axis.unit() * nudge;
         }
     }
     let groups: Vec<u16> = (0..out.triangle_count() as u32).map(|t| out.group(t)).collect();
     let grouped = out.group_count() > 1;
     let snapped = SculptMesh::from_raw_full(positions, out.indices.clone(), if grouped { groups } else { Vec::new() }, Vec::new(), out.quads.clone());
-    let full = crate::subtool_ops::mirrored(&snapped);
+    let full = crate::subtool_ops::mirror_half(&snapped, plane);
     stats.quads = full.triangle_count() / 2;
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
     Ok((full, stats))
@@ -781,9 +793,8 @@ fn stats_quad(m: &SculptMesh) -> f32 {
 }
 
 /// ZRemesh `mesh`, with `seams` held as full-strength guides (the symmetry plane's cut) and
-/// loops put exactly on the `features`. With `half` (the +X half of a symmetric remesh),
-/// FreezeBorder leaves out borders on the plane.
-fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, half: bool) -> Result<(SculptMesh, Stats), String> {
+/// loops put exactly on the `features`. FreezeBorder leaves out the cut on the mirror plane.
+fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, cut: Option<MirrorPlane>) -> Result<(SculptMesh, Stats), String> {
     let start = Instant::now();
     let mut stats = Stats::default();
     let target = (s.target_k * 1000.0).max(50.0);
@@ -1266,7 +1277,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     // nearest it by a strip. A triangle is kept as a quad with its last corner repeated.
     let mut pinned = vec![false; out_p.len()];
     if s.freeze_border && !closed {
-        let strip = frozen_strips(mesh, &quads, &mut out_p, half);
+        let strip = frozen_strips(mesh, &quads, &mut out_p, cut);
         pinned.resize(out_p.len(), true);
         quads.extend(strip);
     }
@@ -1549,13 +1560,14 @@ fn border_loops<'a>(faces: impl Iterator<Item = &'a [u32]>) -> Vec<Vec<u32>> {
 
 /// FreezeBorder: every open border of `mesh` is added to `out_p` as it is and joined to the
 /// new border of `quads` nearest it by a strip of quads, with triangles where one side has
-/// more vertices than the other. Returns the strip. With `half` (the +X half of a symmetric
-/// remesh) the cut on the X = 0 plane is not frozen: a border crossing the plane is frozen
+/// more vertices than the other. Returns the strip. A border crossing the mirror plane is frozen
 /// from the plane to the plane, joined to the stretch of the new border between the same
 /// points, and its mirror image joins it there.
-fn frozen_strips(mesh: &SculptMesh, quads: &[[u32; 4]], out_p: &mut Vec<Vec3>, half: bool) -> Vec<[u32; 4]> {
+fn frozen_strips(mesh: &SculptMesh, quads: &[[u32; 4]], out_p: &mut Vec<Vec3>, plane: Option<MirrorPlane>) -> Vec<[u32; 4]> {
     let mp = &mesh.positions;
-    let cut = |a: u32, b: u32| half && mp[a as usize].x == 0.0 && mp[b as usize].x == 0.0;
+    let cut = |a: u32, b: u32| plane.is_some_and(|p| {
+        p.distance(mp[a as usize]) == 0.0 && p.distance(mp[b as usize]) == 0.0
+    });
     // Old borders: whole loops, and pieces of loops between cut edges.
     let mut olds: Vec<(Vec<u32>, bool)> = Vec::new();
     for l in border_loops(mesh.indices.chunks_exact(3)) {
@@ -1760,7 +1772,7 @@ mod tests {
         let before = border_points(&dome);
         assert_eq!(before.len(), 4 * 30);
         for symmetric in [false, true] {
-            let st = Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, symmetric, ..Settings::default() };
+            let st = Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, mirror: symmetric.then_some(TEST_X_PLANE), ..Settings::default() };
             let (out, stats) = zremesh(&dome, &st, &[]).unwrap();
             eprintln!("symmetric {symmetric}: {stats:?}");
             let after = border_points(&out);
@@ -1929,7 +1941,7 @@ mod tests {
         let (p, i) = crate::mesh::cube_sphere(40, 1.0);
         let p: Vec<Vec3> = p.into_iter().map(|q| Vec3::new(q.x, q.y * 1.3 + 0.2 * q.y * q.y, q.z + 0.1)).collect();
         let m = SculptMesh::from_raw(p, i);
-        let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, symmetric: true, ..Settings::default() };
+        let s = Settings { target_k: 1.0, keep_groups: false, adaptive: 0.0, mirror: Some(TEST_X_PLANE), ..Settings::default() };
         let (out, stats) = zremesh(&m, &s, &[]).unwrap();
         eprintln!("{stats:?}");
         let quads = out.triangle_count() / 2;
@@ -1969,7 +1981,7 @@ mod tests {
         })
         .unwrap();
         let sym = std::env::var("KLAY_SYM").is_ok();
-        let (out, _) = zremesh(&dome, &Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, symmetric: sym, ..Settings::default() }, &[]).unwrap();
+        let (out, _) = zremesh(&dome, &Settings { target_k: 0.5, keep_groups: false, adaptive: 0.0, freeze_border: true, mirror: sym.then_some(TEST_X_PLANE), ..Settings::default() }, &[]).unwrap();
         let mut f = String::new();
         for p in &out.positions {
             f += &format!("v {} {} {}\n", p.x, p.y, p.z);
@@ -2063,7 +2075,7 @@ mod quad_tests {
         eprintln!("{} quads; {} faces guessed from edge lengths", stats.quads, guessed.faces.len());
         assert!(guessed.faces.len() > pm.faces.len(), "the guess leaves triangles");
         // Symmetric: the mirrored half keeps its quads too.
-        let (sym, st) = zremesh(&m, &Settings { symmetric: true, ..s }, &[]).unwrap();
+        let (sym, st) = zremesh(&m, &Settings { mirror: Some(TEST_X_PLANE), ..s }, &[]).unwrap();
         let lone = sym.quads.iter().filter(|&&q| q == crate::mesh::LONE).count();
         assert_eq!(crate::mesh::quad_tests::all_paired(&sym), sym.triangle_count() - lone);
         assert_eq!(crate::zmodeler::PolyMesh::from_mesh(&sym).0.faces.len(), st.quads + lone);

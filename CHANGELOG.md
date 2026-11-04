@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.46.0 — 2026-11-04
+
+- ZRemesher guide strokes, single-guide deletion and clearing all guides support Undo and Redo. Alt-click selects the nearest visible guide segment, including lines off the current mesh.
+- **Mesh › ZRemesher › Symmetry** can follow the brush mirror axis, turn mirroring off, or force X, Y or Z. **SubTool Center** places the plane at the midpoint of the active mesh on that axis.
+- Hold **Space** during a Clip Line, Clip Rect or Clip Circle drag to move the guide. Release Space to resume shaping the stroke.
+- Clip Rect constrains moved vertices to the cut's cross-section on closed meshes, preventing flattened overhangs along the rectangle edge.
+
+## 0.45.0 — 2026-11-04
+
+- **Document › Import Models** and **LightBox › User › Tools** accept GLB, glTF, FBX and GoZ alongside OBJ and STL. Multipart GLB, glTF and FBX imports keep their transforms and fit as an assembly.
+- **Mesh › Deformation** adds an X/Y/Z axis selector and **Mirror Copy**, which places the reflected mesh below its source for **Merge Down**. **Mirror And Weld** uses the selected axis.
+- **Fill Color** below the color picker and in the Space menu applies the current color to visible vertices with mask falloff and one undo step.
+- Double-click a **SubTool** row to rename it.
+
+## 0.44.0 — 2026-11-04
+
+- OBJ import and export preserve polygon boundaries, named groups and per-corner UVs. **Document › Import › Update from OBJ…** updates the active SubTool, carrying its sculpted levels or projecting detail onto revised topology.
+- **Divide** and **Dynamic Subdivision** use Catmull–Clark on all-quad cages. **Smt** controls geometry smoothing and **Suv** smooths UVs while holding island boundaries. Project format 13 records each level’s rule and reads existing Loop stacks.
+- Layers record polypaint and masks alongside sculpting. SubTool folders, Gizmo multi-selection and named selection sets keep multipart projects organized.
+- **UV Map** adds manual seams, a checker preview, island transforms and packing. **Texture Maps** adds signed RGB vector displacement in EXR. **Multi Map Exporter** bakes selected maps for visible SubTools in one background job.
+
+## 0.43.0 — 2026-11-04
+
+- **Brush › Save Brush…** saves a named preset to **LightBox › User › Brushes**. Presets restore the brush, Z and RGB settings, colors, stroke mode, pressure curves, masking and stamp settings. Imported alpha and texture pixels are embedded, including the alpha's rotation mode and angle.
+
+## 0.42.1 — 2026-11-04
+
+- LightBox puts QuickSave next to Projects. QuickSaves, projects, saved tools, OBJ and STL files, and built-in primitives get model thumbnails. LightBox renders previews in the background and refreshes them when QuickSave rotates a file.
+
+## 0.42.0 — 2026-11-04
+
+- Added **LightBox**, a local asset browser opened with comma or the top-bar button. Browse Projects, Tools, Brushes, Materials, Alphas, Textures and QuickSave. Double-click to load, drag horizontally to scroll, and choose one to four rows.
+- Set a User asset folder to browse subfolders and supported local files. LightBox also shows imported alphas, textures and MatCaps. QuickSave opens a recovery copy for Save As.
+
+## 0.41.3 — 2026-11-04
+
+- Alpha rotation defaults to Random. A DragRect or DragDot preview keeps its initial random turn until release.
+- Z+RGB shares alpha and texture samples between paint and sculpt. DragRect and DragDot update once per frame, restore only the previous preview, and upload adjacent paint chunks together.
+
+## 0.41.2 — 2026-11-04
+
+- Fixed the offset between sculpting and polypaint when using an alpha with Grab and other drag brushes in Z+RGB. Both use the same alpha projection and keep one Random rotation for the entire pull.
+
+## 0.41.1 — 2026-11-04
+
+- Fixed the diagonal seam in the Space menu and shelf color pickers. The rounded saturation and value gradient now matches the color sampled for the swatch, hex readout and polypaint.
+
 ## 0.41.0 — 2026-11-03
 
 - **Transpose Master** (SubTool › Transpose Master, ZBrush: ZPlugin › Transpose Master): **TPoseMesh** merges the lowest levels of the visible subtools into one new subtool, one polygroup per source, and hides the sources; pose it with Transpose, the Gizmo, masks (Polygroup masking picks a part) and the Move brushes; **TPose → SubT** hands the pose back to every subtool's lowest level with its detail riding along, as one undo step on each subtool, deletes the TPoseMesh and shows the sources again. A TPoseMesh whose polygons changed is refused; deleting it frees the sources. Shelf commands `cmd:tpose-mesh` and `cmd:tpose-subt`.

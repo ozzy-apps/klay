@@ -334,17 +334,16 @@ impl SculptMesh {
         }
         let old_tris: Vec<[u32; 3]> = indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]].map(|v| remap[v as usize])).collect();
         let mesh = Self::from_partition(groups, positions, indices, tri_groups, colors, Vec::new(), Vec::new(), quads);
-        // Triangles keep their corners in order, rotated at most: key by the sorted corners.
-        let key = |t: [u32; 3]| {
-            let mut k = t;
-            k.sort_unstable();
-            k
-        };
+        // Regrouping preserves corner order and the relative order of repeated triangles.
         let mut at: crate::fx::FxHashMap<[u32; 3], u32> = crate::fx::FxHashMap::default();
-        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
-            at.insert(key([tri[0], tri[1], tri[2]]), t as u32);
+        let mut next = vec![u32::MAX; old_tris.len()];
+        for (t, tri) in mesh.indices.chunks_exact(3).enumerate().rev() {
+            next[t] = at.insert([tri[0], tri[1], tri[2]], t as u32).unwrap_or(u32::MAX);
         }
-        let tri_of_old: Vec<u32> = old_tris.iter().map(|&t| at.get(&key(t)).copied().unwrap_or(u32::MAX)).collect();
+        let tri_of_old = old_tris.iter().map(|t| {
+            let slot = at.get_mut(t).expect("regrouped triangle");
+            std::mem::replace(slot, next[*slot as usize])
+        }).collect();
         (mesh, remap, tri_of_old)
     }
 
@@ -1334,6 +1333,30 @@ impl SculptMesh {
         w.flush()
     }
 
+    /// The two triangles belonging to each marked quad, indexed by triangle.
+    pub(crate) fn quad_mates(&self) -> Vec<Option<usize>> {
+        let mut pending = crate::fx::FxHashMap::default();
+        let mut mates = vec![None; self.triangle_count()];
+        for (t, &d) in self.quads.iter().enumerate().filter(|&(_, d)| *d != LONE) {
+            let d = d as usize;
+            let a = self.indices[3 * t + d];
+            let b = self.indices[3 * t + (d + 1) % 3];
+            if let Some(q) = pending.remove(&(b, a)) {
+                mates[t] = Some(q);
+                mates[q] = Some(t);
+            } else {
+                pending.insert((a, b), t);
+            }
+        }
+        mates
+    }
+
+    fn quad_uvs_join(&self, t: usize, q: usize, uvs: &[[glam::Vec2; 3]]) -> bool {
+        let (Some(a), Some(b)) = (uvs.get(t), uvs.get(q)) else { return true };
+        let (d, e) = (self.quads[t] as usize, self.quads[q] as usize);
+        a[d] == b[(e + 1) % 3] && a[(d + 1) % 3] == b[e]
+    }
+
     /// Append this mesh to an OBJ stream as object `name`, with normals. `first` is the
     /// number of vertices already written (OBJ indices are global and 1-based).
     #[cfg(test)]
@@ -1344,45 +1367,117 @@ impl SculptMesh {
     /// [`write_obj`](Self::write_obj) with UVs: `uvs` holds one triple per triangle (or is
     /// empty for none), `first_uv` the number of `vt` lines already written. Equal UVs are
     /// written once. Returns how many `vt` lines it wrote.
+    #[cfg(test)]
     pub fn write_obj_uv<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize, uvs: &[[glam::Vec2; 3]], first_uv: usize) -> std::io::Result<usize> {
+        self.write_obj_layout(w, name, first, uvs, first_uv, None)
+    }
+
+    pub fn write_obj_layout<W: std::io::Write>(&self, w: &mut W, name: &str, first: usize, uvs: &[[glam::Vec2; 3]], first_uv: usize, layout: Option<&crate::obj::Layout>) -> std::io::Result<usize> {
         writeln!(w, "o {name}")?;
-        for p in &self.positions {
-            writeln!(w, "v {} {} {}", p.x, p.y, p.z)?;
+        for (i, p) in self.positions.iter().enumerate() {
+            if let Some(&[r, g, b, a]) = self.colors.get(i).filter(|c| c[3] != 0) {
+                writeln!(w, "v {} {} {} {} {} {}", p.x, p.y, p.z, r as f32 / a as f32, g as f32 / a as f32, b as f32 / a as f32)?;
+            } else {
+                writeln!(w, "v {} {} {}", p.x, p.y, p.z)?;
+            }
         }
         for n in self.compute_all_normals() {
             let n = unpack_normal(n);
             writeln!(w, "vn {} {} {}", n.x, n.y, n.z)?;
         }
         let with_uvs = !uvs.is_empty() && uvs.len() == self.triangle_count();
-        let mut uv_index: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
-        let mut corner_uv: Vec<[u64; 3]> = Vec::new();
+        let mapped = layout.map_or(&[][..], |l| l.mapped.as_slice());
+        let mut uv_index = crate::fx::FxHashMap::default();
+        let mut corner_uv = Vec::new();
         if with_uvs {
             corner_uv.reserve(uvs.len());
-            for tri in uvs {
-                corner_uv.push(tri.map(|q| {
-                    let next = uv_index.len() as u64;
-                    *uv_index.entry((q.x.to_bits(), q.y.to_bits())).or_insert_with(|| {
-                        let _ = writeln!(w, "vt {} {}", q.x, q.y);
-                        next
-                    })
-                }));
+            for (t, tri) in uvs.iter().enumerate() {
+                let mut corners = [0; 3];
+                let bits = mapped.get(t).copied().unwrap_or(7);
+                for (k, q) in tri.iter().enumerate().filter(|(k, _)| bits & (1 << k) != 0) {
+                    let next = uv_index.len() + first_uv + 1;
+                    let id = match uv_index.entry((q.x.to_bits(), q.y.to_bits())) {
+                        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            writeln!(w, "vt {} {}", q.x, q.y)?;
+                            *e.insert(next)
+                        }
+                    };
+                    corners[k] = id;
+                }
+                corner_uv.push(corners);
             }
         }
-        let first_uv = first_uv as u64 + 1;
-        let first = first as u64 + 1;
-        // Polygroups become OBJ groups, as ZBrush exports them.
+        let first = first + 1;
         let mut group = None;
-        for (t, tri) in self.indices.chunks_exact(3).enumerate() {
-            if !self.groups.is_empty() && group != Some(self.groups[t]) {
-                group = Some(self.groups[t]);
-                writeln!(w, "g {name}_{}", self.groups[t])?;
+        let mut face = |corners: &[(usize, usize)]| -> std::io::Result<()> {
+            let id = self.group(corners[0].0 as u32);
+            if group != Some(id) && (!self.groups.is_empty() || layout.is_some_and(|l| !l.groups.is_empty())) {
+                group = Some(id);
+                if let Some(label) = layout.and_then(|l| l.groups.get(id as usize)).filter(|s| !s.is_empty()) {
+                    writeln!(w, "g {label}")?;
+                } else {
+                    writeln!(w, "g {name}_{id}")?;
+                }
             }
-            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|v| v as u64 + first);
-            if with_uvs {
-                let [ta, tb, tc] = corner_uv[t].map(|k| k + first_uv);
-                writeln!(w, "f {a}/{ta}/{a} {b}/{tb}/{b} {c}/{tc}/{c}")?;
-            } else {
-                writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
+            write!(w, "f")?;
+            for &(tri, k) in corners {
+                let v = self.indices[3 * tri + k] as usize + first;
+                if let Some(uv) = corner_uv.get(tri).map(|uv| uv[k]).filter(|&uv| uv != 0) {
+                    write!(w, " {v}/{uv}/{v}")?;
+                } else {
+                    write!(w, " {v}//{v}")?;
+                }
+            }
+            writeln!(w)
+        };
+        let triangle = |t| [(t, 0), (t, 1), (t, 2)];
+        if let Some(layout) = layout.filter(|l| !l.ends.is_empty()) {
+            let mut begin = 0;
+            let mut corners = Vec::new();
+            let mut uv_at_vertex = crate::fx::FxHashMap::default();
+            for (f, &end) in layout.ends.iter().enumerate() {
+                let triangles = &layout.triangles[begin..end as usize];
+                let boundary = &layout.boundary[begin + 2 * f..end as usize + 2 * (f + 1)];
+                begin = end as usize;
+                let t = triangles[0] as usize;
+                uv_at_vertex.clear();
+                let continuous = triangles.iter().all(|&q| {
+                    let q = q as usize;
+                    self.groups.get(q) == self.groups.get(t) && (!with_uvs || (0..3).all(|k| {
+                        let value = corner_uv[q][k];
+                        *uv_at_vertex.entry(self.indices[3 * q + k]).or_insert(value) == value
+                    }))
+                });
+                if !continuous {
+                    for &q in triangles {
+                        face(&triangle(q as usize))?;
+                    }
+                } else {
+                    corners.clear();
+                    corners.extend(boundary.iter().map(|&c| (c as usize / 3, c as usize % 3)));
+                    face(&corners)?;
+                }
+            }
+        } else if self.quads.iter().any(|&d| d != LONE) {
+            let pairs = self.quad_mates();
+            for (t, mate) in pairs.into_iter().enumerate() {
+                if let Some(q) = mate.filter(|&q| {
+                    self.groups.get(q) == self.groups.get(t)
+                        && self.quad_uvs_join(t, q, uvs)
+                }) {
+                    if t < q {
+                        let d = self.quads[t] as usize;
+                        let e = self.quads[q] as usize;
+                        face(&[(t, (d + 1) % 3), (t, (d + 2) % 3), (t, d), (q, (e + 2) % 3)])?;
+                    }
+                } else {
+                    face(&triangle(t))?;
+                }
+            }
+        } else {
+            for t in 0..self.triangle_count() {
+                face(&triangle(t))?;
             }
         }
         Ok(uv_index.len())

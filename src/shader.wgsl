@@ -129,25 +129,19 @@ struct VsOut {
 
 // A vertex as drawn: the active subtool's moved by the live Transpose preview as far as its
 // mask lets it.
-fn vertex_out(pos: vec3<f32>, nrm: vec4<f32>, color: vec4<f32>, vertex: u32, is_active: bool) -> VsOut {
+fn vertex_out(pos: vec3<f32>, nrm: vec4<f32>, color: vec4<f32>, vertex: u32, is_active: bool, moving: bool) -> VsOut {
     var out: VsOut;
     var p = pos;
     var n = nrm.xyz;
     out.mask = 0.0;
-    if (is_active) {
-        // xf_center.w: a Transpose preview is on; display.w: the subtool has a mask.
-        let previewing = u.xf_center.w > 0.5;
-        var m = 0.0;
-        if (u.display.w > 0.5) {
-            m = mask_at(vertex);
-        }
-        out.mask = m;
-        if (previewing) {
-            let w = 1.0 - m;
-            p = preview_place(pos, w);
-            // Normals stretch the other way (inverse transpose), then turn.
-            n = rotate(stretch(n, u.xf_stretch.xyz, exp(-u.xf_stretch.w * w)), u.xf_rotation.xyz, u.xf_rotation.w * w);
-        }
+    if (is_active && u.display.w > 0.5) {
+        out.mask = mask_at(vertex);
+    }
+    if ((is_active || moving) && u.xf_center.w > 0.5) {
+        let w = 1.0 - out.mask;
+        p = preview_place(pos, w);
+        // Normals stretch the other way (inverse transpose), then turn.
+        n = rotate(stretch(n, u.xf_stretch.xyz, exp(-u.xf_stretch.w * w)), u.xf_rotation.xyz, u.xf_rotation.w * w);
     }
     out.clip = u.view_proj * vec4<f32>(p, 1.0);
     out.world_pos = p;
@@ -168,8 +162,8 @@ fn vs_main(
     @builtin(instance_index) instance: u32,
     @builtin(vertex_index) vertex: u32,
 ) -> VsOut {
-    var out = vertex_out(pos, nrm, color, vertex, instance == 0u);
-    out.parked = instance;
+    var out = vertex_out(pos, nrm, color, vertex, instance == 0u, (instance >> 31u) != 0u);
+    out.parked = instance & 0x7fffffffu;
     return out;
 }
 
@@ -183,7 +177,7 @@ fn vs_active(
     @builtin(instance_index) instance: u32,
     @builtin(vertex_index) vertex: u32,
 ) -> VsOut {
-    var out = vertex_out(pos, nrm, color, vertex, true);
+    var out = vertex_out(pos, nrm, color, vertex, true, false);
     out.prim_base = instance;
     return out;
 }

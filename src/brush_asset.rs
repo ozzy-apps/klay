@@ -10,7 +10,8 @@ use std::sync::{
 pub struct BrushImage {
     pub id: u64,
     pub name: String,
-    pub source: std::path::PathBuf,
+    /// Source file for imported images. Preset-embedded images have no external path.
+    pub source: Option<std::path::PathBuf>,
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<[u8; 4]>,
@@ -45,19 +46,31 @@ impl BrushImage {
             decoded
         }
         .into_rgba8();
+        Ok(Self::from_pixels(
+            path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+            Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf())),
+            image.width() as usize,
+            image.height() as usize,
+            image.pixels().map(|p| p.0).collect(),
+        ))
+    }
+
+    pub(crate) fn from_pixels(
+        name: String,
+        source: Option<std::path::PathBuf>,
+        width: usize,
+        height: usize,
+        rgba: Vec<[u8; 4]>,
+    ) -> Arc<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
-            name: path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            source: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
-            width: image.width() as usize,
-            height: image.height() as usize,
-            rgba: image.pixels().map(|p| p.0).collect(),
-        }))
+            name,
+            source,
+            width,
+            height,
+            rgba,
+        })
     }
 
     /// Colour at `uv` (0..1, clamped at the edges): a cubic B-spline over the 4 × 4 nearest
@@ -111,7 +124,10 @@ pub enum Pattern {
 impl Pattern {
     pub fn locator(&self) -> String {
         match self {
-            Self::Image(i) => format!("file:{}", i.source.to_string_lossy()),
+            Self::Image(i) => i.source.as_ref().map_or_else(
+                || format!("embedded:{}", i.id),
+                |path| format!("file:{}", path.to_string_lossy()),
+            ),
             _ => format!("builtin:{}", self.key()),
         }
     }

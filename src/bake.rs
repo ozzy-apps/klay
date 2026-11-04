@@ -39,6 +39,7 @@ pub struct Source {
     pub indices: Vec<u32>,
     /// One per triangle of the highest level.
     pub places: Vec<Place>,
+    pub subdivided_uvs: Option<Vec<[Vec2; 3]>>,
     /// The base level divided smoothly, in the highest level's vertex order; only needed
     /// for a displacement map (empty otherwise).
     pub smooth: Vec<Vec3>,
@@ -61,7 +62,8 @@ impl Source {
             positions: top.positions.clone(),
             indices: top.indices.clone(),
             places: doc.top_places(),
-            smooth: if kind == Kind::Displacement { doc.smooth_top() } else { Vec::new() },
+            subdivided_uvs: doc.subdivided_uvs(doc.top()),
+            smooth: if matches!(kind, Kind::Displacement | Kind::VectorDisplacement) { doc.smooth_top() } else { Vec::new() },
             colors: if kind == Kind::Color { top.colors.clone() } else { Vec::new() },
         }
     }
@@ -71,6 +73,7 @@ impl Source {
 pub enum Kind {
     Normal,
     Displacement,
+    VectorDisplacement,
     /// The polypaint as a texture (ZBrush: Texture Map › New From Polypaint).
     Color,
 }
@@ -80,6 +83,7 @@ impl Kind {
         match self {
             Kind::Normal => "Normal map",
             Kind::Displacement => "Displacement map",
+            Kind::VectorDisplacement => "Vector displacement",
             Kind::Color => "Color map",
         }
     }
@@ -214,17 +218,17 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
     if src.uvs.len() * 3 != src.base_indices.len() || src.places.len() * 3 != src.indices.len() {
         return Err("the UVs or levels do not match the mesh".into());
     }
-    if kind == Kind::Displacement && src.smooth.len() != src.positions.len() {
+    if matches!(kind, Kind::Displacement | Kind::VectorDisplacement) && src.smooth.len() != src.positions.len() {
         return Err("the smooth base does not match the highest level".into());
     }
     let size = s.size.clamp(16, 16384);
     let ss = s.samples.clamp(1, 4) as usize;
     let channels = match kind {
-        Kind::Normal => 3,
+        Kind::Normal | Kind::VectorDisplacement => 3,
         Kind::Displacement => 1,
         Kind::Color => 4,
     };
-    let tangent = kind == Kind::Normal && s.space == Space::Tangent;
+    let tangent = matches!(kind, Kind::Normal | Kind::VectorDisplacement) && s.space == Space::Tangent;
     if kind == Kind::Color && !src.colors.is_empty() && src.colors.len() != src.positions.len() {
         return Err("the polypaint does not match the highest level".into());
     }
@@ -233,6 +237,7 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
     let high: Vec<Vec3> = match kind {
         Kind::Normal => vertex_normals(&src.positions, &src.indices),
         Kind::Color => Vec::new(),
+        Kind::VectorDisplacement => src.positions.par_iter().zip(&src.smooth).map(|(p, q)| *p - *q).collect(),
         Kind::Displacement => {
             let sn = vertex_normals(&src.smooth, &src.indices);
             src.positions
@@ -243,7 +248,7 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
                 .collect()
         }
     };
-    let max_abs = if kind == Kind::Displacement { high.par_iter().map(|d| d.x.abs()).reduce(|| 0.0, f32::max) } else { 0.0 };
+    let max_abs = if matches!(kind, Kind::Displacement | Kind::VectorDisplacement) { high.par_iter().map(|d| d.length()).reduce(|| 0.0, f32::max) } else { 0.0 };
     // The base level's frames, per corner.
     let (base_n, frames) = if tangent {
         let n = vertex_normals(&src.base_positions, &src.base_indices);
@@ -263,7 +268,7 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
     let screen = |t: usize| -> [Vec2; 3] {
         let pl = &src.places[t];
         std::array::from_fn(|k| {
-            let uv = uv_of(pl, k);
+            let uv = src.subdivided_uvs.as_ref().map_or_else(|| uv_of(pl, k), |uv| uv[t][k]);
             Vec2::new(uv.x * g, (1.0 - uv.y) * g)
         })
     };
@@ -369,15 +374,16 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
                                     o[j] += v;
                                 }
                             }
-                            Kind::Normal => {
-                                let nh = nh.normalize_or(Vec3::Z);
+                            Kind::Normal | Kind::VectorDisplacement => {
+                                let normal = kind == Kind::Normal;
+                                let nh = if normal { nh.normalize_or(Vec3::Z) } else { nh };
                                 let v = if tangent {
                                     let n = (c[0].n * b0 + c[1].n * b1 + c[2].n * b2).normalize_or(Vec3::Z);
                                     let tg = (c[0].t * b0 + c[1].t * b1 + c[2].t * b2).normalize_or(Vec3::X);
                                     let bt = n.cross(tg) * sign;
                                     let m = Mat3::from_cols(tg, bt, n);
                                     let x = if m.determinant().abs() > 1e-6 { m.inverse() * nh } else { Vec3::new(tg.dot(nh), bt.dot(nh), n.dot(nh)) };
-                                    let mut x = x.normalize_or(Vec3::Z);
+                                    let mut x = if normal { x.normalize_or(Vec3::Z) } else { x };
                                     if s.flip_g {
                                         x.y = -x.y;
                                     }
@@ -416,6 +422,7 @@ pub fn bake(src: &Source, kind: Kind, s: &Settings) -> Result<Map, String> {
         Kind::Normal if s.space == Space::Object => &[0.0, 0.0, 0.0],
         Kind::Normal => &[0.0, 0.0, 1.0],
         Kind::Displacement => &[0.0],
+        Kind::VectorDisplacement => &[0.0; 3],
         Kind::Color => &[1.0, 1.0, 1.0, 1.0],
     };
     data.par_chunks_mut(channels).zip(known.par_iter()).for_each(|(o, &k)| {
@@ -498,6 +505,7 @@ pub fn write(map: &Map, path: &std::path::Path) -> Result<u64, String> {
             let px: Vec<u16> = map.data.par_iter().map(|&d| ((0.5 + d / (2.0 * scale)).clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
             image::ImageBuffer::<image::Luma<u16>, _>::from_raw(n, n, px).expect("size matches").save(path).map_err(|e| fail(&e))?;
         }
+        (Kind::VectorDisplacement, false) => return Err("Vector displacement requires an EXR file".into()),
         (_, true) => {
             let names: &[&str] = if map.channels == 3 { &["B", "G", "R"] } else { &["Y"] };
             // Channels go in name order: B, G, R from the stored R, G, B.
@@ -578,6 +586,7 @@ pub fn preview(map: &Map, side: usize) -> Vec<[u8; 4]> {
                     let [r, g, bl] = over_white(d).map(|v| (v * 255.0).round() as u8);
                     [r, g, bl, 255]
                 }
+                3 if map.kind == Kind::VectorDisplacement => [b(d[0] / scale), b(d[1] / scale), b(d[2] / scale), 255],
                 3 => [b(d[0]), b(d[1]), b(d[2]), 255],
                 _ => {
                     let g = b(d[0] / scale);
@@ -616,6 +625,20 @@ mod tests {
         m.positions = moved;
         doc.finish_stroke(top, snap);
         doc
+    }
+
+    #[test]
+    fn parity_vector_displacement_retains_the_signed_model_space_offset() {
+        let mut doc = stack(|_| 0.0);
+        let mut src = Source::of(&mut doc, Kind::VectorDisplacement);
+        let offset = Vec3::new(0.08, -0.02, 0.05);
+        src.positions = src.smooth.iter().map(|p| *p + offset).collect();
+        let map = bake(&src, Kind::VectorDisplacement, &Settings { space: Space::Object, ..settings() }).unwrap();
+        assert_eq!(map.channels, 3);
+        assert!((map.max_abs - offset.length()).abs() < 1e-6);
+        let covered: Vec<_> = map.data.chunks_exact(3).filter(|c| c.iter().any(|&x| x != 0.0)).collect();
+        assert!(!covered.is_empty());
+        assert!(covered.iter().all(|c| Vec3::new(c[0], c[1], c[2]).distance(offset) < 1e-5));
     }
 
     fn settings() -> Settings {

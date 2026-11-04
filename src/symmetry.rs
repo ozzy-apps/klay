@@ -36,6 +36,33 @@ impl Axis {
     }
 }
 
+/// A mirror plane perpendicular to one model axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MirrorPlane {
+    pub axis: Axis,
+    pub at: f32,
+}
+
+impl MirrorPlane {
+    pub fn distance(self, point: Vec3) -> f32 {
+        point[self.axis as usize] - self.at
+    }
+
+    pub fn project(self, mut point: Vec3) -> Vec3 {
+        point[self.axis as usize] = self.at;
+        point
+    }
+
+    pub fn reflect(self, mut point: Vec3) -> Vec3 {
+        point[self.axis as usize] = self.at - self.distance(point);
+        point
+    }
+
+    pub fn fold(self, point: Vec3) -> Vec3 {
+        if self.distance(point) < 0.0 { self.reflect(point) } else { point }
+    }
+}
+
 /// Most images a symmetry may make (eight mirror combinations times a radial count of 8,
 /// or a radial count of 64 alone).
 pub const MAX_IMAGES: usize = 64;

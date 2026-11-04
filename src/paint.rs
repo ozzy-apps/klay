@@ -70,6 +70,37 @@ pub fn blend(old: Color, rgb: [f32; 3], amount: f32) -> Color {
     ]
 }
 
+/// Fill visible vertices with the chosen color, with masks holding paint back.
+pub fn fill(mesh: &mut SculptMesh, color: [u8; 3]) -> Chunks {
+    let rgb = color.map(|c| c as f32 / 255.0);
+    let changes: Chunks = mesh
+        .chunks
+        .par_iter()
+        .enumerate()
+        .filter_map(|(chunk, range)| {
+            let (start, end) = range.range();
+            let mut changed = false;
+            let values = (start..end)
+                .map(|v| {
+                    let old = at(mesh, v);
+                    if mesh.shown.get(v) == Some(&0) {
+                        return old;
+                    }
+                    let color = blend(old, rgb, crate::mask::freedom(&mesh.mask, v as u32));
+                    changed |= color != old;
+                    color
+                })
+                .collect();
+            changed.then_some((chunk as u32, values))
+        })
+        .collect();
+    if changes.is_empty() {
+        changes
+    } else {
+        restore(mesh, changes)
+    }
+}
+
 pub fn scatter(mesh: &mut SculptMesh, sel: &crate::mesh::Selection, values: &[Color]) {
     ensure(mesh);
     let ranges: Vec<_> = sel

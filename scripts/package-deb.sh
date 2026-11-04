@@ -9,6 +9,13 @@ root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 chmod 755 "$root"
 install -Dm755 -s target/release/klay "$root/usr/bin/klay"
+min_glibc=$(LC_ALL=C readelf --version-info --wide "$root/usr/bin/klay" |
+  sed -nE 's/.*Name: GLIBC_([0-9.]+)[[:space:]].*/\1/p' |
+  sort -Vu | tail -n 1)
+if [ -z "$min_glibc" ]; then
+  echo "Could not determine Klay's glibc requirement" >&2
+  exit 1
+fi
 install -Dm644 packaging/klay.desktop "$root/usr/share/applications/klay.desktop"
 install -Dm644 assets/icon/klay.svg "$root/usr/share/icons/hicolor/scalable/apps/klay.svg"
 for size in 32 64 128 256 512; do
@@ -39,7 +46,7 @@ Version: $version
 Architecture: $arch
 Maintainer: Ozzy <klay@ozzy.co.nl>
 Installed-Size: $size
-Depends: libc6 (>= 2.35), libvulkan1, libx11-6, libxkbcommon0
+Depends: libc6 (>= $min_glibc), libvulkan1, libx11-6, libxkbcommon0
 Recommends: mesa-vulkan-drivers | nvidia-driver, libwayland-client0, libxcursor1, libxi6, libxrandr2, curl
 Section: graphics
 Priority: optional

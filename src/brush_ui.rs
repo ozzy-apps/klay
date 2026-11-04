@@ -1,6 +1,7 @@
 //! Brush catalog, image pickers and the compact Space palette.
 use super::*;
 use crate::brush_asset::{BrushImage, Pattern};
+use crate::brush_preset::{self, Preset};
 use crate::sculpt::StampSettings;
 use std::sync::mpsc::{self, Receiver};
 
@@ -52,6 +53,15 @@ pub(super) struct BrushUi {
     import: Option<Receiver<(bool, Result<Option<Pattern>, String>)>>,
     path_dialog: Option<bool>,
     path: String,
+    save_preset: Option<SavePreset>,
+    active_preset: Option<(BrushKind, String)>,
+}
+
+struct SavePreset {
+    name: String,
+    focus: bool,
+    replace: bool,
+    error: Option<String>,
 }
 
 impl BrushUi {
@@ -79,6 +89,8 @@ impl BrushUi {
             import: None,
             path_dialog: None,
             path: String::new(),
+            save_preset: None,
+            active_preset: None,
         }
     }
     pub(super) fn settings(&self) -> StampSettings {
@@ -224,6 +236,7 @@ impl Workspace {
     }
 
     pub fn select_brush(&mut self, brush: &mut Brush, kind: BrushKind) {
+        self.brush_ui.active_preset = None;
         // Z Intensity, Focal Shift, RGB Intensity and Zadd / Zsub follow the brush.
         if kind != brush.kind {
             self.store_settings(brush);
@@ -258,6 +271,163 @@ impl Workspace {
         self.brush_ui.recent.retain(|k| *k != kind);
         self.brush_ui.recent.insert(0, kind);
         self.brush_ui.recent.truncate(6);
+    }
+
+    pub(super) fn brush_display_name(&self, kind: BrushKind) -> &str {
+        self.brush_ui
+            .active_preset
+            .as_ref()
+            .filter(|(base, _)| *base == kind)
+            .map_or(kind.name(), |(_, name)| name.as_str())
+    }
+
+    pub(super) fn save_brush_open(&self) -> bool {
+        self.brush_ui.save_preset.is_some()
+    }
+
+    pub(super) fn open_save_brush(&mut self, kind: BrushKind) {
+        self.brush_ui.save_preset = Some(SavePreset {
+            name: self.brush_display_name(kind).to_string(),
+            focus: true,
+            replace: false,
+            error: None,
+        });
+        self.dropdown = None;
+    }
+
+    pub(super) fn brush_preset(&self, mut brush: Brush) -> Preset {
+        brush.color = self.color.to_srgb();
+        let assets = StampSettings { spotlight: None, ..self.assets.clone() };
+        Preset {
+            brush,
+            alternate: self.color2.to_srgb(),
+            subtract: self.subtract,
+            dynamic: self.dynamic,
+            assets,
+            pressure: self.tablet(brush.kind),
+            stroke: self.stroke_mode(brush.kind),
+            spacing: self.spacing,
+            lazy_mouse: self.lazy_mouse,
+            lazy_radius: self.lazy_radius,
+            curve_smooth: self.curve_smooth,
+            curve_step: self.curve_step,
+            tube_taper: self.tube_taper,
+            tube_sides: self.tube_sides,
+            sculptris: self.sculptris,
+            sculptris_detail: self.sculptris_detail,
+            insert_shape: self.insert_shape,
+            poly_action: self.zm_poly,
+            poly_target: self.zm_target,
+            edge_action: self.zm_edge,
+            edge_loop: self.zm_edge_loop,
+            point_action: self.zm_point,
+        }
+    }
+
+    pub(super) fn load_brush_preset(
+        &mut self,
+        path: &std::path::Path,
+        brush: &mut Brush,
+    ) -> Result<(), String> {
+        // Validate the complete preset before touching any live settings.
+        let p = brush_preset::load(path)?;
+        let kind = p.brush.kind;
+        self.select_brush(brush, kind);
+        *brush = p.brush;
+        self.color = PickerColor::from_srgb(brush.color);
+        self.color2 = PickerColor::from_srgb(p.alternate);
+        self.subtract = p.subtract;
+        self.dynamic = p.dynamic;
+        self.assets = p.assets;
+        if matches!(self.assets.alpha, Pattern::Image(_)) {
+            self.assets.alpha = self.brush_ui.library.import(self.assets.alpha.clone(), false);
+        }
+        if matches!(self.assets.texture, Pattern::Image(_)) {
+            self.assets.texture = self.brush_ui.library.import(self.assets.texture.clone(), true);
+        }
+        self.brush_pressure.insert(kind, p.pressure);
+        self.set_stroke_mode(kind, p.stroke);
+        self.spacing = p.spacing;
+        self.lazy_mouse = p.lazy_mouse;
+        self.lazy_radius = p.lazy_radius;
+        self.curve_smooth = p.curve_smooth;
+        self.curve_step = p.curve_step;
+        self.tube_taper = p.tube_taper;
+        self.tube_sides = p.tube_sides;
+        self.sculptris = p.sculptris;
+        self.sculptris_detail = p.sculptris_detail;
+        self.insert_shape = p.insert_shape;
+        self.zm_poly = p.poly_action;
+        self.zm_target = p.poly_target;
+        self.zm_edge = p.edge_action;
+        self.zm_edge_loop = p.edge_loop;
+        self.zm_point = p.point_action;
+        self.mode = Mode::Draw;
+        let name = path
+            .file_stem()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        self.notify(format!("Loaded brush {name}"));
+        self.brush_ui.active_preset = Some((kind, name));
+        Ok(())
+    }
+
+    pub(super) fn save_brush_dialog(&mut self, ctx: &Context, brush: Brush) {
+        let Some(mut dialog) = self.brush_ui.save_preset.take() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::unique("save-brush"))
+            .frame(popup_frame().inner_margin(14))
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.label(RichText::new("Save Brush").strong());
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .desired_width(ui.available_width())
+                        .hint_text("Brush name"),
+                );
+                if std::mem::take(&mut dialog.focus) {
+                    name.request_focus();
+                }
+                if name.changed() {
+                    dialog.replace = false;
+                    dialog.error = None;
+                }
+                if let Some(error) = &dialog.error {
+                    ui.label(error);
+                }
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel").clicked();
+                    submit = ui.button(if dialog.replace { "Replace" } else { "Save" }).clicked();
+                });
+                submit |= !dialog.replace
+                    && name.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            });
+        if cancel || response.should_close() {
+            return;
+        }
+        if submit {
+            let result = brush_preset::path_for(&self.lightbox.brush_folder(), &dialog.name)
+                .and_then(|path| brush_preset::save(&path, &self.brush_preset(brush), dialog.replace));
+            match result {
+                Ok(()) => {
+                    let name = dialog.name.trim().to_string();
+                    self.notify(format!("Saved brush {name}"));
+                    self.brush_ui.active_preset = Some((brush.kind, name));
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    dialog.replace = true;
+                    dialog.error = Some("A brush with this name already exists.".into());
+                }
+                Err(e) => dialog.error = Some(format!("Could not save brush: {e}")),
+            }
+        }
+        self.brush_ui.save_preset = Some(dialog);
     }
 
     pub(super) fn paint_modes(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
@@ -352,7 +522,22 @@ impl Workspace {
         });
     }
 
-    fn pattern_texture(&mut self, ctx: &Context, p: &Pattern, color: bool) -> TextureId {
+    pub(super) fn lightbox_patterns(&self, texture: bool, user: bool) -> Vec<Pattern> {
+        let list = if texture { &self.brush_ui.library.textures } else { &self.brush_ui.library.alphas };
+        list.iter().filter(|p| matches!(p, Pattern::Image(_)) == user).cloned().collect()
+    }
+
+    pub(super) fn load_lightbox_pattern(&mut self, path: &std::path::Path, texture: bool) -> Result<(), String> {
+        let pattern = self.brush_ui.library.import(Pattern::Image(BrushImage::load(path)?), texture);
+        if texture {
+            self.assets.texture = pattern;
+        } else {
+            self.assets.alpha = pattern;
+        }
+        Ok(())
+    }
+
+    pub(super) fn pattern_texture(&mut self, ctx: &Context, p: &Pattern, color: bool) -> TextureId {
         let key = (p.key(), color);
         self.brush_ui
             .images
@@ -882,7 +1067,7 @@ impl Workspace {
         }
     }
 
-    pub(super) fn draw_quick_menu(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
+    pub(super) fn draw_quick_menu(&mut self, ui: &mut Ui, m: &mut Model<'_>, a: &mut Actions) {
         let Some((pos, held)) = self.quick_menu else {
             return;
         };
@@ -924,6 +1109,10 @@ impl Workspace {
                             {
                                 std::mem::swap(&mut self.color, &mut self.color2);
                             }
+                            a.fill_color |= ui
+                                .add_sized([width, CONTROL_H], egui::Button::new("Fill Color"))
+                                .on_hover_text("Apply this color to the active SubTool. Masks and hidden geometry hold.")
+                                .clicked();
                             let modes_enabled =
                                 !m.brush.kind.is_mask() && m.brush.kind != BrushKind::ClipLine;
                             ui.add_enabled_ui(modes_enabled, |ui| {
@@ -1363,6 +1552,44 @@ mod tests {
         assert!(!a.workspace.brush_catalog_open());
     }
     #[test]
+    fn fill_color_button_respects_the_mask_and_undoes() {
+        let mut a = app("fill-color");
+        let color = [36, 112, 206];
+        a.workspace.color = PickerColor::from_srgb(color);
+        let mut mask = vec![0; a.doc.mesh().vertex_count()];
+        mask[0] = 255;
+        crate::mask::replace(a.doc.mesh_mut(), mask);
+        a.workspace.open_quick_menu(pos2(900.0, 300.0), true);
+        frame(&mut a, vec![]);
+        let out = frame(&mut a, vec![]);
+        let fill = text(&out, "Fill Color", |_| true);
+        click(&mut a, fill + vec2(8.0, 5.0));
+        assert_eq!(a.doc.mesh().colors[0], [0; 4]);
+        assert!(a.doc.mesh().colors[1..].iter().all(|&c| c == [36, 112, 206, 255]));
+        a.history_jump(-1);
+        assert!(a.doc.mesh().colors.iter().all(|&c| c == [0; 4]));
+    }
+
+    #[test]
+    fn double_click_renames_a_parked_subtool_and_the_name_is_saved() {
+        let mut a = app("rename-subtool");
+        a.append_primitive();
+        let name = a.subtools[0].name.clone();
+        a.workspace.open_menu("Mesh");
+        frame(&mut a, vec![]);
+        let out = frame(&mut a, vec![]);
+        let row = text(&out, &name, |_| true) + vec2(8.0, 4.0);
+        click(&mut a, row);
+        click(&mut a, row);
+        assert!(a.workspace.rename_subtool.is_some());
+        frame(&mut a, vec![egui::Event::Text("Body Base".to_owned()), key(egui::Key::Enter)]);
+        assert_eq!(a.subtools[0].name, "Body Base");
+        let bytes = a.project_bytes();
+        let saved = crate::project::read_from(bytes.as_slice(), bytes.len() as u64).unwrap();
+        assert_eq!(saved.tools[0].name, "Body Base");
+    }
+
+    #[test]
     fn space_menu_has_requested_order_live_controls_and_left_color_picker() {
         let mut a = app("space");
         a.workspace.open_quick_menu(pos2(900.0, 300.0), true);
@@ -1392,10 +1619,19 @@ mod tests {
         assert!(a.brush.focal_shift > 20.0);
         click(&mut a, rgb + vec2(80.0, 7.0));
         assert!(a.brush.rgb_intensity > 0.1 && a.brush.rgb_intensity < 0.6);
-        let before = a.brush.color;
-        click(&mut a, hex + vec2(2.0, -30.0));
-        assert_ne!(a.brush.color, before);
-        assert_eq!(a.brush.color, a.workspace.color.to_srgb());
+        let sv = out.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(rect)
+                if rect.rect.size() == Vec2::splat(172.0) && rect.brush.is_some() =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        }).expect("textured saturation/value square");
+        click(&mut a, sv.left_bottom() + vec2(sv.width() / 3.0, 15.0));
+        click(&mut a, sv.center());
+        assert_eq!(a.brush.color, [64, 128, 64]);
+        let out = frame(&mut a, vec![]);
+        text(&out, "#408040", |p| p.x < size.x && p.y > 250.0);
     }
     #[test]
     fn catalog_selects_real_brushes_and_blocks_canvas_shortcuts() {

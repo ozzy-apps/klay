@@ -46,9 +46,10 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"KLAYPRJ\0";
 pub const END: &[u8; 8] = b"KLAYEND\0";
+/// 13: subdivision rules, OBJ polygons and seams, layer paint and masks, folders and selection sets.
 /// 12: the reference image and the Spotlight with their pictures; 11: quads (which triangles pair); 10: Dynamic Subdivision and ZSpheres; 9: frozen subdivision levels; 8: creases; 7: UVs; 6: boolean operation; 5: layers and
 /// Morph Target; 4: vertex paint; 3: polygroups and hidden triangles; 2: mask. Every older version still opens.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// Document › Reference as a project stores it (version 12): the plane and its picture.
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +87,8 @@ pub struct Pictures {
 /// One subtool as stored in a project.
 pub struct SavedTool {
     pub name: String,
+    pub folder: String,
+    pub sets: Vec<crate::selection_set::Set>,
     pub visible: bool,
     pub packed: Packed,
     /// Its sculpt layers (not recording) and Morph Target (level, positions); empty before
@@ -101,6 +104,8 @@ pub struct SavedTool {
 /// What a subtool has besides its stack (version 5): layers and a Morph Target.
 #[derive(Clone, Copy, Default)]
 pub struct Extras<'a> {
+    pub folder: &'a str,
+    pub sets: &'a [crate::selection_set::Set],
     pub layers: Option<&'a crate::layers::Layers>,
     pub morph: Option<(usize, &'a [glam::Vec3])>,
     pub boolean: crate::boolean::BoolOp,
@@ -246,7 +251,7 @@ pub fn write_pictures<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &
     write_full(w, tools, extras, active, VERSION, pictures)
 }
 
-/// Serialise in the layout of `version` (1 to 5; tests write older files with it).
+/// Serialise in the layout of `version` for compatibility fixtures.
 #[cfg(test)]
 pub fn write_version<W: Write>(w: W, tools: &[(&str, bool, &Packed)], active: usize, version: u32) -> io::Result<W> {
     write_full(w, tools, &[], active, version, &Pictures::default())
@@ -275,6 +280,15 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
                 out.u32(l.intensity.to_bits())?;
                 out.u8(l.visible as u8)?;
                 out.slice(&l.delta)?;
+                if version >= 13 {
+                    out.slice(&l.paint)?;
+                    out.slice(&l.mask)?;
+                }
+            }
+            if version >= 13 {
+                out.slice(extra.layers.map_or(&[], |l| l.paint_remainder.as_slice()))?;
+                out.slice(extra.layers.map_or(&[], |l| l.mask_remainder.as_slice()))?;
+                out.slice(extra.layers.map_or(&[], |l| l.top_mask.as_slice()))?;
             }
             match extra.morph {
                 Some((level, positions)) => {
@@ -295,7 +309,7 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
             packed.write_creases(&mut out)?;
         }
         if version >= 9 {
-            packed.write_frozen(&mut out)?;
+            packed.write_frozen(&mut out, version)?;
         }
         if version >= 10 {
             match extras.get(k).and_then(|e| e.dynamic) {
@@ -309,6 +323,11 @@ fn write_full<W: Write>(w: W, tools: &[(&str, bool, &Packed)], extras: &[Extras]
                 None => out.u8(0)?,
             }
             packed.write_zspheres(&mut out)?;
+        }
+        if version >= 13 {
+            packed.write_obj_layout(&mut out)?;
+            out.slice(extras.get(k).map_or("", |e| e.folder).as_bytes())?;
+            crate::selection_set::write(extras.get(k).map_or(&[], |e| e.sets), &mut out)?;
         }
     }
     if version >= 12 {
@@ -409,7 +428,27 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
                 if !intensity.is_finite() {
                     return Err("a layer's intensity is not a number".into());
                 }
-                layers.list.push(crate::layers::SculptLayer { name, delta, intensity, visible });
+                let (paint, mask) = if version >= 13 { (input.vec()?, input.vec()?) } else { (Vec::new(), Vec::new()) };
+                let n = packed.top_vertices();
+                if (!paint.is_empty() && paint.len() != n) || (!mask.is_empty() && mask.len() != n)
+                    || paint.iter().flatten().chain(&mask).any(|v: &f32| !v.is_finite())
+                {
+                    return Err("Layer paint or mask does not fit the highest level".into());
+                }
+                layers.list.push(crate::layers::SculptLayer { name, delta, intensity, visible, paint, mask });
+            }
+            if version >= 13 {
+                layers.paint_remainder = input.vec()?;
+                layers.mask_remainder = input.vec()?;
+                layers.top_mask = input.vec()?;
+                let n = packed.top_vertices();
+                if (!layers.top_mask.is_empty() && layers.top_mask.len() != n)
+                    || (!layers.paint_remainder.is_empty() && layers.paint_remainder.len() != n)
+                    || (!layers.mask_remainder.is_empty() && layers.mask_remainder.len() != n)
+                    || layers.paint_remainder.iter().flatten().chain(&layers.mask_remainder).any(|v| !v.is_finite())
+                {
+                    return Err("Layer remainder does not fit the highest level".into());
+                }
             }
             if input.u8()? != 0 {
                 let level = input.u32()? as usize;
@@ -424,7 +463,7 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
             packed.read_creases(&mut input)?;
         }
         if version >= 9 {
-            packed.read_frozen(&mut input)?;
+            packed.read_frozen(&mut input, version)?;
         }
         let dynamic = if version >= 10 && input.u8()? != 0 {
             let (smooth, flat, qgrid) = (input.u8()?.min(4), input.u8()?.min(3), input.u8()?.min(3));
@@ -437,8 +476,15 @@ pub fn read_from<R: Read>(r: R, len: u64) -> Result<Project, Fail> {
         if version >= 10 {
             packed.read_zspheres(&mut input)?;
         }
+        let folder = if version >= 13 {
+            packed.read_obj_layout(&mut input)?;
+            String::from_utf8(input.vec()?).map_err(|_| "Invalid SubTool folder name")?
+        } else { String::new() };
+        let sets = if version >= 13 { crate::selection_set::read(&mut input)? } else { Vec::new() };
         tools.push(SavedTool {
             name,
+            folder,
+            sets,
             visible,
             packed,
             layers,
@@ -691,7 +737,7 @@ mod tests {
         let mut wrong = Multires::new(sphere(6, 1.0), usize::MAX);
         let m = wrong.base_mesh().triangle_count();
         wrong.set_uvs(vec![[glam::Vec2::ZERO; 3]; m]);
-        let mut bytes = bytes_of(&[("Wrong", true, &wrong.pack_copy())], 0);
+        let mut bytes = write_version(Vec::new(), &[("Wrong", true, &wrong.pack_copy())], 0, 12).unwrap();
         // The UV count is the u64 right before the UV data, which the crease count (a u32,
         // 0), the frozen flag (a u8, 0) and the Dynamic Subdivision and ZSphere flags (a u8,
         // 0, each) follow at the end of the subtool, then the reference and Spotlight

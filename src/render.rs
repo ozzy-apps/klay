@@ -2442,16 +2442,16 @@ impl Gfx {
         debug_assert_eq!(buffers.dirty_flags.len(), mesh.chunks.len());
         let mut count = 0;
         let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut color_runs: Vec<(usize, usize)> = Vec::new();
         let mut normal_chunks = 0;
         // Chunks whose boxes need a refit: moved or re-shaded ones.
         let mut moved: Vec<u32> = Vec::new();
         for (i, ch) in mesh.chunks.iter_mut().enumerate() {
             if std::mem::take(&mut ch.dirty_color) {
-                let (a,b)=ch.range();
-                if mesh.colors.is_empty() {
-                    self.queue.write_buffer(&buffers.colors,(a*4) as u64,&vec![0;(b-a)*4]);
-                } else {
-                    self.queue.write_buffer(&buffers.colors,(a*4) as u64,bytemuck::cast_slice(&mesh.colors[a..b]));
+                let (s, e) = ch.range();
+                match color_runs.last_mut() {
+                    Some(last) if last.1 == s => last.1 = e,
+                    _ => color_runs.push((s, e)),
                 }
             }
             let nrm = std::mem::take(&mut ch.dirty_nrm);
@@ -2467,6 +2467,13 @@ impl Gfx {
             match runs.last_mut() {
                 Some(last) if last.1 == s => last.1 = e,
                 _ => runs.push((s, e)),
+            }
+        }
+        for (s, e) in color_runs {
+            if mesh.colors.is_empty() {
+                self.queue.write_buffer(&buffers.colors, (s * 4) as u64, &vec![0; (e - s) * 4]);
+            } else {
+                self.queue.write_buffer(&buffers.colors, (s * 4) as u64, bytemuck::cast_slice(&mesh.colors[s..e]));
             }
         }
         // One staging view per run, filled from several threads: the memcpy into staging

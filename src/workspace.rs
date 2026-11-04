@@ -14,7 +14,7 @@
 use crate::sculpt::{Brush, BrushKind};
 use crate::subtool::Deform;
 use crate::curve_tube::Tube;
-use egui::ecolor::Hsva;
+use egui::ecolor::{hsv_from_rgb, rgb_from_hsv};
 use egui::{
     Align, Align2, Color32, ColorImage, Context, CornerRadius, FontId, Frame, Id, Layout, Margin,
     Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureId,
@@ -26,6 +26,8 @@ use std::path::PathBuf;
 mod brush_ui;
 #[path = "custom_shelf.rs"]
 mod custom_shelf;
+#[path = "lightbox.rs"]
+pub(crate) mod lightbox;
 use custom_shelf::ShelfSource;
 #[path = "shelves.rs"]
 pub(crate) mod shelves;
@@ -479,6 +481,7 @@ pub struct DockLayout {
     /// user's own themes.
     pub theme: String,
     pub custom_themes: Vec<ThemeSpec>,
+    pub lightbox_rows: u8,
     /// The items of the top, left, right and bottom shelves, in order (`shelves.rs`).
     pub shelves: [Vec<String>; 4],
     /// Preferences › Config: start from the stored config (and its startup document)
@@ -512,6 +515,7 @@ impl Default for DockLayout {
             ui_scale: 1.0,
             theme: "Klay Dark".to_string(),
             custom_themes: Vec::new(),
+            lightbox_rows: 2,
             shelves: ShelfSide::ALL.map(shelves::default_items),
             start_from_stored: false,
             check_updates: true,
@@ -624,6 +628,9 @@ impl DockLayout {
         if !self.dense_points {
             text.push_str("points|off\n");
         }
+        if self.lightbox_rows != 2 {
+            text.push_str(&format!("lightboxrows|{}\n", self.lightbox_rows));
+        }
         if !self.skip_version.is_empty() {
             text.push_str(&format!("skipversion|{}\n", self.skip_version));
         }
@@ -701,6 +708,11 @@ impl DockLayout {
                 ["startup", "stored"] => result.start_from_stored = true,
                 ["updates", "off"] => result.check_updates = false,
                 ["points", "off"] => result.dense_points = false,
+                ["lightboxrows", value] => {
+                    if let Ok(rows) = value.parse::<u8>() {
+                        result.lightbox_rows = rows.clamp(1, 4);
+                    }
+                }
                 ["skipversion", v] => result.skip_version = (*v).to_string(),
                 ["scale", value] => {
                     if let Ok(v) = value.parse::<f32>() {
@@ -781,6 +793,7 @@ pub struct Model<'a> {
     pub axes: [[f32; 3]; 3],
     /// Every subtool, in list order.
     pub subtools: &'a [SubToolRow],
+    pub selection_sets: &'a [crate::selection_set::Set],
     /// RAM held by parked subtools (packed stacks and their undo lists).
     pub parked_bytes: usize,
     /// GPU memory held by the stand-ins of parked subtools.
@@ -825,7 +838,10 @@ pub struct Model<'a> {
 
 /// One line of the SubTool list.
 pub struct SubToolRow {
+    pub id: u64,
     pub name: String,
+    pub folder: String,
+    pub transpose_selected: bool,
     pub visible: bool,
     pub active: bool,
     /// Vertices at the level it is shown at.
@@ -840,8 +856,15 @@ pub struct SubToolRow {
     pub boolean: crate::boolean::BoolOp,
 }
 
+struct RenameSubTool {
+    id: u64,
+    name: String,
+    focus: bool,
+}
+
 #[derive(Default)]
 pub struct Actions {
+    pub lightbox: Option<lightbox::Action>,
     pub rebuild: bool,
     pub export: bool,
     pub undo: bool,
@@ -862,6 +885,14 @@ pub struct Actions {
     pub view: Option<(f32, f32)>,
     /// SubTool list: make this one active.
     pub select_subtool: Option<usize>,
+    pub rename_subtool: Option<(u64, String)>,
+    pub subtool_folder: Option<(usize, String)>,
+    pub transpose_select: Option<usize>,
+    pub transpose_folder: Option<String>,
+    pub transpose_clear: bool,
+    pub save_selection_set: Option<String>,
+    pub restore_selection_set: Option<(usize, crate::selection_set::Channel)>,
+    pub delete_selection_set: Option<usize>,
     /// SubTool list: flip the visibility of this one.
     pub toggle_subtool: Option<usize>,
     pub append: bool,
@@ -900,8 +931,9 @@ pub struct Actions {
     pub export_subtool_gltf: bool,
     /// Document › Export glTF: the visible subtools as one `.glb` with the baked maps.
     pub export_gltf: bool,
-    /// Document › Import OBJ or STL.
+    /// Document › Import Models.
     pub import_mesh: bool,
+    pub update_obj: bool,
     /// Export STL (Document, 3D Print); 3D Print › Send to the slicer, Check.
     pub export_stl: bool,
     pub send_slicer: bool,
@@ -935,7 +967,9 @@ pub struct Actions {
     /// Geometry › Del Hidden, Close Holes; Deformation › Mirror And Weld.
     pub del_hidden: bool,
     pub close_holes: bool,
+    pub mirror_copy: bool,
     pub mirror_weld: bool,
+    pub fill_color: bool,
     /// Deformation › Smart ReSym.
     pub smart_resym: bool,
     /// Geometry › Dynamic Subdiv › Apply.
@@ -985,8 +1019,12 @@ pub struct Actions {
     /// Geometry › UV Map › Unwrap, Delete UVs.
     pub uv_unwrap: bool,
     pub uv_delete: bool,
+    pub uv_pick: Option<glam::Vec2>,
+    pub uv_edit: Option<crate::uv::Edit>,
     /// Geometry › Texture Maps › Bake Normal Map, Bake Displacement Map.
     pub bake: Option<crate::bake::Kind>,
+    pub batch_maps: bool,
+    pub cancel_batch_maps: bool,
 }
 
 /// The name of material `i`: from [`MATERIALS`], or a loaded MatCap's file name.
@@ -1081,10 +1119,40 @@ pub struct CurvePreview {
     pub hot: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemeshSymmetry {
+    #[default]
+    Brush,
+    Off,
+    Force(crate::symmetry::Axis),
+}
+
+impl RemeshSymmetry {
+    const ALL: [Self; 5] = [
+        Self::Brush,
+        Self::Off,
+        Self::Force(crate::symmetry::Axis::X),
+        Self::Force(crate::symmetry::Axis::Y),
+        Self::Force(crate::symmetry::Axis::Z),
+    ];
+
+    fn label(self) -> &'static str {
+        use crate::symmetry::Axis;
+        match self {
+            Self::Brush => "Brush symmetry",
+            Self::Off => "Off",
+            Self::Force(Axis::X) => "Force X",
+            Self::Force(Axis::Y) => "Force Y",
+            Self::Force(Axis::Z) => "Force Z",
+        }
+    }
+}
+
 pub struct Workspace {
     pub layout: DockLayout,
     pub canvas: Rect,
     pub focus: bool,
+    lightbox: lightbox::Browser,
     /// A true modal: the app also uses this to suspend canvas input and shortcuts.
     pub about_open: bool,
     /// Document › Save As or Revert waiting for an answer.
@@ -1115,6 +1183,8 @@ pub struct Workspace {
     pub drag_kinds: Vec<(BrushKind, bool)>,
     pub curve_smooth: f32,
     pub curve_step: f32,
+    pub subdiv_smt: bool,
+    pub subdiv_suv: bool,
     /// Stroke › Spacing (share of Draw Size between dabs), LazyMouse and LazyRadius
     /// (pixels the brush trails the cursor by).
     pub spacing: f32,
@@ -1136,6 +1206,9 @@ pub struct Workspace {
     pub decimation: crate::decimate::Settings,
     /// Geometry › UV Map settings.
     pub uv: crate::uv::Settings,
+    pub uv_seam_mode: bool,
+    pub uv_checker: bool,
+    pub uv_island_selected: bool,
     /// The active subtool's UV layout as a picture (a key that changes with the UVs, and
     /// RGBA pixels), set by the app; `None` without UVs.
     pub uv_layout: Option<(u64, usize, Vec<[u8; 4]>)>,
@@ -1192,6 +1265,8 @@ pub struct Workspace {
     bake_texture: Option<(u64, egui::TextureHandle)>,
     /// Set by the app while a bake runs.
     pub baking: bool,
+    pub baking_batch: bool,
+    pub batch_kinds: [bool; 4],
     /// The geometry job or simulation running, shown over the canvas with Cancel; set by
     /// the app each frame.
     pub job: Option<JobNotice>,
@@ -1205,6 +1280,11 @@ pub struct Workspace {
     /// Mesh › Layers: the selected layer, and the Intensity slider's value while dragged
     /// with the value it started from.
     pub layer_selected: usize,
+    folder_name: String,
+    rename_subtool: Option<RenameSubTool>,
+    new_folder_open: bool,
+    selection_set_name: String,
+    selection_set_index: usize,
     layer_drag: Option<(f32, f32)>,
     /// Preferences › QuickSave: on, and every how many minutes.
     pub quicksave: bool,
@@ -1267,6 +1347,8 @@ pub struct Workspace {
     pub boolean_resolution: f32,
     /// Geometry › ZRemesher settings.
     pub zremesh: crate::zremesh::Settings,
+    pub zremesh_symmetry: RemeshSymmetry,
+    pub zremesh_local_plane: bool,
     /// Brush › ZModeler: the polygon action and target, the edge action and whether it
     /// takes the whole edge loop.
     pub zm_poly: crate::zmodeler::PolyAction,
@@ -1322,14 +1404,15 @@ pub struct Workspace {
     deform_drag: Option<(Deform, f32)>,
     /// Deformation › Size's X, Y and Z toggles: the axes it scales along (ZBrush).
     pub size_axes: [bool; 3],
+    pub mirror_axis: usize,
     pub mode: Mode,
     /// Open hotkey popup and the logical position it was opened at.
     pub popup: Option<(QuickPopup, Pos2)>,
     /// ZBrush quick menu (Space held, or a right-click tap): where it opened and whether
     /// it closes when Space is released rather than on a click elsewhere.
     pub quick_menu: Option<(Pos2, bool)>,
-    pub color: Hsva,
-    pub color2: Hsva,
+    color: PickerColor,
+    color2: PickerColor,
     pub assets: crate::sculpt::StampSettings,
     brush_ui: brush_ui::BrushUi,
     dynamic: bool,
@@ -1405,6 +1488,7 @@ impl Workspace {
             layout,
             canvas: Rect::NOTHING,
             focus: false,
+            lightbox: lightbox::Browser::new(&root),
             about_open: false,
             doc_dialog: None,
             logo: None,
@@ -1424,6 +1508,8 @@ impl Workspace {
             drag_kinds: Vec::new(),
             curve_smooth: 0.5,
             curve_step: 0.16,
+            subdiv_smt: true,
+            subdiv_suv: false,
             spacing: crate::sculpt::SPACING,
             fov: 45.0,
             import_fit: true,
@@ -1433,6 +1519,9 @@ impl Workspace {
             project: crate::project_all::Settings::default(),
             decimation: crate::decimate::Settings::default(),
             uv: crate::uv::Settings::default(),
+            uv_seam_mode: false,
+            uv_checker: false,
+            uv_island_selected: false,
             uv_layout: None,
             uv_info: None,
             uv_texture: None,
@@ -1463,6 +1552,8 @@ impl Workspace {
             bake_preview: None,
             bake_texture: None,
             baking: false,
+            baking_batch: false,
+            batch_kinds: [true, true, false, true],
             job: None,
             quicksave: true,
             quicksave_minutes: 10.0,
@@ -1471,6 +1562,11 @@ impl Workspace {
             light_intensity: 1.0,
             ambient: 1.0,
             layer_selected: 0,
+            folder_name: String::new(),
+            rename_subtool: None,
+            new_folder_open: false,
+            selection_set_name: String::new(),
+            selection_set_index: 0,
             layer_drag: None,
             cavity_intensity: 50.0,
             cavity_depth: 1.0,
@@ -1504,6 +1600,8 @@ impl Workspace {
             live_boolean: false,
             boolean_resolution: 400.0,
             zremesh: crate::zremesh::Settings::default(),
+            zremesh_symmetry: RemeshSymmetry::default(),
+            zremesh_local_plane: false,
             zm_poly: Default::default(),
             zm_target: Default::default(),
             zm_edge: Default::default(),
@@ -1534,11 +1632,12 @@ impl Workspace {
             draw_settings: HashMap::new(),
             deform_drag: None,
             size_axes: [true; 3],
+            mirror_axis: 0,
             mode: Mode::Draw,
             popup: None,
             quick_menu: None,
-            color: Hsva::new(0.06, 0.55, 0.88, 1.0),
-            color2: Hsva::new(0.0, 0.0, 1.0, 1.0),
+            color: PickerColor::from_srgb([0xF1, 0xC7, 0xA9]),
+            color2: PickerColor::from_srgb([255; 3]),
             assets,
             brush_ui,
             dynamic: true,
@@ -1567,7 +1666,7 @@ impl Workspace {
             self.applied_palette = Some(palette);
         }
         custom_shelf::set_customizing(ui.ctx(), self.customize);
-        let held = self.begin_held_brush(m.brush);
+        let held = if self.modal_open() { None } else { self.begin_held_brush(m.brush) };
         let a = self.show_panels(ui, m);
         self.end_held_brush(m.brush, held);
         a
@@ -1613,12 +1712,17 @@ impl Workspace {
         self.update_card(ui.ctx());
         self.canvas_overlays(ui, m, &mut a);
         self.quick_popup(ui, m);
-        self.quick_menu_ui(ui, m);
+        self.draw_quick_menu(ui, m, &mut a);
         self.zm_menu_ui(ui);
         self.dropdown(ui, m, &mut a);
         self.brush_catalog_ui(ui,m);
         self.import_path_ui(ui);
         self.drop_targets(ui);
+        if self.lightbox.open {
+            let mut browser = std::mem::take(&mut self.lightbox);
+            browser.show(ui.ctx(), self, m, &mut a);
+            self.lightbox = browser;
+        }
         if let Some((id, place, before)) = self.pending_move.take() {
             self.layout.move_palette(id, place, before);
             self.scroll_to = Some(id);
@@ -1646,6 +1750,8 @@ impl Workspace {
         }
         self.about_dialog(ui.ctx());
         self.doc_dialog(ui.ctx(), m, &mut a);
+        self.save_brush_dialog(ui.ctx(), *m.brush);
+        self.rename_subtool_dialog(ui.ctx(), &mut a);
         m.brush.color=self.color.to_srgb();
         self.save_brush_assets();
         a
@@ -1991,12 +2097,6 @@ impl Workspace {
         }
     }
 
-    /// The brush row, Zadd/Zsub, the two live sliders and the mode row, like ZBrush's
-    /// Space menu. Sliders start under the cursor so a small move adjusts them.
-    fn quick_menu_ui(&mut self, ui: &mut Ui, m: &mut Model<'_>) {
-        self.draw_quick_menu(ui, m);
-    }
-
     /// Open a hotkey popup at `pos`; the same key again closes it.
     pub fn toggle_popup(&mut self, kind: QuickPopup, pos: Pos2) {
         self.popup = match self.popup {
@@ -2090,6 +2190,13 @@ impl Workspace {
                         self.quick_menu = None;
                     }
                     ui.add_space(8.0);
+                    if ui.add(egui::Button::new("LightBox").selected(self.lightbox.open))
+                        .on_hover_text("Show or hide LightBox · ,").clicked()
+                        && !self.modal_open() && !self.brush_catalog_open()
+                    {
+                        self.toggle_lightbox();
+                    }
+                    ui.add_space(4.0);
                     for id in PaletteId::ALL {
                         let docked = self.layout.palette(id).place != Place::Menu;
                         let on = self.dropdown == Some(id);
@@ -2176,9 +2283,106 @@ impl Workspace {
         }
     }
 
+    fn zremesh_axis(&self) -> Option<crate::symmetry::Axis> {
+        use crate::symmetry::Axis;
+        match self.zremesh_symmetry {
+            RemeshSymmetry::Off => None,
+            RemeshSymmetry::Force(axis) => Some(axis),
+            RemeshSymmetry::Brush => Axis::ALL.into_iter()
+                .zip([self.symmetry, self.symmetry_y, self.symmetry_z])
+                .find_map(|(axis, on)| on.then_some(axis)),
+        }
+    }
+
+    pub fn zremesh_plane(&self, bounds: crate::mesh::Aabb) -> Option<crate::symmetry::MirrorPlane> {
+        let axis = self.zremesh_axis()?;
+        let i = axis as usize;
+        let at = if self.zremesh_local_plane {
+            bounds.min[i] * 0.5 + bounds.max[i] * 0.5
+        } else {
+            0.0
+        };
+        Some(crate::symmetry::MirrorPlane { axis, at })
+    }
+
     /// A dialog is up: canvas input waits (About, Save As, Revert).
     pub fn modal_open(&self) -> bool {
-        self.about_open || self.doc_dialog.is_some()
+        self.about_open || self.doc_dialog.is_some() || self.lightbox.open || self.save_brush_open() || self.rename_subtool.is_some()
+    }
+
+    pub fn lightbox_open(&self) -> bool {
+        self.lightbox.open
+    }
+
+    pub fn toggle_lightbox(&mut self) {
+        self.lightbox.toggle();
+        if self.lightbox.open {
+            self.dropdown = None;
+            self.popup = None;
+            self.quick_menu = None;
+            self.zm_menu = None;
+        }
+    }
+
+    pub fn open_lightbox_category(&mut self, name: &str) {
+        if !self.lightbox.open {
+            self.toggle_lightbox();
+        }
+        self.lightbox.open_category(name);
+    }
+
+    pub fn lightbox_folder(&self) -> &std::path::Path {
+        &self.lightbox.folder
+    }
+
+    pub fn refresh_lightbox_quicksaves(&mut self) {
+        self.lightbox.refresh_quicksaves();
+    }
+
+    pub fn set_lightbox_folder(&mut self, path: PathBuf) {
+        if let Err(error) = self.lightbox.set_folder(path) {
+            self.notify(format!("LightBox: {error}"));
+        }
+    }
+
+    fn rename_subtool_dialog(&mut self, ctx: &Context, actions: &mut Actions) {
+        let Some(mut dialog) = self.rename_subtool.take() else {
+            return;
+        };
+        let response = egui::Modal::new(Id::unique("rename-subtool"))
+            .frame(popup_frame().inner_margin(14))
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.label(RichText::new("Rename SubTool").strong());
+                let mut input = egui::TextEdit::singleline(&mut dialog.name)
+                    .desired_width(ui.available_width())
+                    .char_limit(160)
+                    .show(ui);
+                if std::mem::take(&mut dialog.focus) {
+                    use egui::text::{CCursor, CCursorRange};
+                    input.response.request_focus();
+                    input.state.cursor.set_char_range(Some(CCursorRange::two(
+                        CCursor::new(0), CCursor::new(dialog.name.chars().count()),
+                    )));
+                    input.state.store(ctx, input.response.id);
+                }
+                let valid = !dialog.name.trim().is_empty();
+                let enter = input.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Cancel").clicked();
+                    let rename = ui.add_enabled(valid, egui::Button::new("Rename")).clicked();
+                    (cancel, valid && (enter || rename))
+                }).inner
+            });
+        let (cancel, rename) = response.inner;
+        if cancel || response.should_close() {
+            return;
+        }
+        if rename {
+            actions.rename_subtool = Some((dialog.id, dialog.name.trim().to_owned()));
+        } else {
+            self.rename_subtool = Some(dialog);
+        }
     }
 
     /// Document › Save As (a path, prefilled) and Revert (asks first: unsaved work is lost).
@@ -3020,6 +3224,14 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Save Brush…").clicked() {
+                                ws.open_save_brush(m.brush.kind);
+                            }
+                            if ui.button("User Brushes").clicked() {
+                                ws.open_lightbox_category("User Brushes");
+                            }
+                        });
                         ws.brush_palette(ui,m);
                     },
                 );
@@ -3466,15 +3678,19 @@ impl Workspace {
                     true,
                     &mut |ws, ui| {
                         if ui
-                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Import OBJ / STL"))
-                            .on_hover_text("Pick OBJ or STL files and add each as a new subtool")
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Import Models…"))
+                            .on_hover_text("Import OBJ, STL, GLB, glTF, FBX or GoZ as editable SubTools")
                             .clicked()
                         {
                             a.import_mesh = true;
                         }
+                        a.update_obj |= ui
+                            .add_sized([ui.available_width(), 20.0], egui::Button::new("Update from OBJ…").truncate())
+                            .on_hover_text("Update the active subtool from an OBJ in Klay coordinates and carry its sculpted detail")
+                            .clicked();
                         ui.checkbox(&mut ws.import_fit, "Fit")
-                            .on_hover_text("Centre it and scale it to a new primitive's size, so Draw Size suits it");
-                        note(ui, "OBJ groups become polygroups, vertex colours polypaint. STL corners are welded; with 3D Print › Z Up the file is turned to stand up.");
+                            .on_hover_text("Center and scale each file as a whole so its parts stay aligned");
+                        note(ui, "OBJ · STL · GLB · glTF · FBX · GoZ");
                     },
                 );
             }
@@ -3701,17 +3917,70 @@ impl Workspace {
                     true,
                     true,
                     &mut |ws, ui| {
-                        for (i, row) in m.subtools.iter().enumerate() {
-                            let (pick, eye) = subtool_row(ui, i, row);
-                            if pick {
-                                a.select_subtool = Some(i);
+                        let active = m.subtools.iter().position(|r| r.active).unwrap_or(0);
+                        let folders: std::collections::BTreeSet<_> = m.subtools.iter()
+                            .map(|r| r.folder.as_str()).filter(|s| !s.is_empty()).collect();
+                        let mut draw_row = |ui: &mut Ui, i: usize, row: &SubToolRow| {
+                            let (pick, rename, eye) = subtool_row(ui, row);
+                            if rename {
+                                ws.rename_subtool = Some(RenameSubTool { id: row.id, name: row.name.clone(), focus: true });
+                            } else if pick {
+                                if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                                    a.transpose_select = Some(i);
+                                } else {
+                                    a.select_subtool = Some(i);
+                                }
                             }
                             if eye {
                                 a.toggle_subtool = Some(i);
                             }
+                        };
+                        for (i, row) in m.subtools.iter().enumerate().filter(|(_, r)| r.folder.is_empty()) {
+                            draw_row(ui, i, row);
+                        }
+                        let mut selected_folder = None;
+                        for folder in &folders {
+                            egui::CollapsingHeader::new(*folder).id_salt(("subtool-folder", folder)).default_open(true)
+                                .show(ui, |ui| {
+                                    if ui.button("Transpose Set").clicked() {
+                                        selected_folder = Some(folder.to_string());
+                                    }
+                                    for (i, row) in m.subtools.iter().enumerate().filter(|(_, r)| r.folder == *folder) {
+                                        draw_row(ui, i, row);
+                                    }
+                                });
+                        }
+                        a.transpose_folder = selected_folder;
+                        if let Some(row) = m.subtools.get(active) {
+                            ui.horizontal_wrapped(|ui| {
+                                egui::ComboBox::from_id_salt("assign-subtool-folder").width(103.0)
+                                    .selected_text(if row.folder.is_empty() { "No folder" } else { &row.folder })
+                                    .show_ui(ui, |ui| {
+                                        for folder in std::iter::once("").chain(folders.iter().copied()) {
+                                            if ui.selectable_label(folder == row.folder, if folder.is_empty() { "No folder" } else { folder }).clicked() {
+                                                a.subtool_folder = Some((active, folder.to_string()));
+                                            }
+                                        }
+                                    });
+                                if ui.button("New Folder").clicked() {
+                                    ws.folder_name.clear();
+                                    ws.new_folder_open ^= true;
+                                }
+                            });
+                            if ws.new_folder_open {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut ws.folder_name).desired_width(104.0).hint_text("Folder name"));
+                                    if ui.add_enabled(!ws.folder_name.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                                        a.subtool_folder = Some((active, ws.folder_name.clone()));
+                                        ws.new_folder_open = false;
+                                    }
+                                });
+                            }
+                            if m.subtools.iter().any(|r| r.transpose_selected) {
+                                a.transpose_clear = ui.button("Clear Transpose Selection").clicked();
+                            }
                         }
                         ui.add_space(2.0);
-                        let active = m.subtools.iter().position(|r| r.active).unwrap_or(0);
                         let count = m.subtools.len();
                         // Three fixed cells per row: a label wider than its cell is clipped
                         // instead of widening the tray.
@@ -3837,6 +4106,33 @@ impl Workspace {
                         note(ui, "Alt + click a subtool to select it");
                     },
                 );
+                self.sec(ui, h, id, "selectionsets", "Selection Sets", None, false, true, &mut |ws, ui| {
+                    use crate::selection_set::Channel;
+                    let sets = m.selection_sets;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut ws.selection_set_name).desired_width(105.0).hint_text("Set name"));
+                        let name = ws.selection_set_name.trim();
+                        let exists = sets.iter().any(|s| s.name == name);
+                        if ui.add_enabled(!name.is_empty(), egui::Button::new(if exists { "Replace Set" } else { "Store Set" })).clicked() {
+                            ws.selection_set_index = sets.iter().position(|s| s.name == name).unwrap_or(sets.len());
+                            a.save_selection_set = Some(name.to_string());
+                        }
+                    });
+                    let i = ws.selection_set_index.min(sets.len().saturating_sub(1));
+                    if let Some(set) = sets.get(i) {
+                        egui::ComboBox::from_id_salt("selection-set").width(105.0).selected_text(&set.name).show_ui(ui, |ui| {
+                            for (k, set) in sets.iter().enumerate() {
+                                if ui.selectable_label(k == i, &set.name).clicked() { ws.selection_set_index = k; }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, channel) in [("Mask", Channel::Mask), ("Groups", Channel::Groups), ("UVs", Channel::Uvs), ("Morph", Channel::Morph)] {
+                                if ui.button(label).clicked() { a.restore_selection_set = Some((i, channel)); }
+                            }
+                            if ui.button("Delete Set").clicked() { a.delete_selection_set = Some(i); }
+                        });
+                    }
+                });
                 self.sec(ui, h, id, "tpose", "Transpose Master", None, false, true, &mut |_, ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
                     let w = (r.width() - 4.0) * 0.5;
@@ -3956,9 +4252,17 @@ impl Workspace {
                                 ws.resym_from_negative = !ws.resym_from_negative;
                             }
                         });
+                        ui.label("Mirror Axis");
+                        if let Some(axis) = seg(ui, &["X", "Y", "Z"], ws.mirror_axis, false) {
+                            ws.mirror_axis = axis;
+                        }
+                        a.mirror_copy |= ui
+                            .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror Copy"))
+                            .on_hover_text("Reflect the shown mesh into a new SubTool below this one")
+                            .shelf(ui, "cmd:mirror-copy").clicked();
                         if ui
                             .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror And Weld"))
-                            .on_hover_text("Make the subtool symmetric: the +X half mirrored onto −X and welded (no subdivision levels)")
+                            .on_hover_text("Keep the positive half on the selected axis, mirror it, and weld the seam (no subdivision levels)")
                             .shelf(ui, "cmd:mirror-weld").clicked()
                         {
                             a.mirror_weld = true;
@@ -4069,7 +4373,7 @@ impl Workspace {
                                 }
                             });
                         }
-                        note(ui, "Layers live on the highest subdivision level · REC sculpts into a layer · the eye shows or hides it · Divide waits until they are baked · not saved in projects yet");
+                        note(ui, "REC records shape, polypaint and masking on the highest level");
                     },
                 );
                 self.sec(ui, h, id, "info", "Mesh", None, true, true, &mut |_, ui| {
@@ -4091,7 +4395,11 @@ impl Workspace {
                     None,
                     true,
                     true,
-                    &mut |_, ui| {
+                    &mut |ws, ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut ws.subdiv_smt, "Smt").on_hover_text("Smooth geometry when dividing");
+                            ui.checkbox(&mut ws.subdiv_suv, "Suv").on_hover_text("Smooth UVs when dividing");
+                        });
                         let top = m.levels.len().saturating_sub(1);
                         let fits = m.next_level_vertices <= *m.vertex_budget;
                         if ui
@@ -4332,19 +4640,29 @@ impl Workspace {
                     ui.add_enabled_ui(ws.zremesh.use_polypaint, |ui| {
                         zslider(ui, "ColorDensity", &mut ws.zremesh.color_density, 1.0..=4.0, false, false, 1);
                     });
-                    if ws.symmetry {
-                        note(ui, "X symmetry is on: the result mirrors across X, with a loop on the middle");
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Symmetry");
+                        egui::ComboBox::from_id_salt("zremesher-symmetry")
+                            .width(116.0)
+                            .selected_text(ws.zremesh_symmetry.label())
+                            .show_ui(ui, |ui| {
+                                for mode in RemeshSymmetry::ALL {
+                                    ui.selectable_value(&mut ws.zremesh_symmetry, mode, mode.label());
+                                }
+                            }).response.on_hover_text("Mirror the positive half across one axis. Brush symmetry follows the first enabled mirror axis in X, Y, Z order.");
+                    });
+                    ui.add_enabled(ws.zremesh_axis().is_some(), egui::Checkbox::new(&mut ws.zremesh_local_plane, "SubTool Center"))
+                        .on_hover_text("Put the mirror plane at the middle of the SubTool's bounds. Clear to use the scene origin.");
                     let label = match ws.guide_count {
                         0 => "No guides · draw them with ZRemesherGuide (B Z G)".to_string(),
-                        1 => "1 guide curve".to_string(),
-                        n => format!("{n} guide curves"),
+                        1 => "1 guide · Alt + click to delete".to_string(),
+                        n => format!("{n} guides · Alt + click to delete"),
                     };
                     note(ui, &label);
                     if ws.guide_count > 0
                         && ui
                             .add_sized([ui.available_width(), CONTROL_H], egui::Button::new(RichText::new("Delete guides").size(12.0)))
-                            .on_hover_text("Delete every ZRemesher guide curve of this subtool")
+                            .on_hover_text("Clear every guide on this SubTool · Ctrl + Z restores them")
                             .clicked()
                     {
                         a.delete_guides = true;
@@ -4379,6 +4697,10 @@ impl Workspace {
                     ui.add_enabled_ui(!ws.uv.groups, |ui| {
                         zslider(ui, "Max angle", &mut ws.uv.max_angle, 20.0..=90.0, false, false, 0);
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.toggle_value(&mut ws.uv_seam_mode, "Mark Seams").on_hover_text("Click an edge of the lowest level to mark or unmark it");
+                        ui.checkbox(&mut ws.uv_checker, "Checker");
+                    });
                     // The layout, uploaded again only when the UVs change.
                     match &ws.uv_layout {
                         Some((key, size, px)) => {
@@ -4388,13 +4710,31 @@ impl Workspace {
                             }
                             let side = ui.available_width().min(260.0);
                             if let Some((_, tex)) = &ws.uv_texture {
-                                ui.add(egui::Image::new((tex.id(), vec2(side, side))));
+                                let r = ui.add(egui::Image::new((tex.id(), vec2(side, side))).sense(Sense::click()));
+                                if r.clicked() && let Some(p) = r.interact_pointer_pos() {
+                                    a.uv_pick = Some(glam::Vec2::new((p.x - r.rect.left()) / side, (r.rect.bottom() - p.y) / side));
+                                }
                             }
                         }
                         None => ws.uv_texture = None,
                     }
                     match &ws.uv_info {
                         Some((tris, stats)) => {
+                            use crate::uv::Edit;
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Pack Islands").clicked() { a.uv_edit = Some(Edit::Pack); }
+                                ui.add_enabled_ui(ws.uv_island_selected, |ui| {
+                                    for (label, edit) in [
+                                        ("←", Edit::Move(glam::Vec2::new(-0.02, 0.0))),
+                                        ("→", Edit::Move(glam::Vec2::new(0.02, 0.0))),
+                                        ("↑", Edit::Move(glam::Vec2::new(0.0, 0.02))),
+                                        ("↓", Edit::Move(glam::Vec2::new(0.0, -0.02))),
+                                        ("Rotate", Edit::Rotate), ("−", Edit::Scale(0.9)), ("+", Edit::Scale(1.1)),
+                                    ] {
+                                        if ui.button(label).clicked() { a.uv_edit = Some(edit); }
+                                    }
+                                });
+                            });
                             kv(ui, "Mapped triangles", &crate::fmt_count(*tris));
                             if let Some(s) = stats {
                                 kv(ui, "Islands", &s.charts.to_string());
@@ -4584,6 +4924,11 @@ impl Workspace {
                         if r.shelf(ui, "cmd:bake-displacement").clicked() {
                             a.bake = Some(Kind::Displacement);
                         }
+                        if ui.add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Vector Displacement").truncate())
+                            .on_hover_text("Save signed RGB offsets as a 32-bit EXR in object or tangent space").clicked()
+                        {
+                            a.bake = Some(Kind::VectorDisplacement);
+                        }
                     });
                     ui.add_enabled_ui(ready, |ui| {
                         let r = ui
@@ -4638,6 +4983,19 @@ impl Workspace {
                         note(ui, "Normal and Displacement need subdivision levels · Divide and sculpt the detail first · Color Map bakes this level");
                     } else {
                         note(ui, "From the highest level onto the lowest level's UVs · runs in the background");
+                    }
+                });
+                self.sec(ui, h, id, "multimap", "Multi Map Exporter", None, false, true, &mut |ws, ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, enabled) in ["Normal", "Displacement", "Vector", "Color"].into_iter().zip(&mut ws.batch_kinds) {
+                            ui.checkbox(enabled, label);
+                        }
+                    });
+                    if ws.baking_batch {
+                        a.cancel_batch_maps = ui.button("Cancel after current map").clicked();
+                    } else {
+                        a.batch_maps = ui.add_enabled(!ws.baking && ws.batch_kinds.contains(&true), egui::Button::new("Export Visible Maps…"))
+                            .on_hover_text("Bake selected maps for every visible SubTool with UVs, using Texture Maps settings").clicked();
                     }
                 });
                 self.sec(
@@ -6447,8 +6805,34 @@ fn spaced(code: &str) -> String {
     code.chars().map(String::from).collect::<Vec<_>>().join(" ")
 }
 
+/// HSV coordinates in sRGB space, as shown by the picker and hex readout.
+#[derive(Clone, Copy)]
+struct PickerColor {
+    h: f32,
+    s: f32,
+    v: f32,
+}
+
+impl PickerColor {
+    fn from_srgb(rgb: [u8; 3]) -> Self {
+        let (h, s, v) = hsv_from_rgb(rgb.map(|channel| f32::from(channel) / 255.0));
+        Self { h, s, v }
+    }
+
+    fn to_srgb(self) -> [u8; 3] {
+        rgb_from_hsv((self.h, self.s, self.v)).map(|channel| (channel * 255.0).round() as u8)
+    }
+}
+
+impl From<PickerColor> for Color32 {
+    fn from(color: PickerColor) -> Self {
+        let [r, g, b] = color.to_srgb();
+        Self::from_rgb(r, g, b)
+    }
+}
+
 /// The shelf picker at any size: the square with the hue strip on its right.
-fn color_picker_sized(ui: &mut Ui, color: &mut Hsva, size: Vec2) {
+fn color_picker_sized(ui: &mut Ui, color: &mut PickerColor, size: Vec2) {
     let (r, _) = ui.allocate_exact_size(size, Sense::hover());
     let sv = Rect::from_min_max(r.min, pos2(r.right() - 15.0, r.bottom()));
     let hue = Rect::from_min_max(pos2(r.right() - 12.0, r.top()), r.max);
@@ -6456,54 +6840,52 @@ fn color_picker_sized(ui: &mut Ui, color: &mut Hsva, size: Vec2) {
 }
 
 /// A large square picker with the hue bar underneath it (Space menu).
-fn color_picker_stacked(ui: &mut Ui, color: &mut Hsva, width: f32) {
+fn color_picker_stacked(ui: &mut Ui, color: &mut PickerColor, width: f32) {
     let (r, _) = ui.allocate_exact_size(vec2(width, width + 22.0), Sense::hover());
     let sv = Rect::from_min_size(r.min, vec2(width, width));
     let hue = Rect::from_min_max(pos2(r.left(), r.bottom() - 14.0), r.max);
     hsv_picker(ui, color, sv, hue, true);
 }
 
-fn hsv_picker(ui: &mut Ui, color: &mut Hsva, sv: Rect, hue: Rect, hue_across: bool) {
+fn hsv_picker(ui: &mut Ui, color: &mut PickerColor, sv: Rect, hue: Rect, hue_across: bool) {
     let sv_resp = ui.interact(sv, ui.scope_id().with("picker-sv"), Sense::click_and_drag());
-    if sv_resp.dragged() || sv_resp.clicked() {
-        if let Some(p) = sv_resp.interact_pointer_pos() {
-            color.s = ((p.x - sv.left()) / sv.width()).clamp(0.0, 1.0);
-            color.v = 1.0 - ((p.y - sv.top()) / sv.height()).clamp(0.0, 1.0);
-        }
+    if let Some(p) = sv_resp.interact_pointer_pos() {
+        color.s = ((p.x - sv.left()) / sv.width()).clamp(0.0, 1.0);
+        color.v = ((sv.bottom() - p.y) / sv.height()).clamp(0.0, 1.0);
     }
     let hue_resp = ui.interact(hue, ui.scope_id().with("picker-hue"), Sense::click_and_drag());
-    if hue_resp.dragged() || hue_resp.clicked() {
-        if let Some(p) = hue_resp.interact_pointer_pos() {
-            let t = if hue_across {
-                (p.x - hue.left()) / hue.width()
-            } else {
-                (p.y - hue.top()) / hue.height()
-            };
-            color.h = t.clamp(0.0, 0.999);
-        }
+    if let Some(p) = hue_resp.interact_pointer_pos() {
+        let t = if hue_across {
+            (p.x - hue.left()) / hue.width()
+        } else {
+            (p.y - hue.top()) / hue.height()
+        };
+        color.h = t.clamp(0.0, 1.0);
     }
     let p = ui.painter();
-    // saturation/value square: bilinear corner colours
-    let pure = Color32::from(Hsva::new(color.h, 1.0, 1.0, 1.0));
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(sv.left_top(), Color32::WHITE);
-    mesh.colored_vertex(sv.right_top(), pure);
-    mesh.colored_vertex(sv.right_bottom(), Color32::BLACK);
-    mesh.colored_vertex(sv.left_bottom(), Color32::BLACK);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    p.add(egui::Shape::mesh(mesh));
-    p.rect_stroke(sv, 0, Stroke::new(1.0, LINE()), StrokeKind::Inside);
-    let marker = pos2(sv.left() + color.s * sv.width(), sv.top() + (1.0 - color.v) * sv.height());
     let big = sv.width() > 100.0;
+    let radius = if big { 6 } else { 3 };
+    let pure = Color32::from(PickerColor { s: 1.0, v: 1.0, ..*color });
+    // Bilinear texture filtering mixes white to the hue across, then fades to black down.
+    let texture = ui.ctx().load_texture_cached(
+        "saturation/value gradient",
+        sv_resp.id.with("gradient"),
+        ColorImage::new([2, 2], vec![Color32::WHITE, pure, Color32::BLACK, Color32::BLACK]),
+        TextureOptions::LINEAR,
+    );
+    // Map the rectangle to the four texel centers.
+    let uv = Rect::from_min_max(pos2(0.25, 0.25), pos2(0.75, 0.75));
+    p.add(egui::epaint::RectShape::filled(sv, radius, Color32::WHITE).with_texture(texture.id(), uv));
+    p.rect_stroke(sv, radius, Stroke::new(1.0, LINE()), StrokeKind::Inside);
+    let marker = pos2(sv.left() + color.s * sv.width(), sv.bottom() - color.v * sv.height());
     p.circle_stroke(marker, if big { 6.5 } else { 4.5 }, Stroke::new(1.0, Color32::BLACK));
     p.circle_stroke(marker, if big { 5.5 } else { 3.5 }, Stroke::new(1.5, Color32::WHITE));
     // hue strip
     let mut strip = egui::Mesh::default();
-    let steps = 12;
+    let steps = 6;
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
-        let c = Color32::from(Hsva::new(t.min(0.999), 1.0, 1.0, 1.0));
+        let c = Color32::from(PickerColor { h: t, s: 1.0, v: 1.0 });
         if hue_across {
             let x = hue.left() + t * hue.width();
             strip.colored_vertex(pos2(x, hue.top()), c);
@@ -6639,11 +7021,11 @@ fn kv(ui: &mut Ui, key: &str, value: &str) {
 }
 
 /// A SubTool list line: name and size, highlighted when active, with an eye toggle on the
-/// right. Returns (row clicked, eye clicked).
-fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
+/// right. Returns (select, rename, toggle visibility).
+fn subtool_row(ui: &mut Ui, row: &SubToolRow) -> (bool, bool, bool) {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
     let eye_rect = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(24.0, 24.0));
-    let eye = ui.interact(eye_rect, Id::unique(("subtool-eye", index)), Sense::click());
+    let eye = ui.interact(eye_rect, Id::unique(("subtool-eye", row.id)), Sense::click());
     let p = ui.painter();
     p.rect_filled(
         r,
@@ -6659,11 +7041,12 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
     p.rect_stroke(
         r,
         4,
-        Stroke::new(1.0, if row.active { ACC() } else { LINE() }),
+        Stroke::new(1.0, if row.active || row.transpose_selected { ACC() } else { LINE() }),
         StrokeKind::Inside,
     );
     let text = if row.visible || row.active { FG() } else { FG3() };
-    p.text(
+    let name_right = eye_rect.left() - if row.boolean == crate::boolean::BoolOp::Add { 3.0 } else { 20.0 };
+    p.with_clip_rect(Rect::from_min_max(r.min, pos2(name_right, r.bottom()))).text(
         pos2(r.left() + 10.0, r.top() + 13.0),
         Align2::LEFT_CENTER,
         &row.name,
@@ -6727,7 +7110,10 @@ fn subtool_row(ui: &mut Ui, index: usize, row: &SubToolRow) -> (bool, bool) {
     } else {
         "Show"
     });
-    (resp.clicked() && !eye.hovered(), eye_clicked)
+    let clicked = resp.clicked() && !eye.hovered();
+    let rename = resp.double_clicked() && !eye.hovered()
+        && !ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+    (clicked && !rename, rename, eye_clicked)
 }
 
 /// ZBrush-style deformation slider: drag sets a value in -100..100 from the centre, release
@@ -7130,8 +7516,11 @@ mod tests {
 
     fn row(name: &str, active: bool) -> SubToolRow {
         SubToolRow {
+            id: u64::from(!active),
             boolean: Default::default(),
             name: name.to_string(),
+            folder: String::new(),
+            transpose_selected: false,
             visible: true,
             active,
             vertices: 240002,
@@ -7209,6 +7598,7 @@ mod tests {
                         points_supported: true,
                         axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                         subtools,
+                        selection_sets: &[],
                         parked_bytes: 0,
                         stand_in_bytes: 0,
                         project_path: &mut String::from("untitled.klay"),

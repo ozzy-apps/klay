@@ -26,12 +26,15 @@ pub enum Ask {
     ExportGltf,
     /// SubTool › Export glTF: the active subtool alone.
     ExportSubtoolGltf,
-    /// Document › Import: OBJ or STL files (several at once).
+    /// Document › Import: mesh files (several at once).
     ImportMesh,
+    UpdateObj,
     /// Geometry › Texture Maps › Normal Map.
     ExportNormalMap,
     /// Geometry › Texture Maps › Displacement, as EXR or PNG.
     ExportDisplacementMap,
+    ExportVectorMap,
+    BatchMapFolder,
     /// Geometry › Texture Maps › Color Map (the polypaint).
     ExportColorMap,
     /// Spotlight › Load Image.
@@ -40,6 +43,7 @@ pub enum Ask {
     OpenMatCap,
     /// Document › Reference › Load Image.
     OpenReference,
+    LightboxFolder,
     /// Document › Render › Render.
     ExportRender,
     /// Document › Render › Turntable.
@@ -58,14 +62,18 @@ impl Ask {
             Ask::ExportStl => "Export STL",
             Ask::ExportGltf => "Export glTF",
             Ask::ExportSubtoolGltf => "Export SubTool as glTF",
-            Ask::ImportMesh => "Import OBJ or STL",
+            Ask::ImportMesh => "Import Models",
+            Ask::UpdateObj => "Update SubTool from OBJ",
             Ask::ExportNormalMap => "Save Normal Map",
             Ask::ExportDisplacementMap => "Save Displacement Map",
+            Ask::ExportVectorMap => "Save Vector Displacement",
+            Ask::BatchMapFolder => "Export Maps to Folder",
             Ask::ExportColorMap => "Save Color Map",
             Ask::ExportRender => "Save Render",
             Ask::OpenSpotlight => "Spotlight Image",
             Ask::OpenMatCap => "Load MatCap",
             Ask::OpenReference => "Reference Image",
+            Ask::LightboxFolder => "LightBox Asset Folder",
             Ask::ExportTurntable => "Save Turntable",
         }
     }
@@ -80,14 +88,16 @@ impl Ask {
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             Ask::OpenProject | Ask::SaveProject | Ask::SaveSubtool | Ask::LoadSubtools => &["klay"],
-            Ask::ExportSubtoolObj | Ask::ExportObj => &["obj"],
+            Ask::ExportSubtoolObj | Ask::ExportObj | Ask::UpdateObj => &["obj"],
             Ask::ExportStl => &["stl"],
             Ask::ExportGltf | Ask::ExportSubtoolGltf => &["glb"],
-            Ask::ImportMesh => &["obj", "stl"],
+            Ask::ImportMesh => crate::model_import::EXTENSIONS,
             Ask::ExportNormalMap | Ask::ExportColorMap | Ask::ExportRender => &["png"],
             Ask::ExportTurntable => &["mp4"],
             Ask::OpenSpotlight | Ask::OpenMatCap | Ask::OpenReference => &["png", "jpg", "jpeg", "bmp"],
             Ask::ExportDisplacementMap => &["exr", "png"],
+            Ask::LightboxFolder | Ask::BatchMapFolder => &["*"],
+            Ask::ExportVectorMap => &["exr"],
         }
     }
 
@@ -102,14 +112,14 @@ impl Ask {
             ["exr", "png"] => "OpenEXR or PNG image",
             ["mp4"] => "MP4 video",
             ["png", "jpg", "jpeg", "bmp"] => "Images (PNG, JPEG, BMP)",
-            _ => "Meshes (OBJ, STL)",
+            _ => "3D Models (OBJ, STL, GLB, glTF, FBX, GoZ)",
         }
     }
 
     pub fn saves(self) -> bool {
         matches!(
             self,
-            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportGltf | Ask::ExportSubtoolGltf | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportColorMap | Ask::ExportRender | Ask::ExportTurntable
+            Ask::SaveProject | Ask::SaveSubtool | Ask::ExportSubtoolObj | Ask::ExportObj | Ask::ExportStl | Ask::ExportGltf | Ask::ExportSubtoolGltf | Ask::ExportNormalMap | Ask::ExportDisplacementMap | Ask::ExportVectorMap | Ask::ExportColorMap | Ask::ExportRender | Ask::ExportTurntable
         )
     }
 
@@ -140,11 +150,15 @@ pub fn open(ask: Ask, dir: &Path, file_name: &str, parent: Option<&winit::window
     let ext = ask.extension();
     // Both cases: some file choosers match extensions case-sensitively (MODEL.STL).
     let exts: Vec<String> = ask.extensions().iter().flat_map(|e| [e.to_string(), e.to_uppercase()]).collect();
-    let mut dialog = rfd::FileDialog::new().set_title(ask.title()).set_directory(dir).add_filter(ask.kind(), &exts);
-    if ask.saves() {
-        dialog = dialog.set_file_name(file_name).set_can_create_directories(true);
-    } else {
-        dialog = dialog.add_filter("All files", &["*"]);
+    let mut dialog = rfd::FileDialog::new().set_title(ask.title()).set_directory(dir);
+    let folder = matches!(ask, Ask::LightboxFolder | Ask::BatchMapFolder);
+    if !folder {
+        dialog = dialog.add_filter(ask.kind(), &exts);
+        if ask.saves() {
+            dialog = dialog.set_file_name(file_name).set_can_create_directories(true);
+        } else {
+            dialog = dialog.add_filter("All files", &["*"]);
+        }
     }
     if let Some(window) = parent {
         dialog = dialog.set_parent(window);
@@ -153,7 +167,9 @@ pub fn open(ask: Ask, dir: &Path, file_name: &str, parent: Option<&winit::window
     std::thread::Builder::new()
         .name("file dialog".into())
         .spawn(move || {
-            let paths = if ask.saves() {
+            let paths = if folder {
+                dialog.pick_folder().map(|p| vec![p])
+            } else if ask.saves() {
                 dialog.save_file().map(|p| vec![with_any_extension(p, ask.extensions(), ext)])
             } else if ask.many() {
                 dialog.pick_files()
@@ -220,7 +236,7 @@ mod tests {
         assert_eq!(with_extension("/a/head.v2".into(), "klay"), PathBuf::from("/a/head.v2.klay"));
         assert_eq!(with_extension("/a/head.obj".into(), "obj"), PathBuf::from("/a/head.obj"));
         assert_eq!(with_extension("/a/head".into(), Ask::ExportStl.extension()), PathBuf::from("/a/head.stl"));
-        assert_eq!(Ask::ImportMesh.extensions(), ["obj", "stl"]);
+        assert_eq!(Ask::ImportMesh.extensions(), ["obj", "stl", "glb", "gltf", "fbx", "goz"]);
         assert!(Ask::ExportStl.saves() && !Ask::ImportMesh.saves());
         assert!(Ask::ExportGltf.saves() && Ask::ExportSubtoolGltf.saves());
         assert_eq!(with_extension("/a/head".into(), Ask::ExportGltf.extension()), PathBuf::from("/a/head.glb"));

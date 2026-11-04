@@ -117,7 +117,16 @@ impl Library {
         } else {
             &mut self.alphas
         };
-        if let Some(old) = items.iter().find(|old| old.locator() == p.locator()) {
+        let locator = p.locator();
+        if let Some(old) = items.iter().find(|old| {
+            if let (Pattern::Image(a), Pattern::Image(b)) = (old, &p) {
+                if a.source.is_none() && b.source.is_none() {
+                    return a.name == b.name && a.width == b.width && a.height == b.height
+                        && a.rgba == b.rgba;
+                }
+            }
+            old.locator() == locator
+        }) {
             return old.clone();
         }
         items.push(p.clone());
@@ -125,10 +134,14 @@ impl Library {
     }
 
     fn encode(&self, s: &StampSettings) -> String {
+        let locator = |p: &Pattern| match p {
+            Pattern::Image(image) if image.source.is_none() => Pattern::Off.locator(),
+            _ => p.locator(),
+        };
         let mut out = format!(
             "# Klay brush assets v1\nalpha\t{}\ntexture\t{}\nstrength\t{}\nscale\t{}\nrotate\t{}\n",
-            escape(&s.alpha.locator()),
-            escape(&s.texture.locator()),
+            escape(&locator(&s.alpha)),
+            escape(&locator(&s.texture)),
             s.texture_strength,
             s.texture_scale,
             s.texture_angle
@@ -138,8 +151,8 @@ impl Library {
             ("texture-file", &self.textures),
         ] {
             for p in items {
-                if let Pattern::Image(i) = p {
-                    out.push_str(&format!("{key}\t{}\n", escape(&i.source.to_string_lossy())));
+                if let Pattern::Image(i) = p && let Some(path) = &i.source {
+                    out.push_str(&format!("{key}\t{}\n", escape(&path.to_string_lossy())));
                 }
             }
         }

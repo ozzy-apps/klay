@@ -7,7 +7,7 @@ use crate::mask::MaskData;
 use crate::transform::Affine;
 use crate::brush_asset::{Pattern, tangent};
 use crate::symmetry::{Images, Symmetry};
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -495,7 +495,10 @@ pub enum UndoStep {
     /// A layer's intensity before it was changed.
     LayerIntensity { index: usize, intensity: f32 },
     /// The base level's UVs before UV Master changed them (empty for none).
-    Uvs(Vec<[glam::Vec2; 3]>),
+    Uvs(crate::multires::UvState),
+    UvSeams(Vec<[u32; 2]>),
+    /// Replace a span of the active subtool's ZRemesher guides.
+    Guides { start: usize, remove: usize, insert: Vec<crate::curve::Curve> },
     /// The crease bits of `level` before a crease change (empty for none).
     Creases { level: usize, bits: Vec<u8> },
 }
@@ -585,22 +588,27 @@ impl History {
     }
 
     pub fn undo(&mut self, doc: &mut Multires) {
-        self.edits += 1;
-        if let Some(step) = self.undo.pop() {
-            let inverse = apply_step(doc, step);
-            self.redo.push(inverse);
-            let name = self.undo_names.pop().unwrap_or_default();
-            self.redo_names.push(name);
-        }
+        self.step(doc, None, true);
     }
 
     pub fn redo(&mut self, doc: &mut Multires) {
+        self.step(doc, None, false);
+    }
+
+    pub fn step_with_guides(&mut self, doc: &mut Multires, guides: &mut Vec<crate::curve::Curve>, undo: bool) {
+        self.step(doc, Some(guides), undo);
+    }
+
+    fn step(&mut self, doc: &mut Multires, guides: Option<&mut Vec<crate::curve::Curve>>, undo: bool) {
         self.edits += 1;
-        if let Some(step) = self.redo.pop() {
-            let inverse = apply_step(doc, step);
-            self.undo.push(inverse);
-            let name = self.redo_names.pop().unwrap_or_default();
-            self.undo_names.push(name);
+        let (from, to, names, inverse_names) = if undo {
+            (&mut self.undo, &mut self.redo, &mut self.undo_names, &mut self.redo_names)
+        } else {
+            (&mut self.redo, &mut self.undo, &mut self.redo_names, &mut self.undo_names)
+        };
+        if let Some(step) = from.pop() {
+            to.push(apply_step(doc, guides, step));
+            inverse_names.push(names.pop().unwrap_or_default());
         }
     }
 
@@ -643,6 +651,8 @@ fn step_name(s: &UndoStep) -> &'static str {
         UndoStep::Layers { .. } => "Layers",
         UndoStep::LayerIntensity { .. } => "Layer intensity",
         UndoStep::Uvs(_) => "UV Unwrap",
+        UndoStep::UvSeams(_) => "UV seam",
+        UndoStep::Guides { .. } => "ZRemesher guide",
         UndoStep::Creases { .. } => "Crease",
     }
 }
@@ -663,13 +673,16 @@ fn step_bytes(s: &UndoStep) -> usize {
         UndoStep::Steps(steps) => steps.iter().map(step_bytes).sum(),
         UndoStep::Layers { state, .. } => state.bytes(),
         UndoStep::LayerIntensity { .. } => 0,
-        UndoStep::Uvs(uvs) => uvs.len() * 24,
+        UndoStep::Uvs((uvs, mapped)) => uvs.len() * 24 + mapped.len(),
+        UndoStep::UvSeams(edges) => edges.len() * 8,
+        UndoStep::Guides { insert, .. } => insert.iter().map(|g| g.points.len() * 40
+            + g.pieces.len() * std::mem::size_of::<std::ops::Range<usize>>()).sum(),
         UndoStep::Creases { bits, .. } => bits.len(),
     }
 }
 
 /// Apply a step and return its inverse.
-fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
+fn apply_step(doc: &mut Multires, mut guides: Option<&mut Vec<crate::curve::Curve>>, step: UndoStep) -> UndoStep {
     match step {
         // A step that no longer fits the mesh (its chunks changed size) is left alone
         // rather than written over the wrong vertices.
@@ -688,6 +701,11 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
         }
         UndoStep::Transform(map) => {
             doc.transform(&map);
+            if let Some(guides) = guides {
+                for guide in guides {
+                    guide.apply_affine(&map);
+                }
+            }
             UndoStep::Transform(map.inverse())
         }
         UndoStep::MaskedTransform { map, level, mask } => {
@@ -745,11 +763,20 @@ fn apply_step(doc: &mut Multires, step: UndoStep) -> UndoStep {
             index,
             intensity: doc.set_layer_intensity(index, intensity),
         },
-        UndoStep::Uvs(uvs) => UndoStep::Uvs(doc.swap_uvs(uvs)),
+        UndoStep::Uvs(uvs) => UndoStep::Uvs(doc.swap_uv_state(uvs)),
+        UndoStep::UvSeams(edges) => UndoStep::UvSeams(std::mem::replace(&mut doc.obj_layout.seams, edges)),
         UndoStep::Creases { level, bits } => UndoStep::Creases { level, bits: doc.swap_creases(level, bits) },
+        UndoStep::Guides { start, remove, insert } => {
+            let Some(guides) = guides else {
+                return UndoStep::Guides { start, remove, insert };
+            };
+            let count = insert.len();
+            let previous = guides.splice(start..start + remove, insert).collect();
+            UndoStep::Guides { start, remove: count, insert: previous }
+        }
         UndoStep::Steps(steps) => {
             // Applied in order; their inverses run the other way.
-            let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, s)).collect();
+            let mut inverse: Vec<UndoStep> = steps.into_iter().map(|s| apply_step(doc, guides.as_deref_mut(), s)).collect();
             inverse.reverse();
             UndoStep::Steps(inverse)
         }
@@ -817,7 +844,7 @@ pub struct Stroke {
     images: Images,
     assets: StampSettings,
     paint_snapshots: crate::paint::Chunks,
-    paint_snapshotted: HashSet<u32>,
+    paint_snapshot_index: HashMap<u32, usize>,
     /// Camera forward of the latest dab (Auto Masking's BackfaceMask).
     view: Vec3,
     /// Least distance between dabs, as a share of the radius (Stroke › Spacing).
@@ -828,12 +855,32 @@ pub struct Stroke {
     /// DragRect: the direction the stamp's alpha is turned to (its "up" in the surface),
     /// in the brush's own frame; `None` for the surface's own frame.
     stamp_axis: Option<Vec3>,
+    /// DragRect/DragDot reuse the first stamp's random seed and restore only the previous preview.
+    stamp_seed: Option<Vec3>,
+    preview_chunks: Vec<u32>,
     /// The current dab's alpha turn (Stroke › Alpha rotation), radians.
     dab_angle: f32,
 }
 
 /// Default Stroke › Spacing: a dab every 0.15 radius.
 pub const SPACING: f32 = 0.15;
+
+/// A dab's alpha and texture projection, in the brush's own symmetry frame.
+#[derive(Clone, Copy)]
+struct StampProjection {
+    center: Vec3,
+    across: Vec3,
+    up: Vec3,
+    diameter: f32,
+}
+
+impl StampProjection {
+    fn uv(self, images: &Images, copy: usize, position: Vec3) -> glam::Vec2 {
+        let offset = images.unmap(copy, position) - self.center;
+        glam::Vec2::new(offset.dot(self.across), -offset.dot(self.up)) / self.diameter
+            + glam::Vec2::splat(0.5)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StampSettings {
@@ -854,7 +901,7 @@ pub struct StampSettings {
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::Fixed,angle:0.0,spotlight:None}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::default(),angle:0.0,spotlight:None}}
 }
 
 impl StampSettings {
@@ -865,6 +912,33 @@ impl StampSettings {
         let turned = glam::Vec2::from_angle(self.texture_angle.to_radians()).rotate(c);
         (turned + glam::Vec2::splat(0.5)) * self.texture_scale
     }
+
+    fn sample(&self, images: &Images, copy: usize, position: Vec3, stamp: StampProjection) -> StampSample {
+        if self.alpha == Pattern::Off && self.texture == Pattern::Off {
+            return StampSample { alpha: 1.0, texture: Vec4::ONE };
+        }
+        let uv = stamp.uv(images, copy, position);
+        let alpha = if self.alpha == Pattern::Off { 1.0 } else { self.alpha.alpha(uv) };
+        let texture = if self.texture == Pattern::Off {
+            Vec4::ONE
+        } else {
+            self.texture.sample(self.texture_uv(uv), true)
+        };
+        StampSample { alpha, texture }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StampSample {
+    alpha: f32,
+    texture: Vec4,
+}
+
+impl StampSample {
+    fn relief(self, strength: f32) -> f32 {
+        let height = self.texture.truncate().dot(Vec3::new(0.2126, 0.7152, 0.0722)) * self.texture.w;
+        self.alpha * (1.0 - strength + height * strength)
+    }
 }
 
 /// How the alpha (and texture) of each dab is turned (ZBrush: Stroke › Roll for Follow,
@@ -872,11 +946,11 @@ impl StampSettings {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlphaTurn {
     /// At the set angle.
-    #[default]
     Fixed,
     /// Along the stroke, plus the angle.
     Follow,
     /// A new random turn every dab.
+    #[default]
     Random,
 }
 
@@ -981,19 +1055,37 @@ impl Stroke {
             images: symmetry.into().images(),
             assets: StampSettings::default(),
             paint_snapshots: Vec::new(),
-            paint_snapshotted: HashSet::new(),
+            paint_snapshot_index: HashMap::new(),
             view: -Vec3::Z,
             spacing: SPACING,
             morph: None,
             stamp_axis: None,
+            stamp_seed: None,
+            preview_chunks: Vec::new(),
             dab_angle: 0.0,
         }
     }
 
-    /// The stamp frame (across, along) at `normal`: turned to `stamp_axis` when set, then
-    /// by the dab's alpha turn.
-    fn frame(&self, normal: Vec3) -> (Vec3, Vec3) {
-        turned(self.base_frame(normal), self.dab_angle)
+    fn stamp_projection(&self, center: Vec3, normal: Vec3, radius: f32) -> StampProjection {
+        let (across, up) = turned(self.base_frame(normal), self.dab_angle);
+        StampProjection {
+            center,
+            across,
+            up,
+            diameter: 2.0 * radius,
+        }
+    }
+
+    fn alpha_angle(&self, dab: u32, hit: Vec3, normal: Vec3, along: Option<Vec3>) -> f32 {
+        let fixed = self.assets.angle.to_radians();
+        match self.assets.turn {
+            AlphaTurn::Fixed => fixed,
+            AlphaTurn::Follow => along.map_or(fixed, |along| {
+                let (u, v) = self.base_frame(normal);
+                fixed + along.dot(u).atan2(along.dot(v))
+            }),
+            AlphaTurn::Random => fixed + dab_turn(dab, self.stamp_seed.unwrap_or(hit)),
+        }
     }
 
     fn base_frame(&self, normal: Vec3) -> (Vec3, Vec3) {
@@ -1011,21 +1103,25 @@ impl Stroke {
     /// paint) as it was before the stroke, at `hit`, turned to `axis` when given.
     #[allow(clippy::too_many_arguments)]
     pub fn restamp(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, normal: Vec3, view_dir: Vec3, ray: (Vec3, Vec3), axis: Option<Vec3>) {
-        let chunks: Vec<u32> = self.snapshots.iter().map(|(c, _)| *c).collect();
-        for (c, orig) in &self.snapshots {
-            let start = mesh.chunks[*c as usize].vert_start as usize;
-            mesh.positions[start..start + orig.len()].copy_from_slice(orig);
-        }
-        if !chunks.is_empty() {
-            mesh.finish_edit(&chunks);
-        }
-        for (c, orig) in &self.paint_snapshots {
-            let (a, b) = mesh.chunks[*c as usize].range();
-            if mesh.colors.len() >= b {
-                mesh.colors[a..b].copy_from_slice(orig);
-                mesh.chunks[*c as usize].dirty_color = true;
+        self.preview_chunks.sort_unstable();
+        self.preview_chunks.dedup();
+        let mut restored_positions = Vec::new();
+        for c in self.preview_chunks.drain(..) {
+            let chunk = &mut mesh.chunks[c as usize];
+            let (a, b) = chunk.range();
+            if let Some(&i) = self.snapshot_index.get(&c) {
+                mesh.positions[a..b].copy_from_slice(&self.snapshots[i].1);
+                restored_positions.push(c);
+            }
+            if let Some(&i) = self.paint_snapshot_index.get(&c) {
+                mesh.colors[a..b].copy_from_slice(&self.paint_snapshots[i].1);
+                chunk.dirty_color = true;
             }
         }
+        if !restored_positions.is_empty() {
+            mesh.finish_edit(&restored_positions);
+        }
+        self.stamp_seed.get_or_insert(hit);
         self.last_dab = None;
         self.layer_normal = None;
         self.plane = None;
@@ -1083,46 +1179,75 @@ impl Stroke {
     pub fn with_assets(mut self,assets:StampSettings)->Self {self.assets=assets;self}
     pub fn take_paint(&mut self)->crate::paint::Chunks {std::mem::take(&mut self.paint_snapshots)}
 
-    /// Alpha and texture at `p`, a vertex of symmetry copy `k` of `images`, for a dab at
-    /// `hit` with `normal` in the brush's own frame (so every copy shows the same stamp).
-    fn stamp_weight(&self,images:&Images,k:usize,p:Vec3,hit:Vec3,normal:Vec3,r:f32)->f32 {
+    /// Alpha and texture relief at `p`, a vertex of symmetry copy `k`.
+    fn stamp_weight(&self, images: &Images, k: usize, p: Vec3, stamp: StampProjection) -> f32 {
         // Spotlight: the picture's brightness where the point lands on screen.
-        let spot=self.assets.spotlight.as_ref().map_or(1.0,|s|s.strength(p));
-        if self.assets.alpha==Pattern::Off && self.assets.texture==Pattern::Off {return spot;}
-        let p=images.unmap(k,p);
-        let (u,v)=self.frame(normal);
-        let delta=p-hit;
-        let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*r)+glam::Vec2::splat(0.5);
-        let a=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};
-        let t=self.assets.texture.sample(self.assets.texture_uv(uv),true);
-        let h=t.truncate().dot(Vec3::new(0.2126,0.7152,0.0722))*t.w;
-        spot*a*(1.0-self.assets.texture_strength+h*self.assets.texture_strength)
+        let spot = self.assets.spotlight.as_ref().map_or(1.0, |s| s.strength(p));
+        spot * self.assets.sample(images, k, p, stamp).relief(self.assets.texture_strength)
     }
 
-    /// Polypaint under a dab at `hit` with `normal` in the brush's own frame. Vertex `i`
-    /// belongs to symmetry copy `copy` of `images`, or with `None` to its selection image.
+    /// Paint the selection and/or compute sculpt weights. Z+RGB samples each vertex's
+    /// alpha and texture once, before either channel modifies the mesh.
     #[allow(clippy::too_many_arguments)]
-    fn paint_selected(&mut self,mesh:&mut SculptMesh,sel:&Selection,brush:&Brush,hit:Vec3,normal:Vec3,auto:Option<&[f32]>,images:&Images,copy:Option<usize>) {
-        if !brush.paint||brush.rgb_intensity<=0.0{return;}
-        let fresh:Vec<_>=sel.chunks().into_iter().filter(|c|self.paint_snapshotted.insert(*c)).collect();
-        self.paint_snapshots.extend(crate::paint::snapshot(mesh,&fresh));
-        let (u,v)=self.frame(normal);let base=Vec3::from_array(brush.color.map(|x|x as f32/255.0));
-        let values=sel.par_map(|i,vert| {
-            let p=images.unmap(copy.unwrap_or_else(||sel.image(i)),mesh.positions[vert as usize]);
-            let delta=p-hit;
-            let uv=glam::Vec2::new(delta.dot(u),-delta.dot(v))/(2.0*brush.radius)+glam::Vec2::splat(0.5);
-            let tex=self.assets.texture.sample(self.assets.texture_uv(uv),true);
-            // Spotlight: the picture's colour where the vertex lands on screen, none off it.
-            let (rgb,cover)=match &self.assets.spotlight {
-                Some(s)=>s.sample(mesh.positions[vert as usize]).map_or((base,0.0),|c|(Vec3::new(c[0],c[1],c[2])*tex.truncate(),c[3])),
-                None=>(base*tex.truncate(),1.0),
+    fn apply_stamp(
+        &mut self,
+        mesh: &mut SculptMesh,
+        sel: &Selection,
+        brush: &Brush,
+        stamp: StampProjection,
+        auto: Option<&[f32]>,
+        images: &Images,
+        copy: Option<usize>,
+        weights: Option<&mut Vec<f32>>,
+        profile: impl Fn(f32, Vec3) -> f32 + Sync,
+    ) {
+        let image = |i| copy.unwrap_or_else(|| sel.image(i));
+        let auto = |i| auto.map_or(1.0, |a| a[i]);
+        if !brush.paint || brush.rgb_intensity <= 0.0 {
+            if let Some(weights) = weights {
+                sel.par_map_into(weights, |i, vert| {
+                    let p = mesh.positions[vert as usize];
+                    let falloff = focal_falloff(sel.dist[i], brush.radius, brush.focal_shift);
+                    profile(falloff, p) * self.stamp_weight(images, image(i), p, stamp)
+                        * crate::mask::freedom(&mesh.mask, vert) * auto(i)
+                });
+            }
+            return;
+        }
+        let base = Vec3::from_array(brush.color.map(|x| x as f32 / 255.0));
+        let paint = |vert, p, sample: StampSample, falloff, freedom, auto| {
+            let (rgb, cover) = match &self.assets.spotlight {
+                Some(s) => s.sample(p).map_or((base, 0.0), |c| (Vec3::new(c[0], c[1], c[2]), c[3])),
+                None => (base, 1.0),
             };
-            let weight=cover*focal_falloff(sel.dist[i],brush.radius,brush.focal_shift)
-                *if self.assets.alpha==Pattern::Off{1.0}else{self.assets.alpha.alpha(uv)}
-                *crate::mask::freedom(&mesh.mask,vert)*tex.w*brush.rgb_intensity*0.35*auto.map_or(1.0,|a|a[i]);
-            crate::paint::blend(crate::paint::at(mesh,vert as usize),rgb.to_array(),weight)
-        });
-        crate::paint::scatter(mesh,sel,&values);
+            let weight = cover * falloff * sample.alpha * freedom * sample.texture.w
+                * brush.rgb_intensity * 0.35 * auto;
+            crate::paint::blend(crate::paint::at(mesh, vert as usize), (rgb * sample.texture.truncate()).to_array(), weight)
+        };
+        let sample = |i: usize, vert: u32| {
+            let p = mesh.positions[vert as usize];
+            let sample = self.assets.sample(images, image(i), p, stamp);
+            let falloff = focal_falloff(sel.dist[i], brush.radius, brush.focal_shift);
+            let freedom = crate::mask::freedom(&mesh.mask, vert);
+            (p, sample, falloff, freedom)
+        };
+        let mut values = Vec::new();
+        if let Some(weights) = weights {
+            sel.verts.par_iter().enumerate().map(|(i, &vert)| {
+                let (p, sample, falloff, freedom) = sample(i, vert);
+                let spot = self.assets.spotlight.as_ref().map_or(1.0, |s| s.strength(p));
+                let weight = profile(falloff, p) * spot * sample.relief(self.assets.texture_strength) * freedom * auto(i);
+                let color = paint(vert, p, sample, falloff, freedom, auto(i));
+                (weight, color)
+            }).unzip_into_vecs(weights, &mut values);
+        } else {
+            sel.par_map_into(&mut values, |i, vert| {
+                let (p, sample, falloff, freedom) = sample(i, vert);
+                paint(vert, p, sample, falloff, freedom, auto(i))
+            });
+        }
+        self.snapshot_paint(mesh, sel.groups.iter().map(|g| g.chunk));
+        crate::paint::scatter(mesh, sel, &values);
     }
 
     fn select(&self, mesh: &SculptMesh, hit: Vec3, radius: f32) -> Selection {
@@ -1166,6 +1291,14 @@ impl Stroke {
         }
     }
 
+    fn snapshot_paint(&mut self, mesh: &SculptMesh, chunks: impl Iterator<Item = u32>) {
+        let fresh: Vec<_> = chunks.filter(|c| !self.paint_snapshot_index.contains_key(c)).collect();
+        for data in crate::paint::snapshot(mesh, &fresh) {
+            self.paint_snapshot_index.insert(data.0, self.paint_snapshots.len());
+            self.paint_snapshots.push(data);
+        }
+    }
+
     /// Apply the brush at a surface hit. `view_dir` is the camera forward vector and
     /// `ray` the current cursor ray, both used by Grab.
     pub fn dab(
@@ -1206,17 +1339,7 @@ impl Stroke {
         let moved = previous_hit.map_or(Vec3::ZERO, |p| hit - p);
         let along = (moved - hit_normal * moved.dot(hit_normal)).normalize_or(fallback - hit_normal * fallback.dot(hit_normal)).normalize_or(tangent(hit_normal).0);
         self.direction = Some(along);
-        // Stroke › Alpha rotation for this dab.
-        let fixed = self.assets.angle.to_radians();
-        self.dab_angle = match self.assets.turn {
-            AlphaTurn::Fixed => fixed,
-            AlphaTurn::Follow => {
-                // The stroke's direction measured in the stamp's own frame.
-                let (u, v) = self.base_frame(hit_normal);
-                fixed + along.dot(u).atan2(along.dot(v))
-            }
-            AlphaTurn::Random => fixed + dab_turn(self.dabs, hit),
-        };
+        self.dab_angle = self.alpha_angle(self.dabs, hit, hit_normal, Some(along));
         // With symmetry every copy of the brush makes a whole dab of its own, one after
         // another, as in ZBrush: where copies overlap (a big brush, a stroke on a symmetry
         // plane) both apply, and the surface stays whole.
@@ -1252,34 +1375,26 @@ impl Stroke {
         }
         self.last_count = sel.len();
         let chunks = sel.chunks();
+        if self.stamp_seed.is_some() {
+            self.preview_chunks.extend_from_slice(&chunks);
+        }
         if brush.sculpt && brush.kind!=BrushKind::Paint {self.snapshot(mesh, &chunks);}
         let auto = self.auto_weights(mesh, &sel);
-        self.paint_selected(mesh,&sel,brush,own_hit,own_normal,auto.as_deref(),images,Some(k));
-        if !brush.sculpt || brush.kind==BrushKind::Paint {return;}
-        let sign = if self.invert { -1.0 } else { 1.0 };
+        let stamp = self.stamp_projection(own_hit, own_normal, brush.radius);
+        let sculpt = brush.sculpt && brush.kind != BrushKind::Paint;
         let r = brush.radius;
-        // Masked vertices (Ctrl) are held still.
-        let mask = &mesh.mask;
         let square = brush.kind.is_square();
         let mut weights=std::mem::take(&mut self.weights);
-        sel.dist
-            .par_iter()
-            .zip(sel.verts.par_iter())
-            .enumerate()
-            .map(|(_,(&d, &v))| {
-                let p = mesh.positions[v as usize];
-                let profile = if square {
-                    square_footprint(images.unmap(k, p), own_hit, own_normal, along, r, brush.kind == BrushKind::MalletFast)
-                } else {
-                    focal_falloff(d, r, brush.focal_shift)
-                };
-                profile*self.stamp_weight(images,k,p,own_hit,own_normal,r)*crate::mask::freedom(mask, v)
-            })
-            .collect_into_vec(&mut weights);
-        if let Some(a) = &auto {
-            weights.par_iter_mut().zip(a.par_iter()).for_each(|(w, a)| *w *= a);
-        }
+        self.apply_stamp(mesh, &sel, brush, stamp, auto.as_deref(), images, Some(k), sculpt.then_some(&mut weights), |falloff, p| {
+            if square {
+                square_footprint(images.unmap(k, p), own_hit, own_normal, along, r, brush.kind == BrushKind::MalletFast)
+            } else {
+                falloff
+            }
+        });
         self.weights=weights;
+        if !sculpt { return; }
+        let sign = if self.invert { -1.0 } else { 1.0 };
         let w = &self.weights;
         let new = &mut self.scratch;
 
@@ -1567,7 +1682,8 @@ impl Stroke {
         let chunks=sel.chunks();self.snapshot(mesh,&chunks);
         let auto=self.auto_weights(mesh,&sel);
         let images=self.images.clone();
-        self.paint_selected(mesh,&sel,brush,centre,normal,auto.as_deref(),&images,None);
+        let stamp = self.stamp_projection(centre, normal, r);
+        self.apply_stamp(mesh, &sel, brush, stamp, auto.as_deref(), &images, None, None, |_, _| 0.0);
         let phase=self.detail_distance;self.detail_distance+=length;
         let sign=if self.invert{-1.0}else{1.0};
         let next=sel.par_map(|i,v| {
@@ -1577,7 +1693,7 @@ impl Stroke {
             let offset=p-start;let along=offset.dot(direction);let across=offset.dot(sideways);
             if along < -r*0.04 || along > length+r*0.04 || across.abs()>r || offset.dot(normal).abs()>r*0.65 {return actual;}
             let weight=focal_falloff(across.abs(),r,brush.focal_shift)
-                *self.stamp_weight(&self.images,k,actual,centre,normal,r)*crate::mask::freedom(&mesh.mask,v)
+                *self.stamp_weight(&self.images,k,actual,stamp)*crate::mask::freedom(&mesh.mask,v)
                 *auto.as_ref().map_or(1.0,|a|a[i]);
             if weight<=0.0 {return actual;}
             let height=crate::detail_brush::profile(brush.kind,across/r,(phase+along)/r)*r*0.12*brush.strength*sign*weight;
@@ -1619,19 +1735,21 @@ impl Stroke {
         let mid = curve.points.len() / 2;
         let auto = self.auto_weights(mesh, &sel);
         let images = self.images.clone();
-        self.paint_selected(mesh, &sel, brush, curve.points[mid], curve.normals[mid], auto.as_deref(), &images, None);
+        let stamp = self.stamp_projection(curve.points[mid], curve.normals[mid], r);
+        self.apply_stamp(mesh, &sel, brush, stamp, auto.as_deref(), &images, None, None, |_, _| 0.0);
         self.last_count = sel.len();
         self.dabs += 1;
         if !brush.sculpt || !brush.kind.is_detail() {
             return;
         }
         let sign = if self.invert { -1.0 } else { 1.0 };
+        let identity = Images::identity();
         let next = sel.par_map(|i, v| {
             let f = feet[i];
             let actual = mesh.positions[v as usize];
             // The foot is on the vertex's own side, so the stamp needs no mirroring.
             let weight = focal_falloff(f.across.abs(), r, brush.focal_shift)
-                * self.stamp_weight(&Images::identity(), 0, actual, f.point, f.normal, r)
+                * self.stamp_weight(&identity, 0, actual, self.stamp_projection(f.point, f.normal, r))
                 * crate::mask::freedom(&mesh.mask, v)
                 * auto.as_ref().map_or(1.0, |a| a[i]);
             if weight <= 0.0 {
@@ -1670,8 +1788,7 @@ impl Stroke {
         self.snapshot(mesh, chunks);
         // Colours only once the model has paint: an unpainted level has none to keep.
         if !mesh.colors.is_empty() {
-            let fresh: Vec<_> = chunks.iter().copied().filter(|c| self.paint_snapshotted.insert(*c)).collect();
-            self.paint_snapshots.extend(crate::paint::snapshot(mesh, &fresh));
+            self.snapshot_paint(mesh, chunks.iter().copied());
         }
     }
 
@@ -1687,25 +1804,28 @@ impl Stroke {
 
     fn grab_dab(&mut self, mesh: &mut SculptMesh, brush: &Brush, hit: Vec3, view_dir: Vec3, ray: (Vec3, Vec3)) {
         if self.grab.is_none() {
-            let sel = self.select(mesh, hit, brush.radius);
+            // A drag picks up a single stamp. Keep its rotation with the picked vertices.
+            let normal = -view_dir;
+            let r = brush.radius;
+            self.dab_angle = self.alpha_angle(1, hit, normal, None);
+            let stamp = self.stamp_projection(hit, normal, r);
+            let sel = self.select(mesh, hit, r);
             let auto = self.auto_weights(mesh, &sel);
             let images = self.images.clone();
-            self.paint_selected(mesh,&sel,brush,hit,-view_dir,auto.as_deref(),&images,None);
             let chunks = sel.chunks();
             self.snapshot(mesh, &chunks);
-            let r = brush.radius;
-            // Each symmetry copy moves with its own image of the delta (`grab_offset`).
-            let mask = &mesh.mask;
-            let weight = |i: usize, d: f32, k: usize| {
-                let f = focal_falloff(d, r, brush.focal_shift);
-                let profile = match brush.kind { BrushKind::SnakeHook => f.powi(3), BrushKind::Elastic => f.sqrt(), BrushKind::Spiral => f * f, _ => f };
-                profile * self.stamp_weight(&self.images, k, mesh.positions[sel.verts[i] as usize], hit, view_dir, r)
-                    * crate::mask::freedom(mask, sel.verts[i])
+            let profile = |f: f32| {
+                match brush.kind { BrushKind::SnakeHook => f.powi(3), BrushKind::Elastic => f.sqrt(), BrushKind::Spiral => f * f, _ => f }
             };
-            // Per vertex: Move Topological's and Auto Masking's factor.
+            let mut weights = Vec::new();
+            self.apply_stamp(mesh, &sel, brush, stamp, auto.as_deref(), &images, None, Some(&mut weights), |f, _| profile(f));
+            // Each symmetry copy moves with its own image of the delta (`grab_offset`).
             let joined = (brush.kind == BrushKind::MoveTopological).then(|| connected(mesh, &sel));
-            let keep = |i: usize| joined.as_ref().map_or(1.0, |j| j[i] as u8 as f32) * auto.as_ref().map_or(1.0, |a| a[i]);
-            let weights: Vec<f32> = (0..sel.len()).into_par_iter().map(|i| weight(i, sel.dist[i], sel.image(i)) * keep(i)).collect();
+            if let Some(joined) = &joined {
+                weights.par_iter_mut().zip(joined).for_each(|(w, &j)| {
+                    if !j { *w = 0.0; }
+                });
+            }
             // Vertices several copies reach get every copy's weight.
             let (mut overlap_of, mut overlaps) = (Vec::new(), Vec::new());
             if self.images.len() > 1 {
@@ -1719,7 +1839,14 @@ impl Stroke {
                             .iter()
                             .enumerate()
                             .filter(|&(k, c)| k != own && p.distance(*c) <= r)
-                            .map(|(k, c)| (k as u8, weight(i, p.distance(*c), k) * keep(i)))
+                            .map(|(k, c)| {
+                                let falloff = focal_falloff(p.distance(*c), r, brush.focal_shift);
+                                let weight = profile(falloff) * self.stamp_weight(&self.images, k, p, stamp)
+                                    * crate::mask::freedom(&mesh.mask, sel.verts[i])
+                                    * joined.as_ref().map_or(1.0, |j| j[i] as u8 as f32)
+                                    * auto.as_ref().map_or(1.0, |a| a[i]);
+                                (k as u8, weight)
+                            })
                             .collect();
                         (!others.is_empty()).then(|| std::iter::once((own as u8, weights[i])).chain(others).collect())
                     })
@@ -1793,7 +1920,8 @@ impl Stroke {
         self.snapshotted.clear();
         self.snapshot_index.clear();
         self.paint_snapshots.clear();
-        self.paint_snapshotted.clear();
+        self.paint_snapshot_index.clear();
+        self.preview_chunks.clear();
     }
 
     /// Whether a stroke with `kind` can run with Sculptris Pro: brushes that move the
@@ -1920,7 +2048,7 @@ mod brush_tests {
     #[test]
     fn opaque_black_alpha_blocks_sculpting_and_mask_blocks_new_brushes() {
         let mut m=mesh();let before=m.positions.clone();
-        let image=crate::brush_asset::BrushImage {id:999,name:"black".into(),source:"black.png".into(),width:2,height:2,rgba:vec![[0,0,0,255];4]};
+        let image=crate::brush_asset::BrushImage {id:999,name:"black".into(),source:Some("black.png".into()),width:2,height:2,rgba:vec![[0,0,0,255];4]};
         let mut s=Stroke::begin(false,false,false).with_assets(StampSettings {alpha:Pattern::Image(std::sync::Arc::new(image)),..StampSettings::default()});
         s.dab(&mut m,&Brush::default(),Vec3::Z,Vec3::Z,-Vec3::Z,(Vec3::Z*5.0,-Vec3::Z));assert_eq!(m.positions,before);
         m.mask=vec![255;m.vertex_count()];dab(&mut m,BrushKind::DamStandard,false);assert_eq!(m.positions,before);
@@ -2867,6 +2995,51 @@ mod alpha_turn_tests {
     }
 
     #[test]
+    fn grab_uses_one_random_alpha_for_sculpt_and_paint() {
+        let brush = Brush {
+            kind: BrushKind::Grab,
+            radius: 0.3,
+            strength: 1.0,
+            paint: true,
+            ..Brush::default()
+        };
+        let assets = StampSettings {
+            alpha: Pattern::Grain,
+            turn: AlphaTurn::Random,
+            angle: 17.0,
+            ..StampSettings::default()
+        };
+        let hit = Vec3::new(0.46, 0.07, 0.0);
+        let view = -Vec3::Z;
+        let pull = Vec3::X * 0.125;
+        let (u, v) = turned(tangent(-view), assets.angle.to_radians() + dab_turn(1, hit));
+
+        for gpu in [false, true] {
+            let mut mesh = plane();
+            let before = mesh.positions.clone();
+            let mut stroke = Stroke::begin(false, gpu, true).with_assets(assets.clone());
+            let origin = hit - view * 4.0;
+            stroke.dab(&mut mesh, &brush, hit, -view, view, (origin, view));
+            stroke.dab(&mut mesh, &brush, hit, -view, view, (origin + pull, view));
+            assert_eq!(stroke.gpu_grab_setup().is_some(), gpu);
+            stroke.end(&mut mesh);
+
+            assert!(mesh.colors.iter().any(|c| c[3] > 0));
+            for (i, &p) in before.iter().enumerate() {
+                // The stamp is clear of its mirror, so each vertex has at most one copy.
+                let offset = Vec3::new(p.x.abs(), p.y, p.z) - hit;
+                let uv = glam::Vec2::new(offset.dot(u), -offset.dot(v)) / (2.0 * brush.radius)
+                    + glam::Vec2::splat(0.5);
+                let weight = falloff(offset.length(), brush.radius) * assets.alpha.alpha(uv);
+                let expected = p + pull * (2.0 * p.x.signum() * weight);
+                assert!(mesh.positions[i].distance(expected) < 1e-6, "sculpt at {p:?}, gpu={gpu}");
+                let coverage = (weight * 0.35 * 255.0).round() as u8;
+                assert!(mesh.colors[i][3].abs_diff(coverage) <= 1, "paint at {p:?}, gpu={gpu}");
+            }
+        }
+    }
+
+    #[test]
     fn follow_turns_the_alpha_with_the_stroke() {
         // Along Y with Follow, the stamp is the X stroke's stamp turned a quarter: compare one
         // dab's footprint height at mirrored places.
@@ -2887,6 +3060,61 @@ mod alpha_turn_tests {
             let b = height(&y, Vec3::new(-k, 0.12, 0.0));
             assert!((a - b).abs() < 2e-3, "{k}: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn a_sliding_stamp_keeps_its_random_turn_and_replaces_both_channels() {
+        let brush = Brush { radius: 0.14, paint: true, ..Brush::default() };
+        let assets = StampSettings {
+            alpha: Pattern::Grain,
+            texture: Pattern::Marble,
+            ..StampSettings::default()
+        };
+        assert_eq!(assets.turn, AlphaTurn::Random);
+        let start = Vec3::new(-0.7, 0.2, 0.0);
+        let end = Vec3::new(0.7, -0.2, 0.0);
+        let mut mesh = plane();
+        let original = mesh.clone();
+        let mut stroke = Stroke::begin(false, false, false).with_assets(assets.clone());
+        for hit in [start, Vec3::ZERO, end] {
+            stroke.restamp(&mut mesh, &brush, hit, Vec3::Z, -Vec3::Z, (hit + Vec3::Z, -Vec3::Z), None);
+            assert_eq!(stroke.dab_angle, dab_turn(1, start));
+        }
+
+        let mut expected = original;
+        let mut single = Stroke::begin(false, false, false).with_assets(assets);
+        single.stamp_seed = Some(start);
+        single.restamp(&mut expected, &brush, end, Vec3::Z, -Vec3::Z, (end + Vec3::Z, -Vec3::Z), None);
+        assert_eq!(mesh.colors, expected.colors);
+        assert!(mesh.positions.iter().zip(expected.positions).all(|(a, b)| a.distance(b) < 1e-6));
+    }
+
+    #[test]
+    #[ignore = "dense Z+RGB timing"]
+    fn dense_alpha_drag_timings() {
+        use std::time::Instant;
+        let (positions, indices) = crate::mesh::cube_sphere(600, 1.0);
+        let mut mesh = SculptMesh::from_raw(positions, indices);
+        let alpha = crate::alpha_library::Baked::Pores;
+        crate::alpha_library::image(alpha);
+        let assets = StampSettings { alpha: Pattern::Library(alpha), turn: AlphaTurn::Random, ..StampSettings::default() };
+        let hit = Vec3::Z;
+        let ray = (hit * 5.0, -hit);
+        let mut brush = Brush { radius: 0.8, strength: 1.0, paint: true, ..Brush::default() };
+        let mut stroke = Stroke::begin(false, false, false).with_assets(assets.clone());
+        let t = Instant::now();
+        for i in 0..24 {
+            let axis = Vec3::new(1.0, i as f32 / 24.0, 0.0).normalize();
+            stroke.restamp(&mut mesh, &brush, hit, hit, -hit, ray, Some(axis));
+        }
+        eprintln!("{} verts, {} touched, DragRect {:.2} ms/update", mesh.vertex_count(), stroke.last_count, t.elapsed().as_secs_f64() * 1000.0 / 24.0);
+        brush.kind = BrushKind::Grab;
+        let t = Instant::now();
+        for _ in 0..12 {
+            let mut stroke = Stroke::begin(false, true, false).with_assets(assets.clone());
+            stroke.dab(&mut mesh, &brush, hit, hit, -hit, ray);
+        }
+        eprintln!("Z+RGB Grab pickup {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 12.0);
     }
 }
 

@@ -50,7 +50,7 @@ pub fn default_items(side: ShelfSide) -> Vec<String> {
             "slider:focal", "slider:size", "space",
             "cmd:undo", "cmd:redo",
         ],
-        ShelfSide::Left => &["thumb:brush", "thumb:stroke", "thumb:alpha", "thumb:texture", "thumb:material", "color", "alternate"],
+        ShelfSide::Left => &["thumb:brush", "thumb:stroke", "thumb:alpha", "thumb:texture", "thumb:material", "color", "cmd:fill-color"],
         ShelfSide::Right => &[
             "cmd:frame", "toggle:persp", "toggle:floor", "toggle:sym", "sep",
             "toggle:polyf", "toggle:local", "toggle:transp", "toggle:ghost", "toggle:solo", "sep",
@@ -79,18 +79,17 @@ const BUILTIN: &[(&str, &str)] = &[
     ("thumb:texture", "Texture"),
     ("thumb:material", "Material"),
     ("color", "Colour picker"),
-    ("alternate", "Alternate"),
     ("sep", "Separator"),
     ("space", "Spring (pushes the rest to the end)"),
 ];
 
-/// The id an item saved by an older version has now (Local, Transp and Ghost were
-/// placeholders before 0.30).
+/// Resolve shelf items saved under an earlier name.
 pub fn current_id(id: &str) -> &str {
     match id {
         "stub:local" => "toggle:local",
         "stub:transp" => "toggle:transp",
         "stub:ghost" => "toggle:ghost",
+        "alternate" => "cmd:fill-color",
         other => other,
     }
 }
@@ -555,7 +554,7 @@ impl Workspace {
             }
             "thumb:brush" => {
                 let tex = self.texture(ui.ctx(), Some(m.brush.kind), self.subtract);
-                let resp = thumb(ui, "Brush", Thumb::Texture(tex), m.brush.kind.name(), true, false);
+                let resp = thumb(ui, "Brush", Thumb::Texture(tex), self.brush_display_name(m.brush.kind), true, false);
                 if resp.clicked() {
                     self.open_brush_catalog(resp.rect.right_top() + vec2(6.0, 0.0));
                 }
@@ -587,11 +586,6 @@ impl Workspace {
                     });
             }
             "color" => self.color_item(ui, horizontal),
-            "alternate" => {
-                ui.add_enabled_ui(false, |ui| {
-                    let _ = ui.add(egui::Button::new(RichText::new("Alternate").color(ACC_FG())).fill(ACC()).min_size(vec2(w, CONTROL_H)));
-                });
-            }
             _ => {
                 // Actions: a shelf button with its icon on a side shelf, a text button on a
                 // top or bottom one; brushes show their preview.
@@ -606,7 +600,7 @@ impl Workspace {
                     ui.add_space(((ui.available_height() - 32.0) * 0.5).max(0.0));
                     ui.add_enabled(enabled, egui::Button::new(label.as_str()).min_size(vec2(w, 32.0)))
                 } else {
-                    self.action_button(ui, id, &label, on, !stub, if horizontal { CONTROL_H } else { 44.0 })
+                    self.action_button(ui, id, &label, on, !stub, if horizontal || id == "cmd:fill-color" { CONTROL_H } else { 44.0 })
                 };
                 if resp.on_hover_text(hint).clicked() && !stub {
                     self.run_action(id, m, a);
@@ -667,15 +661,17 @@ impl Workspace {
                 std::mem::swap(&mut ws.color, &mut ws.color2);
             }
         };
-        let [cr, cg, cb] = self.color.to_srgb();
-        let hex = format!("#{cr:02X}{cg:02X}{cb:02X}");
+        let hex = |color: PickerColor| {
+            let [r, g, b] = color.to_srgb();
+            format!("#{r:02X}{g:02X}{b:02X}")
+        };
         if horizontal {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 color_picker_sized(ui, &mut self.color, vec2(90.0, 56.0));
                 ui.vertical(|ui| {
                     swatches(self, ui);
-                    ui.label(RichText::new(hex).font(font(11.5, Weight::Medium)).color(FG2()));
+                    ui.label(RichText::new(hex(self.color)).font(font(11.5, Weight::Medium)).color(FG2()));
                 });
             });
         } else {
@@ -685,7 +681,7 @@ impl Workspace {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 swatches(self, ui);
                 if w >= 70.0 {
-                    ui.label(RichText::new(hex).font(font(12.0, Weight::Medium)).color(FG2()));
+                    ui.label(RichText::new(hex(self.color)).font(font(12.0, Weight::Medium)).color(FG2()));
                 }
             });
         }

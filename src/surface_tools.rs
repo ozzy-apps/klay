@@ -61,6 +61,8 @@ pub struct Gesture {
     pub points: Vec<Vec2>,
     pub alternate: bool,
     pub ctrl: bool,
+    pub cursor: Vec2,
+    pub positioning: bool,
 }
 
 impl Gesture {
@@ -72,10 +74,23 @@ impl Gesture {
             points: vec![start],
             alternate,
             ctrl: false,
+            cursor: start,
+            positioning: false,
         }
     }
 
     pub fn update(&mut self, mut p: Vec2, snap: bool, alternate: bool) {
+        let delta = p - self.cursor;
+        self.cursor = p;
+        self.alternate = alternate;
+        if self.positioning {
+            self.start += delta;
+            self.end += delta;
+            for point in &mut self.points {
+                *point += delta;
+            }
+            return;
+        }
         if snap && self.kind.shape() == Some(Shape::Line) {
             let d = p - self.start;
             let angle = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round()
@@ -83,7 +98,6 @@ impl Gesture {
             p = self.start + Vec2::new(angle.cos(), angle.sin()) * d.length();
         }
         self.end = p;
-        self.alternate = alternate;
         if self.kind.shape() == Some(Shape::Lasso)
             && self
                 .points
@@ -162,9 +176,9 @@ impl Gesture {
     }
 }
 
-/// Nearest point of the closed outline `poly` to `p`.
-fn nearest_on_outline(poly: &[Vec2], p: Vec2) -> Vec2 {
-    let mut best = (f32::MAX, p);
+/// The nearest edge and point of a closed screen-space outline.
+fn nearest_on_outline(poly: &[Vec2], p: Vec2) -> (usize, Vec2) {
+    let mut best = (f32::MAX, 0, p);
     for k in 0..poly.len() {
         let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
         let d = b - a;
@@ -172,16 +186,43 @@ fn nearest_on_outline(poly: &[Vec2], p: Vec2) -> Vec2 {
         let q = a + d * t;
         let e = q.distance_squared(p);
         if e < best.0 {
-            best = (e, q);
+            best = (e, k, q);
         }
     }
-    best.1
+    (best.1, best.2)
+}
+
+/// For each rectangle image, the solid's cross-section at each rectangle edge.
+/// Limit the outline search to the part of that plane between the two adjacent edges.
+fn rect_sections(mesh: &SculptMesh, screen: Screen, poly: &[Vec2], images: &crate::symmetry::Images) -> Option<Vec<[Option<Section>; 4]>> {
+    let planes: [Vec4; 4] = [
+        screen.plane(poly[0], poly[1])?,
+        screen.plane(poly[1], poly[2])?,
+        screen.plane(poly[2], poly[3])?,
+        screen.plane(poly[3], poly[0])?,
+    ];
+    let bounds = mesh.bounds();
+    let centre = (bounds.min + bounds.max) * 0.5;
+    let half_size = (bounds.max - bounds.min) * 0.5;
+    Some((0..images.len()).map(|k| {
+        let world = planes.map(|p| images.map(k, p.truncate()).extend(p.w));
+        std::array::from_fn(|edge| {
+            let plane = world[edge];
+            let n = plane.truncate();
+            if (n.dot(centre) + plane.w).abs() > n.abs().dot(half_size) {
+                return None;
+            }
+            Section::new(mesh, plane)
+                .map(|s| s.restrict([world[(edge + 3) % 4], world[(edge + 1) % 4]]))
+        })
+    }).collect())
 }
 
 /// Clip Rect / Clip Circle: every visible vertex whose screen position is outside the
 /// outline (inside with Alt) moves, at its own depth, to the outline's nearest point, so the
-/// model is pressed into the outline's shape all the way through. With symmetry the mirrored
-/// outline presses the other side. Returns the positions it replaced, per chunk.
+/// model is pressed into the outline's shape all the way through. On a closed mesh,
+/// rectangle edges constrain moved points to the cut's cross-section. Returns the
+/// positions it replaced, per chunk.
 pub fn clip_shape(
     mesh: &mut SculptMesh,
     screen: Screen,
@@ -197,9 +238,11 @@ pub fn clip_shape(
     }
     let images = symmetry.into().images();
     let ellipse = gesture.kind.shape() == Some(Shape::Circle);
+    let sections = (!ellipse && crate::wedge::closed(mesh))
+        .then(|| rect_sections(mesh, screen, &poly, &images)).flatten();
     let (lo, hi) = (gesture.start.min(gesture.end), gesture.start.max(gesture.end));
     let (centre, radii) = ((lo + hi) * 0.5, ((hi - lo) * 0.5).max(Vec2::splat(1.0)));
-    let target = |s: Vec2| -> Option<Vec2> {
+    let target = |s: Vec2| -> Option<(usize, Vec2)> {
         let inside = gesture.contains(s);
         if inside != gesture.alternate {
             return None;
@@ -207,7 +250,7 @@ pub fn clip_shape(
         // Onto the ellipse along its radius (a squashed circle stays a squashed circle).
         Some(if ellipse {
             let q = (s - centre) / radii;
-            centre + q.normalize_or(Vec2::X) * radii
+            (0, centre + q.normalize_or(Vec2::X) * radii)
         } else {
             nearest_on_outline(&poly, s)
         })
@@ -220,8 +263,10 @@ pub fn clip_shape(
         for k in 0..images.len() {
             let own = images.unmap(k, p);
             let (Some(s), Some(z)) = (screen.project(own), screen.ndc_z(own)) else { continue };
-            if let Some(t) = target(s) {
+            if let Some((edge, t)) = target(s) {
                 let q = images.map(k, screen.unproject(t, z));
+                let q = sections.as_ref().and_then(|sections| sections[k][edge].as_ref())
+                    .map_or(q, |section| section.keep_inside(q));
                 let freedom = crate::mask::freedom(&mesh.mask, v as u32);
                 return Some(p + (q - p) * freedom);
             }
@@ -359,6 +404,7 @@ struct Section {
     cell: f32,
     side: usize,
     cells: Vec<Vec<u32>>,
+    limits: Option<[Vec3; 2]>,
 }
 
 impl Section {
@@ -406,7 +452,34 @@ impl Section {
                 }
             }
         }
-        Some(Self { origin, u, v, segments, lo, cell, side, cells })
+        Some(Self { origin, u, v, segments, lo, cell, side, cells, limits: None })
+    }
+
+    fn restrict(mut self, planes: [Vec4; 2]) -> Self {
+        self.limits = Some(planes.map(|p| {
+            let n = p.truncate();
+            Vec3::new(n.dot(self.u), n.dot(self.v), n.dot(self.origin) + p.w)
+        }));
+        self
+    }
+
+    /// Restrict an outline segment to the rectangle edge's span.
+    fn restrict_segment(&self, a: Vec2, b: Vec2) -> Option<(Vec2, Vec2)> {
+        let Some(limits) = self.limits else { return Some((a, b)); };
+        let (mut start, mut end) = (0.0f32, 1.0f32);
+        for plane in limits {
+            let da = plane.dot(a.extend(1.0)) - 1e-6;
+            let db = plane.dot(b.extend(1.0)) - 1e-6;
+            if da > 0.0 && db > 0.0 {
+                return None;
+            }
+            if da > 0.0 {
+                start = start.max(da / (da - db));
+            } else if db > 0.0 {
+                end = end.min(da / (da - db));
+            }
+        }
+        (start <= end).then(|| (a.lerp(b, start), a.lerp(b, end)))
     }
 
     fn cell_of(&self, p: Vec2) -> (i64, i64) {
@@ -469,6 +542,7 @@ impl Section {
                     any = true;
                     for &k in &self.cells[(y * side + x) as usize] {
                         let (a, b) = self.segments[k as usize];
+                        let Some((a, b)) = self.restrict_segment(a, b) else { continue; };
                         let ab = b - a;
                         let t = ((flat - a).dot(ab) / ab.length_squared().max(1e-20)).clamp(0.0, 1.0);
                         let c = a + ab * t;
@@ -483,7 +557,11 @@ impl Section {
                 break;
             }
         }
-        self.origin + self.u * best.1.x + self.v * best.1.y
+        if best.0 == f32::MAX {
+            q
+        } else {
+            self.origin + self.u * best.1.x + self.v * best.1.y
+        }
     }
 }
 
@@ -588,6 +666,36 @@ mod tests {
         Screen {
             matrix: Mat4::IDENTITY,
             size: Vec2::splat(400.0),
+        }
+    }
+
+    #[test]
+    fn clip_rect_does_not_leave_a_flattened_limb_past_the_cross_section() {
+        let (p, i) = crate::mesh::cube_sphere(20, 1.0);
+        let main = p.iter().map(|&p| p * 0.35 + Vec3::Y * 0.4);
+        let limb = p.iter().map(|&p| p * 0.16 + Vec3::new(0.75, -0.6, 0.0));
+        let positions: Vec<_> = main.chain(limb).collect();
+        let indices: Vec<_> = i.iter().copied().chain(i.iter().map(|v| v + p.len() as u32)).collect();
+        for alternate in [false, true] {
+            let mut mesh = SculptMesh::from_raw(positions.clone(), indices.clone());
+            let before = mesh.positions.clone();
+            let topology = mesh.indices.clone();
+            // Both rectangles use the center edge to clip the limb.
+            let (left, right) = if alternate { (200.0, 900.0) } else { (-500.0, 200.0) };
+            let mut gesture = Gesture::new(BrushKind::ClipRect, Vec2::new(left, -500.0), alternate);
+            gesture.update(Vec2::new(right, 900.0), false, alternate);
+            let saved = clip_shape(&mut mesh, screen(), &gesture, false).unwrap();
+            assert_eq!(mesh.indices, topology);
+            for (p, q) in before.iter().zip(&mesh.positions) {
+                if p.x < -1e-6 {
+                    assert_eq!(p, q);
+                }
+                if p.y < -0.4 {
+                    assert!(q.x.abs() < 1e-5 && q.y >= 0.049, "flattened geometry at {q:?}");
+                }
+            }
+            mesh.restore_chunks(&saved);
+            assert_eq!(mesh.positions, before);
         }
     }
 

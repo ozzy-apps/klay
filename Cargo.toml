@@ -1,6 +1,6 @@
 [package]
 name = "klay"
-version = "0.41.0"
+version = "0.46.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ozzy-apps/klay"
@@ -13,6 +13,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 wgpu = "30.0"
 winit = "0.30"
 glam = { version = "0.34", features = ["bytemuck"] }
+gltf = { version = "1.4.1", default-features = false, features = ["names", "utils"] }
+ufbx = "0.11.5"
+base64 = "0.22"
+percent-encoding = "2.3"
 rayon = "1.12"
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "1.0"
