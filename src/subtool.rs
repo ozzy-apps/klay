@@ -125,8 +125,7 @@ pub fn deform_map(kind: Deform, value: f32, bounds: Aabb, axes: [bool; 3]) -> Af
 /// Union of two boxes.
 pub fn union(a: Aabb, b: Aabb) -> Aabb {
     let mut out = a;
-    out.grow(b.min);
-    out.grow(b.max);
+    out.merge(b);
     out
 }
 

@@ -89,6 +89,13 @@ impl Library {
                                 }
                             }
                         }
+                        "wrap" => {
+                            if let Ok(x) = v.parse::<f32>() {
+                                if x.is_finite() {
+                                    l.settings.wrap = x.clamp(0.0, 1.0)
+                                }
+                            }
+                        }
                         "rotate" => {
                             if let Ok(x) = v.parse::<f32>() {
                                 if x.is_finite() {
@@ -139,12 +146,13 @@ impl Library {
             _ => p.locator(),
         };
         let mut out = format!(
-            "# Klay brush assets v1\nalpha\t{}\ntexture\t{}\nstrength\t{}\nscale\t{}\nrotate\t{}\n",
+            "# Klay brush assets v1\nalpha\t{}\ntexture\t{}\nstrength\t{}\nscale\t{}\nrotate\t{}\nwrap\t{}\n",
             escape(&locator(&s.alpha)),
             escape(&locator(&s.texture)),
             s.texture_strength,
             s.texture_scale,
-            s.texture_angle
+            s.texture_angle,
+            s.wrap
         );
         for (key, items) in [
             ("alpha-file", &self.alphas),

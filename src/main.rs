@@ -35,6 +35,7 @@ mod zremesh;
 mod crease;
 mod reconstruct;
 mod project_all;
+mod retopo;
 mod quad_subdiv;
 mod bake;
 mod bake_batch;
@@ -350,6 +351,7 @@ enum GeoDone {
     UpdatedObj { doc: Box<Multires>, exact: bool },
     /// ProjectAll: where the shown level's vertices go, and their paint.
     Projection(project_all::Projection),
+    RetopoReference(retopo::Reference),
     /// Make Boolean Mesh: the result as a new subtool, and the ids of the subtools it came
     /// from.
     Boolean { mesh: SculptMesh, used: Vec<u64> },
@@ -828,6 +830,9 @@ struct App {
     insert: Option<InsertDrag>,
     zmodel: Option<ZModel>,
     zm_hover: Option<zmodeler::Hover>,
+    retopo_reference: Option<retopo::Reference>,
+    retopo_cage: Option<u64>,
+    retopo_placing: bool,
     zm_drag: Option<ZDrag>,
     /// Transpose's gizmo, aimed by a click.
     zm_aim: Option<ZAim>,
@@ -1071,6 +1076,9 @@ impl App {
             insert: None,
             zmodel: None,
             zm_hover: None,
+            retopo_reference: None,
+            retopo_cage: None,
+            retopo_placing: false,
             zm_drag: None,
             zm_aim: None,
             zs_drag: None,
@@ -1225,10 +1233,19 @@ impl App {
         } = *tool.parked.take().expect("only a parked subtool can be activated");
         tool.visible = true;
         let id = tool.id;
+        // A reference that becomes active can be edited before it is parked again.
+        if self.retopo_reference.as_ref().is_some_and(|r| r.id == id) {
+            self.retopo_reference = None;
+            self.retopo_cage = None;
+            self.retopo_placing = false;
+        }
         self.doc = packed.unpack();
         self.doc.layers = layers;
         self.history = history;
         self.active_tool = i;
+        // ZModeler's target and Bridge start belonged to the subtool that was active.
+        self.zm_hover = None;
+        self.zm_bridge = None;
         let ms = t.elapsed().as_secs_f32() * 1000.0;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.drop_stand_in(id);
@@ -1575,6 +1592,15 @@ impl App {
                 if r.missed * 20 > n {
                     self.workspace.notify(format!("ProjectAll: {} vertices found no surface within Dist and stayed", fmt_count(r.missed)));
                 }
+            }
+            GeoDone::RetopoReference(reference) => {
+                let active = self.subtools[self.active_tool].id;
+                self.retopo_cage = (active != reference.id && self.doc.count() == 1).then_some(active);
+                self.retopo_reference = Some(reference);
+                self.retopo_placing = false;
+                self.workspace.retopo_snap = true;
+                self.status = "Retopology reference ready".into();
+                self.workspace.notify(self.status.clone());
             }
             GeoDone::Boolean { mesh, used } => {
                 let tris = mesh.triangle_count();
@@ -3537,6 +3563,9 @@ impl App {
             return;
         }
         let (Some(hover), Some(z)) = (self.zm_hover, self.zmodel.as_ref()) else { return };
+        if !hover.fits(&z.poly) {
+            return;
+        }
         // Bridge's first polygon stays lit.
         let first = self.zm_bridge.as_ref().and_then(|v| z.poly.face_with(v));
         let view = self.view();
@@ -4857,6 +4886,9 @@ impl App {
         #[cfg(feature = "strata")]
         {self.strata=Default::default();}
         self.subtools = staged;
+        self.retopo_reference = None;
+        self.retopo_cage = None;
+        self.retopo_placing = false;
         self.morph_targets = morphs.into_iter().collect();
         self.active_tool = active;
         self.doc = doc;
@@ -4885,6 +4917,9 @@ impl App {
         self.doc = Multires::new(SculptMesh::from_raw_paired(p, i, g), budget);
         self.history = History::new(32);
         let id = self.new_tool_id();
+        self.retopo_reference = None;
+        self.retopo_cage = None;
+        self.retopo_placing = false;
         self.subtools = vec![SubTool { folder: String::new(), transpose_selected: false, sets: Vec::new(), guides: Default::default(), dynamic: None,
             boolean: Default::default(),
             id,
@@ -5107,8 +5142,7 @@ impl App {
         let mut b = Aabb::empty();
         for (i, t) in self.subtools.iter().enumerate() {
             let tb = if i == self.active_tool { self.doc.bounds() } else if t.visible { t.bounds } else { continue };
-            b.grow(tb.min);
-            b.grow(tb.max);
+            b.merge(tb);
         }
         (b.max.cmpge(b.min).all()).then(|| b.max - b.min)
     }
@@ -7901,6 +7935,21 @@ impl App {
         }
         self.show_active_level();
         self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.refresh_zmodel_hover();
+    }
+
+    /// After the mesh changed under a still pointer (undo, redo, a subtool switch): find
+    /// ZModeler's target again, and drop a Bridge or Stitch start that no longer exists.
+    fn refresh_zmodel_hover(&mut self) {
+        let n = self.mesh().vertex_count() as u32;
+        if self.zm_bridge.as_ref().is_some_and(|v| v.iter().any(|&i| i >= n)) {
+            self.zm_bridge = None;
+        }
+        if self.brush.kind.is_zmodeler() && self.zm_hover.is_some() {
+            self.update_zmodel_hover();
+        } else {
+            self.zm_hover = None;
+        }
     }
 
     /// Whether `kind` strokes along a curve (Stroke › Curve).
@@ -8192,7 +8241,11 @@ impl App {
             return None;
         }
         let (o, d) = self.cursor_ray();
-        let hit = self.doc.mesh().raycast(o, d)?;
+        let hit = self.doc.mesh().raycast(o, d);
+        if self.retopo_live() && let Some(feature) = self.retopo_feature_at_cursor() {
+            return Some(feature);
+        }
+        let hit = hit?;
         let at = self.canvas_cursor();
         let view_size = self.viewport();
         let camera = self.camera.clone();
@@ -8829,6 +8882,7 @@ impl App {
             }
         }
         let Some(r) = self.zmodel_result(d, param.map(|p| p.0)) else { return };
+        let Some(r) = self.retopo_zmodel_result(d, r) else { return };
         match r {
             ZResult::Points(pts) => {
                 let mut pos = d.base.pos.clone();
@@ -9478,8 +9532,12 @@ impl App {
             .drawn_parked()
             .iter()
             .fold(self.doc.mesh().visible_bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds));
+        // Nothing shown (or no finite box): keep the camera rather than aim it at NaN.
+        if b.is_empty() || !(b.min.is_finite() && b.max.is_finite()) {
+            return;
+        }
         self.camera.target = (b.min + b.max) * 0.5;
-        self.camera.distance = (b.max - b.min).length() * 1.1;
+        self.camera.distance = ((b.max - b.min).length() * 1.1).max(1e-3);
     }
 
     /// Default view angle plus a frame: `Home`.
@@ -9897,6 +9955,10 @@ impl App {
             self.begin_nav(MouseButton::Left);
             return;
         }
+        if free && !border && self.retopo_placing && self.modifiers.is_empty() {
+            self.place_retopo_quad();
+            return;
+        }
         if free && !border && self.workspace.uv_seam_mode && self.modifiers.is_empty() && self.uv_seam_press() {
             return;
         }
@@ -9986,7 +10048,13 @@ impl App {
             let hit = self.mesh().raycast(o, d);
             log::trace!("press cursor={:?} hit={:?}", self.cursor, hit.as_ref().map(|h| h.point));
             if hit.is_none() {
-                self.begin_nav(MouseButton::Left);
+                if self.effective_brush().kind.is_zmodeler() && self.retopo_live()
+                    && self.zmodel_hover().is_some()
+                {
+                    self.begin_zmodel();
+                } else {
+                    self.begin_nav(MouseButton::Left);
+                }
             } else if self.effective_brush().kind.is_imm() {
                 self.begin_insert();
             } else if self.effective_brush().kind.is_zmodeler() {
@@ -10085,6 +10153,10 @@ impl App {
         }
         if key == KeyCode::Escape && self.turntable.is_some() {
             self.finish_turntable(None);
+            return;
+        }
+        if key == KeyCode::Escape && self.retopo_placing {
+            self.retopo_placing = false;
             return;
         }
         if key==KeyCode::Escape && self.gesture.is_some() {
@@ -10270,6 +10342,7 @@ impl App {
         let creases = self.crease_lines().iter().map(|l| l.len().saturating_sub(1)).sum::<usize>();
         let frozen_levels = self.doc.frozen_levels();
         self.workspace.guide_count = self.subtools[self.active_tool].guides.len();
+        self.refresh_retopo_controls();
         self.workspace.dynamic_subdiv = self.subtools[self.active_tool].dynamic;
         self.workspace.zsphere_round = self.doc.zspheres.as_ref().map(|t| t.spheres[(self.zs_selected as usize).min(t.spheres.len() - 1)].roundness);
         let round_before = self.workspace.zsphere_round;
@@ -10359,6 +10432,9 @@ impl App {
         }
         if actions.fill_color {
             self.fill_color();
+        }
+        if let Some(action) = actions.retopo {
+            self.retopo_action(action);
         }
         if actions.fiber_accept {
             self.fiber_accept_now();
@@ -10648,6 +10724,7 @@ impl App {
             self.camera.yaw = yaw;
             self.camera.pitch = pitch;
         }
+        self.paint_retopo(ui.ctx());
         self.paint_zmodel(ui.ctx());
         if self.workspace.gizmo {
             self.paint_gizmo(ui.ctx());
@@ -11334,7 +11411,8 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed if !event.repeat && !typing => {
                             // ZBrush: with ZModeler, Space over a target shows its actions.
-                            match self.zm_hover.filter(|_| self.brush.kind.is_zmodeler()) {
+                            let fits = |h: &zmodeler::Hover| self.zmodel.as_ref().is_some_and(|z| h.fits(&z.poly));
+                            match self.zm_hover.filter(|h| self.brush.kind.is_zmodeler() && fits(h)) {
                                 Some(hover) => self.workspace.open_zm_menu(self.cursor_pos(), hover),
                                 None => self.workspace.open_quick_menu(self.cursor_pos(), true),
                             }
@@ -11860,6 +11938,8 @@ fn main() {
     // Self-tests and snapshots check a geometry operation's result the moment it is asked
     // for: wait for each job as it starts.
     app.jobs_wait = app.automated;
+    // Automated runs leave the user's layout and brush settings as they found them.
+    app.workspace.persist = !app.automated;
     // Look for a newer release only in a normal run (not self-tests, demos, snapshots).
     app.workspace.updates_allowed = !app.automated && !args.iter().any(|a| a == "--no-update-check");
     // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).

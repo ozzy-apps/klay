@@ -997,14 +997,19 @@ struct PackedLevel {
 impl Packed {
     /// Rebuild at most a small prefix for LightBox. Dense base meshes can be rendered
     /// directly from their packed triangles without allocating sculpting adjacency.
-    pub(crate) fn into_preview_geometry(mut self) -> Result<crate::model_thumbnail::Geometry, String> {
-        use crate::model_thumbnail::Geometry;
-
+    pub(crate) fn into_preview_geometry(self) -> Result<crate::model_thumbnail::Geometry, String> {
         const PREVIEW_VERTICES: usize = 160_000;
         let level = (0..=self.active)
             .rev()
             .find(|&l| self.counts[l] <= PREVIEW_VERTICES)
             .unwrap_or(0);
+        self.into_geometry_at(level)
+    }
+
+    /// Extract visible triangles at the requested level without rebuilding higher levels.
+    pub(crate) fn into_geometry_at(mut self, level: usize) -> Result<crate::model_thumbnail::Geometry, String> {
+        use crate::model_thumbnail::Geometry;
+
         if level == 0 {
             let mut indices = self.indices;
             if let Some(marks) = self.marks.first() {
@@ -2871,8 +2876,7 @@ impl Multires {
                 b
             })
             .reduce(Aabb::empty, |mut a, b| {
-                a.grow(b.min);
-                a.grow(b.max);
+                a.merge(b);
                 a
             });
         StandIn {

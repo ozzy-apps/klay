@@ -574,6 +574,7 @@ impl Workspace {
             zslider(ui, "Relief", &mut self.assets.texture_strength, 0.0..=1.0, false, false, 2);
             zslider(ui, "Tiling", &mut self.assets.texture_scale, 0.25..=16.0, true, false, 2);
             zslider(ui, "Rotate", &mut self.assets.texture_angle, -180.0..=180.0, false, false, 0);
+            wrap_slider(ui, &mut self.assets.wrap);
         } else {
             // How each dab's alpha and texture are turned (ZBrush: Roll, spray strokes).
             ui.label(RichText::new("Alpha rotation").size(12.0).color(FG2()));
@@ -584,6 +585,7 @@ impl Workspace {
                 self.assets.turn = turns[i];
             }
             zslider(ui, "Angle", &mut self.assets.angle, -180.0..=180.0, false, false, 0);
+            wrap_slider(ui, &mut self.assets.wrap);
         }
         ui.add_space(2.0);
     }
@@ -1768,5 +1770,14 @@ mod tests {
         let layer = text(&out, "Layer", |p| p.x > 300.0 && p.y > 200.0);
         click(&mut a, layer + vec2(4.0, 3.0));
         assert_eq!(a.brush.kind, BrushKind::Layer);
+    }
+}
+
+/// Alpha › Wrap (ZBrush: Wrap Mode) as 0–100: how far the alpha and texture follow the
+/// surface round a curve instead of lying flat (flat streaks where the form turns away).
+fn wrap_slider(ui: &mut Ui, wrap: &mut f32) {
+    let mut percent = *wrap * 100.0;
+    if zslider(ui, "Wrap", &mut percent, 0.0..=100.0, false, false, 0) {
+        *wrap = (percent / 100.0).clamp(0.0, 1.0);
     }
 }

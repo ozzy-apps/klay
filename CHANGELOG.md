@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.48.0 — 2026-11-05
+
+- **Wrap** for alphas and textures (Alpha and Texture controls, 0–100, default 100; ZBrush: Wrap Mode). Stamps used to lie flat on the plane under the brush, so where a dab reached a rim, a box edge or the side of a thin part, every point down the turning surface read the same pixel and the alpha or texture streaked. The stamp distance now follows the surface: the arc of the circle through the dab centre and the point (exact on spheres and across cylinders), never below the plane distance plus 0.35 × height, so a box's side face keeps going. The stamp lies on a plane fitted to the surface as it was before the stroke, and the stretch eases in over the inner fifth of the radius, so the stroke's own relief does not cross-hatch it. Applies to sculpting and painting.
+- Brush presets save Wrap (preset format 2; format 1 presets load with Wrap at 100). The brush-asset settings file stores it too.
+- Verification: 447 release tests (new: the arc-length unwrap on a sphere, no fold past 90°, little movement from relief near the centre, a box side face moving at once, Wrap 0 equal to the flat projection, Wrap saved in a brush preset). Visual A/B on a 345k cube, with a striped alpha sculpt and a dotted texture paint along a face next to an edge: Wrap 0 streaks down the side face; Wrap 100 carries the pattern round it.
+
+## 0.47.1 — 2026-11-04
+
+- Fixed a crash when undoing in ZModeler or Retopology with the pointer still over a point, edge or polygon the undo removed. Undo, Redo and SubTool switches find the target under the pointer again and drop a Bridge or Stitch start that no longer exists.
+- Fixed a black canvas after hiding polygons. With part of a mesh hidden, its visible bounds came out infinite, so Frame (F) and automatic framing aimed the camera at nothing. Empty boxes no longer stretch a merged bounding box. Framing keeps the camera when nothing is shown.
+- Fixed Clip Rect and Clip Circle with symmetry tearing the mesh in turned views. The outline and its mirror images now act as one shape: a vertex inside any of them stays, and one outside all of them moves to the nearest outline. Vertices on the symmetry plane stay on it.
+- A Clip Rect or Clip Circle drawn as a line, under 3 pixels across, no longer flattens the whole model. It does nothing, as Trim and Mask already did.
+- Fixed **Close Holes** leaving a non-manifold edge where two holes touch at one vertex, which made Divide refuse the mesh. Each hole now gets its own cap.
+- Self-tests, demos and snapshots no longer save the workspace layout or brush settings. A self-test that changed the texture previously changed the user's default brush.
+- Verification: 445 release tests. New tests cover the undo-under-hover regression, the bounds of a mostly hidden mesh, a mirror-symmetric Clip Rect in a turned view, flat clip outlines, and two holes touching at a vertex. The scratch multi-angle deep test (`deep-test/2026-11-04/`) was rerun on the fixed build.
+
+## 0.47.0 — 2026-11-04
+
+- **Mesh › Retopology** indexes a reference SubTool at its shown subdivision level. **Place Retopo Quad** creates a single-quad cage on the clicked surface. **Snap Active Mesh** projects an existing cage and enables live snapping for it.
+- **Snap to Surface** keeps new ZModeler edge extrusions and point, edge, and polygon moves on the reference. A themed wire overlay makes cage edges visible over the sculpt.
+
 ## 0.46.0 — 2026-11-04
 
 - ZRemesher guide strokes, single-guide deletion and clearing all guides support Undo and Redo. Alt-click selects the nearest visible guide segment, including lines off the current mesh.

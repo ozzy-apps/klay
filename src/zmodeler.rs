@@ -346,6 +346,19 @@ pub enum Hover {
     Poly(u32),
 }
 
+impl Hover {
+    /// Whether this target still names a point, edge or polygon of `poly` (an undo or a
+    /// subtool switch can leave an older hover behind).
+    pub fn fits(self, poly: &PolyMesh) -> bool {
+        let n = poly.pos.len() as u32;
+        match self {
+            Self::Point(v) => v < n,
+            Self::Edge(a, b) => a < n && b < n,
+            Self::Poly(f) => (f as usize) < poly.faces.len(),
+        }
+    }
+}
+
 fn key(a: u32, b: u32) -> (u32, u32) {
     (a.min(b), a.max(b))
 }

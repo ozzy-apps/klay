@@ -871,15 +871,54 @@ struct StampProjection {
     center: Vec3,
     across: Vec3,
     up: Vec3,
+    /// The dab's surface normal (`across × up` up to sign): the tangent plane's normal.
+    normal: Vec3,
     diameter: f32,
+    /// Wrap (ZBrush: Alpha › Wrap Mode), 0..1: how far the stamp follows the surface round
+    /// instead of lying flat on the tangent plane.
+    wrap: f32,
 }
 
 impl StampProjection {
     fn uv(self, images: &Images, copy: usize, position: Vec3) -> glam::Vec2 {
         let offset = images.unmap(copy, position) - self.center;
-        glam::Vec2::new(offset.dot(self.across), -offset.dot(self.up)) / self.diameter
-            + glam::Vec2::splat(0.5)
+        let mut q = glam::Vec2::new(offset.dot(self.across), -offset.dot(self.up));
+        if self.wrap > 0.0 {
+            let height = offset.dot(self.normal);
+            let flat = (offset - self.normal * height).length();
+            if flat > 0.0 {
+                let stretch = wrapped_distance(flat, height) / flat;
+                // Near the centre the stroke's own bumps would read as tight curvature
+                // and the stamp would jitter from dab to dab (a cross-hatch): let the
+                // stretch in gradually, fully from 20 % of the radius out (straight-line
+                // distance, which keeps growing round the back), where the rims and
+                // edges that streak are.
+                let reach = (offset.length() / (0.1 * self.diameter)).min(1.0);
+                q *= 1.0 + self.wrap * reach * (stretch - 1.0);
+            }
+        }
+        q / self.diameter + glam::Vec2::splat(0.5)
     }
+}
+
+/// How far along the surface a point lies from the dab centre, from its distance in the
+/// tangent plane (`flat`) and its height above it. Mostly the arc of the circle that
+/// touches the plane at the centre and passes through the point: exact on spheres and
+/// across cylinders, `flat` on flat ground. The plane distance stops growing where the
+/// surface turns away from the plane (every point there reads the same alpha texel: the
+/// streaks at a silhouette); the arc keeps growing all the way round. At a sharp edge
+/// the arc starts too slowly down the side (a circle leaves the plane flat), so it never
+/// goes below `flat + 0.35·|height|`, which keeps a box's side face moving at once and
+/// overestimates a sphere by at most 4 % (between about 10° and 50°).
+pub fn wrapped_distance(flat: f32, height: f32) -> f32 {
+    let chord = (flat * flat + height * height).sqrt();
+    let h = height.abs();
+    let edge = flat + 0.35 * h;
+    if h <= 1e-6 * chord || chord == 0.0 {
+        return chord.max(edge);
+    }
+    // Circle radius c² / 2h; the angle at its centre is 2·asin(h / c).
+    (chord * chord / h * (h / chord).min(1.0).asin()).max(edge)
 }
 
 #[derive(Clone, Debug)]
@@ -891,6 +930,9 @@ pub struct StampSettings {
     /// Texture › Rotate: the texture's own turn inside the stamp (degrees), on top of the
     /// alpha rotation that turns the whole stamp.
     pub texture_angle: f32,
+    /// Alpha › Wrap, 0..1: the stamp follows the surface round its curvature instead of
+    /// a flat projection on the tangent plane (which streaks where a form turns away).
+    pub wrap: f32,
     /// Brush › Auto Masking.
     pub auto: AutoMask,
     /// Stroke › Alpha rotation and its angle (degrees).
@@ -901,7 +943,7 @@ pub struct StampSettings {
 }
 
 impl Default for StampSettings {
-    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,auto:AutoMask::default(),turn:AlphaTurn::default(),angle:0.0,spotlight:None}}
+    fn default()->Self {Self {alpha:Pattern::Off,texture:Pattern::Off,texture_strength:0.5,texture_scale:2.0,texture_angle:0.0,wrap:1.0,auto:AutoMask::default(),turn:AlphaTurn::default(),angle:0.0,spotlight:None}}
 }
 
 impl StampSettings {
@@ -1072,7 +1114,9 @@ impl Stroke {
             center,
             across,
             up,
+            normal: across.cross(up).normalize_or(normal.normalize_or(Vec3::Z)),
             diameter: 2.0 * radius,
+            wrap: self.assets.wrap.clamp(0.0, 1.0),
         }
     }
 
@@ -1179,11 +1223,68 @@ impl Stroke {
     pub fn with_assets(mut self,assets:StampSettings)->Self {self.assets=assets;self}
     pub fn take_paint(&mut self)->crate::paint::Chunks {std::mem::take(&mut self.paint_snapshots)}
 
-    /// Alpha and texture relief at `p`, a vertex of symmetry copy `k`.
-    fn stamp_weight(&self, images: &Images, k: usize, p: Vec3, stamp: StampProjection) -> f32 {
+    /// Where vertex `v` was before this stroke moved it (where it is, if the stroke has
+    /// not touched its chunk). The stamp is laid on that surface: on the surface as it
+    /// rises, Wrap would read the stroke's own relief as curvature and the stamp would
+    /// swim from dab to dab.
+    fn rest_position(&self, mesh: &SculptMesh, v: u32) -> Vec3 {
+        let chunk = mesh.vert_chunk[v as usize];
+        self.snapshot_index
+            .get(&chunk)
+            .and_then(|&i| self.snapshots[i].1.get((v - mesh.chunks[chunk as usize].vert_start) as usize))
+            .copied()
+            .unwrap_or(mesh.positions[v as usize])
+    }
+
+    /// Whether stamps wrap round the form (Wrap on, with an alpha or texture to wrap).
+    fn wraps(&self) -> bool {
+        self.assets.wrap > 0.0 && (self.assets.alpha != Pattern::Off || self.assets.texture != Pattern::Off)
+    }
+
+    /// The plane a wrapped stamp lies on: fitted to the surface as it was before this
+    /// stroke, within 30 % of the radius of `hit` (centroid, and the direction the points
+    /// spread least in). The plane of the surface as it rises rocks on the stroke's own
+    /// relief, and a tilted plane creases the wrapped stamp. `(hit, normal)` when too few
+    /// points are near.
+    fn rest_plane(&self, mesh: &SculptMesh, sel: &crate::mesh::Selection, hit: Vec3, normal: Vec3, radius: f32) -> (Vec3, Vec3) {
+        let near: Vec<Vec3> = sel
+            .verts
+            .iter()
+            .zip(&sel.dist)
+            .filter(|(_, d)| **d < 0.3 * radius)
+            .map(|(&v, _)| self.rest_position(mesh, v))
+            .collect();
+        let normal = normal.normalize_or(Vec3::Z);
+        if near.len() < 6 {
+            return (hit, normal);
+        }
+        let c = near.iter().sum::<Vec3>() / near.len() as f32;
+        let mut m = glam::Mat3::ZERO;
+        for p in &near {
+            let d = *p - c;
+            m += glam::Mat3::from_cols(d * d.x, d * d.y, d * d.z);
+        }
+        // Power iteration on trace·I − M finds M's least-spread direction.
+        let a = glam::Mat3::from_diagonal(Vec3::splat(m.x_axis.x + m.y_axis.y + m.z_axis.z)) - m;
+        let mut n = normal;
+        for _ in 0..16 {
+            n = (a * n).normalize_or(n);
+        }
+        if n.dot(normal) < 0.0 {
+            n = -n;
+        }
+        (hit - n * (hit - c).dot(n), n)
+    }
+
+    /// Alpha and texture relief at vertex `v` (now at `p`) of symmetry copy `k`.
+    fn stamp_weight(&self, mesh: &SculptMesh, images: &Images, k: usize, v: u32, p: Vec3, stamp: StampProjection) -> f32 {
+        if self.assets.alpha == Pattern::Off && self.assets.texture == Pattern::Off && self.assets.spotlight.is_none() {
+            return 1.0;
+        }
         // Spotlight: the picture's brightness where the point lands on screen.
         let spot = self.assets.spotlight.as_ref().map_or(1.0, |s| s.strength(p));
-        spot * self.assets.sample(images, k, p, stamp).relief(self.assets.texture_strength)
+        let rest = self.rest_position(mesh, v);
+        spot * self.assets.sample(images, k, rest, stamp).relief(self.assets.texture_strength)
     }
 
     /// Paint the selection and/or compute sculpt weights. Z+RGB samples each vertex's
@@ -1208,7 +1309,7 @@ impl Stroke {
                 sel.par_map_into(weights, |i, vert| {
                     let p = mesh.positions[vert as usize];
                     let falloff = focal_falloff(sel.dist[i], brush.radius, brush.focal_shift);
-                    profile(falloff, p) * self.stamp_weight(images, image(i), p, stamp)
+                    profile(falloff, p) * self.stamp_weight(mesh, images, image(i), vert, p, stamp)
                         * crate::mask::freedom(&mesh.mask, vert) * auto(i)
                 });
             }
@@ -1226,7 +1327,7 @@ impl Stroke {
         };
         let sample = |i: usize, vert: u32| {
             let p = mesh.positions[vert as usize];
-            let sample = self.assets.sample(images, image(i), p, stamp);
+            let sample = self.assets.sample(images, image(i), self.rest_position(mesh, vert), stamp);
             let falloff = focal_falloff(sel.dist[i], brush.radius, brush.focal_shift);
             let freedom = crate::mask::freedom(&mesh.mask, vert);
             (p, sample, falloff, freedom)
@@ -1380,7 +1481,12 @@ impl Stroke {
         }
         if brush.sculpt && brush.kind!=BrushKind::Paint {self.snapshot(mesh, &chunks);}
         let auto = self.auto_weights(mesh, &sel);
-        let stamp = self.stamp_projection(own_hit, own_normal, brush.radius);
+        let stamp = if self.wraps() {
+            let (centre, normal) = self.rest_plane(mesh, &sel, hit, hit_normal, brush.radius);
+            self.stamp_projection(images.unmap(k, centre), images.unmap(k, normal), brush.radius)
+        } else {
+            self.stamp_projection(own_hit, own_normal, brush.radius)
+        };
         let sculpt = brush.sculpt && brush.kind != BrushKind::Paint;
         let r = brush.radius;
         let square = brush.kind.is_square();
@@ -1693,7 +1799,7 @@ impl Stroke {
             let offset=p-start;let along=offset.dot(direction);let across=offset.dot(sideways);
             if along < -r*0.04 || along > length+r*0.04 || across.abs()>r || offset.dot(normal).abs()>r*0.65 {return actual;}
             let weight=focal_falloff(across.abs(),r,brush.focal_shift)
-                *self.stamp_weight(&self.images,k,actual,stamp)*crate::mask::freedom(&mesh.mask,v)
+                *self.stamp_weight(mesh,&self.images,k,v,actual,stamp)*crate::mask::freedom(&mesh.mask,v)
                 *auto.as_ref().map_or(1.0,|a|a[i]);
             if weight<=0.0 {return actual;}
             let height=crate::detail_brush::profile(brush.kind,across/r,(phase+along)/r)*r*0.12*brush.strength*sign*weight;
@@ -1749,7 +1855,7 @@ impl Stroke {
             let actual = mesh.positions[v as usize];
             // The foot is on the vertex's own side, so the stamp needs no mirroring.
             let weight = focal_falloff(f.across.abs(), r, brush.focal_shift)
-                * self.stamp_weight(&identity, 0, actual, self.stamp_projection(f.point, f.normal, r))
+                * self.stamp_weight(mesh, &identity, 0, v, actual, self.stamp_projection(f.point, f.normal, r))
                 * crate::mask::freedom(&mesh.mask, v)
                 * auto.as_ref().map_or(1.0, |a| a[i]);
             if weight <= 0.0 {
@@ -1841,7 +1947,7 @@ impl Stroke {
                             .filter(|&(k, c)| k != own && p.distance(*c) <= r)
                             .map(|(k, c)| {
                                 let falloff = focal_falloff(p.distance(*c), r, brush.focal_shift);
-                                let weight = profile(falloff) * self.stamp_weight(&self.images, k, p, stamp)
+                                let weight = profile(falloff) * self.stamp_weight(mesh, &self.images, k, sel.verts[i], p, stamp)
                                     * crate::mask::freedom(&mesh.mask, sel.verts[i])
                                     * joined.as_ref().map_or(1.0, |j| j[i] as u8 as f32)
                                     * auto.as_ref().map_or(1.0, |a| a[i]);
@@ -3134,5 +3240,60 @@ mod texture_turn_tests {
         assert!(s.texture_uv(uv).distance(glam::Vec2::new(1.0, 0.5)) < 1e-5);
         // The centre stays put.
         assert!(s.texture_uv(glam::Vec2::splat(0.5)).distance(glam::Vec2::splat(1.0)) < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    /// On a unit sphere a point `φ` round from the dab centre is `φ` away along the surface.
+    /// Wrap gives that to within 4.5 %, and keeps growing past 90° where the flat projection
+    /// turns back (two points reading the same alpha texel: the streaks at a silhouette).
+    #[test]
+    fn wrap_unrolls_a_sphere_by_arc_length() {
+        let mut last = 0.0;
+        for deg in 1..=170 {
+            let phi = (deg as f32).to_radians();
+            let (flat, height) = (phi.sin(), phi.cos() - 1.0);
+            let arc = wrapped_distance(flat, height);
+            assert!(arc >= phi - 1e-3 && arc <= phi * 1.045, "{deg}°: {arc} vs {phi}");
+            assert!(arc > last, "{deg}°: grows");
+            last = arc;
+        }
+        assert_eq!(wrapped_distance(0.3, 0.0), 0.3, "flat ground is unchanged");
+        assert!((wrapped_distance(0.0, -2.0) - std::f32::consts::PI).abs() < 1e-4, "the far pole is half round");
+    }
+
+    #[test]
+    fn stamp_uv_wraps_round_the_form_and_wrap_zero_is_the_flat_projection() {
+        let images = Images::identity();
+        let stamp = |wrap| StampProjection { center: Vec3::Z, across: Vec3::X, up: Vec3::Y, normal: Vec3::Z, diameter: 2.0, wrap };
+        // Points on the unit sphere round from the north pole towards +X.
+        let at = |deg: f32| {
+            let a = deg.to_radians();
+            Vec3::new(a.sin(), 0.0, a.cos())
+        };
+        let mut last = 0.5;
+        for deg in (5..=170).step_by(5).map(|d| d as f32) {
+            let phi = deg.to_radians();
+            let flat = stamp(0.0).uv(&images, 0, at(deg));
+            assert!((flat.x - (0.5 + phi.sin() / 2.0)).abs() < 1e-5, "wrap 0 at {deg}°");
+            let wrapped = stamp(1.0).uv(&images, 0, at(deg));
+            assert!((wrapped.y - 0.5).abs() < 1e-6);
+            // Never short of the flat projection, never past the true arc, and always
+            // further round: no fold where the sphere turns away.
+            assert!(wrapped.x >= flat.x - 1e-5 && wrapped.x <= 0.5 + phi * 1.045 / 2.0 + 1e-4, "wrap 1 at {deg}°: {wrapped:?}");
+            assert!(wrapped.x > last, "wrap 1 folds back at {deg}°");
+            last = wrapped.x;
+        }
+        // Relief near the centre barely moves the stamp (no jitter from the stroke's own
+        // bumps): under 1 % of the dab.
+        let bump = Vec3::new(0.05, 0.0, 1.0 + 0.04);
+        assert!((stamp(1.0).uv(&images, 0, bump) - stamp(0.0).uv(&images, 0, bump)).length() < 0.01);
+        // A box edge: the side face goes on round the corner instead of piling up on it.
+        let box_stamp = StampProjection { center: Vec3::new(0.8, 0.0, 1.0), ..stamp(1.0) };
+        let side: Vec<f32> = [0.0, 0.1, 0.2, 0.3].iter().map(|&d| box_stamp.uv(&images, 0, Vec3::new(1.0, 0.0, 1.0 - d)).x).collect();
+        assert!(side.windows(2).all(|w| w[1] - w[0] > 0.015), "{side:?}");
     }
 }
