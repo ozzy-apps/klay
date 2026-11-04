@@ -501,6 +501,16 @@ mod tests {
         );
         app.left_release();
         assert_eq!(app.zmodel_view().poly.faces.len(), 2);
+        // Hover a point the extrusion made, then undo with the pointer still: the target
+        // must not outlive the points (it used to crash the next paint).
+        let newest = *app.zmodel_view().poly.pos.last().unwrap();
+        app.cursor_moved(app.project(newest), false);
+        assert!(app.zm_hover.is_some());
+        app.history_jump(-1);
+        let poly = app.zmodel_view().poly.clone();
+        assert!(app.zm_hover.is_none_or(|h| h.fits(&poly)), "{:?} vs {} points", app.zm_hover, poly.pos.len());
+        app.history_jump(1);
+        assert_eq!(app.zmodel_view().poly.faces.len(), 2);
         app.history_jump(-1);
         assert_eq!(app.mesh().positions, seed);
         app.history_jump(1);

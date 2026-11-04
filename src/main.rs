@@ -1243,6 +1243,9 @@ impl App {
         self.doc.layers = layers;
         self.history = history;
         self.active_tool = i;
+        // ZModeler's target and Bridge start belonged to the subtool that was active.
+        self.zm_hover = None;
+        self.zm_bridge = None;
         let ms = t.elapsed().as_secs_f32() * 1000.0;
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.drop_stand_in(id);
@@ -3560,6 +3563,9 @@ impl App {
             return;
         }
         let (Some(hover), Some(z)) = (self.zm_hover, self.zmodel.as_ref()) else { return };
+        if !hover.fits(&z.poly) {
+            return;
+        }
         // Bridge's first polygon stays lit.
         let first = self.zm_bridge.as_ref().and_then(|v| z.poly.face_with(v));
         let view = self.view();
@@ -5136,8 +5142,7 @@ impl App {
         let mut b = Aabb::empty();
         for (i, t) in self.subtools.iter().enumerate() {
             let tb = if i == self.active_tool { self.doc.bounds() } else if t.visible { t.bounds } else { continue };
-            b.grow(tb.min);
-            b.grow(tb.max);
+            b.merge(tb);
         }
         (b.max.cmpge(b.min).all()).then(|| b.max - b.min)
     }
@@ -7930,6 +7935,21 @@ impl App {
         }
         self.show_active_level();
         self.subtools[self.active_tool].bounds = self.doc.bounds();
+        self.refresh_zmodel_hover();
+    }
+
+    /// After the mesh changed under a still pointer (undo, redo, a subtool switch): find
+    /// ZModeler's target again, and drop a Bridge or Stitch start that no longer exists.
+    fn refresh_zmodel_hover(&mut self) {
+        let n = self.mesh().vertex_count() as u32;
+        if self.zm_bridge.as_ref().is_some_and(|v| v.iter().any(|&i| i >= n)) {
+            self.zm_bridge = None;
+        }
+        if self.brush.kind.is_zmodeler() && self.zm_hover.is_some() {
+            self.update_zmodel_hover();
+        } else {
+            self.zm_hover = None;
+        }
     }
 
     /// Whether `kind` strokes along a curve (Stroke › Curve).
@@ -9512,8 +9532,12 @@ impl App {
             .drawn_parked()
             .iter()
             .fold(self.doc.mesh().visible_bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds));
+        // Nothing shown (or no finite box): keep the camera rather than aim it at NaN.
+        if b.is_empty() || !(b.min.is_finite() && b.max.is_finite()) {
+            return;
+        }
         self.camera.target = (b.min + b.max) * 0.5;
-        self.camera.distance = (b.max - b.min).length() * 1.1;
+        self.camera.distance = ((b.max - b.min).length() * 1.1).max(1e-3);
     }
 
     /// Default view angle plus a frame: `Home`.
@@ -11387,7 +11411,8 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed if !event.repeat && !typing => {
                             // ZBrush: with ZModeler, Space over a target shows its actions.
-                            match self.zm_hover.filter(|_| self.brush.kind.is_zmodeler()) {
+                            let fits = |h: &zmodeler::Hover| self.zmodel.as_ref().is_some_and(|z| h.fits(&z.poly));
+                            match self.zm_hover.filter(|h| self.brush.kind.is_zmodeler() && fits(h)) {
                                 Some(hover) => self.workspace.open_zm_menu(self.cursor_pos(), hover),
                                 None => self.workspace.open_quick_menu(self.cursor_pos(), true),
                             }
@@ -11913,6 +11938,8 @@ fn main() {
     // Self-tests and snapshots check a geometry operation's result the moment it is asked
     // for: wait for each job as it starts.
     app.jobs_wait = app.automated;
+    // Automated runs leave the user's layout and brush settings as they found them.
+    app.workspace.persist = !app.automated;
     // Look for a newer release only in a normal run (not self-tests, demos, snapshots).
     app.workspace.updates_allowed = !app.automated && !args.iter().any(|a| a == "--no-update-check");
     // `--symmetry x,y,z,rz8`: start with these mirrors and radial symmetry (axis, count).

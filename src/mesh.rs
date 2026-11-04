@@ -39,6 +39,20 @@ impl Aabb {
         self.max = self.max.max(p);
     }
 
+    /// No point inside (as [`empty`](Self::empty) leaves it).
+    pub fn is_empty(&self) -> bool {
+        self.min.cmpgt(self.max).any()
+    }
+
+    /// The box around both. An empty box adds nothing: growing by its corners would
+    /// stretch the result to infinity.
+    pub fn merge(&mut self, other: Aabb) {
+        if !other.is_empty() {
+            self.grow(other.min);
+            self.grow(other.max);
+        }
+    }
+
     pub fn intersects_sphere(&self, c: Vec3, r: f32) -> bool {
         let q = c.clamp(self.min, self.max);
         (q - c).length_squared() <= r * r
@@ -1309,8 +1323,7 @@ impl SculptMesh {
                 b
             })
             .reduce(Aabb::empty, |mut a, b| {
-                a.grow(b.min);
-                a.grow(b.max);
+                a.merge(b);
                 a
             })
     }
@@ -1318,8 +1331,7 @@ impl SculptMesh {
     pub fn bounds(&self) -> Aabb {
         let mut aabb = Aabb::empty();
         for ch in &self.chunks {
-            aabb.grow(ch.aabb.min);
-            aabb.grow(ch.aabb.max);
+            aabb.merge(ch.aabb);
         }
         aabb
     }
@@ -1748,5 +1760,30 @@ pub mod quad_tests {
         let unknown = SculptMesh::from_raw(m.positions.clone(), m.indices.clone());
         assert!(unknown.quads.is_empty());
         assert_eq!((unknown.drawn_groups_packed()[0] & 0xffff) >> 13, 4);
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    /// Hiding most of the model leaves whole chunks (and rayon's partial boxes) empty: the
+    /// box around what is shown must stay finite, or framing aims the camera at NaN.
+    #[test]
+    fn visible_bounds_of_a_mostly_hidden_mesh_are_finite() {
+        let (p, i) = cube_sphere(120, 1.0);
+        let mut m = SculptMesh::from_raw(p, i);
+        let hidden = (0..m.triangle_count())
+            .map(|k| (m.positions[m.indices[3 * k] as usize].x <= 0.5) as u8)
+            .collect();
+        m.set_hidden(hidden);
+        let b = m.visible_bounds();
+        assert!(b.min.is_finite() && b.max.is_finite(), "{b:?}");
+        assert!(b.min.x > 0.4 && b.max.x <= 1.0 + 1e-4, "{b:?}");
+        let mut e = Aabb::empty();
+        e.merge(Aabb::empty());
+        assert!(e.is_empty());
+        e.merge(b);
+        assert_eq!((e.min, e.max), (b.min, b.max));
     }
 }

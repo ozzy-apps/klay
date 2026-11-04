@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.47.0
+## Latest implementation — 0.47.1
 
-See Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 99 for manual retopology and Step 98 for the published 0.46.0 release. 
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.47.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.47.1**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -864,3 +864,20 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - The release-profile suite passed 441 tests with 14 ignored. The input regression builds and reindexes a subdivided reference, clicks to place a quad, picks an open edge from just outside the cage, extrudes and moves points, checks surface contact and undo/redo, and checks reference visibility and invalidation. Native validation in an isolated X display placed a quad and extruded it into a seven-quad cage over a 98,306-vertex reference. The README screenshot is from that run.
 - Follow-up work can add multi-row extrusion, attraction between cage vertices, and a persisted source binding if projects need to restore the editing setup after reopening.
 - [Maxon ZModeler retopology reference](https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/modeling-basics/creating-meshes/zmodeler/single-sided-meshes/single-sided-meshes.html)
+
+## Step 100 — Deep test and six fixes, 0.47.1 (2026-11-04)
+
+- The user asked for a deep test of every tool from several angles. Report and evidence: `deep-test/2026-11-04/REPORT.md`. The scratch driver is saved next to it as `deeptest.rs.txt`. It is not part of the build: it was compiled into a scratch copy with a `--deeptest GROUP` flag. It drives the real handlers, checks mesh and GPU state, compares undo with stored copies, and snapshots 8 camera angles per step. Run it with a fresh `XDG_CONFIG_HOME` each time.
+- Fixed in 0.47.1. **ZModeler/Retopology undo crash**: `history_jump` now calls `refresh_zmodel_hover`, `activate` clears `zm_hover`/`zm_bridge`, and `paint_zmodel` plus the Space menu check `Hover::fits`. **Infinite visible bounds**: the new `Aabb::merge` ignores empty boxes and is used by `visible_bounds`, `bounds`, the stand-in bounds, `subtool::union` and `print_extent`; `frame_camera` ignores non-finite boxes. **Clip Rect/Circle with symmetry**: union semantics with tie averaging (`surface_tools::clip_shape`). **Flat clip outlines**: `Gesture::flat`. **Close Holes figure-eight borders**: loops are split at revisited vertices (`subtool_ops::holes_closed`). **Config writes in automated runs**: `Workspace::persist`.
+- Known remainder: with Alt, a symmetric Clip Rect can still differ slightly between halves where a vertex is almost equally near two mirror images. The nearest image wins, so the choice can flip. The Alt test checks only that uncovered vertices stay.
+- Flaws from the report still open: Smooth weakens with density (about 45% of a bump removed at 9.6k vertices, about 2% at 1.4M); Trim Rect/Lasso and Make Boolean Mesh multiply polygon counts by 6–65×; Close Holes fills with fans; Extract borders are jagged; Clip Line with X symmetry leaves a cap seam; `--selftest-cull` and `--selftest-splat` need `--segments 400 --divide 2`. Parity gaps: circle gestures from the centre out; undoable Del Lower/Higher.
+
+### User request to look into: stamp streaking where a brush meets a model's edge
+
+- The user wants the striped projection gone when a brush with an alpha or texture (sculpt or paint) hits a silhouette or a thin part. They asked whether the projection can wrap around and follow the normals.
+- Cause: `StampProjection::uv` (sculpt.rs) is a planar projection onto the tangent plane at the dab centre (`base_frame(normal)`). Vertices where the surface turns away from that plane share nearly the same `offset · across` / `offset · up`. Every point along that direction then reads the same alpha or texture texel, which shows as stripes. The same projection feeds paint (`StampSettings::sample`) and the reliefs (`StampSample::relief`).
+- Suggested approach, cheapest first:
+  1. **Wrap by normals (ZBrush: Alpha › Wrap Mode).** Keep the planar direction but stretch the distance by the surface turn. With `n0` as the dab normal and `n` as the vertex normal, `θ = acos(n·n0)` and the planar radius `r = |offset − (offset·n0) n0|`, use `uv = dir · r·θ/sin θ` (clamped near 0 and capped past 90°). That is an exact unwrap on a sphere and close on smooth forms. Vertex normals are already at hand per dab, so it costs almost nothing. Fade the stamp as `n·n0` drops below 0 so the far side of a thin part stays clean, as BackfaceMask does. Expose it as a 0–100 Wrap slider and keep 0 = today's planar behaviour.
+  2. **Triplanar for tiled textures.** Sample the texture on the three axis planes of the dab frame and blend by `|n|^k`. This removes streaks for noise-like textures (paint, Surface noise) but blurs shaped alphas, so it suits textures, not alphas.
+  3. **Geodesic polar coordinates (exact).** Per dab, a Dijkstra or heat-method distance plus a transported angle over the vertices inside the brush. It follows folds, ears and fingers, but costs more on million-vertex dabs; run it per chunk on the selected vertices only.
+- Verify with `--demo-stamp alpha:NAME` / `texture:NAME` strokes run across a sphere's silhouette and along a thin cylinder, snapshotted from the side (multi-angle sheet).

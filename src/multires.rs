@@ -2876,8 +2876,7 @@ impl Multires {
                 b
             })
             .reduce(Aabb::empty, |mut a, b| {
-                a.grow(b.min);
-                a.grow(b.max);
+                a.merge(b);
                 a
             });
         StandIn {

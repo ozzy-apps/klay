@@ -174,6 +174,13 @@ impl Gesture {
             self.start.distance(self.end) < 3.0
         }
     }
+
+    /// A rectangle or circle drawn as a line (under 3 pixels across in one direction): it
+    /// encloses nothing, so a clip would press the whole model onto that line.
+    pub fn flat(&self) -> bool {
+        matches!(self.kind.shape(), Some(Shape::Rect | Shape::Circle))
+            && (self.end - self.start).abs().min_element() < 3.0
+    }
 }
 
 /// The nearest edge and point of a closed screen-space outline.
@@ -229,7 +236,7 @@ pub fn clip_shape(
     gesture: &Gesture,
     symmetry: impl Into<crate::symmetry::Symmetry>,
 ) -> Option<ChunkData> {
-    if gesture.tiny() {
+    if gesture.tiny() || gesture.flat() {
         return None;
     }
     let poly = gesture.outline();
@@ -260,18 +267,37 @@ pub fn clip_shape(
             return None;
         }
         let p = mesh.positions[v];
+        // With symmetry the outline and its mirror images act as one shape (as the shape
+        // masks do): a vertex inside any of them stays, and one outside all of them goes to
+        // the nearest of their outlines. Taking the first image that called it outside
+        // pressed the mirrored half across the model onto the other image's outline.
+        let mut found: Vec<Vec3> = Vec::new();
         for k in 0..images.len() {
             let own = images.unmap(k, p);
             let (Some(s), Some(z)) = (screen.project(own), screen.ndc_z(own)) else { continue };
-            if let Some((edge, t)) = target(s) {
-                let q = images.map(k, screen.unproject(t, z));
-                let q = sections.as_ref().and_then(|sections| sections[k][edge].as_ref())
-                    .map_or(q, |section| section.keep_inside(q));
-                let freedom = crate::mask::freedom(&mesh.mask, v as u32);
-                return Some(p + (q - p) * freedom);
+            match target(s) {
+                Some((edge, t)) => {
+                    let q = images.map(k, screen.unproject(t, z));
+                    let q = sections.as_ref().and_then(|sections| sections[k][edge].as_ref())
+                        .map_or(q, |section| section.keep_inside(q));
+                    found.push(q);
+                }
+                // Kept by this image (Clip), or left outside it (Alt): another image's
+                // pressing must not move it.
+                None if !gesture.alternate => return None,
+                None => {}
             }
         }
-        None
+        // The nearest outline; images that tie (a vertex on the symmetry plane sees its own
+        // mirror) share it, so such a vertex stays on the plane.
+        let near = found.iter().map(|q| q.distance(p)).fold(f32::INFINITY, f32::min);
+        let ties: Vec<Vec3> = found.into_iter().filter(|q| q.distance(p) <= near * (1.0 + 1e-4) + 1e-7).collect();
+        if ties.is_empty() {
+            return None;
+        }
+        let q = ties.iter().sum::<Vec3>() / ties.len() as f32;
+        let freedom = crate::mask::freedom(&mesh.mask, v as u32);
+        Some(p + (q - p) * freedom)
     };
     let changed: Vec<_> = mesh
         .chunks
@@ -666,6 +692,58 @@ mod tests {
         Screen {
             matrix: Mat4::IDENTITY,
             size: Vec2::splat(400.0),
+        }
+    }
+
+    /// X symmetry on a symmetric model, in a turned view: the result must be mirror
+    /// symmetric, and what either rectangle covers must stay (the mirrored half used to be
+    /// pressed across the model onto the first image's outline, tearing it).
+    #[test]
+    fn a_symmetric_clip_rect_in_a_turned_view_stays_mirror_symmetric() {
+        let screen = Screen {
+            matrix: Mat4::from_scale(Vec3::splat(0.7)) * Mat4::from_rotation_x(0.35) * Mat4::from_rotation_y(0.6),
+            size: Vec2::splat(400.0),
+        };
+        let key = |p: Vec3| (p * 1e4).round().as_ivec3();
+        for (kind, alternate) in [(BrushKind::ClipRect, false), (BrushKind::ClipRect, true), (BrushKind::ClipCircle, false)] {
+            let mut m = mesh();
+            let before = m.positions.clone();
+            let index: std::collections::HashMap<_, _> = before.iter().enumerate().map(|(i, &p)| (key(p), i)).collect();
+            let mut g = Gesture::new(kind, Vec2::new(150.0, 40.0), alternate);
+            g.update(Vec2::new(330.0, 250.0), false, alternate);
+            let images = crate::symmetry::Symmetry::from(true).images();
+            clip_shape(&mut m, screen, &g, true).unwrap();
+            for (v, &p) in before.iter().enumerate() {
+                let w = index[&key(Vec3::new(-p.x, p.y, p.z))];
+                let (a, b) = (m.positions[v], m.positions[w]);
+                let covered = (0..images.len()).any(|k| screen.project(images.unmap(k, p)).is_some_and(|s| g.contains(s)));
+                if alternate {
+                    // Alt presses the inside out; what no image covers stays.
+                    if !covered {
+                        assert_eq!(a, p, "{kind:?} alt: a vertex outside every outline moved");
+                    }
+                    continue;
+                }
+                assert!(a.distance(Vec3::new(-b.x, b.y, b.z)) < 1e-4, "{kind:?}: {a:?} vs mirror {b:?}");
+                if covered {
+                    assert_eq!(a, p, "{kind:?}: a vertex inside the outline moved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_clip_rect_or_circle_leaves_the_model_alone() {
+        for kind in [BrushKind::ClipRect, BrushKind::ClipCircle] {
+            for alternate in [false, true] {
+                let mut m = mesh();
+                let before = m.positions.clone();
+                let mut g = Gesture::new(kind, Vec2::new(120.0, 200.0), alternate);
+                g.update(Vec2::new(300.0, 201.0), false, alternate);
+                assert!(g.flat() && !g.tiny());
+                assert!(clip_shape(&mut m, screen(), &g, false).is_none(), "{kind:?}");
+                assert_eq!(m.positions, before);
+            }
         }
     }
 

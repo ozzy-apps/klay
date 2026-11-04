@@ -167,12 +167,25 @@ pub fn holes_closed(mesh: &SculptMesh) -> Option<SculptMesh> {
     let mut group = groups.iter().copied().max().unwrap_or(0);
     let mut starts: Vec<u32> = next.keys().copied().collect();
     starts.sort_unstable();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
     for start in starts {
         while let Some(first) = next.get_mut(&start).and_then(|v| v.pop()) {
-            // Follow the border round to where it began.
+            // Follow the border round to where it began. Where two holes touch at a vertex
+            // the walk passes it twice (a figure eight): each time it comes back to a vertex
+            // already on the walk, the stretch since then is a loop of its own. One fan over
+            // the figure eight put four triangles on an edge (non-manifold: Divide refused).
             let mut lp = vec![start];
+            let mut on_walk: HashMap<u32, usize> = HashMap::from([(start, 0)]);
             let mut at = first;
             while at != start {
+                if let Some(&i) = on_walk.get(&at) {
+                    let closed = lp.split_off(i);
+                    for v in &closed {
+                        on_walk.remove(v);
+                    }
+                    loops.push(closed);
+                }
+                on_walk.insert(at, lp.len());
                 lp.push(at);
                 let Some(n) = next.get_mut(&at).and_then(|v| v.pop()) else { break };
                 at = n;
@@ -180,25 +193,30 @@ pub fn holes_closed(mesh: &SculptMesh) -> Option<SculptMesh> {
                     break;
                 }
             }
-            if at != start || lp.len() < 3 {
-                continue;
+            if at == start {
+                loops.push(lp);
             }
-            let centre = positions.len() as u32;
-            positions.push(lp.iter().map(|&v| mesh.positions[v as usize]).sum::<Vec3>() / lp.len() as f32);
-            if !colors.is_empty() {
-                let sum = lp.iter().fold([0u32; 4], |acc, &v| {
-                    let c = mesh.colors[v as usize];
-                    [acc[0] + c[0] as u32, acc[1] + c[1] as u32, acc[2] + c[2] as u32, acc[3] + c[3] as u32]
-                });
-                colors.push(sum.map(|x| (x / lp.len() as u32) as u8));
-            }
-            group = group.saturating_add(1);
-            for k in 0..lp.len() {
-                let (a, b) = (lp[k], lp[(k + 1) % lp.len()]);
-                // The border runs a → b in its triangle; the cap meets it as b → a.
-                indices.extend_from_slice(&[b, a, centre]);
-                groups.push(group);
-            }
+        }
+    }
+    for lp in loops {
+        if lp.len() < 3 {
+            continue;
+        }
+        let centre = positions.len() as u32;
+        positions.push(lp.iter().map(|&v| mesh.positions[v as usize]).sum::<Vec3>() / lp.len() as f32);
+        if !colors.is_empty() {
+            let sum = lp.iter().fold([0u32; 4], |acc, &v| {
+                let c = mesh.colors[v as usize];
+                [acc[0] + c[0] as u32, acc[1] + c[1] as u32, acc[2] + c[2] as u32, acc[3] + c[3] as u32]
+            });
+            colors.push(sum.map(|x| (x / lp.len() as u32) as u8));
+        }
+        group = group.saturating_add(1);
+        for k in 0..lp.len() {
+            let (a, b) = (lp[k], lp[(k + 1) % lp.len()]);
+            // The border runs a → b in its triangle; the cap meets it as b → a.
+            indices.extend_from_slice(&[b, a, centre]);
+            groups.push(group);
         }
     }
     (indices.len() > mesh.indices.len()).then(|| SculptMesh::from_raw_painted(positions, indices, groups, colors))
@@ -460,6 +478,23 @@ mod tests {
         assert!(edge_counts(&closed).values().all(|&c| c == 2), "closed");
         assert!(volume(&closed) > 0.0);
         assert_eq!(closed.group_count(), 3, "the band and one group per cap");
+    }
+
+    /// Two holes that touch at one vertex (Del Hidden leaves these): the border passes that
+    /// vertex twice. Each hole needs its own cap, or the fan puts four triangles on an edge
+    /// and Divide refuses the mesh.
+    #[test]
+    fn close_holes_caps_holes_that_touch_at_a_vertex_separately() {
+        let m = sphere();
+        let tri = |t: usize| [m.indices[3 * t], m.indices[3 * t + 1], m.indices[3 * t + 2]];
+        let a = tri(0);
+        let b = (1..m.triangle_count())
+            .find(|&t| tri(t).iter().filter(|v| a.contains(v)).count() == 1)
+            .unwrap();
+        let open = part(&m, |t| t != 0 && t as usize != b).unwrap();
+        let closed = holes_closed(&open).unwrap();
+        assert!(edge_counts(&closed).values().all(|&c| c == 2), "closed and two-manifold");
+        assert_eq!(closed.subdivision_blocker(), None);
     }
 
     #[test]

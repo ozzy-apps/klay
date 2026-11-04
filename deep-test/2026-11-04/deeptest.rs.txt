@@ -1,0 +1,892 @@
+//! Scratch deep-test driver (not part of Klay): runs tool scenarios through the real
+//! handlers, checks integrity after each step and photographs the model from many angles.
+use super::*;
+use std::f32::consts::{FRAC_PI_2, PI};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use glam::Quat;
+use crate::sculpt::Shape;
+
+type Act = Box<dyn FnMut(&mut App)>;
+
+pub(super) enum Step {
+    Run(String, Act),
+    Wait(u32),
+    /// Brush/gesture drag over several frames: kind, path relative to the model's projected
+    /// centre in units of its projected radius, modifiers.
+    Stroke(BrushKind, Vec<Vec2>, ModifiersState),
+    Check(String),
+    Undo(u32),
+    Redo(u32),
+    Shots(String),
+    Sheet(String),
+    /// Record the positions of the shown level under a name.
+    Remember(String),
+    /// Compare the shown level with a remembered one.
+    Same(String),
+}
+
+pub(super) struct Deep {
+    steps: VecDeque<Step>,
+    frame_wait: u32,
+    stroke_at: usize,
+    shot_angle: usize,
+    shot_cam: Option<Camera>,
+    shot_wait: u32,
+    pub want_image: bool,
+    pub image: Option<(u32, u32, Vec<u8>)>,
+    row: Vec<image::RgbaImage>,
+    rows: Vec<image::RgbaImage>,
+    out: PathBuf,
+    memory: std::collections::HashMap<String, (usize, usize, Vec<Vec3>)>,
+    pub log: Vec<String>,
+    undo_left: u32,
+    redo_left: u32,
+}
+
+const ANGLES: [(f32, f32); 8] = [
+    (0.6, 0.35),
+    (0.0, 0.0),
+    (FRAC_PI_2, 0.0),
+    (PI, 0.0),
+    (-FRAC_PI_2, 0.0),
+    (0.6, 1.35),
+    (0.6, -1.3),
+    (2.4, 0.5),
+];
+
+fn p(x: f32, y: f32) -> Vec2 {
+    Vec2::new(x, y)
+}
+fn line(a: Vec2, b: Vec2, n: usize) -> Vec<Vec2> {
+    (0..=n).map(|i| a.lerp(b, i as f32 / n as f32)).collect()
+}
+fn circle_path(c: Vec2, r: f32, n: usize) -> Vec<Vec2> {
+    (0..=n).map(|i| { let a = i as f32 / n as f32 * TAU_F; c + Vec2::new(a.cos(), a.sin()) * r }).collect()
+}
+const TAU_F: f32 = std::f32::consts::TAU;
+fn none() -> ModifiersState {
+    ModifiersState::empty()
+}
+
+/// A fresh single subtool of this primitive and resolution, divided `div` times.
+fn fresh(kind: Primitive, seg: u32, div: u32) -> Step {
+    Step::Run(format!("fresh {kind:?} seg {seg} div {div}"), Box::new(move |app: &mut App| {
+        while app.subtools.len() > 1 {
+            app.delete_subtool();
+        }
+        app.primitive.kind = kind;
+        app.primitive.set_current(seg);
+        app.rebuild();
+        for _ in 0..div {
+            app.divide();
+        }
+        app.history.clear();
+        app.workspace.symmetry = false;
+        app.workspace.mode = Mode::Draw;
+        app.brush.strength = 0.6;
+        app.pressure = None;
+        app.home_camera();
+    }))
+}
+fn run(name: &str, f: impl FnMut(&mut App) + 'static) -> Step {
+    Step::Run(name.into(), Box::new(f))
+}
+fn shots(s: &str) -> Step {
+    Step::Shots(s.into())
+}
+fn check(s: &str) -> Step {
+    Step::Check(s.into())
+}
+fn radius(f: f32) -> Step {
+    run(&format!("radius {f}"), move |a| {
+        let b = a.doc.bounds();
+        a.brush.radius = (b.max - b.min).max_element() * f;
+    })
+}
+fn sym(on: bool) -> Step {
+    run(&format!("symmetry {on}"), move |a| a.workspace.symmetry = on)
+}
+
+fn scenarios(group: &str) -> Vec<Step> {
+    use BrushKind as K;
+    use Primitive as P;
+    let mut s: Vec<Step> = Vec::new();
+    let wave = || -> Vec<Vec2> { (0..=24).map(|i| { let t = i as f32 / 24.0; p(-0.7 + 1.0 * t, -0.1 + 0.15 * (t * 6.0).sin()) }).collect() };
+    match group {
+        g if g.starts_with("brushes") => {
+            let all: Vec<BrushKind> = vec![
+                K::Draw, K::Clay, K::ClayBuildup, K::ClayTubes, K::DamStandard, K::Inflate,
+                K::Pinch, K::Flatten, K::Polish, K::HPolish, K::TrimDynamic, K::TrimAdaptive,
+                K::Planar, K::TrimSmoothBorder, K::Layer, K::Fill, K::Scrape, K::Blob, K::Crease,
+                K::Sharpen, K::Magnify, K::Noise, K::Slash, K::PenA, K::PenS, K::OrbCracks,
+                K::MalletFast, K::FormSoft, K::FormHard, K::Rake, K::Zipper, K::Stitch,
+                K::Grab, K::Nudge, K::Elastic, K::SnakeHook, K::MoveTopological,
+                K::InflateBalloon, K::Gravity, K::Spiral, K::Smooth, K::SmoothStronger,
+                K::SmoothValleys, K::SmoothPeaks,
+            ];
+            let part: usize = g.trim_start_matches("brushes").parse().unwrap_or(0);
+            for (n, chunk) in all.chunks(6).enumerate() {
+                if n != part { continue; }
+                for &k in chunk {
+                    s.push(fresh(P::Sphere, 120, 1));
+                    s.push(sym(true));
+                    s.push(radius(0.12));
+                    s.push(Step::Remember("orig".into()));
+                    let drag = matches!(k, K::Grab | K::Nudge | K::Elastic | K::SnakeHook | K::MoveTopological | K::Gravity | K::Spiral);
+                    let smooth = matches!(k, K::Smooth | K::SmoothStronger | K::SmoothValleys | K::SmoothPeaks | K::Polish | K::HPolish | K::Planar | K::Flatten | K::TrimDynamic | K::TrimAdaptive | K::TrimSmoothBorder | K::Scrape);
+                    if smooth {
+                        // Something to smooth or flatten first.
+                        s.push(Step::Stroke(K::Draw, wave(), none()));
+                        s.push(Step::Stroke(K::Draw, wave().iter().map(|q| *q + p(0.0, 0.08)).collect(), none()));
+                    }
+                    let path = if drag { line(p(-0.35, -0.2), p(-0.9, -0.7), 12) } else { wave() };
+                    s.push(Step::Stroke(k, path, none()));
+                    s.push(check(&format!("{} stroke", k.name())));
+                    s.push(shots(k.name()));
+                    s.push(Step::Undo(if smooth { 3 } else { 1 }));
+                    s.push(Step::Wait(3));
+                    s.push(Step::Same("orig".into()));
+                }
+                s.push(Step::Sheet(format!("brushes{part}")));
+            }
+        }
+        "gestures" | "gestures-cube" | "gestures-div" => {
+            let (prim, seg, div) = match group { "gestures-cube" => (P::Cube, 40, 0), "gestures-div" => (P::Sphere, 40, 2), _ => (P::Sphere, 120, 0) };
+            let lasso = || vec![p(-0.6, -0.5), p(0.4, -0.7), p(0.7, 0.2), p(0.0, 0.6), p(-0.5, 0.3), p(-0.6, -0.5)];
+            let curve = || line(p(-1.3, -0.2), p(1.3, 0.35), 16);
+            let cases: Vec<(BrushKind, Vec<Vec2>)> = vec![
+                (K::ClipLine, vec![p(-1.4, -0.3), p(1.4, 0.5)]),
+                (K::ClipRect, vec![p(-0.4, -1.4), p(0.5, 0.2)]),
+                (K::ClipCircle, vec![p(0.3, -0.3), p(0.9, -0.3)]),
+                (K::TrimCurve, curve()),
+                (K::TrimRect, vec![p(-0.6, -0.6), p(0.5, 0.4)]),
+                (K::TrimCircle, vec![p(0.0, 0.0), p(0.55, 0.0)]),
+                (K::TrimLasso, lasso()),
+                (K::SliceCurve, curve()),
+                (K::KnifeCurve, curve()),
+                (K::SelectRect, vec![p(-0.6, -0.6), p(0.5, 0.4)]),
+                (K::SelectLasso, lasso()),
+                (K::MaskRect, vec![p(-0.6, -0.6), p(0.5, 0.4)]),
+                (K::MaskLasso, lasso()),
+                (K::MaskCircle, vec![p(0.0, 0.0), p(0.55, 0.0)]),
+                (K::MaskLine, vec![p(-1.4, -0.3), p(1.4, 0.5)]),
+            ];
+            for (k, path) in cases {
+                for symm in [false, true] {
+                    if symm && !matches!(k, K::ClipLine | K::ClipRect | K::ClipCircle | K::TrimCurve | K::SliceCurve) { continue; }
+                    s.push(fresh(prim, seg, div));
+                    s.push(sym(symm));
+                    s.push(Step::Remember("orig".into()));
+                    let path = if matches!(k.shape(), Some(Shape::Rect | Shape::Circle | Shape::Line)) && path.len() == 2 { line(path[0], path[1], 10) } else { path.clone() };
+                    s.push(Step::Stroke(k, path, none()));
+                    s.push(check(&format!("{}{}", k.name(), if symm { " +X sym" } else { "" })));
+                    s.push(shots(&format!("{}{}", k.name(), if symm { " sym" } else { "" })));
+                    s.push(Step::Undo(1));
+                    s.push(Step::Wait(3));
+                    s.push(Step::Same("orig".into()));
+                }
+            }
+            // Crossing cuts in turned views.
+            s.push(fresh(prim, seg, div));
+            s.push(Step::Stroke(K::ClipRect, line(p(-0.4, -1.4), p(0.5, 0.2), 8), none()));
+            s.push(run("turn", |a| { a.camera.yaw += 1.2; a.camera.pitch -= 0.5; }));
+            s.push(Step::Stroke(K::ClipLine, line(p(1.4, -0.5), p(-1.4, 0.3), 8), none()));
+            s.push(run("turn", |a| { a.camera.yaw -= 2.0; a.camera.pitch += 0.9; }));
+            s.push(Step::Stroke(K::ClipCircle, line(p(-0.2, 0.3), p(0.4, 0.3), 8), none()));
+            s.push(check("three crossing clips"));
+            s.push(shots("crossing clips"));
+            s.push(Step::Undo(3));
+            s.push(Step::Wait(3));
+            s.push(Step::Same("orig".into()));
+            s.push(Step::Sheet(group.into()));
+        }
+        "undo-dense" => {
+            // Dense mesh, mixed tools, long undo/redo chains, branching.
+            s.push(fresh(P::Sphere, 300, 1));
+            s.push(sym(true));
+            s.push(radius(0.1));
+            s.push(Step::Remember("L1".into()));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(Step::Stroke(K::ClayBuildup, line(p(-0.5, 0.3), p(0.3, 0.4), 12), none()));
+            s.push(Step::Stroke(K::Grab, line(p(-0.3, -0.3), p(-0.8, -0.8), 10), none()));
+            s.push(Step::Stroke(K::DamStandard, line(p(-0.6, 0.0), p(0.5, -0.2), 12), none()));
+            s.push(check("after 4 strokes (L1)"));
+            s.push(run("divide", |a| a.divide()));
+            s.push(check("divided to L2"));
+            s.push(Step::Stroke(K::Draw, line(p(-0.4, 0.1), p(0.4, 0.2), 12), none()));
+            s.push(run("level 0", |a| a.set_level(0)));
+            s.push(Step::Stroke(K::Inflate, line(p(-0.4, -0.4), p(0.4, -0.4), 12), none()));
+            s.push(run("level 2", |a| { let t = a.doc.top(); a.set_level(t) }));
+            s.push(check("L0 edit shown at L2"));
+            s.push(shots("dense after strokes + divide"));
+            s.push(Step::Remember("before-clip".into()));
+            s.push(Step::Stroke(K::ClipLine, vec![p(-1.4, 0.5), p(1.4, 0.7)], none()));
+            s.push(Step::Stroke(K::MaskLasso, vec![p(-0.6, -0.5), p(0.4, -0.7), p(0.7, 0.2), p(-0.6, -0.5)], none()));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(check("clip + mask + stroke at L2"));
+            s.push(Step::Undo(3));
+            s.push(Step::Wait(2));
+            s.push(Step::Same("before-clip".into()));
+            s.push(Step::Redo(3));
+            s.push(check("redo 3"));
+            s.push(Step::Undo(20));
+            s.push(Step::Wait(3));
+            s.push(check("undo everything"));
+            s.push(Step::Redo(20));
+            s.push(check("redo everything"));
+            s.push(shots("dense after redo all"));
+            s.push(Step::Undo(4));
+            s.push(Step::Stroke(K::Clay, line(p(-0.3, 0.3), p(0.3, 0.3), 8), none()));
+            s.push(check("branch after undo"));
+            s.push(Step::Undo(30));
+            s.push(check("undo to start"));
+            s.push(Step::Sheet("undo-dense".into()));
+        }
+        "undo-remesh" => {
+            s.push(fresh(P::Sphere, 250, 1));
+            s.push(radius(0.1));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(Step::Stroke(K::SnakeHook, line(p(0.3, -0.3), p(0.9, -0.9), 10), none()));
+            s.push(run("del lower", |a| { a.pending_geo = Some(GeoOp::DelLower); }));
+            s.push(Step::Wait(2));
+            s.push(check("del lower"));
+            s.push(run("dynamesh (wedge on)", |a| { a.wedge.resolution = 256; a.pending_geo = Some(GeoOp::WedgeToggle); }));
+            s.push(Step::Wait(3));
+            s.push(check("dynamesh 256"));
+            s.push(shots("dynamesh 256"));
+            s.push(Step::Stroke(K::ClayBuildup, wave(), none()));
+            s.push(run("zremesh 5k", |a| { a.workspace.zremesh.target_k = 5.0; a.zremesh_now(); }));
+            s.push(Step::Wait(3));
+            s.push(check("zremesh 5k"));
+            s.push(shots("zremesh 5k"));
+            s.push(run("divide x2", |a| { a.divide(); a.divide(); }));
+            s.push(check("divide x2"));
+            s.push(Step::Stroke(K::DamStandard, line(p(-0.6, 0.0), p(0.5, -0.2), 12), none()));
+            s.push(run("decimate 20%", |a| { a.pending_geo = Some(GeoOp::DelLower); }));
+            s.push(Step::Wait(2));
+            s.push(run("decimate", |a| { a.workspace.decimation.keep_percent = 20.0; a.start_decimation(); a.poll_geo(true); }));
+            s.push(Step::Wait(3));
+            s.push(check("decimate 20%"));
+            s.push(shots("decimated"));
+            s.push(run("uv unwrap", |a| a.uv_unwrap_now()));
+            s.push(check("uv unwrap"));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(Step::Undo(1)); s.push(check("undo 1"));
+            s.push(Step::Undo(1)); s.push(check("undo 2"));
+            s.push(Step::Undo(1)); s.push(check("undo 3"));
+            s.push(Step::Undo(1)); s.push(check("undo 4"));
+            s.push(Step::Undo(1)); s.push(check("undo 5"));
+            s.push(Step::Undo(1)); s.push(check("undo 6"));
+            s.push(Step::Undo(1)); s.push(check("undo 7"));
+            s.push(Step::Undo(1)); s.push(check("undo 8"));
+            s.push(Step::Undo(1)); s.push(check("undo 9"));
+            s.push(Step::Undo(1)); s.push(check("undo 10"));
+            s.push(Step::Undo(10)); s.push(check("undo 20"));
+            s.push(shots("after undo all"));
+            s.push(Step::Redo(30)); s.push(check("redo all"));
+            s.push(shots("after redo all"));
+            s.push(Step::Undo(5)); s.push(check("undo 5 again"));
+            s.push(Step::Stroke(K::Inflate, wave(), none()));
+            s.push(check("branch"));
+            s.push(Step::Redo(3)); s.push(check("redo after branch (should do nothing)"));
+            s.push(Step::Sheet("undo-remesh".into()));
+        }
+        "geometry" => {
+            // Deformations, mirror, crease, panel loops, polygroups, reconstruct.
+            for d in subtool::Deform::ALL {
+                s.push(fresh(P::Cube, 30, 1));
+                s.push(Step::Remember("orig".into()));
+                s.push(run(&format!("deform {}", d.label()), move |a| a.deform(d, 40.0)));
+                s.push(check(&format!("deform {}", d.label())));
+                s.push(shots(&format!("deform {}", d.label())));
+                s.push(Step::Undo(1));
+                s.push(Step::Wait(2));
+                s.push(Step::Same("orig".into()));
+            }
+            s.push(Step::Sheet("deform".into()));
+            s.push(fresh(P::Sphere, 80, 0));
+            s.push(Step::Stroke(K::Draw, line(p(0.2, -0.3), p(0.6, 0.3), 10), none()));
+            s.push(run("mirror and weld", |a| { a.pending_geo = Some(GeoOp::MirrorWeld); }));
+            s.push(Step::Wait(3));
+            s.push(check("mirror and weld"));
+            s.push(shots("mirror and weld"));
+            s.push(Step::Stroke(K::MaskLasso, vec![p(-0.6, -0.5), p(0.4, -0.7), p(0.7, 0.2), p(-0.6, -0.5)], none()));
+            s.push(run("extract", |a| a.extract()));
+            s.push(Step::Wait(3));
+            s.push(check("extract"));
+            s.push(shots("extract"));
+            s.push(fresh(P::Sphere, 80, 0));
+            s.push(Step::Stroke(K::SelectRect, line(p(-0.6, -0.6), p(0.5, 0.4), 6), none()));
+            s.push(run("del hidden", |a| { a.pending_geo = Some(GeoOp::DelHidden); }));
+            s.push(Step::Wait(3));
+            s.push(check("del hidden"));
+            s.push(run("close holes", |a| { a.pending_geo = Some(GeoOp::CloseHoles); }));
+            s.push(Step::Wait(3));
+            s.push(check("close holes"));
+            s.push(shots("del hidden + close holes"));
+            s.push(fresh(P::Sphere, 80, 0));
+            s.push(Step::Stroke(K::SliceCurve, line(p(-1.3, -0.2), p(1.3, 0.35), 16), none()));
+            s.push(run("panel loops", |a| { a.pending_geo = Some(GeoOp::PanelLoops); }));
+            s.push(Step::Wait(3));
+            s.push(check("panel loops"));
+            s.push(shots("slice + panel loops"));
+            s.push(run("crease PG + divide 2", |a| { a.crease_now(crease::CreaseOp::Groups); a.divide(); a.divide(); }));
+            s.push(check("crease + divide"));
+            s.push(shots("crease PG + divide"));
+            s.push(run("reconstruct", |a| { a.set_level(0); a.pending_geo = Some(GeoOp::DelLower); }));
+            s.push(Step::Wait(2));
+            s.push(Step::Undo(8));
+            s.push(check("undo all geometry"));
+            s.push(Step::Sheet("geometry".into()));
+        }
+        "subtools" => {
+            s.push(fresh(P::Sphere, 80, 1));
+            s.push(run("append cube + move", |a| { a.primitive.kind = Primitive::Cube; a.append_primitive(); a.deform(subtool::Deform::OffsetX, 40.0); a.frame_camera(); }));
+            s.push(check("append cube"));
+            s.push(shots("two subtools"));
+            s.push(run("boolean: cube subtract", |a| { a.subtools[a.active_tool].boolean = crate::boolean::BoolOp::Subtract; a.workspace.live_boolean = true; }));
+            s.push(Step::Wait(4));
+            s.push(shots("live boolean"));
+            s.push(run("make boolean mesh", |a| { a.make_boolean_mesh(); a.poll_geo(true); }));
+            s.push(Step::Wait(4));
+            s.push(check("make boolean"));
+            s.push(run("live boolean off", |a| a.workspace.live_boolean = false));
+            s.push(shots("boolean result"));
+            s.push(run("merge down", |a| { a.select_subtool(0); a.merge_down(); }));
+            s.push(Step::Wait(3));
+            s.push(check("merge down"));
+            s.push(run("duplicate + mirror copy", |a| { a.duplicate_subtool(); a.pending_geo = Some(GeoOp::MirrorCopy); }));
+            s.push(Step::Wait(3));
+            s.push(check("dup + mirror copy"));
+            s.push(shots("dup + mirror copy"));
+            s.push(run("groups split", |a| a.groups_split()));
+            s.push(check("groups split"));
+            s.push(run("select subtool 0..n", |a| { for i in 0..a.subtools.len() { a.select_subtool(i); } }));
+            s.push(check("cycle subtools"));
+            s.push(Step::Undo(10));
+            s.push(check("undo"));
+            s.push(Step::Sheet("subtools".into()));
+        }
+        "zmodeler" => {
+            // The crash path: hover an edge, extrude, undo without moving the pointer.
+            s.push(fresh(P::Cube, 1, 0));
+            s.push(run("zmodeler extrude edge", |a| {
+                a.workspace.select_brush(&mut a.brush, BrushKind::ZModeler);
+                a.workspace.zm_edge = zmodeler::EdgeAction::Extrude;
+                a.workspace.mode = Mode::Draw;
+            }));
+            for k in 0..3 {
+                s.push(run(&format!("extrude {k}"), move |a| {
+                    let z = a.zmodel_view().poly.clone();
+                    // An open edge if there is one, else the first edge of the last face.
+                    let f = z.faces.last().unwrap().clone();
+                    let (va, vb) = (f[0], f[1]);
+                    let m = (z.pos[va as usize] + z.pos[vb as usize]) * 0.5;
+                    let at = a.project(m);
+                    a.cursor_moved(at, false);
+                    let hov = a.zm_hover;
+                    a.left_press(false, false);
+                    let c = a.project({ let b = a.doc.bounds(); (b.min + b.max) * 0.5 });
+                    for i in 1..=8 { a.cursor_moved(at + (at - c).normalize_or(Vec2::X) * (i as f32 * 8.0), false); }
+                    a.left_release();
+                    log::info!("deeptest: extrude {k} hover {hov:?} -> {} points", a.zmodel_view().poly.pos.len());
+                }));
+                s.push(Step::Wait(2));
+            }
+            s.push(run("hover the newest point", |a| {
+                let z = a.zmodel_view().poly.clone();
+                let v = z.pos.len() - 1;
+                let at = a.project(z.pos[v]);
+                a.cursor_moved(at, false);
+                log::info!("deeptest: hover {:?} of {} points", a.zm_hover, z.pos.len());
+            }));
+            s.push(Step::Wait(2));
+            s.push(Step::Undo(1));
+            s.push(Step::Wait(3));
+            s.push(check("undo with stale hover"));
+            s.push(Step::Undo(1));
+            s.push(Step::Wait(3));
+            s.push(check("undo twice with stale hover"));
+            s.push(shots("zmodeler after undo"));
+            s.push(Step::Sheet("zmodeler".into()));
+        }
+        "retopo" => {
+            s.push(fresh(P::Sphere, 150, 1));
+            s.push(sym(true));
+            s.push(radius(0.12));
+            s.push(Step::Stroke(K::ClayBuildup, wave(), none()));
+            s.push(run("reference + place", |a| {
+                let id = a.subtools[a.active_tool].id;
+                a.retopo_action(retopo::Action::Reference(id));
+                a.poll_geo(true);
+                a.retopo_action(retopo::Action::Place);
+                let c = a.project({ let b = a.doc.bounds(); (b.min + b.max) * 0.5 });
+                a.cursor_moved(c, false);
+                a.left_press(false, false);
+                a.left_release();
+                log::info!("deeptest: retopo subtools {} live {}", a.subtools.len(), a.retopo_live());
+            }));
+            s.push(Step::Wait(3));
+            for k in 0..4 {
+                s.push(run(&format!("retopo extrude {k}"), move |a| {
+                    let z = a.zmodel_view().poly.clone();
+                    let f = z.faces.last().unwrap().clone();
+                    let (va, vb) = (f[k % f.len()], f[(k + 1) % f.len()]);
+                    let m = (z.pos[va as usize] + z.pos[vb as usize]) * 0.5;
+                    let at = a.project(m);
+                    a.cursor_moved(at, false);
+                    let hov = a.zm_hover;
+                    a.left_press(false, false);
+                    let c = a.project((z.pos.iter().copied().sum::<Vec3>()) / z.pos.len() as f32);
+                    for i in 1..=8 { a.cursor_moved(at + (at - c).normalize_or(Vec2::X) * (i as f32 * 6.0), false); }
+                    a.left_release();
+                    log::info!("deeptest: retopo extrude {k} hover {hov:?} -> {} points, {} faces", a.zmodel_view().poly.pos.len(), a.zmodel_view().poly.faces.len());
+                }));
+                s.push(Step::Wait(2));
+            }
+            s.push(check("retopo cage"));
+            s.push(shots("retopo cage"));
+            s.push(run("hover newest point", |a| {
+                let z = a.zmodel_view().poly.clone();
+                let at = a.project(*z.pos.last().unwrap());
+                a.cursor_moved(at, false);
+                log::info!("deeptest: hover {:?} of {}", a.zm_hover, z.pos.len());
+            }));
+            s.push(Step::Wait(2));
+            s.push(Step::Undo(1));
+            s.push(Step::Wait(3));
+            s.push(check("retopo undo with stale hover"));
+            s.push(Step::Undo(1));
+            s.push(Step::Wait(3));
+            s.push(check("retopo undo 2"));
+            s.push(Step::Sheet("retopo".into()));
+        }
+        "misc" => {
+            s.push(fresh(P::Sphere, 100, 0));
+            s.push(Step::Stroke(K::CurveTube, line(p(-0.8, -0.5), p(0.7, 0.4), 30), none()));
+            s.push(run("esc", |a| a.on_key(KeyCode::Escape)));
+            s.push(check("curve tube"));
+            s.push(shots("curve tube"));
+            s.push(fresh(P::Sphere, 100, 0));
+            s.push(Step::Stroke(K::InsertMesh, line(p(0.0, 0.0), p(0.25, 0.0), 6), none()));
+            s.push(check("insert mesh"));
+            s.push(shots("insert mesh"));
+            s.push(fresh(P::Sphere, 100, 1));
+            s.push(run("layer new", |a| a.layer_op(LayerOp::New)));
+            s.push(radius(0.12));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(run("layer intensity -1", |a| { a.layer_op(LayerOp::Intensity(0, -1.0)); a.layer_op(LayerOp::IntensityDone(0, 1.0)); }));
+            s.push(Step::Wait(2));
+            s.push(check("layer -1"));
+            s.push(shots("layer at -1"));
+            s.push(run("layer delete", |a| a.layer_op(LayerOp::Delete(0))));
+            s.push(check("layer delete"));
+            s.push(Step::Undo(4));
+            s.push(check("undo layers"));
+            s.push(fresh(P::Sphere, 100, 0));
+            s.push(run("sculptris pro on", |a| a.workspace.sculptris = true));
+            s.push(radius(0.1));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(Step::Stroke(K::Draw, line(p(-0.5, 0.3), p(0.5, 0.3), 20), none()));
+            s.push(check("sculptris pro"));
+            s.push(shots("sculptris pro"));
+            s.push(Step::Undo(2));
+            s.push(check("sculptris undo"));
+            s.push(run("sculptris off", |a| a.workspace.sculptris = false));
+            s.push(fresh(P::Sphere, 100, 0));
+            s.push(run("transpose move/rotate", |a| {
+                a.apply_transform(transform::Affine::rotation_about(Vec3::ZERO, Quat::from_rotation_y(0.7)));
+            }));
+            s.push(check("transform"));
+            s.push(run("polish features + groups split by normal", |a| a.deform(subtool::Deform::PolishFeatures, 50.0)));
+            s.push(check("polish features"));
+            s.push(Step::Sheet("misc".into()));
+        }
+        "gpulag" => {
+            for (seg, div) in [(120u32, 1u32), (300, 1)] {
+                for k in [K::Draw, K::Grab, K::ClayBuildup, K::Inflate] {
+                    s.push(fresh(P::Sphere, seg, div));
+                    s.push(radius(0.12));
+                    let path = if k == K::Grab { line(p(-0.3, -0.2), p(-0.8, -0.7), 12) } else { wave() };
+                    s.push(Step::Stroke(k, path, none()));
+                    s.push(Step::Wait(5));
+                    s.push(check(&format!("{} {seg}/{div} after stroke", k.name())));
+                    s.push(Step::Undo(1));
+                    s.push(check("undo +0"));
+                    s.push(Step::Wait(1)); s.push(check("undo +1"));
+                    s.push(Step::Wait(10)); s.push(check("undo +11"));
+                    s.push(Step::Wait(60)); s.push(check("undo +71"));
+                    s.push(Step::Redo(1));
+                    s.push(check("redo +0"));
+                    s.push(Step::Wait(10)); s.push(check("redo +10"));
+                    s.push(Step::Wait(60)); s.push(check("redo +70"));
+                }
+            }
+            // Two strokes, undo one.
+            s.push(fresh(P::Sphere, 120, 1));
+            s.push(radius(0.12));
+            s.push(Step::Stroke(K::Draw, wave(), none()));
+            s.push(Step::Stroke(K::Draw, wave().iter().map(|q| *q + p(0.0, 0.3)).collect(), none()));
+            s.push(Step::Wait(5));
+            s.push(Step::Undo(1));
+            s.push(Step::Wait(30)); s.push(check("2 strokes, undo 1, +30"));
+            s.push(shots("after undo of 2nd stroke"));
+            s.push(Step::Sheet("gpulag".into()));
+        }
+        "hidden" => {
+            s.push(fresh(P::Sphere, 120, 0));
+            s.push(Step::Stroke(K::SelectRect, line(p(-0.6, -0.6), p(0.5, 0.4), 6), none()));
+            s.push(Step::Wait(30));
+            s.push(run("log camera", |a| {
+                let m = a.mesh();
+                let shown = m.shown.iter().filter(|&&x| x != 0).count();
+                log::warn!("deeptest: camera before {:?} {:?} d {} | shown {} of {} | visible_bounds {:?}", a.camera.target, (a.camera.yaw, a.camera.pitch), a.camera.distance, shown, m.shown.len(), m.visible_bounds());
+                a.frame_camera();
+                log::warn!("deeptest: camera after frame {:?} d {}", a.camera.target, a.camera.distance);
+            }));
+            s.push(check("select rect"));
+            s.push(shots("select rect +30 frames"));
+            s.push(run("ui snapshot on", |a| { if let Some(g) = a.gfx.as_mut() { g.snapshot_ui = true; } }));
+            s.push(shots("select rect, full window"));
+            s.push(run("ui snapshot off; brush Draw", |a| { if let Some(g) = a.gfx.as_mut() { g.snapshot_ui = false; } a.workspace.select_brush(&mut a.brush, BrushKind::Draw); }));
+            s.push(Step::Wait(10));
+            s.push(shots("select rect, brush switched to Draw"));
+            s.push(run("show all", |a| a.show_all()));
+            s.push(Step::Wait(5));
+            s.push(shots("show all"));
+            s.push(Step::Sheet("hidden".into()));
+        }
+        "clipdiv" => {
+            for div in [0u32, 1, 2] {
+                s.push(fresh(P::Sphere, 40, div));
+                s.push(Step::Remember("s0".into()));
+                s.push(Step::Stroke(K::ClipRect, line(p(-0.4, -1.4), p(0.5, 0.2), 8), none()));
+                s.push(check(&format!("div {div} clip rect")));
+                s.push(Step::Remember("s1".into()));
+                s.push(run("turn", |a| { a.camera.yaw += 1.2; a.camera.pitch -= 0.5; }));
+                s.push(Step::Stroke(K::ClipLine, line(p(1.4, -0.5), p(-1.4, 0.3), 8), none()));
+                s.push(check("clip line"));
+                s.push(Step::Remember("s2".into()));
+                s.push(run("turn", |a| { a.camera.yaw -= 2.0; a.camera.pitch += 0.9; }));
+                s.push(Step::Stroke(K::ClipCircle, line(p(-0.2, 0.0), p(0.4, 0.5), 8), none()));
+                s.push(check("clip circle"));
+                s.push(shots(&format!("div {div} three clips")));
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("s2".into()));
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("s1".into()));
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("s0".into()));
+                s.push(shots(&format!("div {div} after undo 3")));
+                s.push(run("level 0", |a| a.set_level(0)));
+                s.push(Step::Remember("l0".into()));
+                s.push(run("level top", |a| { let t = a.doc.top(); a.set_level(t) }));
+                s.push(Step::Same("s0".into()));
+            }
+            s.push(Step::Sheet("clipdiv".into()));
+        }
+        "flatcircle" => {
+            for div in [0u32, 1, 2] {
+                for k in [K::ClipCircle, K::ClipRect] {
+                    s.push(fresh(P::Sphere, 40, div));
+                    s.push(Step::Remember("s0".into()));
+                    s.push(Step::Stroke(k, line(p(-0.2, 0.3), p(0.4, 0.3), 8), none()));
+                    s.push(check(&format!("div {div} flat {}", k.name())));
+                    s.push(shots(&format!("div {div} flat {}", k.name())));
+                    s.push(Step::Undo(1)); s.push(Step::Wait(3)); s.push(Step::Same("s0".into()));
+                    s.push(run("level 0 then top", |a| { a.set_level(0); let t = a.doc.top(); a.set_level(t); }));
+                    s.push(Step::Same("s0".into()));
+                    s.push(shots(&format!("div {div} after undo")));
+                }
+            }
+            s.push(Step::Sheet("flatcircle".into()));
+        }
+        "crossdiv" => {
+            for div in [0u32, 2] {
+            for wait in [false, true] {
+            s.push(fresh(P::Sphere, 40, div));
+            s.push(Step::Remember("orig".into()));
+            s.push(Step::Stroke(K::ClipRect, line(p(-0.4, -1.4), p(0.5, 0.2), 8), none()));
+            s.push(Step::Remember("a".into()));
+            s.push(run("turn", |a| { a.camera.yaw += 1.2; a.camera.pitch -= 0.5; }));
+            s.push(Step::Stroke(K::ClipLine, line(p(1.4, -0.5), p(-1.4, 0.3), 8), none()));
+            s.push(Step::Remember("b".into()));
+            s.push(run("turn", |a| { a.camera.yaw -= 2.0; a.camera.pitch += 0.9; }));
+            s.push(Step::Stroke(K::ClipCircle, line(p(-0.2, 0.3), p(0.4, 0.3), 8), none()));
+            s.push(check(&format!("div {div} crossing")));
+            if wait {
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("b".into()));
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("a".into()));
+                s.push(Step::Undo(1)); s.push(Step::Wait(2)); s.push(Step::Same("orig".into()));
+            } else {
+                s.push(Step::Undo(3)); s.push(Step::Wait(3)); s.push(Step::Same("orig".into()));
+            }
+            s.push(check("after undo"));
+            }}
+        }
+        "moved" => {
+            for k in [K::Nudge, K::Gravity, K::Smooth, K::Elastic, K::MoveTopological, K::Spiral] {
+                for symm in [false, true] {
+                    s.push(fresh(P::Sphere, 120, 1));
+                    s.push(sym(symm));
+                    s.push(radius(0.12));
+                    s.push(Step::Stroke(K::Draw, wave(), none()));
+                    s.push(Step::Remember("o".into()));
+                    s.push(run(&format!("{} sym {symm}", k.name()), |_| {}));
+                    let path = if matches!(k, K::Smooth) { wave() } else { line(p(-0.35, -0.2), p(-0.9, -0.7), 12) };
+                    s.push(Step::Stroke(k, path, none()));
+                    s.push(Step::Same("o".into()));
+                }
+            }
+        }
+        "smoothdensity" => {
+            for (seg, div) in [(40u32, 0u32), (120, 0), (120, 1), (120, 2)] {
+                s.push(fresh(P::Sphere, seg, div));
+                s.push(radius(0.12));
+                s.push(Step::Remember("base".into()));
+                s.push(Step::Stroke(K::Draw, wave(), none()));
+                s.push(Step::Remember("o".into()));
+                s.push(run(&format!("draw height seg {seg} div {div}"), |_| {}));
+                s.push(Step::Same("base".into()));
+                s.push(Step::Stroke(K::Smooth, wave(), none()));
+                s.push(run("smooth removed", |_| {}));
+                s.push(Step::Same("o".into()));
+            }
+        }
+        _ => panic!("unknown deeptest group {group}"),
+    }
+    s
+}
+
+impl Deep {
+    pub fn new(group: &str, out: &str) -> Self {
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).ok();
+        Deep {
+            steps: scenarios(group).into(),
+            frame_wait: 25,
+            stroke_at: 0,
+            shot_angle: 0,
+            shot_cam: None,
+            shot_wait: 0,
+            want_image: false,
+            image: None,
+            row: Vec::new(),
+            rows: Vec::new(),
+            out,
+            memory: Default::default(),
+            log: Vec::new(),
+            undo_left: 0,
+            redo_left: 0,
+        }
+    }
+}
+
+impl App {
+    fn deep_say(&mut self, d: &mut Deep, s: String) {
+        log::warn!("deeptest: {s}");
+        d.log.push(s);
+    }
+
+    fn deep_check(&mut self, label: &str) -> String {
+        let m = self.mesh();
+        let n = m.vertex_count();
+        let nan = m.positions.iter().filter(|p| !p.is_finite()).count();
+        let bad = m.indices.iter().filter(|&&i| i as usize >= n).count();
+        let degen = m.indices.chunks_exact(3).filter(|t| t[0] == t[1] || t[1] == t[2] || t[0] == t[2]).count();
+        let blocker = m.subdivision_blocker();
+        // Open edges (boundary) and edge use counts.
+        let mut edges: std::collections::HashMap<(u32, u32), u32> = Default::default();
+        for t in m.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let open = edges.values().filter(|&&c| c == 1).count();
+        let over = edges.values().filter(|&&c| c > 2).count();
+        let gpu = self.gfx.as_ref().and_then(Gfx::read_positions).unwrap_or_default();
+        let gpu_note = if gpu.len() == n {
+            let worst = gpu.iter().zip(&m.positions).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
+            if worst > 1e-4 { format!("GPU≠CPU worst {worst:.2e} FAIL") } else { "gpu ok".into() }
+        } else {
+            format!("GPU has {} vs CPU {n} vertices{}", gpu.len(), if gpu.is_empty() { "" } else { " FAIL" })
+        };
+        let mask_len_bad = !m.mask.is_empty() && m.mask.len() != n;
+        let colors_bad = !m.colors.is_empty() && m.colors.len() != n;
+        let groups_bad = !m.groups.is_empty() && m.groups.len() != m.triangle_count();
+        let hidden_bad = !m.hidden.is_empty() && m.hidden.len() != m.triangle_count();
+        let mut flags = Vec::new();
+        if nan > 0 { flags.push(format!("NaN {nan} FAIL")); }
+        if bad > 0 { flags.push(format!("index out of range {bad} FAIL")); }
+        if degen > 0 { flags.push(format!("degenerate tris {degen}")); }
+        if over > 0 { flags.push(format!("non-manifold edges {over}")); }
+        if mask_len_bad { flags.push("mask length FAIL".into()); }
+        if colors_bad { flags.push("color length FAIL".into()); }
+        if groups_bad { flags.push("groups length FAIL".into()); }
+        if hidden_bad { flags.push("hidden length FAIL".into()); }
+        format!(
+            "[{label}] subtools {} level {}/{} verts {} tris {} open edges {open} {gpu_note} blocker {:?} undo {} {}",
+            self.subtools.len(), self.doc.active(), self.doc.top(), n, m.triangle_count(), blocker, self.history.can_undo(), flags.join(", ")
+        )
+    }
+
+    /// One frame of the deep test; true when done.
+    pub(super) fn deep_frame(&mut self, d: &mut Deep) -> bool {
+        if d.frame_wait > 0 {
+            d.frame_wait -= 1;
+            return false;
+        }
+        if d.undo_left > 0 {
+            d.undo_left -= 1;
+            self.pending_undo = true;
+            return false;
+        }
+        if d.redo_left > 0 {
+            d.redo_left -= 1;
+            self.pending_redo = true;
+            return false;
+        }
+        let Some(mut step) = d.steps.pop_front() else {
+            let report = d.log.join("\n");
+            std::fs::write(d.out.join("report.txt"), report).ok();
+            log::warn!("deeptest: done");
+            return true;
+        };
+        let mut keep = false;
+        match &mut step {
+            Step::Run(name, f) => {
+                let name = name.clone();
+                let t = Instant::now();
+                f(self);
+                self.poll_geo(true);
+                let ms = t.elapsed().as_secs_f32() * 1000.0;
+                let st = self.status.clone();
+                self.deep_say(d, format!("run {name} in {ms:.0} ms · status: {st}"));
+                d.frame_wait = 1;
+            }
+            Step::Wait(n) => {
+                if *n > 0 { *n -= 1; keep = true; }
+            }
+            Step::Stroke(kind, path, mods) => {
+                let (kind, mods) = (*kind, *mods);
+                let b = self.doc.bounds();
+                let centre = (b.min + b.max) * 0.5;
+                let c = self.project(centre);
+                let r = (self.project(centre + self.camera.right() * (b.max - b.min).max_element() * 0.5) - c).length();
+                let at = |q: Vec2| c + q * r;
+                let i = d.stroke_at;
+                if i == 0 {
+                    self.workspace.select_brush(&mut self.brush, kind);
+                    self.modifiers = mods;
+                    self.cursor_moved(at(path[0]), false);
+                    self.left_press(false, false);
+                } else if i < path.len() {
+                    self.cursor_moved(at(path[i]), false);
+                } else {
+                    self.left_release();
+                    self.modifiers = ModifiersState::empty();
+                    self.poll_geo(true);
+                    let st = self.status.clone();
+                    self.deep_say(d, format!("stroke {} · status: {st}", kind.name()));
+                        d.stroke_at = 0;
+                    d.frame_wait = 2;
+                    return false;
+                }
+                d.stroke_at += 1;
+                keep = true;
+            }
+            Step::Check(label) => {
+                let label = label.clone();
+                let s = self.deep_check(&label);
+                self.deep_say(d, s);
+            }
+            Step::Undo(n) => {
+                d.undo_left = *n;
+            }
+            Step::Redo(n) => {
+                d.redo_left = *n;
+            }
+            Step::Remember(name) => {
+                let name = name.clone();
+                d.memory.insert(name, (self.doc.active(), self.mesh().triangle_count(), self.mesh().positions.clone()));
+            }
+            Step::Same(name) => {
+                let name = name.clone();
+                let (lvl, tris, pos) = d.memory.get(&name).cloned().unwrap_or_default();
+                let m = self.mesh();
+                let msg = if m.positions.len() != pos.len() || tris != m.triangle_count() || lvl != self.doc.active() {
+                    format!("undo back to '{name}': FAIL shape changed ({} vs {} verts, {} vs {tris} tris, level {} vs {lvl})", m.positions.len(), pos.len(), m.triangle_count(), self.doc.active())
+                } else {
+                    let worst = m.positions.iter().zip(&pos).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
+                    format!("undo back to '{name}': worst {worst:.2e} {}", if worst > 1e-5 { "FAIL" } else { "ok" })
+                };
+                self.deep_say(d, msg);
+            }
+            Step::Shots(label) => {
+                let label = label.clone();
+                if d.shot_cam.is_none() {
+                    d.shot_cam = Some(self.camera.clone());
+                    d.shot_angle = 0;
+                    d.shot_wait = 0;
+                    self.hover = None;
+                }
+                if let Some((w, h, rgba)) = d.image.take() {
+                    let img = image::RgbaImage::from_raw(w, h, rgba).unwrap();
+                    let tw = 300;
+                    let th = (h as f32 * tw as f32 / w as f32) as u32;
+                    d.row.push(image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle));
+                    d.want_image = false;
+                    d.shot_angle += 1;
+                    d.shot_wait = 0;
+                }
+                if d.want_image {
+                    d.steps.push_front(step);
+                    return false;
+                }
+                if d.shot_angle == ANGLES.len() {
+                    // Row done.
+                    let (tw, th) = (d.row[0].width(), d.row[0].height());
+                    let mut row = image::RgbaImage::from_pixel(tw * d.row.len() as u32, th, image::Rgba([0, 0, 0, 255]));
+                    for (i, t) in d.row.drain(..).enumerate() {
+                        image::imageops::overlay(&mut row, &t, (i as u32 * tw) as i64, 0);
+                    }
+                    d.rows.push(row);
+                    self.camera = d.shot_cam.take().unwrap();
+                    self.deep_say(d, format!("shots row {}: {label}", d.rows.len()));
+                        return false;
+                }
+                if d.shot_wait == 0 {
+                    let (yaw, pitch) = ANGLES[d.shot_angle];
+                    self.frame_camera();
+                    self.camera.yaw = yaw;
+                    self.camera.pitch = pitch;
+                    self.camera.roll = 0.0;
+                }
+                d.shot_wait += 1;
+                if d.shot_wait == 4 {
+                    d.want_image = true;
+                    self.request_snapshot();
+                }
+                keep = true;
+            }
+            Step::Sheet(name) => {
+                let name = name.clone();
+                if !d.rows.is_empty() {
+                    let w = d.rows.iter().map(|r| r.width()).max().unwrap();
+                    let h: u32 = d.rows.iter().map(|r| r.height() + 4).sum();
+                    let mut sheet = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 255, 255]));
+                    let mut y = 0;
+                    for r in d.rows.drain(..) {
+                        image::imageops::overlay(&mut sheet, &r, 0, y as i64);
+                        y += r.height() + 4;
+                    }
+                    sheet.save(d.out.join(format!("{name}.png"))).ok();
+                }
+                self.deep_say(d, format!("sheet {name}"));
+            }
+        }
+        if keep {
+            d.steps.push_front(step);
+        }
+        false
+    }
+}

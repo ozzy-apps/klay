@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.47.1 — 2026-11-04
+
+- Fixed a crash when undoing in ZModeler or Retopology with the pointer still over a point, edge or polygon the undo removed. Undo, Redo and SubTool switches find the target under the pointer again and drop a Bridge or Stitch start that no longer exists.
+- Fixed a black canvas after hiding polygons. With part of a mesh hidden, its visible bounds came out infinite, so Frame (F) and automatic framing aimed the camera at nothing. Empty boxes no longer stretch a merged bounding box. Framing keeps the camera when nothing is shown.
+- Fixed Clip Rect and Clip Circle with symmetry tearing the mesh in turned views. The outline and its mirror images now act as one shape: a vertex inside any of them stays, and one outside all of them moves to the nearest outline. Vertices on the symmetry plane stay on it.
+- A Clip Rect or Clip Circle drawn as a line, under 3 pixels across, no longer flattens the whole model. It does nothing, as Trim and Mask already did.
+- Fixed **Close Holes** leaving a non-manifold edge where two holes touch at one vertex, which made Divide refuse the mesh. Each hole now gets its own cap.
+- Self-tests, demos and snapshots no longer save the workspace layout or brush settings. A self-test that changed the texture previously changed the user's default brush.
+- Verification: 445 release tests. New tests cover the undo-under-hover regression, the bounds of a mostly hidden mesh, a mirror-symmetric Clip Rect in a turned view, flat clip outlines, and two holes touching at a vertex. The scratch multi-angle deep test (`deep-test/2026-11-04/`) was rerun on the fixed build.
+
 ## 0.47.0 — 2026-11-04
 
 - **Mesh › Retopology** indexes a reference SubTool at its shown subdivision level. **Place Retopo Quad** creates a single-quad cage on the clicked surface. **Snap Active Mesh** projects an existing cage and enables live snapping for it.

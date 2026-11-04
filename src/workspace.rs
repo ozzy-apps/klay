@@ -1390,6 +1390,10 @@ pub struct Workspace {
     /// Update checks: allowed in this run (not in tests and scripted runs), the check in
     /// flight, what it found, a short status, when to check next, and "Later" for now.
     pub updates_allowed: bool,
+    /// Save the layout and brush settings as they change. Off in automated runs (self-tests,
+    /// demos, snapshots), which change brushes and textures and must not leave those
+    /// changes in the user's configuration.
+    pub persist: bool,
     update_rx: Option<std::sync::mpsc::Receiver<crate::update::Outcome>>,
     update_found: Option<crate::update::Release>,
     update_status: String,
@@ -1633,6 +1637,7 @@ impl Workspace {
             store_doc: true,
             factory_armed: None,
             updates_allowed: false,
+            persist: true,
             update_rx: None,
             update_found: None,
             update_status: String::new(),
@@ -1749,7 +1754,7 @@ impl Workspace {
             );
         }
         let encoded = self.layout.encode();
-        if encoded != self.saved {
+        if encoded != self.saved && self.persist {
             let result = self
                 .persistence_path
                 .parent()
@@ -1766,7 +1771,9 @@ impl Workspace {
         self.save_brush_dialog(ui.ctx(), *m.brush);
         self.rename_subtool_dialog(ui.ctx(), &mut a);
         m.brush.color=self.color.to_srgb();
-        self.save_brush_assets();
+        if self.persist {
+            self.save_brush_assets();
+        }
         a
     }
 
