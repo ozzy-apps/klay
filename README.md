@@ -18,7 +18,7 @@
 - **OBJ round trips** preserve faces, UVs and named groups. Update a SubTool’s cage from OBJ and carry its sculpted detail forward.
 - **Subdivision and layers** with Catmull–Clark on quad cages, geometry and UV smoothing controls, and layers that record shape, paint and masks.
 - **UV editing and map export** with manual seams, checker previews, island editing, vector displacement and batch baking across visible SubTools.
-- **Retopology**: **ZRemesher** with undoable guide curves, polypaint density, X/Y/Z mirror planes, KeepCreases, Detect Edges and FreezeBorder; **ProjectAll** to bring the sculpt's detail onto the new mesh; **Reconstruct Subdiv** and **Freeze SubDiv Levels**
+- **Retopology**: place and extrude a hand-built cage with **Snap to Surface**, or use **ZRemesher** with undoable guide curves, polypaint density, X/Y/Z mirror planes, KeepCreases, Detect Edges and FreezeBorder; **ProjectAll** to bring the sculpt's detail onto the new mesh; **Reconstruct Subdiv** and **Freeze SubDiv Levels**
 - **Geometry**: **ZSpheres** (with cube nodes), **Dynamic Subdivision**, **Panel Loops**, **Sculptris Pro**, **Live Boolean**, **Decimation**, **UV Master**, **normal, displacement and colour map baking**, **ZModeler**, creases that Divide keeps sharp, Remesh, Insert Mesh and CurveTube
 - **Render** with shadows and ambient occlusion, **Turntable** videos, **Spotlight**, **FiberMesh** and cloth **Dynamics**
 - **Select, Clip, Trim, Slice and Knife** tools, masking, polygroups and **polypaint** with brush alphas and textures in RGB and Z+RGB, including live DragRect and DragDot stamp previews
@@ -82,6 +82,14 @@ The full manual is in [docs/guide.md](docs/guide.md), and what changed in each v
 - Double-click a SubTool row to rename it. Click **Fill Color** below the color picker or in the **Space** menu to apply the picked color to visible, unmasked areas of the active SubTool.
 
 ![LightBox Tools with FBX, GoZ, GLB and glTF model previews](docs/images/model-import.png)
+
+## Manual retopology
+
+1. In **Mesh › Retopology › Reference**, choose the high-resolution SubTool.
+2. Click **Place Retopo Quad**, then click the sculpt. Klay creates a separate SubTool and selects ZModeler Edge Extrude.
+3. Drag an open cage edge to extend it. New vertices follow the reference while **Snap to Surface** is enabled. Use **Snap Active Mesh** to start from an existing low-poly plane.
+
+![A seven-quad retopology cage over a subdivided reference in Klay](docs/images/manual-retopology.png)
 
 ## ZRemesher guides and symmetry
 

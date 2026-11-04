@@ -904,6 +904,7 @@ pub struct Actions {
     pub extract: bool,
     /// SubTool › Project › ProjectAll.
     pub project_all: bool,
+    pub retopo: Option<crate::retopo::Action>,
     /// SubTool › Transpose Master › TPoseMesh and TPose → SubT.
     pub tpose_mesh: bool,
     pub tpose_subt: bool,
@@ -1202,6 +1203,12 @@ pub struct Workspace {
     pub extract_thick: f32,
     /// SubTool › Project settings.
     pub project: crate::project_all::Settings,
+    pub retopo_target: Option<u64>,
+    pub retopo_ready: bool,
+    pub retopo_attached: bool,
+    pub retopo_placing: bool,
+    pub retopo_snap: bool,
+    pub retopo_size: f32,
     /// Geometry › Decimation settings.
     pub decimation: crate::decimate::Settings,
     /// Geometry › UV Map settings.
@@ -1517,6 +1524,12 @@ impl Workspace {
             strata_visible:false,strata_can_update:false,strata_pending:false,
             extract_thick: 2.0,
             project: crate::project_all::Settings::default(),
+            retopo_target: None,
+            retopo_ready: false,
+            retopo_attached: false,
+            retopo_placing: false,
+            retopo_snap: true,
+            retopo_size: 4.0,
             decimation: crate::decimate::Settings::default(),
             uv: crate::uv::Settings::default(),
             uv_seam_mode: false,
@@ -4171,6 +4184,47 @@ impl Workspace {
                         ui.checkbox(&mut ws.project.paint, "Paint").on_hover_text("Take the polypaint too");
                     });
                     note(ui, "Duplicate a sculpt, ZRemesh the copy, then Divide and ProjectAll at each level, with the sculpt visible");
+                });
+                self.sec(ui, h, id, "retopology", "Retopology", None, false, true, &mut |ws, ui| {
+                    use crate::retopo::Action;
+                    let target = m.subtools.iter().find(|row| Some(row.id) == ws.retopo_target);
+                    ui.label("Reference");
+                    egui::ComboBox::from_id_salt("retopo-reference")
+                        .width((ui.available_width() - 10.0).max(96.0))
+                        .truncate()
+                        .selected_text(target.map_or("Choose SubTool", |row| row.name.as_str()))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(ws.retopo_target.is_none(), "None").clicked() {
+                                a.retopo = Some(Action::Clear);
+                            }
+                            for row in m.subtools.iter().filter(|row| row.visible) {
+                                if ui.selectable_label(Some(row.id) == ws.retopo_target, &row.name).clicked() {
+                                    a.retopo = Some(Action::Reference(row.id));
+                                }
+                            }
+                        });
+                    ui.add_enabled(ws.retopo_ready && ws.retopo_attached, egui::Checkbox::new(&mut ws.retopo_snap, "Snap to Surface"))
+                        .on_hover_text("Snap ZModeler Edge Extrude and Move to the reference while dragging");
+                    zslider(ui, "Quad Size %", &mut ws.retopo_size, 0.5..=20.0, false, false, 1);
+                    ui.add_enabled_ui(ws.retopo_ready, |ui| {
+                        if ui.add_sized([ui.available_width(), CONTROL_H], egui::Button::new(
+                            if ws.retopo_placing { "Cancel Placement" } else { "Place Retopo Quad" }
+                        )).on_hover_text("Click the reference surface to add a single-quad SubTool").clicked() {
+                            a.retopo = Some(Action::Place);
+                        }
+                    });
+                    let can_snap = ws.retopo_ready && target.is_some_and(|row| !row.active) && m.levels.len() == 1;
+                    ui.add_enabled_ui(can_snap, |ui| {
+                        if ui.add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Snap Active Mesh"))
+                            .on_hover_text("Project the visible vertices of the active low-poly SubTool onto the reference")
+                            .clicked()
+                        {
+                            a.retopo = Some(Action::Snap);
+                        }
+                    });
+                    if ws.retopo_placing {
+                        note(ui, "Click the reference to place a quad · Esc to cancel");
+                    }
                 });
                 self.sec(ui, h, id, "boolean", "Boolean", None, false, true, &mut |ws, ui| {
                     ui.checkbox(&mut ws.live_boolean, "Live Boolean")

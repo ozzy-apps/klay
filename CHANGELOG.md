@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.47.0 — 2026-11-04
+
+- **Mesh › Retopology** indexes a reference SubTool at its shown subdivision level. **Place Retopo Quad** creates a single-quad cage on the clicked surface. **Snap Active Mesh** projects an existing cage and enables live snapping for it.
+- **Snap to Surface** keeps new ZModeler edge extrusions and point, edge, and polygon moves on the reference. A themed wire overlay makes cage edges visible over the sculpt.
+
 ## 0.46.0 — 2026-11-04
 
 - ZRemesher guide strokes, single-guide deletion and clearing all guides support Undo and Redo. Alt-click selects the nearest visible guide segment, including lines off the current mesh.

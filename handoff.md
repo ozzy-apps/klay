@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.46.0
+## Latest implementation — 0.47.0
 
-See Step 97 for ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 97 for ZRemesher guides, remesh symmetry and Clip brushes. Step 96 cove
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature release is **0.46.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.47.0**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -854,3 +854,13 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - The Debian package declares the glibc version required by the executable's ELF version table. The 0.46.0 Debian package and AppImage require glibc 2.39 or later. AppStream records the application version and release date.
 - The offline release suite passed 440 tests with 14 ignored. The extracted Debian and AppImage executables reported Klay 0.46.0. The Flatpak reported the same version from a temporary user installation inside its runtime.
 - For future releases, check the prior GitHub asset names, build the three packages from the release commit and smoke-test each one. Upload them to a draft for the pushed tag, verify the asset list, then publish.
+
+## Step 99 — Manual retopology (2026-11-04)
+
+- Klay 0.47.0 is the local Rust 2024, egui, winit and wgpu build with a **Retopology** section in the Mesh palette. Klay 0.46.0 is the published GitHub release. Project format 13 stores the resulting SubTool as ordinary editable geometry.
+- `src/retopo.rs` indexes the visible triangles of one reference SubTool using the existing ProjectAll BVH and background geometry job. Parked references use their actual shown subdivision level. The reference and cage IDs, the reference level and edit count guard the session binding. Revisiting or editing the source requires selecting the reference again. Choosing None releases the index.
+- **Place Retopo Quad** raycasts the reference, constructs a view-oriented tangent quad, and snaps all four corners back to the surface. **Snap Active Mesh** projects a nearby single-level cage onto the reference as an undoable edit. The themed cage overlay and screen-space edge picking keep the boundary usable above the high-resolution surface.
+- ZModeler Edge Extrude snaps only the new points, preserving its starting edge. ZModeler Move projects points, edges, and polygons through their proposed screen positions. Missing reference rays keep the last valid drag preview. The geometry follows existing ZModeler undo and redo. Snapping applies to the attached cage, and the project stores the cage geometry with the usual save command.
+- The release-profile suite passed 441 tests with 14 ignored. The input regression builds and reindexes a subdivided reference, clicks to place a quad, picks an open edge from just outside the cage, extrudes and moves points, checks surface contact and undo/redo, and checks reference visibility and invalidation. Native validation in an isolated X display placed a quad and extruded it into a seven-quad cage over a 98,306-vertex reference. The README screenshot is from that run.
+- Follow-up work can add multi-row extrusion, attraction between cage vertices, and a persisted source binding if projects need to restore the editing setup after reopening.
+- [Maxon ZModeler retopology reference](https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/modeling-basics/creating-meshes/zmodeler/single-sided-meshes/single-sided-meshes.html)

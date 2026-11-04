@@ -765,6 +765,31 @@ subtool gets an undo step of its own. Do not change the TPoseMesh's polygons (Di
 ZRemesher, Sculptris): it is then refused, and deleting it frees the sources. Switching
 through big subtools takes a second or two each.
 
+### Manual retopology
+
+In **Mesh › Retopology**, choose the visible sculpt under **Reference**. Klay indexes the
+visible triangles at the reference's shown subdivision level. Adjust **Quad Size %** to
+set the starter quad's size relative to the reference bounds.
+
+Click **Place Retopo Quad**, then click a visible part of the reference. Klay creates
+a separate single-quad SubTool, enables **Snap to Surface** for it, and selects
+**ZModeler › Edge › Extrude**. Use a smaller quad near the silhouette. **Esc** cancels
+placement.
+
+Drag an open edge to extend the cage. The new edge's vertices follow the reference
+under their projected screen positions, and the starting edge stays in place. ZModeler
+**Move** also snaps points, edges, and polygons. A drag that leaves the reference keeps
+its last valid preview. Undo and redo use regular SubTool history.
+
+For an existing single-level plane or cage, position it near the sculpt, select it, then
+choose the reference and click **Snap Active Mesh**. This projects nearby visible
+vertices, respects masks, and attaches snapping to that cage. The themed wire overlay
+shows the cage over the reference while ZModeler is active. Clear **Snap to Surface** to
+edit the cage freely.
+
+The cage geometry saves in the project. Choose the reference again after reopening
+the project or editing the reference.
+
 ### ProjectAll
 
 SubTool › Project › **ProjectAll** moves the active subtool onto the other visible subtools,
