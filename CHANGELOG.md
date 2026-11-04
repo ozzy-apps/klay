@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.48.0 — 2026-11-05
+
+- **Wrap** for alphas and textures (Alpha and Texture controls, 0–100, default 100; ZBrush: Wrap Mode). Stamps used to lie flat on the plane under the brush, so where a dab reached a rim, a box edge or the side of a thin part, every point down the turning surface read the same pixel and the alpha or texture streaked. The stamp distance now follows the surface: the arc of the circle through the dab centre and the point (exact on spheres and across cylinders), never below the plane distance plus 0.35 × height, so a box's side face keeps going. The stamp lies on a plane fitted to the surface as it was before the stroke, and the stretch eases in over the inner fifth of the radius, so the stroke's own relief does not cross-hatch it. Applies to sculpting and painting.
+- Brush presets save Wrap (preset format 2; format 1 presets load with Wrap at 100). The brush-asset settings file stores it too.
+- Verification: 447 release tests (new: the arc-length unwrap on a sphere, no fold past 90°, little movement from relief near the centre, a box side face moving at once, Wrap 0 equal to the flat projection, Wrap saved in a brush preset). Visual A/B on a 345k cube, with a striped alpha sculpt and a dotted texture paint along a face next to an edge: Wrap 0 streaks down the side face; Wrap 100 carries the pattern round it.
+
 ## 0.47.1 — 2026-11-04
 
 - Fixed a crash when undoing in ZModeler or Retopology with the pointer still over a point, edge or polygon the undo removed. Undo, Redo and SubTool switches find the target under the pointer again and drop a Bridge or Stitch start that no longer exists.

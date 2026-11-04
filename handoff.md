@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.47.1
+## Latest implementation — 0.48.0
 
-See Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 100 for the deep test and its six fixes, Step 99 for manual retopology 
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.47.1**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.48.0**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -881,3 +881,10 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
   2. **Triplanar for tiled textures.** Sample the texture on the three axis planes of the dab frame and blend by `|n|^k`. This removes streaks for noise-like textures (paint, Surface noise) but blurs shaped alphas, so it suits textures, not alphas.
   3. **Geodesic polar coordinates (exact).** Per dab, a Dijkstra or heat-method distance plus a transported angle over the vertices inside the brush. It follows folds, ears and fingers, but costs more on million-vertex dabs; run it per chunk on the selected vertices only.
 - Verify with `--demo-stamp alpha:NAME` / `texture:NAME` strokes run across a sphere's silhouette and along a thin cylinder, snapshotted from the side (multi-angle sheet).
+
+## Step 101 — Wrap for alphas and textures, 0.48.0 (2026-11-05)
+
+- Built from the Step 100 analysis (option 1, wrap by form). It is all in `sculpt.rs`. `StampProjection` gained `normal` and `wrap`. `uv` scales the in-plane offset by `wrapped_distance(flat, height) / flat`, eased in by `min(1, |offset| / (0.1·diameter))`. `wrapped_distance` is `max(circle arc through centre and point, flat + 0.35·|h|)`.
+- Two problems found in the visual A/B and fixed: relief from the same stroke made the stamp cross-hatch, and a plane tilted by that relief creased it. `rest_position` reads the stroke's pre-stroke chunk snapshots for every stamp sample. With Wrap on and an alpha or texture set, `rest_plane` fits the dab plane to pre-stroke points within 0.3 r (centroid plus power iteration on trace·I − covariance). Both apply only through `stamp_weight` / `apply_stamp` while an alpha, texture or spotlight is set. Side effect: with Wrap 0 the stamp is also evaluated at pre-stroke positions, which only matters for brushes that slide vertices sideways (Pinch, Nudge) with an alpha.
+- `StampSettings::wrap` (default 1.0), the Wrap slider in both the alpha and texture controls (`brush_ui::wrap_slider`), the `wrap` key in brush-assets.v1, and `brush_preset` VERSION 2 (reads 1).
+- Not covered: Grab/drag brushes pick their stamp once on a view-facing plane (`grab_dab` uses `-view_dir`), and detail reliefs and curve strokes keep their own frames. Wrap applies there through the uv, but those frames are not refitted. Triplanar (option 2) and geodesic (option 3) remain open if Wrap is not enough on folds such as ears.

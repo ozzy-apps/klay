@@ -18,7 +18,8 @@ use std::{
 
 pub const EXTENSION: &str = "klaybrush";
 const MAGIC: &[u8; 8] = b"KLAYBRSH";
-const VERSION: u32 = 1;
+/// 2 added Wrap after Auto Masking; version 1 presets load with the default Wrap.
+const VERSION: u32 = 2;
 const MAX_FILE_BYTES: u64 = 10 << 20;
 
 pub struct Preset {
@@ -166,6 +167,7 @@ fn write<W: Write>(w: W, p: &Preset) -> io::Result<()> {
         p.assets.auto.backface as u8,
         p.assets.auto.topological as u8,
     ])?;
+    out.u32(p.assets.wrap.to_bits())?;
     write_pattern(&mut out, &p.assets.alpha)?;
     write_pattern(&mut out, &p.assets.texture)
 }
@@ -192,28 +194,29 @@ fn input(path: &Path) -> Result<In<BufReader<File>>, String> {
     Ok(In::new(BufReader::new(file), size))
 }
 
-fn header<R: Read>(input: &mut In<R>) -> Result<(BrushKind, bool), String> {
+fn header<R: Read>(input: &mut In<R>) -> Result<(BrushKind, bool, u32), String> {
     let mut magic = [0; MAGIC.len()];
     input.fill_raw(&mut magic)?;
     if &magic != MAGIC {
         return Err("Invalid Klay brush preset".into());
     }
-    if input.u32()? != VERSION {
+    let version = input.u32()?;
+    if !(1..=VERSION).contains(&version) {
         return Err("Unsupported Klay brush preset version".into());
     }
     let a = input.u8()? as char;
     let b = input.u8()? as char;
     let kind = BrushKind::from_code(a, b).ok_or("Unknown base brush")?;
-    Ok((kind, boolean(input)?))
+    Ok((kind, boolean(input)?, version))
 }
 
 pub fn preview(path: &Path) -> Option<(BrushKind, bool)> {
-    header(&mut input(path).ok()?).ok()
+    header(&mut input(path).ok()?).ok().map(|(kind, subtract, _)| (kind, subtract))
 }
 
 pub fn load(path: &Path) -> Result<Preset, String> {
     let mut input = input(path)?;
-    let (kind, subtract) = header(&mut input)?;
+    let (kind, subtract, version) = header(&mut input)?;
     let mut brush = Brush {
         kind,
         radius: float(&mut input, 0.01, 2.0)?,
@@ -266,12 +269,14 @@ pub fn load(path: &Path) -> Result<Preset, String> {
         backface: boolean(&mut input)?,
         topological: boolean(&mut input)?,
     };
+    let wrap = if version >= 2 { float(&mut input, 0.0, 1.0)? } else { StampSettings::default().wrap };
     let assets = StampSettings {
         turn,
         angle,
         texture_strength,
         texture_scale,
         texture_angle,
+        wrap,
         auto,
         alpha: read_pattern(&mut input, Pattern::alphas())?,
         texture: read_pattern(&mut input, Pattern::textures())?,

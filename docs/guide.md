@@ -1141,6 +1141,13 @@ from their name (Zipper **Z I**, Clip Line **C C**). Clicking in the search box 
   **Tiling** controls repetition within the brush footprint.
   **Alpha rotation › Random** turns each freehand dab. Drag brushes such as Grab pick one
   rotation at the start of the pull and use it for both sculpting and paint.
+- **Wrap** (under the alpha and texture controls, 0–100, default 100; ZBrush: Wrap Mode)
+  lays the alpha and texture round the form instead of flat on the plane under the brush.
+  At 0 a stamp that reaches a rim, a box edge or the side of a thin part streaks there,
+  because every point down the turning surface reads the same pixel of the image. With
+  Wrap the stamp follows the surface round the turn. The stamp lies on the surface as it
+  was before the stroke, so the stroke's own relief does not make it swim. Wrap is saved
+  with brush presets.
 - **Z** sculpts, **RGB** paints color only and **Z+RGB** does both. Selecting Paint activates
   RGB mode. Choose color with the left HSV picker; RGB Intensity controls paint opacity.
   Textures supply their sampled color when painting, tinted by the chosen color. Masks,

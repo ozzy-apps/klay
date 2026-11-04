@@ -1066,6 +1066,7 @@ mod tests {
         ws.assets.texture_angle = -17.0;
         ws.assets.texture_strength = 0.7;
         ws.assets.texture_scale = 2.0;
+        ws.assets.wrap = 0.35;
         ws.assets.auto.topological = true;
         ws.set_stroke_mode(kind, "DragRect");
         ws.color = PickerColor::from_srgb([133, 42, 15]);
@@ -1154,6 +1155,7 @@ mod tests {
         assert!(app.brush.paint && app.brush.sculpt);
         assert_eq!(ws.stroke_mode(kind), "DragRect");
         assert_eq!(ws.assets.turn.name(), "Random");
+        assert_eq!(ws.assets.wrap, 0.35, "Wrap is saved with the brush");
         assert!(matches!(&ws.assets.alpha, Pattern::Image(image) if image.source.is_none()));
         assert!(matches!(&ws.assets.texture, Pattern::Image(image) if image.source.is_none()));
 
