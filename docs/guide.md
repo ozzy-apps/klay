@@ -1574,6 +1574,13 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
   64-bit atomics, and with Performance › Drawing › Points for dense meshes unticked
   (saved with the workspace; the palette also shows what the last frames drew).
   `--selftest-splat` compares points with triangles for empty pixels and colour.
+  Since 0.48.1 only chunks whose every triangle faces the camera by a clear margin become
+  points, so silhouettes and clip-folded caps stay triangles (clean edges).
+- **Anti-aliasing** (0.49.0): the canvas is drawn with 4× multisampling and resolved before
+  the interface. Points join in: they land in a grid twice as fine (a cell per sample), and
+  the resolve pass runs per sample, so their outlines are smooth too; the point threshold
+  becomes 4 per pixel. About 1 ms at 15.4M framed, nothing measurable zoomed out. Set
+  `KLAY_MSAA=1` to draw with one sample per pixel.
 
 ## Numbers (RTX 5060, 16 cores, release build)
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.49.0 — 2026-11-05
+
+- **Anti-aliasing**: the canvas is drawn with 4× multisampling. Zoomed out, a dense mesh puts many triangles in each pixel, which gave stair-stepped silhouettes and cut edges and a noisy fringe where the shading changes. Points for dense meshes get the same four samples: they land in a grid twice as fine, and each sample of the resolve takes its own point, so point-drawn outlines are smooth too. `KLAY_MSAA=1` turns it off (A/B, slow GPUs). GPUs without 4× multisampling for the window format draw as before.
+- Cost at 15.4M vertices with vsync off: framed 3.0 → 4.1 ms, zoomed out 3.1 → 3.2 ms.
+- Verification: 447 release tests. Every GPU self-test passes with it on, with no GPU validation errors. `--selftest-splat` at 15.4M: no empty model pixels, colour within 0.5/255 of triangles. A two-Clip-Line sphere at 8.6M seen at three distances: smooth outlines and cut edges where 1× stepped.
+
 ## 0.48.1 — 2026-11-05
 
 - Fixed fuzzy cut edges, dotted seams and specks on dense meshes, most visible after Clip Line on 15M+ vertices. Chunks dense enough to draw as points now have to face the camera with every triangle by a clear margin (their normal cone, the angle to the camera and their size within 70°). Silhouettes and the folded surface a clip leaves on its cut are drawn as triangles. Points dropped vertices whose normals faced away; inside such chunks no triangle does, so every vertex is drawn and no holes open.

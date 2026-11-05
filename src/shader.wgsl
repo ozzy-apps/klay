@@ -457,10 +457,12 @@ fn fs_reference(in: RefOut) -> @location(0) vec4<f32> {
 struct SplatView {
     width: u32,
     height: u32,
-    _pad0: u32,
+    // Cells per pixel along each axis: 2 with 4x anti-aliasing (one cell per sample), else 1.
+    scale: u32,
     _pad1: u32,
 };
-// Per framebuffer pixel: the winning vertex and its inverted depth (both 0: empty).
+// Per cell (a pixel, or a sample's quarter of it): the winning vertex and its inverted depth
+// (both 0: empty).
 @group(3) @binding(0) var<storage, read> splat_keys: array<vec2<u32>>;
 @group(3) @binding(1) var<storage, read> splat_positions: array<f32>;
 @group(3) @binding(2) var<storage, read> splat_normals: array<u32>;
@@ -479,10 +481,14 @@ fn splat_key(x: i32, y: i32) -> vec2<u32> {
     return splat_keys[u32(y) * splat_view.width + u32(x)];
 }
 
+// With anti-aliasing this runs once per sample (it reads `sample_index`), and `at` is the
+// sample's own position: each sample takes the cell of the pixel quarter it lies in, so a
+// point-drawn outline gets coverage like a triangle's and resolves smooth.
 @fragment
-fn fs_splat(@builtin(position) at: vec4<f32>) -> SplatOut {
-    let x = i32(at.x);
-    let y = i32(at.y);
+fn fs_splat(@builtin(position) at: vec4<f32>, @builtin(sample_index) sample: u32) -> SplatOut {
+    let cell = floor(at.xy * f32(max(splat_view.scale, 1u)) + vec2<f32>(f32(sample) * 0.0));
+    let x = i32(cell.x);
+    let y = i32(cell.y);
     var key = splat_key(x, y);
     if (key.y == 0u) {
         // A pixel no point landed in, inside the surface: take the nearest neighbour's

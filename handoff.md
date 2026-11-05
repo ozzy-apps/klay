@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.48.1
+## Latest implementation — 0.49.0
 
-See Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 10
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.48.1**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.49.0**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -910,3 +910,11 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - v0.48.1 (annotated tag on the `Release Klay 0.48.1` commit, `main`) is the published GitHub release and rolls up 0.47.0–0.48.1 since v0.46.0. The AppStream file records 0.48.1. Assets: `klay_0.48.1_amd64.deb`, `Klay-0.48.1-x86_64.flatpak`, `Klay-0.48.1-x86_64.AppImage`.
 - appimagetool is not on the PATH here. The AppImage was built with `APPIMAGETOOL` pointing at a wrapper that runs `~/Documents/creative-projects/Mail/.runtime/appimage-tools/appimagetool-1.9.1-x86_64.AppImage --runtime-file …/runtime-20251108-x86_64` (offline type 2 runtime).
 - Smoke tests: the extracted .deb and AppImage binaries report Klay 0.48.1 (deb depends on libc6 ≥ 2.39). The Flatpak was installed into a throwaway `FLATPAK_USER_DIR`, so the user's own Klay Flatpak was not touched, and reports Klay 0.48.1.
+
+## Step 104 — Anti-aliasing (0.49.0) and the pixol question (2026-11-05)
+
+- User: sharp up close after 0.48.1, but fuzzy zoomed out. That is aliasing: many triangles per pixel, one sample each. 4× MSAA in render.rs: `Gfx::msaa` (4 when the swapchain format and Depth32Float support it, 1 with `KLAY_MSAA=1`) and `msaa_targets` from `create_msaa` (recreated in `resize`). The mesh pass draws into them and resolves to the frame before egui. Every pipeline drawn in the mesh pass (the `mesh_pipeline` closure, background, reference, splat resolve) uses `multisample`; the pick pass keeps one sample and its own depth.
+- Points: with 4× the splat key grid is 2× per axis (`cells`), `SplatParams` viewport/frame and size are scaled, and `SplatView.scale` tells `fs_splat`. That shader reads `sample_index`, so it runs per sample, and takes the cell under the sample's own position: point outlines get per-sample coverage. The cull density threshold is `splat_density × cells² × 0.5`. With ×1, nearly every chunk became triangles; with ×0.5, the resolve's gap fill still leaves no empty pixels (selftest-splat).
+- Measured at 15.4M, novsync: 1× 3.0 ms framed / 3.1 ms at distance ×4; 4× 4.1 / 3.2 ms.
+- Pixol question (user: "isn't this exactly why the pixol is so powerful?"). A pixol is ZBrush's 2.5D pixel (colour, depth, material, orientation). It bounds the cost of *drawing* by the screen's pixel count, not the polygon count. Klay already has the GPU equivalent: point splats with one winner per pixel (now per sample). Drawing is not the limit (61M frames in ~15 ms). Storing and editing the mesh is: RAM per vertex and the 2 GiB index binding (Step 102). What gives ZBrush its counts is mostly storage: compact data, and HD Geometry, where the top divisions exist only where you sculpt, with the rest kept on disk and shown only at render time.
+- Klay's version of that, the largest lever and bigger than Step 102's compaction: an **implicit top level**. Subdivision is deterministic, so the top level's topology (indices, adjacency, stencils) is derivable from its parent, and its positions are parent stencil + the sparse per-chunk `offsets` Klay already keeps (empty for unsculpted chunks). Keep the top level as parent + offsets. Materialise a chunk only while a brush or the GPU needs it: GPU upload per visible chunk, an LRU of brushed chunks on the CPU. RAM then scales with the sculpted area, not the polygon count. The GPU needs the same idea for 250M+: draw the top level only for chunks in view and near, with the parent level or points elsewhere. Order of work: Step 102 items 1 and 5 first (index windows, safe budget), then the implicit top level for parked and unsculpted chunks, then on-demand GPU residency.

@@ -366,6 +366,13 @@ pub struct Gfx {
     pub snapshot_image: Option<(u32, u32, Vec<u8>)>,
     pub config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    /// Anti-aliasing of the canvas: samples per pixel (4, or 1 where the GPU cannot, or with
+    /// `KLAY_MSAA=1`), and the multisampled colour and depth targets the mesh pass draws into
+    /// and resolves to the frame. At a distance a dense mesh puts many triangles in a pixel:
+    /// one sample per pixel gives stair-stepped silhouettes and cut edges and a noisy fringe
+    /// where the shading changes.
+    pub msaa: u32,
+    msaa_targets: Option<(wgpu::TextureView, wgpu::TextureView)>,
     /// Parked subtools' stand-ins (`vs_main`), plain and for Live Boolean.
     pipeline: wgpu::RenderPipeline,
     /// The active subtool (`vs_active`, drawn per chunk when culling), plain and for Live
@@ -552,6 +559,14 @@ impl Gfx {
         surface.configure(&device, &config);
 
         let depth_view = create_depth(&device, config.width, config.height);
+        let msaa = {
+            let colour = adapter.get_texture_format_features(config.format).flags;
+            let depth = adapter.get_texture_format_features(wgpu::TextureFormat::Depth32Float).flags;
+            let off = std::env::var("KLAY_MSAA").is_ok_and(|v| v.trim() == "1");
+            if !off && colour.sample_count_supported(4) && depth.sample_count_supported(4) { 4 } else { 1 }
+        };
+        let msaa_targets = create_msaa(&device, config.format, config.width, config.height, msaa);
+        let multisample = wgpu::MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: false };
 
         // --- Mesh pipeline -------------------------------------------------------------
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -704,7 +719,7 @@ impl Gfx {
                 bias: Default::default(),
             }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            multisample: Default::default(),
+            multisample,
             multiview_mask: None,
             cache: None,
         });
@@ -817,7 +832,7 @@ impl Gfx {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: Default::default(),
+                multisample,
                 fragment: Some(wgpu::FragmentState {
                     module,
                     entry_point: Some(fs),
@@ -906,7 +921,7 @@ impl Gfx {
                 bias: Default::default(),
             }),
             primitive: Default::default(),
-            multisample: Default::default(),
+            multisample,
             multiview_mask: None,
             cache: None,
         });
@@ -1134,7 +1149,7 @@ impl Gfx {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: Default::default(),
+            multisample,
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_splat"),
@@ -1267,6 +1282,8 @@ impl Gfx {
             snapshot_image: None,
             config,
             depth_view,
+            msaa,
+            msaa_targets,
             pipeline,
             active_pipeline,
             active_bool_pipeline,
@@ -1351,6 +1368,7 @@ impl Gfx {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth(&self.device, width, height);
+        self.msaa_targets = create_msaa(&self.device, self.config.format, width, height, self.msaa);
     }
 
     /// Upload the draw-only copy of a parked subtool. Returns false when it does not fit;
@@ -2746,7 +2764,10 @@ impl Gfx {
         // Points stand in for triangles only where shading needs nothing per triangle:
         // not with polygroups shown or Live Boolean, which cuts per fragment.
         let splat_on = cull_on && !self.dynamic && self.splatting && self.splat_pipeline.is_some() && !groups_on && self.bool_count == 0;
-        let (fw, fh) = (self.config.width, self.config.height);
+        // With anti-aliasing the points land in a grid twice as fine (a cell per sample), so
+        // the resolve pass can give each sample its own point.
+        let cells = if self.msaa == 4 { 2 } else { 1 };
+        let (fw, fh) = (self.config.width * cells, self.config.height * cells);
         if splat_on && self.splat_keys.as_ref().is_none_or(|k| (k.1, k.2) != (fw, fh)) {
             let keys = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("splat keys"),
@@ -2755,9 +2776,9 @@ impl Gfx {
                 mapped_at_creation: false,
             });
             self.splat_keys = Some((keys, fw, fh));
-            self.queue.write_buffer(&self.splat_view, 0, bytemuck::cast_slice(&[fw, fh, 0, 0]));
+            self.queue.write_buffer(&self.splat_view, 0, bytemuck::cast_slice(&[fw, fh, cells, 0]));
         }
-        let frame_rect = document_frame(uniforms, fw, fh);
+        let frame_rect = document_frame(uniforms, self.config.width, self.config.height).map(|v| v * cells as f32);
         let mut resolve = None;
         let mut read_counts = false;
         if let Some(m) = self.levels.get_mut(self.active).and_then(Option::as_mut) {
@@ -2781,7 +2802,8 @@ impl Gfx {
             }
             if cull_on {
                 let mut params = cull_params(uniforms, chunks, self.bool_count == 0, self.cull_first_instance);
-                params.splat = [splat_on as u32 as f32, self.splat_density, 0.0, 0.0];
+                // Points per cell, not per pixel: holes otherwise.
+                params.splat = [splat_on as u32 as f32, self.splat_density * (cells * cells) as f32 * 0.5, 0.0, 0.0];
                 self.queue.write_buffer(&self.cull_params, 0, bytemuck::bytes_of(&params));
                 encoder.clear_buffer(&m.draw_counts, 0, None);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2806,7 +2828,7 @@ impl Gfx {
                     view_proj: uniforms.view_proj,
                     eye: cull_eye(uniforms),
                     forward: cull_forward(uniforms),
-                    viewport: uniforms.viewport,
+                    viewport: uniforms.viewport.map(|v| v * cells as f32),
                     frame: frame_rect,
                     width: fw,
                     height: fh,
@@ -2839,14 +2861,18 @@ impl Gfx {
             self.drawn = None;
         }
 
-        // Mesh pass.
+        // Mesh pass: into the multisampled targets when anti-aliasing, resolved to the frame.
         {
+            let (colour, depth, resolve_to) = match &self.msaa_targets {
+                Some((c, d)) => (c, d, Some(&view)),
+                None => (&view, &self.depth_view, None),
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mesh"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: colour,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: resolve_to,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: crate::workspace::BACKGROUND.r() as f64 / 255.0,
@@ -2858,7 +2884,7 @@ impl Gfx {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -3175,6 +3201,27 @@ fn matcap_texture_view(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Text
         matcap_size,
     );
     texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
+}
+
+/// The multisampled colour and depth targets of the mesh pass (none with one sample).
+fn create_msaa(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32, samples: u32) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+    (samples > 1).then(|| {
+        let target = |label, format| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        (target("canvas msaa", format), target("depth msaa", wgpu::TextureFormat::Depth32Float))
+    })
 }
 
 fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
