@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.48.1 — 2026-11-05
+
+- Fixed fuzzy cut edges, dotted seams and specks on dense meshes, most visible after Clip Line on 15M+ vertices. Chunks dense enough to draw as points now have to face the camera with every triangle by a clear margin (their normal cone, the angle to the camera and their size within 70°). Silhouettes and the folded surface a clip leaves on its cut are drawn as triangles. Points dropped vertices whose normals faced away; inside such chunks no triangle does, so every vertex is drawn and no holes open.
+- Cost: at 15.4M vertices, framed, chunks drawn as points went from about 1,530 to about 730, and the frame from 1.7 to 2.5 ms with vsync off.
+- Verification: 447 release tests. `--selftest-splat` and `--selftest-cull` at 15.4M pass: no empty model pixels, colour within 0.7/255 of triangles. A two-Clip-Line sphere at 8.6M, from five angles at full resolution, renders the same as with triangles only.
+
 ## 0.48.0 — 2026-11-05
 
 - **Wrap** for alphas and textures (Alpha and Texture controls, 0–100, default 100; ZBrush: Wrap Mode). Stamps used to lie flat on the plane under the brush, so where a dab reached a rim, a box edge or the side of a thin part, every point down the turning surface read the same pixel and the alpha or texture streaked. The stamp distance now follows the surface: the arc of the circle through the dab centre and the point (exact on spheres and across cylinders), never below the plane distance plus 0.35 × height, so a box's side face keeps going. The stamp lies on a plane fitted to the surface as it was before the stroke, and the stretch eases in over the inner fifth of the radius, so the stroke's own relief does not cross-hatch it. Applies to sculpting and painting.

@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.48.0
+## Latest implementation — 0.48.1
 
-See Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.48.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.48.1**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -888,3 +888,19 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
 - Two problems found in the visual A/B and fixed: relief from the same stroke made the stamp cross-hatch, and a plane tilted by that relief creased it. `rest_position` reads the stroke's pre-stroke chunk snapshots for every stamp sample. With Wrap on and an alpha or texture set, `rest_plane` fits the dab plane to pre-stroke points within 0.3 r (centroid plus power iteration on trace·I − covariance). Both apply only through `stamp_weight` / `apply_stamp` while an alpha, texture or spotlight is set. Side effect: with Wrap 0 the stamp is also evaluated at pre-stroke positions, which only matters for brushes that slide vertices sideways (Pinch, Nudge) with an alpha.
 - `StampSettings::wrap` (default 1.0), the Wrap slider in both the alpha and texture controls (`brush_ui::wrap_slider`), the `wrap` key in brush-assets.v1, and `brush_preset` VERSION 2 (reads 1).
 - Not covered: Grab/drag brushes pick their stamp once on a view-facing plane (`grab_dab` uses `-view_dir`), and detail reliefs and curve strokes keep their own frames. Wrap applies there through the uv, but those frames are not refitted. Triplanar (option 2) and geodesic (option 3) remain open if Wrap is not enough on folds such as ears.
+
+## Step 102 — Clean dense rendering (0.48.1) and the polygon-count plan (2026-11-05)
+
+- User report: after two Clip Lines on a 25M-vertex mesh, the cut edges looked fuzzy, and a crease line of dark specks ran over the cap. Reproduced at 8.6M with the scratch deep-test driver (full-resolution close-ups). The clip geometry is not the cause: `--render triangles` showed clean edges and no specks, and two rewrites of the clip (rim vertices placed on the true intersection, winding-number inside test) left the triangles-only image pixel-identical, so they were reverted. The cause is the point-splat path. `cull.wgsl` gave points to any chunk with two or more vertices per pixel of its screen box. A clip folds the removed surface onto the cut in layers facing both ways, so those chunks are very dense. `cs_splat` then dropped every vertex whose (cancelled, garbage) normal faced away, opening holes: dotted seams against triangle chunks, specks, and fuzzy silhouettes from point-drawn rim chunks.
+- Fix: `faces_camera` in cull.wgsl. Points only when the chunk's normal cone (meshoptimizer cutoff = sine of the spread), plus the angle from its axis to the camera, plus the box's angular radius, stays within 70°, and never for cutoff ≥ 0.94. `cs_splat` lost its per-vertex facing test (every triangle of a point chunk faces the camera now). Cost +0.8 ms/frame at 15.4M (1.7 → 2.5 ms).
+- Polygon count: what limits it, measured on this machine (31 GB RAM, RTX 5060 8 GB):
+  - `DEFAULT_BUDGET` = 64M vertices (main.rs). A 25M mesh divides to 100M, so Divide is refused there.
+  - GPU: `max_storage_buffer_binding_size` = 2 GiB (`max_buffer_size` 4 GiB). normals.wgsl and bounds.wgsl bind the whole index buffer (24 B per vertex) as storage, which caps a level at about 89M vertices however much memory there is. Positions (12 B/vertex) reach 2 GiB only at 178M. VRAM at ~52 B/vertex allows ~140M on 8 GB.
+  - CPU: ~127 B per top-level vertex (indices 24, adj CSR 28, vertex→triangle CSR 28, stencil 16, offsets 12, positions 12, vert_chunk 4, labels/quads 3), plus about a third for the lower levels. Peak RSS while dividing measured 1.19 GB at 3.84M and 3.87 GB at 15.4M, about 250 B/vertex transient. 100M would peak around 25 GB, which this machine cannot do safely (an OOM here killed the user's Klay during this session's testing).
+- Plan to reach 100M+ (in order, each measurable on its own):
+  1. Windowed index bindings: run the normals and bounds passes over chunk windows whose triangle range fits in 2 GiB, binding an offset sub-range (256-byte aligned) and indexing relative to it. Drawing is unaffected (the index buffer is an INDEX buffer there, up to 4 GiB). This removes the 89M ceiling.
+  2. Chunk-local u16 adjacency: `adj_verts` and `vt_tris` as u16 offsets within the chunk plus a small spill table for border entries (vertices ≤ 4096 and triangles ≤ 8192 per chunk). Saves ~26 B/vertex.
+  3. Implicit stencils for the top level: derive each child's parents from the parent topology when syncing instead of storing 16 B/vertex. Together with step 2 that brings ~127 B/vertex down to about 85.
+  4. Stream the divide: build the new level chunk by chunk and drop temporaries as it goes, so the transient peak stays near the steady size.
+  5. Replace the fixed budget with one from `MemAvailable` and the GPU limits (a refusal that says why), so Divide never risks the OOM killer.
+  With 1–5, 100M needs about 11 GB of RAM and 5 GB of VRAM, inside this machine's limits.

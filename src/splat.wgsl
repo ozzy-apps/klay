@@ -44,15 +44,9 @@ fn cs_splat(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     let end = chunk_verts[c + 1u];
     for (var v = chunk_verts[c] + lid.x; v < end; v += WG) {
         let p = vec3<f32>(positions[3u * v], positions[3u * v + 1u], positions[3u * v + 2u]);
-        let n = unpack4x8snorm(normals[v]).xyz;
-        // Facing away: hidden behind the front surface, or past the silhouette.
-        var view = p - params.eye.xyz;
-        if (params.eye.w > 0.5) {
-            view = params.forward.xyz;
-        }
-        if (dot(n, view) > 0.0) {
-            continue;
-        }
+        // No facing test: cull.wgsl gives points only to chunks whose triangles all face
+        // the camera, and a vertex normal can point away there (a crease, a squashed
+        // triangle) and would leave a hole.
         let clip = params.view_proj * vec4<f32>(p, 1.0);
         if (clip.w <= 0.0) {
             continue;
