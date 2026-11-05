@@ -904,3 +904,9 @@ Run the updated sibling source with `../Strata/run-klay.sh` (builds Studio and r
   4. Stream the divide: build the new level chunk by chunk and drop temporaries as it goes, so the transient peak stays near the steady size.
   5. Replace the fixed budget with one from `MemAvailable` and the GPU limits (a refusal that says why), so Divide never risks the OOM killer.
   With 1–5, 100M needs about 11 GB of RAM and 5 GB of VRAM, inside this machine's limits.
+
+## Step 103 — Klay 0.48.1 published (2026-11-05)
+
+- v0.48.1 (annotated tag on the `Release Klay 0.48.1` commit, `main`) is the published GitHub release and rolls up 0.47.0–0.48.1 since v0.46.0. The AppStream file records 0.48.1. Assets: `klay_0.48.1_amd64.deb`, `Klay-0.48.1-x86_64.flatpak`, `Klay-0.48.1-x86_64.AppImage`.
+- appimagetool is not on the PATH here. The AppImage was built with `APPIMAGETOOL` pointing at a wrapper that runs `~/Documents/creative-projects/Mail/.runtime/appimage-tools/appimagetool-1.9.1-x86_64.AppImage --runtime-file …/runtime-20251108-x86_64` (offline type 2 runtime).
+- Smoke tests: the extracted .deb and AppImage binaries report Klay 0.48.1 (deb depends on libc6 ≥ 2.39). The Flatpak was installed into a throwaway `FLATPAK_USER_DIR`, so the user's own Klay Flatpak was not touched, and reports Klay 0.48.1.
