@@ -90,6 +90,34 @@ fn visible(b: Bounds) -> bool {
     return true;
 }
 
+// Whether every triangle of chunk box `b` faces the camera by a clear margin: the cone of
+// its face normals, turned by the angle to the camera and widened by the box's angular size,
+// stays within 70 degrees of the view. Points stand in for such chunks only. A chunk on a
+// silhouette, or with faces spread wide (a clip folds the removed surface onto its cut in
+// layers facing both ways), would show its points' gaps there: a fuzzy outline, dotted seams
+// against the triangle-drawn chunks beside it, and specks.
+fn faces_camera(b: Bounds) -> bool {
+    let cutoff = b.min.w;
+    if (cutoff >= 0.94) {
+        return false;
+    }
+    let c = (b.min.xyz + b.max.xyz) * 0.5;
+    var to_eye = -params.forward.xyz;
+    var spread = 0.0;
+    if (params.eye.w < 0.5) {
+        let d = params.eye.xyz - c;
+        let dist = length(d);
+        let r = length(b.max.xyz - b.min.xyz) * 0.5;
+        if (dist <= r * 1.05) {
+            return false;
+        }
+        to_eye = d / dist;
+        spread = asin(r / dist);
+    }
+    let turn = acos(clamp(dot(b.axis.xyz, to_eye), -1.0, 1.0));
+    return turn + asin(cutoff) + spread <= 1.2217;
+}
+
 // Whether chunk `c` with box `b` packs at least `splat.y` vertices into each pixel of its
 // box's screen rectangle. The rectangle is larger than the surface it holds, so this errs
 // towards triangles; a box reaching behind the camera never counts.
@@ -122,7 +150,7 @@ fn cs_cull(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups)
     let shown = range.y > 0u && visible(b);
     // Points only for chunks with nothing hidden (a point stands for all its triangles).
     let whole = range.y == chunk_tris[c + 1u] - chunk_tris[c];
-    let points = shown && params.splat.x > 0.5 && whole && dense(c, b);
+    let points = shown && params.splat.x > 0.5 && whole && dense(c, b) && faces_camera(b);
     let triangles = shown && !points;
     if (triangles) {
         atomicAdd(&counts[0], 1u);
