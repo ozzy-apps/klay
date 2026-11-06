@@ -2570,6 +2570,18 @@ mod shape_tests {
             // ZR_EYELOOPS: closed guide loops round the blob's eye sockets and nose (directions
             // round each feature, cast onto the surface).
             let mut guides: Vec<Vec<Vec3>> = Vec::new();
+            // ZR_BROW: an open guide across the blob's brow, above the eyes.
+            if name == "blob" && std::env::var_os("ZR_BROW").is_some() {
+                let lat = 0.62f32;
+                let pts: Vec<Vec3> = (0..=48)
+                    .filter_map(|i| {
+                        let a = -0.9 + 1.8 * i as f32 / 48.0;
+                        let dir = Vec3::new(a.sin() * lat.cos(), lat.sin(), a.cos() * lat.cos());
+                        m.raycast(dir * 10.0, -dir).map(|h| h.point)
+                    })
+                    .collect();
+                guides.push(pts);
+            }
             if name == "blob" && std::env::var_os("ZR_EYELOOPS").is_some() {
                 for (c, ang) in [(Vec3::new(0.35, 0.25, 0.85), 0.24f32), (Vec3::new(-0.35, 0.25, 0.85), 0.24), (Vec3::new(0.0, -0.05, 1.0), 0.16)] {
                     let d0 = c.normalize();
@@ -2587,6 +2599,26 @@ mod shape_tests {
                         loop_pts.push(p0);
                     }
                     eprintln!("eye loop: {} points, {:.3} long", loop_pts.len(), loop_pts.windows(2).map(|e| e[0].distance(e[1])).sum::<f32>());
+                    guides.push(loop_pts);
+                }
+            }
+            // ZR_BUSTLOOPS: closed guide loops round the eyes and mouth of the test bust in
+            // quadremesh-ref (ellipses in model x/y, cast along -z onto the face).
+            if name == "obj" && std::env::var_os("ZR_BUSTLOOPS").is_some() {
+                let scale: f32 = std::env::var("ZR_BUSTSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                for (cx, cy, rx, ry) in [(-0.111f32, 0.413f32, 0.058f32, 0.042f32), (0.099, 0.403, 0.058, 0.042), (-0.011, 0.248, 0.078, 0.036)] {
+                    let mut loop_pts = Vec::new();
+                    for i in 0..64 {
+                        let t = std::f32::consts::TAU * i as f32 / 64.0;
+                        let o = Vec3::new(cx + rx * scale * t.cos(), cy + ry * scale * t.sin(), 10.0);
+                        if let Some(h) = m.raycast(o, Vec3::NEG_Z) {
+                            loop_pts.push(h.point);
+                        }
+                    }
+                    if let Some(&p0) = loop_pts.first() {
+                        loop_pts.push(p0);
+                    }
+                    eprintln!("bust loop: {} points, {:.3} long", loop_pts.len(), loop_pts.windows(2).map(|e| e[0].distance(e[1])).sum::<f32>());
                     guides.push(loop_pts);
                 }
             }

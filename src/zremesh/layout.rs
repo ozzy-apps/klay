@@ -685,10 +685,14 @@ fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec
     let mut count = 0;
     for g in guides {
         let length: f32 = g.windows(2).map(|e| e[0].distance(e[1])).sum();
-        if g.len() < 4 || length < quad * 4.0 || g[0].distance(*g.last().unwrap()) > quad.max(length * 0.08) {
-            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
-                eprintln!("    guide: not closed ({} points, {:.1} quads long, ends {:.2} quads apart)", g.len(), length / quad, g[0].distance(*g.last().unwrap()) / quad);
-            }
+        if g.len() < 2 || length < quad * 2.0 {
+            continue;
+        }
+        // Open guides (ends apart) become hard lines along them (ZR_NOOPENGUIDES leaves them).
+        let closed = g.len() >= 4 && length >= quad * 4.0 && g[0].distance(*g.last().unwrap()) <= quad.max(length * 0.08);
+        // Open guides as hard lines are experimental (they leave thin strips beside them and
+        // made the blob 24–32% bad): off unless ZR_OPENGUIDES.
+        if !closed && std::env::var_os("ZR_OPENGUIDES").is_none() {
             continue;
         }
         // Points about a third of a quad apart, snapped; consecutive ones joined by paths.
@@ -703,20 +707,24 @@ fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec
         }
         let mut snapped: Vec<u32> = samples.iter().filter_map(|&p| nearest(w, p)).collect();
         snapped.dedup();
-        if snapped.len() > 1 && snapped.first() == snapped.last() {
+        if closed && snapped.len() > 1 && snapped.first() == snapped.last() {
             snapped.pop();
         }
-        if snapped.len() < 4 {
+        if snapped.len() < if closed { 4 } else { 2 } {
             continue;
         }
         let m = snapped.len();
         let mut lp: Vec<u32> = Vec::new();
         let mut ok = true;
-        for k in 0..m {
+        let steps = if closed { m } else { m - 1 };
+        for k in 0..steps {
             let Some(seg) = path(w, snapped[k], snapped[(k + 1) % m]) else { ok = false; break };
             for &v in &seg[..seg.len() - 1] {
                 lp.push(v);
             }
+        }
+        if !closed {
+            lp.push(snapped[m - 1]);
         }
         // A loop must not cross itself: cut out any repeated stretch.
         let mut seen: HashMap<u32, usize> = HashMap::default();
@@ -731,7 +739,7 @@ fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec
                 clean.push(v);
             }
         }
-        if !ok || clean.len() < 6 {
+        if !ok || clean.len() < if closed { 6 } else { 3 } {
             if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
                 eprintln!("    guide: no path (ok {ok}, {} vertices)", clean.len());
             }
@@ -739,7 +747,8 @@ fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec
         }
         // Mark the loop's half-edges hard and soft.
         let key = |a: u32, b: u32| (a.min(b), a.max(b));
-        let edges: HashSet<(u32, u32)> = (0..clean.len()).map(|k| key(clean[k], clean[(k + 1) % clean.len()])).collect();
+        let nedges = if closed { clean.len() } else { clean.len() - 1 };
+        let edges: HashSet<(u32, u32)> = (0..nedges).map(|k| key(clean[k], clean[(k + 1) % clean.len()])).collect();
         let mut marked = 0;
         for h in 0..nf * 3 {
             let (a, b) = (w.from(h as u32), w.to(h as u32));
@@ -750,6 +759,11 @@ fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec
             }
         }
         if marked < edges.len() {
+            continue;
+        }
+        if !closed {
+            // An open line: no inside; lines carry on from its ends (see the hard corners).
+            count += 1;
             continue;
         }
         // Inside: the smaller of the regions the loop splits the faces into.
@@ -885,7 +899,10 @@ fn cross_field(w: &Work, follow: f32, quad: f32, grid: &[(Vec3, f32)]) -> Vec<Ve
             expi(4.0 * (af - ag))
         })
         .collect();
-    // Held faces: along their longest hard edge.
+    // Held faces: along their longest hard edge. A soft line (guide, feature loop) snaps
+    // along working-mesh edges that zigzag: its direction is taken over a stretch of the line
+    // (ZR_SOFTHOLD=edge holds along the single edge as before).
+    let soft_dir = soft_line_directions(w);
     let mut fixed = vec![false; nf];
     let mut z = vec![Vec2::ZERO; nf];
     for f in 0..nf {
@@ -893,7 +910,11 @@ fn cross_field(w: &Work, follow: f32, quad: f32, grid: &[(Vec3, f32)]) -> Vec<Ve
         for k in 0..3 {
             let h = (f * 3 + k) as u32;
             if w.hard[h as usize] {
-                let e = w.p[w.to(h) as usize] - w.p[w.from(h) as usize];
+                let e = if w.soft[h as usize] {
+                    soft_dir.get(&(w.from(h).min(w.to(h)), w.from(h).max(w.to(h)))).copied().unwrap_or(w.p[w.to(h) as usize] - w.p[w.from(h) as usize])
+                } else {
+                    w.p[w.to(h) as usize] - w.p[w.from(h) as usize]
+                };
                 if e.length() > best {
                     best = e.length();
                     z[f] = expi(4.0 * w.angle(f, e));
@@ -1044,6 +1065,45 @@ fn cross_field(w: &Work, follow: f32, quad: f32, grid: &[(Vec3, f32)]) -> Vec<Ve
         }
     }
     z
+}
+
+/// Each soft line edge's smoothed direction: the chord over about four edges either way
+/// along the line (oriented like the edge).
+fn soft_line_directions(w: &Work) -> HashMap<(u32, u32), Vec3> {
+    let mut out: HashMap<(u32, u32), Vec3> = HashMap::default();
+    // Off by default: holding along the single snapped edge serves closed loops far better
+    // (blob with eye loops 8.8% bad quads against 27.4%); ZR_SOFTHOLD=smooth turns it on.
+    if !std::env::var("ZR_SOFTHOLD").is_ok_and(|v| v == "smooth") {
+        return out;
+    }
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let mut nb: HashMap<u32, Vec<u32>> = HashMap::default();
+    let mut seen: HashSet<(u32, u32)> = HashSet::default();
+    for h in 0..w.t.len() as u32 * 3 {
+        if w.soft[h as usize] && seen.insert(key(w.from(h), w.to(h))) {
+            nb.entry(w.from(h)).or_default().push(w.to(h));
+            nb.entry(w.to(h)).or_default().push(w.from(h));
+        }
+    }
+    // Walk `steps` along the line from `v`, away from `from`.
+    let walk = |mut from: u32, mut v: u32, steps: usize| -> u32 {
+        for _ in 0..steps {
+            let Some(list) = nb.get(&v) else { break };
+            if list.len() != 2 {
+                break;
+            }
+            let nx = if list[0] != from { list[0] } else { list[1] };
+            from = v;
+            v = nx;
+        }
+        v
+    };
+    for &(a, b) in &seen {
+        let (fa, fb) = (walk(b, a, 4), walk(a, b, 4));
+        let d = w.p[fb as usize] - w.p[fa as usize];
+        out.insert((a, b), if d.length_squared() > 0.0 { d } else { w.p[b as usize] - w.p[a as usize] });
+    }
+    out
 }
 
 /// The four directions of face `f` (in 3D).
@@ -2125,7 +2185,7 @@ struct Cut {
     faults: Vec<Fault>,
 }
 
-fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, nodes: &HashSet<u32>, quad: f32, edge_line: &HashMap<(u32, u32), u32>, same: &HashMap<u32, u32>, pole_lines: &HashSet<u32>, keep: &HashSet<u32>, lenient: bool) -> Cut {
+fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, nodes: &HashSet<u32>, quad: f32, edge_line: &HashMap<(u32, u32), u32>, same: &HashMap<u32, u32>, pole_lines: &HashSet<u32>, keep: &HashSet<u32>, lenient: bool, stale: &HashSet<u32>) -> Cut {
     let root = |mut id: u32| -> u32 {
         let mut guard = 0;
         while let Some(&n) = same.get(&id) {
@@ -2596,8 +2656,8 @@ fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, 
             }));
         let thin = 2.0 * area / perimeter.max(1e-12) < quad * 1.2 && perimeter > quad * 6.0;
         // A big patch with many corners is cut in two (deleting its lines only grows it).
-        if real > 8 && area > quad * quad * 40.0 && std::env::var_os("ZR_NOBIGSPLIT").is_none() {
-            if std::env::var_os("KLAY_ZR_DEBUG").is_some() { eprintln!("    fault ({} faces): {} corners over {:.0} quads², split", faces.len(), real, area / (quad * quad)); }
+        if real > 8 && area > quad * quad * 40.0 && std::env::var_os("ZR_NOBIGSPLIT").is_none() && (stale.is_empty() || !stale.contains(&inside())) {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() { let c = inside(); eprintln!("    fault ({} faces): {} corners over {:.0} quads², split at {c} {:.3} pole {} near pole {}", faces.len(), real, area / (quad * quad), w.p[c as usize], is_pole[c as usize], w.neighbours(c).iter().any(|&u| is_pole[u as usize])); }
             faulty.extend(faces.iter().copied());
             faults.push(Fault::Split(inside()));
             continue;
@@ -3432,10 +3492,15 @@ fn ring_fill(mut ids: Vec<u32>, mut pos: Vec<Vec2>, mut corners: Vec<usize>, poi
             quads.push([ids[0], ids[1], ids[2], ids[3]]);
             return;
         }
-        // Corners that leave a side shorter than three are dropped (the side joins the next).
+        // Corners that leave a side shorter than three are dropped (the side joins the next),
+        // unless the four corners make an exact rectangle (a grid finishes it below).
+        let exact = corners.len() == 4 && {
+            let side = |i: usize| -> usize { (corners[(i + 1) % 4] + len - corners[i]) % len };
+            side(0) == side(2) && side(1) == side(3) && side(0).min(side(1)) <= 4 && side(0).min(side(1)) >= 2
+        };
         loop {
             let nc = corners.len();
-            if nc <= 3 {
+            if nc <= 3 || exact {
                 break;
             }
             let side = |i: usize| -> usize { (corners[(i + 1) % nc] + len - corners[i]) % len };
@@ -4093,7 +4158,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         let border = !w.interior(v);
         // On a feature loop alone: smooth, never a corner.
         let all_soft = fan.iter().all(|&h| !w.hard[h as usize] || w.soft[h as usize]) && fan.iter().all(|&h| !w.hard[Work::prev(h) as usize] || w.soft[Work::prev(h) as usize]);
-        if all_soft && hard_deg[v as usize] <= 2 {
+        if all_soft && hard_deg[v as usize] == 2 {
             continue;
         }
         let corner = if hard_deg[v as usize] != 2 {
@@ -4377,7 +4442,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     prune(&mut traces, &mut marks, &w);
     settle(&mut traces, &mut marks, &mut extra, &w, &z, quad, &pole_list, &is_pole);
     let (mut cut_edges, mut edge_line, mut same, mut nodes) = rebuild(&traces, &extra);
-    let mut c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), false);
+    let mut c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), false, &HashSet::default());
     if select {
         let mut chosen: HashSet<u32> = HashSet::default();
         for iter in 0..64 {
@@ -4465,7 +4530,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             prune(&mut traces, &mut marks, &w);
             settle(&mut traces, &mut marks, &mut extra, &w, &z, quad, &pole_list, &is_pole);
             (cut_edges, edge_line, same, nodes) = rebuild(&traces, &extra);
-            c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), false);
+            c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), false, &HashSet::default());
             crate::jobs::check()?;
         }
     }
@@ -4474,6 +4539,9 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     let n = loop {
     let mut rounds = 0;
     let mut tried: HashSet<u32> = HashSet::default();
+    // Split points already cut from in an earlier round: a patch that comes back with the
+    // same point (its lines got stuck) is cut from a point a few rings away instead.
+    let mut split_tries: HashMap<u32, u32> = HashMap::default();
     while !c.faults.is_empty() {
         if debug {
             // Dangling ends and vertices two lines pass through.
@@ -4607,7 +4675,32 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                         traces.push(t);
                     }
                 }
-                Fault::Split(v) | Fault::Topo(v, _) => {
+                Fault::Split(v0) | Fault::Topo(v0, _) => {
+                    let tries = split_tries.entry(v0).or_default();
+                    *tries += 1;
+                    let mut v = v0;
+                    if *tries > 1 && std::env::var_os("ZR_NOSPLITMOVE").is_none() {
+                        // Out by 3 rings per earlier try, off any line or hard edge.
+                        let rings = 3 * (*tries - 1);
+                        let mut seen: HashSet<u32> = [v0].into_iter().collect();
+                        let mut front = vec![v0];
+                        for _ in 0..rings {
+                            let mut next = Vec::new();
+                            for &a in &front {
+                                for &u in w.neighbours(a) {
+                                    if marks[u as usize] == NONE && seen.insert(u) {
+                                        next.push(u);
+                                    }
+                                }
+                            }
+                            if next.is_empty() {
+                                break;
+                            }
+                            next.sort_unstable();
+                            front = next;
+                        }
+                        v = front[(*tries as usize * 7) % front.len()];
+                    }
                     if !gone.is_empty() || !used.insert(v) {
                         continue;
                     }
@@ -4680,7 +4773,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         prune(&mut traces, &mut marks, &w);
         settle(&mut traces, &mut marks, &mut extra, &w, &z, quad, &pole_list, &is_pole);
         (cut_edges, edge_line, same, nodes) = rebuild(&traces, &extra);
-        c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), rounds > 3);
+        c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), rounds > 3, &split_tries.iter().filter(|e| *e.1 >= 6).map(|e| *e.0).collect());
         crate::jobs::check()?;
     }
     // Selection: lines that make bad patches are taken away (lines ended on them go on), one
@@ -4737,7 +4830,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                     prune(&mut t2, &mut m2, &w);
                     settle(&mut t2, &mut m2, &mut x2, &w, &z, quad, &pole_list, &is_pole);
                     let (ce, el, sm, nd) = rebuild(&t2, &x2);
-                    let c2 = cut(&w, &z, &is_pole, &ce, &nd, quad, &el, &sm, &pole_lines(&t2, &sm, &protected), &protected.iter().map(|&i| root_of(&sm, i)).collect(), true);
+                    let c2 = cut(&w, &z, &is_pole, &ce, &nd, quad, &el, &sm, &pole_lines(&t2, &sm, &protected), &protected.iter().map(|&i| root_of(&sm, i)).collect(), true, &HashSet::default());
                     let cost = total(&c2);
                     let mf = messy_faces(&c2);
                     if c2.faults.is_empty() && cost < best - 0.5 && (mf <= best_messy || std::env::var_os("KLAY_ZR_GROWMESSY").is_none()) {
@@ -4878,6 +4971,15 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                         }
                         break;
                     };
+                    // Not past `cap`× an arc's length (+2): the patch takes the general fill
+                    // rather than stretching every patch the strip crosses.
+                    let cap: f32 = std::env::var("ZR_WIDENCAP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.6);
+                    if cap > 0.0 && path.iter().any(|&a| (n[a as usize] + 2) as f32 > target[a as usize] * cap + 2.0) {
+                        if debug && k >= 5 {
+                            eprintln!("    widen p{p}: {l:?} strip from side {side} would stretch an arc: stop");
+                        }
+                        break;
+                    }
                     for a in path {
                         n[a as usize] += 2;
                     }
@@ -4913,6 +5015,18 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                     eprintln!("    patch {} faces: real {} messy {} sides {:?} lengths {:?}{}{}", pa.faces.len(), pa.real, pa.messy, l, t, if ring { "  <- rings" } else { "" }, if squeeze > 1.8 { format!("  <- squeezed {squeeze:.1}") } else { String::new() });
                 }
                 eprintln!("  {} patches ok, {bad} filled by rings", c.patches.len());
+                // Where the counts go over the lengths: by arc length in quads.
+                let mut by_len: Vec<(usize, i64, f32)> = vec![(0, 0, 0.0); 5];
+                for a in 0..c.arcs.len() {
+                    let t = target[a];
+                    let b = if t < 0.5 { 0 } else if t < 1.0 { 1 } else if t < 2.0 { 2 } else if t < 5.0 { 3 } else { 4 };
+                    by_len[b].0 += 1;
+                    by_len[b].1 += n[a];
+                    by_len[b].2 += t;
+                }
+                eprintln!("  arc counts by length (<0.5, <1, <2, <5, more: arcs, count, length): {:?}", by_len.iter().map(|&(k, c, t)| (k, c, t.round())).collect::<Vec<_>>());
+                let area: f32 = c.patches.iter().map(|pa| pa.faces.iter().map(|&f| { let t = w.t[f as usize]; (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length() * 0.5 }).sum::<f32>()).sum();
+                eprintln!("  area {:.0} quads², {} patches, mean {:.1} quads² a patch", area / (quad * quad), c.patches.len(), area / (quad * quad) / c.patches.len() as f32);
             }
             break n;
         }
@@ -5038,6 +5152,96 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         } else {
             2
         };
+        // A thin patch (a fill by its counts would make far more quads than its area) is
+        // laid on a long a×b rectangle instead of a circle or trapezoid: a·b its area,
+        // 2(a+b) its border count, the short sides at its two farthest-apart border points.
+        let strip: Option<[usize; 4]> = (|| {
+            if std::env::var_os("ZR_NOSTRIP").is_some() || pinched || !(pattern == 2 || pattern == 3) || total < 8 || total % 2 != 0 {
+                return None;
+            }
+            let area = pa.faces.iter().map(|&f| {
+                let t = w.t[f as usize];
+                (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length() * 0.5
+            }).sum::<f32>() / (quad * quad);
+            let p = total as f32;
+            let made = if pattern == 3 { let sb = trap?; (l[sb] + l[(sb + 2) % 4]) as f32 * 0.5 * l[(sb + 1) % 4] as f32 } else { p * p / (4.0 * std::f32::consts::PI) };
+            let thin_limit: f32 = std::env::var("ZR_STRIPTHIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.75);
+            if area >= p * p / 16.0 * thin_limit || made < area * 1.5 {
+                return None;
+            }
+            let half = total / 2;
+            let b = (((p * 0.5 - (p * p * 0.25 - 4.0 * area).max(0.0).sqrt()) * 0.5).round() as i64).clamp(std::env::var("ZR_STRIPMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2), half / 2);
+            let a = half - b;
+            // Border points in loop order (one per count), and the farthest-apart pair.
+            let mut pts: Vec<Vec3> = Vec::with_capacity(total as usize);
+            for side in &pa.sides {
+                for &(arc, fwd) in side {
+                    let ids = &arc_pts[arc as usize];
+                    let m = ids.len().saturating_sub(1);
+                    for j in 0..m {
+                        let id = if fwd { ids[j] } else { ids[m - j] };
+                        pts.push(out_p[id as usize]);
+                    }
+                }
+            }
+            if pts.len() != total as usize {
+                return None;
+            }
+            let mut best = (0.0f32, 0usize, 0usize);
+            for i in 0..pts.len() {
+                for j in i + 1..pts.len() {
+                    let d = pts[i].distance_squared(pts[j]);
+                    if d > best.0 {
+                        best = (d, i, j);
+                    }
+                }
+            }
+            let t = total as usize;
+            // The short sides (legs, h each) centred on the two tips; the long sides between
+            // may differ (a trapezoid, its merges spread along the rows). Legs widened while
+            // the rows have no room for their merges; else equal long sides from one tip.
+            let room = |a: i64, c: i64, h: i64| -> bool {
+                let d = (a - c) / 2;
+                a >= c && c >= 1 && h >= 1 && (a - c) % 2 == 0 && (0..h).all(|j| {
+                    let kj = (j + 1) * d / h - j * d / h;
+                    a - 2 * (j * d / h) >= 3 * kj
+                })
+            };
+            let (i0, j0) = (best.1 as i64, best.2 as i64);
+            let ti = total;
+            let mut pick: Option<[usize; 4]> = None;
+            if std::env::var_os("ZR_STRIPTRAP").is_some() {
+                for h in b..=(b + 4).min(half / 2) {
+                    let c0 = (i0 - h / 2).rem_euclid(ti);
+                    let c1 = (c0 + h).rem_euclid(ti);
+                    let c2 = (j0 - h / 2).rem_euclid(ti);
+                    let c3 = (c2 + h).rem_euclid(ti);
+                    let s1 = (c2 - c1).rem_euclid(ti);
+                    let s2 = (c0 - c3).rem_euclid(ti);
+                    if s1 < 1 || s2 < 1 || s1 + s2 + 2 * h != ti {
+                        continue;
+                    }
+                    // Bottom: the longer long side; [start, bottom, legs, top].
+                    let (start, bot, top) = if s1 >= s2 { (c1, s1, s2) } else { (c3, s2, s1) };
+                    if room(bot, top, h) {
+                        pick = Some([start as usize, bot as usize, h as usize, top as usize]);
+                        break;
+                    }
+                }
+            }
+            // Equal long sides: the short sides' middles half the loop apart, the mismatch
+            // with the tips shared between both ends.
+            let l1 = (j0 - i0).rem_euclid(ti);
+            let e = (l1 - half) / 2;
+            let pick = pick.unwrap_or([((i0 + e + b - b / 2).rem_euclid(ti)) as usize, a as usize, b as usize, a as usize]);
+            if debug {
+                let mid = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
+                eprintln!("  strip patch {pi}: pattern {pattern}, {total} round, {area:.0} quads² (a fill would make {made:.0}), {a}×{b} -> {pick:?}, ends {:.1} quads apart, middle {mid:.2}", best.0.sqrt() / quad);
+            }
+            let _ = t;
+            Some(pick)
+        })();
+        let pattern = if strip.is_some() { 2 } else { pattern };
         // The flat polygon: a rectangle for a grid, a regular polygon round a middle point,
         // else a circle (rings).
         let corners: Vec<Vec2> = if pattern == 0 {
@@ -5078,7 +5282,25 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             let a = std::f32::consts::TAU * t / total as f32;
             Vec2::new(a.cos(), a.sin()) * radius
         };
-        let on_side = |s: usize, u: f32| -> Vec2 { if pattern == 2 || pattern == 5 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
+        // On the strip's trapezoid ([start, bottom a, legs h, top c]), counter-clockwise from
+        // the bottom's first corner; the top centred over the bottom.
+        let rect = |t: f32| -> Vec2 {
+            let [st, a, h, c] = strip.unwrap();
+            let (a, h, c) = (a as f32, h as f32, c as f32);
+            let tot = a + c + 2.0 * h;
+            let s = (t - st as f32).rem_euclid(tot);
+            let (br, tr, tl) = (Vec2::new(a, 0.0), Vec2::new((a + c) * 0.5, h), Vec2::new((a - c) * 0.5, h));
+            if s < a {
+                Vec2::new(s, 0.0)
+            } else if s < a + h {
+                br.lerp(tr, (s - a) / h)
+            } else if s < a + h + c {
+                tr.lerp(tl, (s - a - h) / c)
+            } else {
+                tl.lerp(Vec2::ZERO, (s - a - h - c) / h)
+            }
+        };
+        let on_side = |s: usize, u: f32| -> Vec2 { if strip.is_some() { rect(base[s] + u) } else if pattern == 2 || pattern == 5 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
         // Loop vertices onto the polygon; side points' ids by (side, offset). A vertex the
         // loop passes twice (a pinch) is a second, separate vertex on its second pass, for
         // the faces on that side of it.
@@ -5263,10 +5485,19 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         if pattern == 0 {
             let (nx, ny) = (l[0] as usize, l[1] as usize);
             grid([corners[0], corners[1], corners[2], corners[3]], nx, ny, Some(&side_ids[0]), Some(&side_ids[1]), Some(&side_ids[2]), Some(&side_ids[3]), &mut out_p, &mut quads_out);
+        } else if let Some((bottom_ids, right_ids, top_ids, left_ids, a, c, h)) = if let Some([st, a, h, c]) = strip {
+            // The strip's four sides, cut from the border loop.
+            let ring: Vec<u32> = (0..k).flat_map(|s| side_ids[s][..l[s] as usize].iter().copied()).collect();
+            let m = ring.len();
+            let run = |from: usize, len: usize| -> Vec<u32> { (0..=len).map(|q| ring[(from + q) % m]).collect() };
+            (m == a + c + 2 * h).then(|| (run(st, a), run(st + a, h), run(st + a + h, c), run(st + a + h + c, h), a as i64, c as i64, h as i64))
         } else if let (3, Some(sb)) = (pattern, trap) {
-            drop(grid);
             let (sr, st, sl) = ((sb + 1) % 4, (sb + 2) % 4, (sb + 3) % 4);
-            let (a, c, h) = (l[sb], l[st], l[sr]);
+            Some((side_ids[sb].clone(), side_ids[sr].clone(), side_ids[st].clone(), side_ids[sl].clone(), l[sb], l[st], l[sr]))
+        } else {
+            None
+        } {
+            drop(grid);
             let d = (a - c) / 2;
             let (af, cf, hf) = (a as f32, c as f32, h as f32);
             let x_at = |y: f32, i: usize, n: i64| -> Vec2 {
@@ -5275,22 +5506,22 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 Vec2::new(xl + (xr - xl) * i as f32 / n as f32, y)
             };
             // Row 0's points: the bottom side.
-            let mut row: Vec<u32> = side_ids[sb].clone();
+            let mut row: Vec<u32> = bottom_ids.clone();
             let mut n0 = a;
             for j in 0..h {
                 let kj = (j + 1) * d / h - j * d / h;
                 let n1 = n0 - 2 * kj;
                 let y1 = (j + 1) as f32;
                 let top: Vec<u32> = if j + 1 == h {
-                    let mut t = side_ids[st].clone();
+                    let mut t = top_ids.clone();
                     t.reverse();
                     t
                 } else {
-                    let mut t = vec![side_ids[sl][(h - j - 1) as usize]];
+                    let mut t = vec![left_ids[(h - j - 1) as usize]];
                     for i in 1..n1 as usize {
                         t.push(point(x_at(y1, i, n1), &mut out_p));
                     }
-                    t.push(side_ids[sr][(j + 1) as usize]);
+                    t.push(right_ids[(j + 1) as usize]);
                     t
                 };
                 // Merges spread along the row: each takes three bottom edges to one top edge.
@@ -5607,6 +5838,35 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 let bin = if st < 1.5 { 0 } else if st < 2.0 { 1 } else if st < 3.0 { 2 } else { 3 };
                 by_stretch[bin].0 += 1;
                 by_stretch[bin].1 += bad as usize;
+            }
+            // Quads made against patch area, by pattern.
+            let mut made_area: HashMap<u8, (usize, f32, usize)> = HashMap::default();
+            let mut counted: HashSet<usize> = HashSet::default();
+            for &(pi, pat) in made_by.iter() {
+                let e = made_area.entry(pat).or_default();
+                e.0 += 1;
+                if counted.insert(pi) {
+                    e.2 += 1;
+                    e.1 += c.patches[pi].faces.iter().map(|&f| { let t = w.t[f as usize]; (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length() * 0.5 }).sum::<f32>() / (quad * quad);
+                }
+            }
+            let mut ma: Vec<_> = made_area.into_iter().map(|(k, (q, a, np))| (k, np, q, a.round() as i64)).collect();
+            ma.sort();
+            eprintln!("  quads made vs area by pattern (pattern, patches, quads, quads²): {ma:?}");
+            let mut per: HashMap<usize, (u8, usize)> = HashMap::default();
+            for &(pi, pat) in made_by.iter() {
+                per.entry(pi).or_insert((pat, 0)).1 += 1;
+            }
+            let mut ex: Vec<(f32, usize, u8, usize, f32)> = per.iter().map(|(&pi, &(pat, q))| {
+                let a = c.patches[pi].faces.iter().map(|&f| { let t = w.t[f as usize]; (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length() * 0.5 }).sum::<f32>() / (quad * quad);
+                (q as f32 - a, pi, pat, q, a)
+            }).collect();
+            ex.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for &(_, pi, pat, q, a) in ex.iter().take(15) {
+                let pa = &c.patches[pi];
+                let l: Vec<i64> = pa.sides.iter().map(|sd| sd.iter().map(|&(a, _)| n[a as usize]).sum()).collect();
+                let t: Vec<f32> = pa.sides.iter().map(|sd| (sd.iter().map(|&(a, _)| c.arcs[a as usize].windows(2).map(|e| w.p[e[0] as usize].distance(w.p[e[1] as usize])).sum::<f32>() / quad).sum::<f32>() * 10.0).round() / 10.0).collect();
+                eprintln!("    over: patch {pi} pattern {pat}: {q} quads for {a:.0} quads², real {} messy {} band {} counts {l:?} lengths {t:?}", pa.real, pa.messy, pa.band);
             }
             let mut pats: Vec<_> = by_pat.into_iter().collect();
             pats.sort();
