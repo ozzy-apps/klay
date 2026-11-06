@@ -1190,7 +1190,6 @@ impl SculptMesh {
     /// The other half of the quad triangle `t` is half of, by [`quads`](Self::quads):
     /// the triangle across its diagonal whose own diagonal is that edge. `None` for a lone
     /// triangle or while the quads are unknown.
-    #[cfg(test)]
     pub fn quad_partner(&self, t: u32) -> Option<u32> {
         let d = *self.quads.get(t as usize)?;
         if d >= LONE {

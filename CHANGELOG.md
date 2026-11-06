@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **ZRemesher Follow Shape** (0–100, default 60): edge loops follow the way the surface bends. Each sample's bending (the second fundamental form, fitted to how the normal turns over two rings of neighbours and smoothed to about quad size) gives the direction it bends most; where the two bends clearly differ, the direction field is pulled toward it, by the slider, by how lopsided the bend is (0 on a ball or a plane, 1 on a cylinder or a saddle) and by how much it shows over one quad. Guides, polygroup borders and edge lines still win where they reach. Measured: mean misalignment of the loops on a torus 7.8° → 3.9°, on a vase 7.2° → 4.0°; a ball is unchanged.
+- **Detect Edges** is on by default, so hard-surface parts get loops on their sharp edges without a click.
+- **Planned quad layout** (experimental, off: `zremesh::Settings::layout`): a QuadWild-style remesher that plans the whole layout first (a cross field on a refined copy of the model, lines traced from its poles, patches, whole quad counts, and regular fills: grids, centre splits for 3–8 sides, trapezoids, bands between loops), selects lines by predicted poles, then relaxes and projects. On the test shapes it gives far fewer poles than the piecewise fit (ball 8, torus 0, cube 8, rook 0.4%); on a detailed bust it is valid but still rough. Falls back to the piecewise fit when it cannot plan. Debugging under `KLAY_ZR_DEBUG`.
+- Not yet: the vertices with other than four edges (poles) stay at about 5–8%, as before; they come from the lattice step, which phase 2 (a planned quad layout) replaces.
+
 ## 0.49.0 — 2026-11-05
 
 - **Anti-aliasing**: the canvas is drawn with 4× multisampling. Zoomed out, a dense mesh puts many triangles in each pixel, which gave stair-stepped silhouettes and cut edges and a noisy fringe where the shading changes. Points for dense meshes get the same four samples: they land in a grid twice as fine, and each sample of the resolve takes its own point, so point-drawn outlines are smooth too. `KLAY_MSAA=1` turns it off (A/B, slow GPUs). GPUs without 4× multisampling for the window format draw as before.

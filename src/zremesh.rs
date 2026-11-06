@@ -37,6 +37,8 @@
 //! the counts differ) joins the old border to the new one.
 
 use crate::{mesh::SculptMesh, symmetry::MirrorPlane};
+
+mod layout;
 use crate::fx::FxHashMap as HashMap;
 use glam::Vec3;
 use rayon::prelude::*;
@@ -73,6 +75,12 @@ pub struct Settings {
     pub alternate: bool,
     /// Edge loops along sharp edges (ZBrush: Detect Edges).
     pub detect_edges: bool,
+    /// 0..=100: how strongly edge loops follow the way the surface bends (round a
+    /// cylinder, along a ridge, round a hollow) where it bends more one way than the other.
+    pub follow_shape: f32,
+    /// Plan the whole layout (lines from the poles, patches, matched quad counts) instead of
+    /// fitting quads piece by piece. Falls back to the piecewise fit if the plan fails.
+    pub layout: bool,
 }
 
 /// Detect Edges: how sharply the surface must turn at an edge, in degrees.
@@ -94,7 +102,7 @@ impl Features {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, mirror: None, freeze_border: false, keep_creases: true, detect_edges: false, alternate: false }
+        Self { target_k: 5.0, keep_groups: true, adaptive: 50.0, curves_strength: 50.0, use_polypaint: false, color_density: 2.0, mirror: None, freeze_border: false, keep_creases: true, detect_edges: true, alternate: false, follow_shape: 60.0, layout: false }
     }
 }
 
@@ -204,6 +212,9 @@ struct Pull {
     dir: Vec3,
     at: Vec3,
     w: f32,
+    /// Also shift the lattice so a line runs on `at` (guides and edge lines); the
+    /// curvature pull only turns the direction.
+    lattice: bool,
 }
 
 /// The pull of `guides` on every sample of `g` within `reach` of one, with weight `w`.
@@ -219,7 +230,7 @@ fn pulls(g: &Graph, guides: &Guides, reach: f32, w: f32) -> Vec<Pull> {
                 .nearest(g.p[i], reach)
                 .and_then(|(_, at, d)| {
                     let d = d - n * d.dot(n);
-                    (d.length() > 0.3).then(|| Pull { dir: d.normalize(), at, w })
+                    (d.length() > 0.3).then(|| Pull { dir: d.normalize(), at, w, lattice: true })
                 })
                 .unwrap_or_default()
         })
@@ -236,6 +247,9 @@ pub struct Stats {
     pub holes: usize,
     /// Vertices put on a guide curve.
     pub on_guides: usize,
+    /// The whole layout was planned; else why not (the piecewise fit was used).
+    pub planned: bool,
+    pub fallback: Option<String>,
     pub ms: f32,
 }
 
@@ -534,7 +548,7 @@ fn smooth_positions(g: &Graph, q: &[Vec3], o: &mut [Vec3], colours: &[Vec<u32>],
                     }
                     // Along a guide: the lattice line across it is shifted onto it.
                     let pl = pull[i];
-                    if pl.w > 0.0 {
+                    if pl.w > 0.0 && pl.lattice {
                         let t = n.cross(q[i]);
                         let axis = if q[i].dot(pl.dir).abs() >= t.dot(pl.dir).abs() { t } else { q[i] };
                         let off = axis.dot(sum - pl.at);
@@ -603,6 +617,104 @@ fn adaptive_scale(g: &Graph, scale: f32, adaptive: f32) -> Vec<f32> {
     let mean: f32 = ln.iter().map(|&x| (-2.0 * x).exp()).sum::<f32>() / m as f32;
     let fix = mean.sqrt();
     ln.iter().map(|&x| scale * x.exp() * fix).collect()
+}
+
+/// The surface's bending at every sample of `g`, as a symmetric 3×3 tensor in its tangent
+/// plane (the second fundamental form): fitted to how the normal turns toward the samples
+/// within two steps, then smoothed so it reads the shape at about a quad's size.
+fn curvature_tensors(g: &Graph, passes: usize) -> Vec<glam::Mat3> {
+    let m = g.len();
+    let outer = |a: Vec3, b: Vec3| glam::Mat3::from_cols(a * b.x, a * b.y, a * b.z);
+    let mut t: Vec<glam::Mat3> = (0..m)
+        .into_par_iter()
+        .map(|i| {
+            let (p, n) = (g.p[i], g.n[i]);
+            let u = n.any_orthonormal_vector();
+            let v = n.cross(u);
+            // Normal equations for II = [a b; b c]: κ(x, y) = a x² + 2b xy + c y².
+            let mut ata = glam::Mat3::ZERO;
+            let mut atb = Vec3::ZERO;
+            let mut add = |j: usize| {
+                let d = g.p[j] - p;
+                let dt = d - n * n.dot(d);
+                let l2 = dt.length_squared();
+                if l2 < 1e-20 {
+                    return;
+                }
+                let k = (g.n[j] - n).dot(dt) / l2;
+                let l = l2.sqrt();
+                let (x, y) = (dt.dot(u) / l, dt.dot(v) / l);
+                let row = Vec3::new(x * x, 2.0 * x * y, y * y);
+                ata += outer(row, row);
+                atb += row * k;
+            };
+            for &j in g.neighbours(i) {
+                add(j as usize);
+                for &k in g.neighbours(j as usize) {
+                    if k as usize != i {
+                        add(k as usize);
+                    }
+                }
+            }
+            if ata.determinant().abs() < 1e-9 {
+                return glam::Mat3::ZERO;
+            }
+            let abc = (ata + glam::Mat3::IDENTITY * 1e-6).inverse() * atb;
+            outer(u, u) * abc.x + (outer(u, v) + outer(v, u)) * abc.y + outer(v, v) * abc.z
+        })
+        .collect();
+    for _ in 0..passes {
+        t = (0..m)
+            .into_par_iter()
+            .map(|i| {
+                let nb = g.neighbours(i);
+                if nb.is_empty() {
+                    return t[i];
+                }
+                let mut sum = glam::Mat3::ZERO;
+                for &j in nb {
+                    sum += t[j as usize];
+                }
+                t[i] * 0.5 + sum * (0.5 / nb.len() as f32)
+            })
+            .collect();
+    }
+    t
+}
+
+/// Follow Shape: where the surface bends clearly more one way than the other, a pull of the
+/// direction field toward the way it bends most (a quarter turn of the way it bends least,
+/// which the four-way field treats as the same), by `strength` (0..=1) and by how clear the
+/// difference is over a quad of size `quad`. Flat and evenly rounded parts are left alone.
+fn shape_pulls(g: &Graph, tensors: &[glam::Mat3], quad: f32, strength: f32) -> Vec<Pull> {
+    (0..g.len())
+        .into_par_iter()
+        .map(|i| {
+            let n = g.n[i];
+            let u = n.any_orthonormal_vector();
+            let v = n.cross(u);
+            let t = tensors[i];
+            let (a, b, c) = (u.dot(t * u), u.dot(t * v), v.dot(t * v));
+            let mean = 0.5 * (a + c);
+            let half = (0.25 * (a - c) * (a - c) + b * b).sqrt();
+            let (k1, k2) = (mean + half, mean - half);
+            let diff = k1 - k2;
+            if diff <= 0.0 {
+                return Pull::default();
+            }
+            // How lopsided: 0 on a ball or a plane, 1 on a cylinder or a saddle.
+            let lopsided = (diff / (k1.abs() + k2.abs()).max(1e-12)).clamp(0.0, 1.0);
+            // How much the turn differs across one quad: clear from about 8°.
+            let clear = (diff * quad / 0.15).clamp(0.0, 1.0);
+            let w = strength * lopsided * lopsided * clear;
+            if w < 0.02 {
+                return Pull::default();
+            }
+            let angle = 0.5 * (2.0 * b).atan2(a - c);
+            let dir = u * angle.cos() + v * angle.sin();
+            Pull { dir, at: g.p[i], w, lattice: false }
+        })
+        .collect()
 }
 
 /// Union-find.
@@ -809,6 +921,18 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     // Quad size, and the lattice step: twice it, as every face is split in the end.
     let quad = (area / target).sqrt();
     let scale = quad * 2.0;
+    if s.layout && !s.freeze_border {
+        match layout::quads(mesh, s, guides, seams, features, cut, quad) {
+            Ok((out_p, quads)) => {
+                stats.planned = true;
+                let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
+                let g = Guides::new(guides, quad);
+                let closed = crate::wedge::closed(mesh);
+                return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12), closed, cut, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
+            }
+            Err(why) => stats.fallback = Some(why),
+        }
+    }
 
     // 1. Samples: subdivide until edges are well under the cell size.
     let groups: Vec<u16> = if s.keep_groups { (0..mesh.triangle_count() as u32).map(|t| mesh.group(t)).collect() } else { Vec::new() };
@@ -848,15 +972,40 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let guides = Guides::new(guides, quad);
     let seams: Vec<Vec<Vec3>> = seams.iter().chain(&features.lines).cloned().collect();
     let seams = Guides::new(&seams, quad);
-    // A seam holds fully, ahead of any guide.
+    // Follow Shape: the bending of the surface, read at the finest level and averaged
+    // into the coarser ones.
+    let follow = (s.follow_shape / 100.0).clamp(0.0, 1.0);
+    let mut tensors: Vec<Vec<glam::Mat3>> = Vec::new();
+    if follow > 0.0 {
+        tensors.push(curvature_tensors(&levels[0].0, 4));
+        for l in 1..levels.len() {
+            let mut sum = vec![glam::Mat3::ZERO; levels[l].0.len()];
+            let mut cnt = vec![0.0f32; levels[l].0.len()];
+            for (i, &pa) in levels[l - 1].1.iter().enumerate() {
+                sum[pa as usize] += tensors[l - 1][i];
+                cnt[pa as usize] += 1.0;
+            }
+            tensors.push(sum.iter().zip(&cnt).map(|(t, &c)| *t * (1.0 / c.max(1.0))).collect());
+        }
+    }
+    crate::jobs::check()?;
+    // A seam holds fully, ahead of any guide; a guide ahead of the shape.
     let pull: Vec<Vec<Pull>> = levels
         .iter()
         .zip(&cells)
-        .map(|((g, _), &c)| {
+        .enumerate()
+        .map(|(l, ((g, _), &c))| {
             let mut p = pulls(g, &guides, c * 0.75, strength);
             for (x, y) in p.iter_mut().zip(pulls(g, &seams, c * 0.75, 1.0)) {
                 if y.w > 0.0 {
                     *x = y;
+                }
+            }
+            if follow > 0.0 {
+                for (x, y) in p.iter_mut().zip(shape_pulls(g, &tensors[l], quad, follow)) {
+                    if x.w <= 0.0 {
+                        *x = y;
+                    }
                 }
             }
             p
@@ -1273,6 +1422,28 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
             quads.push([f[i], ms[i], c, ms[(i + k - 1) % k]]);
         }
     }
+    finish(mesh, s, out_p, quads, &Finish { passes: 4, closed, cut, biggest, guides: &guides, strength, quad, features, start }, stats)
+}
+
+/// What the last stage needs from the one before.
+struct Finish<'a> {
+    /// Relax passes (the planned layout's lines zigzag along the working mesh).
+    passes: usize,
+    closed: bool,
+    cut: Option<MirrorPlane>,
+    /// The longest lattice step: how far a vertex may be from the old surface.
+    biggest: f32,
+    guides: &'a Guides,
+    strength: f32,
+    quad: f32,
+    features: &'a Features,
+    start: Instant,
+}
+
+/// The last stage: quads `quads` on points `out_p` are put onto the old surface, spaced
+/// evenly along it, put on guides, edge lines and polygroup borders, and triangulated.
+fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<[u32; 4]>, f: &Finish, mut stats: Stats) -> Result<(SculptMesh, Stats), String> {
+    let Finish { passes, closed, cut, biggest, guides, strength, quad, features, start } = *f;
     // FreezeBorder: the old open borders come back exactly, each joined to the new border
     // nearest it by a strip. A triangle is kept as a quad with its last corner repeated.
     let mut pinned = vec![false; out_p.len()];
@@ -1308,7 +1479,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
             }
         }
     }
-    for pass in 0..4 {
+    for pass in 0..passes {
         normals(&out_p, &mut vnorm);
         if pass > 0 {
             let relaxed: Vec<Vec3> = (0..out_p.len())
@@ -2087,5 +2258,324 @@ mod quad_tests {
             k
         };
         assert_ne!(key(&alt), key(&out), "Alt lays the loops out differently");
+    }
+}
+
+/// Follow Shape: shapes with a known way of bending, and how well the loops follow it.
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    /// A closed surface of revolution round Y through `profile` (radius, height), each
+    /// segment cut `fine` times, `seg` round.
+    pub fn revolve(profile: &[(f32, f32)], fine: usize, seg: usize) -> SculptMesh {
+        let mut pts: Vec<(f32, f32)> = Vec::new();
+        for w in profile.windows(2) {
+            for k in 0..fine {
+                let t = k as f32 / fine as f32;
+                pts.push((w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t));
+            }
+        }
+        pts.push(*profile.last().unwrap());
+        let mut pos = Vec::new();
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for &(r, y) in &pts {
+            if r <= 1e-6 {
+                pos.push(Vec3::new(0.0, y, 0.0));
+                rows.push(vec![(pos.len() - 1) as u32; seg]);
+            } else {
+                let base = pos.len() as u32;
+                for s in 0..seg {
+                    let a = s as f32 / seg as f32 * std::f32::consts::TAU;
+                    pos.push(Vec3::new(r * a.cos(), y, -r * a.sin()));
+                }
+                rows.push((0..seg as u32).map(|s| base + s).collect());
+            }
+        }
+        let mut idx = Vec::new();
+        for w in rows.windows(2) {
+            for s in 0..seg {
+                let (a, b, c, d) = (w[0][s], w[0][(s + 1) % seg], w[1][s], w[1][(s + 1) % seg]);
+                for t in [[a, b, c], [b, d, c]] {
+                    if t[0] != t[1] && t[1] != t[2] && t[0] != t[2] {
+                        idx.extend_from_slice(&t);
+                    }
+                }
+            }
+        }
+        SculptMesh::from_raw(pos, idx)
+    }
+
+    pub fn rook() -> SculptMesh {
+        let p = [
+            (0.0, 0.0), (1.0, 0.0), (1.0, 0.15), (0.88, 0.2), (0.88, 0.3), (0.62, 0.42),
+            (0.42, 1.35), (0.62, 1.45), (0.62, 1.55), (0.48, 1.6), (0.55, 1.75), (0.55, 2.05), (0.0, 2.05),
+        ];
+        revolve(&p, 12, 160)
+    }
+
+    pub fn vase() -> SculptMesh {
+        let p: Vec<(f32, f32)> = (0..=40).map(|k| {
+            let y = k as f32 / 40.0 * 2.0;
+            (0.55 + 0.3 * (y * 2.2).sin() + 0.1 * (y * 5.0).cos(), y)
+        }).collect();
+        let mut prof = vec![(0.0, 0.0)];
+        prof.extend(p);
+        prof.push((0.0, 2.0));
+        revolve(&prof, 4, 160)
+    }
+
+    pub fn torus() -> SculptMesh {
+        let (n, m) = (160usize, 64usize);
+        let mut pos = Vec::new();
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            for j in 0..m {
+                let b = j as f32 / m as f32 * std::f32::consts::TAU;
+                let r = 1.0 + 0.35 * b.cos();
+                pos.push(Vec3::new(r * a.cos(), 0.35 * b.sin(), -r * a.sin()));
+            }
+        }
+        let mut idx = Vec::new();
+        let at = |i: usize, j: usize| ((i % n) * m + j % m) as u32;
+        for i in 0..n {
+            for j in 0..m {
+                let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
+                idx.extend_from_slice(&[a, b, c, c, b, d]);
+            }
+        }
+        SculptMesh::from_raw(pos, idx)
+    }
+
+    /// A head-like blob: a stretched ball with two sockets, a brow ridge and a nose.
+    pub fn blob() -> SculptMesh {
+        let (p, i) = crate::mesh::cube_sphere(96, 1.0);
+        let feats = [
+            (Vec3::new(0.35, 0.25, 0.85), -0.22, 0.22),
+            (Vec3::new(-0.35, 0.25, 0.85), -0.22, 0.22),
+            (Vec3::new(0.0, -0.05, 1.0), 0.25, 0.14),
+            (Vec3::new(0.0, 0.5, 0.85), 0.08, 0.35),
+        ];
+        let p = p.into_iter().map(|v| {
+            let mut r = 1.0;
+            for (c, a, s) in feats {
+                r += a * (-(v - c).length_squared() / (s * s)).exp();
+            }
+            v * r * Vec3::new(0.9, 1.2, 1.0)
+        }).collect();
+        SculptMesh::from_raw(p, i)
+    }
+
+    /// The polygons of `m`: quads from paired triangles, the rest as triangles.
+    pub fn polygons(m: &SculptMesh) -> Vec<Vec<u32>> {
+        let mut out = Vec::new();
+        for t in 0..m.triangle_count() as u32 {
+            let tri = &m.indices[t as usize * 3..t as usize * 3 + 3];
+            match m.quad_partner(t) {
+                Some(p) if p < t => {}
+                Some(p) => {
+                    let o = &m.indices[p as usize * 3..p as usize * 3 + 3];
+                    let k = (0..3).find(|&k| o.contains(&tri[k]) && o.contains(&tri[(k + 1) % 3])).unwrap_or(0);
+                    let d = *o.iter().find(|v| !tri.contains(v)).unwrap();
+                    out.push(vec![tri[k], d, tri[(k + 1) % 3], tri[(k + 2) % 3]]);
+                }
+                None => out.push(tri.to_vec()),
+            }
+        }
+        out
+    }
+
+    /// Interior vertices with other than four edges, and all interior vertices.
+    pub fn irregular(m: &SculptMesh) -> (usize, usize) {
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+        for f in polygons(m) {
+            for k in 0..f.len() {
+                let (a, b) = (f[k], f[(k + 1) % f.len()]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let mut val = vec![0u32; m.positions.len()];
+        let mut border = vec![false; m.positions.len()];
+        for (&(a, b), &c) in &edges {
+            val[a as usize] += 1;
+            val[b as usize] += 1;
+            if c == 1 {
+                border[a as usize] = true;
+                border[b as usize] = true;
+            }
+        }
+        let inner: Vec<usize> = (0..val.len()).filter(|&v| val[v] > 0 && !border[v]).collect();
+        (inner.iter().filter(|&&v| val[v] != 4).count(), inner.len())
+    }
+
+    /// For a shape turned round Y: the mean angle (degrees) between the quads' edges on its
+    /// sides and the nearest of round / along, skipping caps and the axis.
+    pub fn misalignment(m: &SculptMesh) -> f32 {
+        let (mut sum, mut n) = (0.0f32, 0usize);
+        for f in polygons(m).into_iter().filter(|f| f.len() == 4) {
+            let p: Vec<Vec3> = f.iter().map(|&v| m.positions[v as usize]).collect();
+            let nrm = (p[2] - p[0]).cross(p[3] - p[1]).normalize_or_zero();
+            let c = (p[0] + p[1] + p[2] + p[3]) * 0.25;
+            if nrm.y.abs() > 0.8 || Vec3::new(c.x, 0.0, c.z).length() < 0.15 {
+                continue;
+            }
+            let round = Vec3::Y.cross(c).normalize_or_zero();
+            for k in 0..4 {
+                let e = (p[(k + 1) % 4] - p[k]).normalize_or_zero();
+                let a = e.dot(round).abs().clamp(0.0, 1.0).acos().to_degrees();
+                sum += a.min(90.0 - a).abs();
+                n += 1;
+            }
+        }
+        sum / n.max(1) as f32
+    }
+
+    #[test]
+    fn follow_shape_runs_loops_round_and_along_a_torus_and_a_vase() {
+        for (name, m) in [("torus", torus()), ("vase", vase())] {
+            let run = |follow: f32| misalignment(&zremesh(&m, &Settings { target_k: 1.5, keep_groups: false, follow_shape: follow, ..Settings::default() }, &[]).unwrap().0);
+            let (off, on) = (run(0.0), run(60.0));
+            eprintln!("{name}: {off:.1}° off, {on:.1}° with Follow Shape");
+            assert!(on < off * 0.75, "{name}: {off:.1}° off, {on:.1}° on");
+        }
+    }
+
+    #[test]
+    fn follow_shape_leaves_a_ball_alone() {
+        let (p, i) = crate::mesh::cube_sphere(48, 1.0);
+        let m = SculptMesh::from_raw(p, i);
+        let (irr, inner) = irregular(&zremesh(&m, &Settings { target_k: 1.0, keep_groups: false, ..Settings::default() }, &[]).unwrap().0);
+        assert!((irr as f32) < inner as f32 * 0.08, "{irr} of {inner}");
+    }
+
+    fn write_obj(m: &SculptMesh, path: &std::path::Path) {
+        use std::fmt::Write;
+        let mut s = String::new();
+        for p in &m.positions {
+            writeln!(s, "v {} {} {}", p.x, p.y, p.z).unwrap();
+        }
+        for f in polygons(m) {
+            s.push('f');
+            for v in f {
+                write!(s, " {}", v + 1).unwrap();
+            }
+            s.push('\n');
+        }
+        std::fs::write(path, s).unwrap();
+    }
+
+    /// `KLAY_ZR_DUMP=dir cargo test --release zremesh::shape_tests::dump -- --ignored
+    /// --nocapture`: every shape remeshed with Follow Shape off and on, as OBJ, with numbers.
+    #[test]
+    #[ignore]
+    fn dump() {
+        let dir = std::path::PathBuf::from(std::env::var("KLAY_ZR_DUMP").expect("KLAY_ZR_DUMP"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ball = { let (p, i) = crate::mesh::cube_sphere(48, 1.0); SculptMesh::from_raw(p, i) };
+        let cube = { let (p, i) = crate::primitive::box_surface([24; 3], |p| p); SculptMesh::from_raw(p, i) };
+        let shapes: [(&str, SculptMesh, f32, bool); 6] = [("ball", ball, 1.0, false), ("cube", cube, 1.0, false), ("torus", torus(), 1.5, true), ("vase", vase(), 2.0, true), ("rook", rook(), 2.0, true), ("blob", blob(), 2.5, false)];
+        let only = std::env::var("ZR_ONLY").ok();
+        let mut shapes: Vec<(&str, SculptMesh, f32, bool)> = shapes.into_iter().collect();
+        // ZR_OBJ=file.obj: a model from disk as "obj" (ZR_K thousand quads, default 5),
+        // corners welded by position.
+        if let Ok(path) = std::env::var("ZR_OBJ") {
+            let text = std::fs::read_to_string(&path).expect("ZR_OBJ");
+            let mut pos: Vec<Vec3> = Vec::new();
+            let mut idx: Vec<u32> = Vec::new();
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                match it.next() {
+                    Some("v") => {
+                        let c: Vec<f32> = it.take(3).map(|x| x.parse().unwrap_or(0.0)).collect();
+                        pos.push(Vec3::new(c[0], c[1], c[2]));
+                    }
+                    Some("f") => {
+                        let vs: Vec<u32> = it.map(|t| t.split('/').next().unwrap().parse::<i64>().unwrap()).map(|i| if i < 0 { (pos.len() as i64 + i) as u32 } else { (i - 1) as u32 }).collect();
+                        for k in 1..vs.len().saturating_sub(1) {
+                            idx.extend_from_slice(&[vs[0], vs[k], vs[k + 1]]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut weld: HashMap<[u32; 3], u32> = HashMap::default();
+            let mut np: Vec<Vec3> = Vec::new();
+            let remap: Vec<u32> = pos.iter().map(|p| *weld.entry(p.to_array().map(f32::to_bits)).or_insert_with(|| { np.push(*p); (np.len() - 1) as u32 })).collect();
+            let idx: Vec<u32> = idx.into_iter().map(|i| remap[i as usize]).collect();
+            let idx: Vec<u32> = idx.chunks_exact(3).filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]).flatten().copied().collect();
+            eprintln!("obj: {} vertices, {} triangles", np.len(), idx.len() / 3);
+            let k: f32 = std::env::var("ZR_K").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
+            let mut m = SculptMesh::from_raw(np, idx);
+            let b = m.bounds();
+            eprintln!("obj: size {:.3}", b.max - b.min);
+            // ZR_VOXEL=res: voxel remesh first (DynaMesh), projected onto the model.
+            if let Some(res) = std::env::var("ZR_VOXEL").ok().and_then(|v| v.parse::<u32>().ok()) {
+                let t = std::time::Instant::now();
+                let o = crate::wedge::remesh(&m, &crate::wedge::Settings { resolution: res, blur: 1, project: true }).expect("voxel");
+                // The largest piece only (voxels leave crumbs), and how many handles are left.
+                let (p, i) = (o.positions, o.indices);
+                let mut parent: Vec<u32> = (0..p.len() as u32).collect();
+                fn root(par: &mut [u32], mut x: u32) -> u32 {
+                    while par[x as usize] != x {
+                        par[x as usize] = par[par[x as usize] as usize];
+                        x = par[x as usize];
+                    }
+                    x
+                }
+                for t in i.chunks_exact(3) {
+                    let a = root(&mut parent, t[0]);
+                    for &v in &t[1..] {
+                        let b = root(&mut parent, v);
+                        if a != b {
+                            parent[b as usize] = a;
+                        }
+                    }
+                }
+                let mut size: HashMap<u32, usize> = HashMap::default();
+                for t in i.chunks_exact(3) {
+                    *size.entry(root(&mut parent, t[0])).or_default() += 1;
+                }
+                let big = size.iter().max_by_key(|x| *x.1).map(|x| *x.0).unwrap();
+                let keep: Vec<u32> = i.chunks_exact(3).filter(|t| root(&mut parent, t[0]) == big).flatten().copied().collect();
+                eprintln!("obj: voxel {res}: {} pieces, keeping {} of {} triangles", size.len(), keep.len() / 3, i.len() / 3);
+                m = SculptMesh::from_raw(p, keep);
+                let mut edges: crate::fx::FxHashSet<(u32, u32)> = Default::default();
+                for t in m.indices.chunks_exact(3) {
+                    for k in 0..3 {
+                        let (a, b) = (t[k], t[(k + 1) % 3]);
+                        edges.insert((a.min(b), a.max(b)));
+                    }
+                }
+                let used: crate::fx::FxHashSet<u32> = m.indices.iter().copied().collect();
+                let chi = used.len() as i64 - edges.len() as i64 + m.triangle_count() as i64;
+                eprintln!("obj: {} vertices, {} triangles, Euler {chi} (handles {}), {:.1} s", m.vertex_count(), m.triangle_count(), (2 - chi) / 2, t.elapsed().as_secs_f32());
+            }
+            shapes.push(("obj", m, k, false));
+        }
+        for (name, m, k, turned) in shapes {
+            if only.as_deref().is_some_and(|o| !o.split(',').any(|x| x == name)) {
+                continue;
+            }
+            write_obj(&m, &dir.join(format!("{name}-input.obj")));
+            let mirrored = std::env::var_os("ZR_MIRROR").is_some();
+            for planned in [false, true] {
+                let follow: f32 = std::env::var("ZR_FOLLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
+                let detect = std::env::var("ZR_EDGES").map(|v| v != "0").unwrap_or(true);
+                let s = Settings { target_k: k, keep_groups: false, layout: planned, mirror: mirrored.then_some(TEST_X_PLANE), follow_shape: follow, detect_edges: detect, ..Settings::default() };
+                let (out, st) = match zremesh(&m, &s, &[]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{name:6} {}: error {e}", if planned { "new" } else { "old" });
+                        continue;
+                    }
+                };
+                let (irr, inner) = irregular(&out);
+                let mis = if turned { misalignment(&out) } else { f32::NAN };
+                let tag = if planned { "new" } else { "old" };
+                eprintln!("{name:6} {tag}: {} quads, {irr} poles of {inner} ({:.1}%), misaligned {mis:.1}°, {:.0} ms, planned {} {:?}", st.quads, irr as f32 * 100.0 / inner.max(1) as f32, st.ms, st.planned, st.fallback);
+                let follow = if planned { 1 } else { 0 };
+                write_obj(&out, &dir.join(format!("{name}-{}.obj", ["old", "new"][follow])));
+            }
+        }
     }
 }

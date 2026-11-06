@@ -425,7 +425,10 @@ Geometry › **ZRemesher** rebuilds the active subtool as clean quads whose edge
 its form, at about **Target Polygons Count** thousand quads (**Half / Same / Double** set it
 from the subtool's polygons now). **AdaptiveSize** (0–100, default 50) makes quads smaller
 where the surface curves more and larger where it is flat, by up to half and twice the
-even size, keeping about the target count. With **KeepGroups** edge loops run along the polygroup
+even size, keeping about the target count. **Follow Shape** (0–100, default 60) turns the
+edge loops toward the way the surface bends where it bends more one way than the other:
+round a cylinder, a limb or a torus, along a ridge, round a hollow. Flat and evenly rounded
+areas (a plane, a ball) are left to the plain smoothing. With **KeepGroups** edge loops run along the polygroup
 borders, and vertices on a border are put exactly on it, so a polygrouped hard-surface
 part keeps crisp edges and corners. Holes in a closed surface are closed; the result is
 all quads (a few three- and five-sided poles where the surface needs them). One undo
@@ -468,7 +471,7 @@ is empty, try **SubTool Center** or choose another axis.
 
 **KeepCreases** (on by default) runs an edge loop exactly along every creased edge (see
 Crease below) and creases the new edges there again, so the next Divide keeps them sharp.
-**Detect Edges** does the same along sharp edges, where the surface turns by more than 40°,
+**Detect Edges** (on by default) does the same along sharp edges, where the surface turns by more than 40°,
 counting only lines at least two quads long so surface noise does not; on a cube the loops
 land on all twelve edges and all eight corners. **FreezeBorder** keeps every open border
 exactly as it was, vertex for vertex, and joins it to the new quads by one strip (quads, with

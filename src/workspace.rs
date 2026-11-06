@@ -4685,6 +4685,8 @@ impl Workspace {
                         }
                     });
                     zslider(ui, "AdaptiveSize", &mut ws.zremesh.adaptive, 0.0..=100.0, false, false, 0);
+                    // Edge loops follow the way the surface bends: round limbs, along ridges, round hollows.
+                    zslider(ui, "Follow Shape", &mut ws.zremesh.follow_shape, 0.0..=100.0, false, false, 0);
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut ws.zremesh.keep_groups, "KeepGroups")
                             .on_hover_text("Edge loops run along polygroup borders");
