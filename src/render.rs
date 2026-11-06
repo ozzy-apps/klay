@@ -48,6 +48,8 @@ pub struct Uniforms {
     pub sym: [f32; 4],
     /// The Transpose preview's stretch: unit axis and the logarithm of the factor (0: none).
     pub xf_stretch: [f32; 4],
+    /// Active SubTool symmetry center (xyz) and floor height (w).
+    pub scene: [f32; 4],
 }
 
 /// Uniform of the normal passes (see `normals.wgsl`). Written once per frame that needs
@@ -325,6 +327,8 @@ struct GroupBuffers {
 /// Base geometry uses 40 bytes per vertex (positions 12, baked
 /// normals 4, indices 24), no normal pass, no chunk tables.
 struct StandInBuffers {
+    bounds: crate::mesh::Aabb,
+    preview_points: Vec<glam::Vec3>,
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
     colors: wgpu::Buffer,
@@ -1394,6 +1398,8 @@ impl Gfx {
         self.stand_ins.insert(
             id,
             StandInBuffers {
+                bounds: s.bounds,
+                preview_points: if id == DYNAMIC_KEY { s.visible_positions() } else { Vec::new() },
                 positions,
                 normals,
                 colors,
@@ -1403,6 +1409,15 @@ impl Gfx {
             },
         );
         true
+    }
+
+    /// The active model's displayed preview can have a different floor from its cage.
+    pub fn dynamic_floor_y(&self, map: &crate::transform::Affine) -> Option<f32> {
+        let stand_in = self.stand_ins.get(&DYNAMIC_KEY).filter(|_| self.dynamic)?;
+        Some(map.floor_y(stand_in.bounds).unwrap_or_else(|| {
+            use rayon::prelude::*;
+            stand_in.preview_points.par_iter().map(|&p| map.apply(p).y).reduce(|| f32::INFINITY, f32::min)
+        }))
     }
 
     /// Triangles drawn for the active level (fewer than it has while some are hidden).

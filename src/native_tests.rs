@@ -439,8 +439,9 @@ impl App {
         };
         let frame = t.frame;
         t.frame += 1;
-        let sym = crate::symmetry::Symmetry { y: true, radial: Some((crate::symmetry::Axis::Z, 6)), ..Default::default() };
-        let start = Vec3::new(0.55, 0.2, 0.81).normalize();
+        let center = Vec3::new(2.0, -1.25, 0.45);
+        let sym = crate::symmetry::Symmetry { center, y: true, radial: Some((crate::symmetry::Axis::Z, 6)), ..Default::default() };
+        let start = center + Vec3::new(0.55, 0.2, 0.81).normalize();
         let check_gpu = |app: &App| {
             let gpu = app.gfx.as_ref().and_then(Gfx::read_positions).unwrap_or_default();
             let error = gpu.iter().zip(&app.mesh().positions).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
@@ -453,7 +454,13 @@ impl App {
                 self.workspace.radial = true;
                 self.workspace.radial_axis = crate::symmetry::Axis::Z;
                 self.workspace.radial_count = 6.0;
-                assert_eq!(self.workspace.sym(), sym);
+                if t.index == 0 {
+                    self.apply_transform(Affine::translation(center));
+                    self.camera.target += center;
+                }
+                let actual = self.sculpt_symmetry();
+                assert!(actual.center.abs_diff_eq(center, 1e-5));
+                assert_eq!(actual.label(), sym.label());
                 t.original = self.mesh().positions.clone();
                 self.workspace.select_brush(&mut self.brush, kind);
                 self.brush.radius = 0.2;
@@ -475,7 +482,7 @@ impl App {
                     let v = (0..t.original.len()).min_by(|&a, &b| t.original[a].distance(q).total_cmp(&t.original[b].distance(q))).unwrap();
                     t.edited[v].distance(t.original[v])
                 };
-                let least = (0..images.len()).map(|k| moved(images.map(k, start))).fold(f32::INFINITY, f32::min);
+                let least = (0..images.len()).map(|k| moved(images.map_point(k, start))).fold(f32::INFINITY, f32::min);
                 assert!(least > 1e-4, "{kind:?}: every one of the {} copies moves (least {least})", images.len());
                 check_gpu(self);
                 self.history.undo(&mut self.doc);
@@ -492,7 +499,7 @@ impl App {
                 check_gpu(self);
                 self.history.undo(&mut self.doc);
                 self.show_active_level();
-                log::info!("selftest-symmetry: {} with Y and Radial Z 6 ({} copies): canvas, GPU, undo and redo (ok)", kind.name(), sym.images().len());
+                log::info!("selftest-symmetry: {} with off-center Y and Radial Z 6 ({} copies): canvas, GPU, undo and redo (ok)", kind.name(), sym.images().len());
                 t.index += 1;
                 t.frame = 18;
             }

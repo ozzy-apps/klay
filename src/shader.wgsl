@@ -26,6 +26,8 @@ struct Uniforms {
     sym: vec4<f32>,
     // Transpose preview stretch: unit axis, w = log of the factor (0 none).
     xf_stretch: vec4<f32>,
+    // Active SubTool symmetry center (xyz) and floor height (w).
+    scene: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -89,13 +91,13 @@ fn fs_background(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     let origin = near_h.xyz / near_h.w;
     let direction = normalize(far_h.xyz / far_h.w - origin);
     let safe_y = select(-0.00001, direction.y, abs(direction.y) > 0.00001);
-    let t = (-1.12 - origin.y) / safe_y;
+    let t = (u.scene.w - origin.y) / safe_y;
     let point = origin + direction * t;
     let grid_pos = point.xz * 4.0;
     let width = max(fwidth(grid_pos), vec2<f32>(0.001));
     let lines = abs(fract(grid_pos - 0.5) - 0.5) / width;
     let grid_line = 1.0 - min(min(lines.x, lines.y), 1.0);
-    let fade = exp(-length(point.xz) * 0.30) * smoothstep(0.02, 0.25, abs(direction.y));
+    let fade = exp(-length(point.xz - u.cam_pos.xz) * 0.30) * smoothstep(0.02, 0.25, abs(direction.y));
     let visible = select(0.0, 1.0, t > 0.0 && u.display.x > 0.5);
     // The border around the document frame: flat Border colour, nothing drawn on it.
     let inset = u.back_shape.z;
@@ -346,7 +348,7 @@ fn shade(in: VsOut, base: vec3<f32>) -> vec4<f32> {
         var d = distance(in.world_pos, u.brush.xyz);
         // Symmetry: a ring at every image of the brush (as symmetry.rs makes them).
         if (u.display.y > 0.5) {
-            d = min(d, symmetric_distance(in.world_pos, u.brush.xyz));
+            d = min(d, symmetric_distance(in.world_pos - u.scene.xyz, u.brush.xyz - u.scene.xyz));
         }
         let r = u.brush.w;
         let px = u.params.z;

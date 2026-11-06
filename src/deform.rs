@@ -178,22 +178,15 @@ fn relax_along(mesh: &SculptMesh, lines: &[Option<Vec<u32>>], p: &[Vec3], k: f32
 /// deformations.
 pub fn smart_resym(mesh: &SculptMesh, axis: usize, from_negative: bool) -> Option<Vec<Vec3>> {
     let sign = if from_negative { -1.0 } else { 1.0 };
-    let mirror = |mut q: Vec3| {
-        q[axis] = -q[axis];
-        q
-    };
-    let (lo, hi) = mesh
-        .positions
-        .par_iter()
-        .fold(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &p| (a.min(p), b.max(p)))
-        .reduce(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |x, y| (x.0.min(y.0), x.1.max(y.1)));
-    let tol = (hi - lo).max_element().max(1e-6) * 1e-5;
+    let bounds = mesh.bounds();
+    let plane = crate::symmetry::MirrorPlane { axis: crate::symmetry::Axis::ALL[axis], at: bounds.center()[axis] };
+    let tol = (bounds.max - bounds.min).max_element().max(1e-6) * 1e-5;
     // The kept side: triangles whose centre is on it (or on the plane).
     let p = &mesh.positions;
     let tri: Vec<[u32; 3]> = mesh
         .indices
         .chunks_exact(3)
-        .filter(|t| (p[t[0] as usize][axis] + p[t[1] as usize][axis] + p[t[2] as usize][axis]) * sign >= -3.0 * tol)
+        .filter(|t| (plane.distance(p[t[0] as usize]) + plane.distance(p[t[1] as usize]) + plane.distance(p[t[2] as usize])) * sign >= -3.0 * tol)
         .map(|t| [t[0], t[1], t[2]])
         .collect();
     if tri.is_empty() {
@@ -204,18 +197,17 @@ pub fn smart_resym(mesh: &SculptMesh, axis: usize, from_negative: bool) -> Optio
         .into_par_iter()
         .map(|v| {
             let q = p[v as usize];
-            let side = q[axis] * sign;
+            let side = plane.distance(q) * sign;
             if side > tol {
                 return q;
             }
             if side >= -tol {
-                let mut on = q;
-                on[axis] = 0.0;
-                return on;
+                return plane.project(q);
             }
-            let image = mirror(q);
-            let facing = mirror(mesh.normal_at(v));
-            kept.closest(image, facing).or_else(|| kept.closest(image, Vec3::ZERO)).map_or(q, |(x, _)| mirror(x))
+            let image = plane.reflect(q);
+            let mut facing = mesh.normal_at(v);
+            facing[axis] = -facing[axis];
+            kept.closest(image, facing).or_else(|| kept.closest(image, Vec3::ZERO)).map_or(q, |(x, _)| plane.reflect(x))
         })
         .collect();
     held(mesh, moved)

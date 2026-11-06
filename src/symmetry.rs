@@ -1,11 +1,11 @@
 //! Symmetry, ZBrush style (Transform › Activate Symmetry): mirror planes across X, Y and Z
 //! and Radial symmetry about one axis with a count. Together they make a set of images, each
-//! an orthogonal map through the origin; a brush applied at a point also applies at every
+//! an orthogonal map about the active SubTool center; a brush applied at a point also applies at every
 //! image of it, mirrored or turned like its image.
 //!
 //! Brushes select once for all images ([`crate::mesh::SculptMesh::select_sphere_images`]):
 //! every vertex goes to the nearest image of the brush, and the brush works in that image's
-//! frame ([`Images::unmap`] into the brush's own frame, [`Images::map`] back out).
+//! frame ([`Images::unmap_point`] into the brush's own frame, [`Images::map_point`] back out).
 
 use glam::{Mat3, Vec3};
 
@@ -58,6 +58,14 @@ impl MirrorPlane {
         point
     }
 
+    pub fn reflect_plane(self, plane: glam::Vec4) -> glam::Vec4 {
+        let i = self.axis as usize;
+        let mut reflected = plane;
+        reflected[i] = -plane[i];
+        reflected.w += 2.0 * self.at * plane[i];
+        reflected
+    }
+
     pub fn fold(self, point: Vec3) -> Vec3 {
         if self.distance(point) < 0.0 { self.reflect(point) } else { point }
     }
@@ -70,12 +78,13 @@ pub const MAX_IMAGES: usize = 64;
 /// Which symmetry is on.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Symmetry {
-    /// Mirror across the plane through the origin perpendicular to X (Y, Z).
+    /// Mirror across the plane through the SubTool center perpendicular to X (Y, Z).
     pub x: bool,
     pub y: bool,
     pub z: bool,
     /// Radial: copies turned about this axis, this many in a full turn (2 or more).
     pub radial: Option<(Axis, u8)>,
+    pub center: Vec3,
 }
 
 /// `true` is ZBrush's default X symmetry.
@@ -87,7 +96,7 @@ impl From<bool> for Symmetry {
 
 impl Symmetry {
     pub fn is_on(&self) -> bool {
-        self.images().len() > 1
+        self.x || self.y || self.z || self.radial.is_some_and(|(_, count)| count >= 2)
     }
 
     /// Every image, the identity first. Duplicates (a radial half turn equals two mirrors)
@@ -114,7 +123,7 @@ impl Symmetry {
             }
         }
         unique.truncate(MAX_IMAGES);
-        Images(unique)
+        Images { maps: unique, center: self.center }
     }
 
     /// Short description for the interface, e.g. "X · Radial Z 8".
@@ -133,38 +142,64 @@ impl Symmetry {
 
 /// The images of a symmetry: orthogonal maps, the identity first.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Images(pub Vec<Mat3>);
+pub struct Images {
+    maps: Vec<Mat3>,
+    center: Vec3,
+}
 
 impl Images {
     /// No symmetry: the identity alone.
     pub fn identity() -> Self {
-        Images(vec![Mat3::IDENTITY])
+        Images { maps: vec![Mat3::IDENTITY], center: Vec3::ZERO }
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.maps.len()
     }
 
-    /// `v` (a point, direction or normal) in image `k`.
+    pub fn center(&self) -> Vec3 {
+        self.center
+    }
+
+    /// A direction or normal in image `k`.
     #[inline]
-    pub fn map(&self, k: usize, v: Vec3) -> Vec3 {
-        if k == 0 { v } else { self.0[k] * v }
+    pub fn map_vector(&self, k: usize, v: Vec3) -> Vec3 {
+        if k == 0 { v } else { self.maps[k] * v }
     }
 
     /// `v` in image `k` taken back to the brush's own frame (the maps are orthogonal).
     #[inline]
-    pub fn unmap(&self, k: usize, v: Vec3) -> Vec3 {
-        if k == 0 { v } else { self.0[k].transpose() * v }
+    pub fn unmap_vector(&self, k: usize, v: Vec3) -> Vec3 {
+        if k == 0 { v } else { self.maps[k].transpose() * v }
+    }
+
+    /// A position in image `k`, about the shared center.
+    #[inline]
+    pub fn map_point(&self, k: usize, p: Vec3) -> Vec3 {
+        if k == 0 { p } else { self.center + self.map_vector(k, p - self.center) }
+    }
+
+    /// A position in image `k` taken back to the brush's own frame.
+    #[inline]
+    pub fn unmap_point(&self, k: usize, p: Vec3) -> Vec3 {
+        if k == 0 { p } else { self.center + self.unmap_vector(k, p - self.center) }
+    }
+
+    /// An implicit plane (normal, constant) in image `k`.
+    pub fn map_plane(&self, k: usize, plane: glam::Vec4) -> glam::Vec4 {
+        let n = plane.truncate();
+        let mapped = self.map_vector(k, n);
+        mapped.extend(plane.w + (n - mapped).dot(self.center))
     }
 
     /// Whether image `k` mirrors (turns handedness), so patterns across a stroke flip.
     pub fn mirrors(&self, k: usize) -> bool {
-        self.0[k].determinant() < 0.0
+        self.maps[k].determinant() < 0.0
     }
 
     /// Every image of point `c`.
     pub fn of(&self, c: Vec3) -> Vec<Vec3> {
-        self.0.iter().map(|m| *m * c).collect()
+        (0..self.len()).map(|k| self.map_point(k, c)).collect()
     }
 }
 
@@ -178,9 +213,9 @@ mod tests {
         assert!(!Symmetry::default().is_on());
         let x = Symmetry::from(true).images();
         assert_eq!(x.len(), 2);
-        assert_eq!(x.map(1, Vec3::new(1.0, 2.0, 3.0)), Vec3::new(-1.0, 2.0, 3.0));
+        assert_eq!(x.map_point(1, Vec3::new(1.0, 2.0, 3.0)), Vec3::new(-1.0, 2.0, 3.0));
         assert!(x.mirrors(1) && !x.mirrors(0));
-        let xyz = Symmetry { x: true, y: true, z: true, radial: None }.images();
+        let xyz = Symmetry { x: true, y: true, z: true, radial: None, ..Default::default() }.images();
         assert_eq!(xyz.len(), 8);
         let radial = Symmetry { radial: Some((Axis::Z, 6)), ..Default::default() }.images();
         assert_eq!(radial.len(), 6);
@@ -189,16 +224,16 @@ mod tests {
             assert!((q.truncate().length() - 1.0).abs() < 1e-5 && (q.z - 0.5).abs() < 1e-6);
         }
         // A radial half turn about Z is X and Y mirrors together: no duplicates.
-        let both = Symmetry { x: true, y: true, z: false, radial: Some((Axis::Z, 2)) }.images();
+        let both = Symmetry { x: true, y: true, z: false, radial: Some((Axis::Z, 2)), ..Default::default() }.images();
         assert_eq!(both.len(), 4);
         // Mirror with radial: twice the radial count.
         assert_eq!(Symmetry { x: true, radial: Some((Axis::Y, 8)), ..Default::default() }.images().len(), 16);
         // Capped.
-        assert_eq!(Symmetry { x: true, y: true, z: true, radial: Some((Axis::Z, 64)) }.images().len(), MAX_IMAGES);
+        assert_eq!(Symmetry { x: true, y: true, z: true, radial: Some((Axis::Z, 64)), ..Default::default() }.images().len(), MAX_IMAGES);
         // unmap undoes map.
         let v = Vec3::new(0.3, -0.7, 0.2);
         for k in 0..xyz.len() {
-            assert!(xyz.unmap(k, xyz.map(k, v)).distance(v) < 1e-6);
+            assert!(xyz.unmap_point(k, xyz.map_point(k, v)).distance(v) < 1e-6);
         }
     }
 

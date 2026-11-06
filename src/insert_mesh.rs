@@ -52,7 +52,7 @@ pub fn inserted(shape: Primitive, segments: u32, at: Vec3, normal: Vec3, radius:
     let (mut positions, mut indices) = (Vec::with_capacity(placed.len() * images.len()), Vec::with_capacity(tris.len() * images.len()));
     for k in 0..images.len() {
         let first = positions.len() as u32;
-        positions.extend(placed.iter().map(|&p| images.map(k, p)));
+        positions.extend(placed.iter().map(|&p| images.map_point(k, p)));
         // A mirror image turns the triangles inside out; put their order back.
         let flip = images.mirrors(k);
         indices.extend(tris.chunks_exact(3).flat_map(|t| {

@@ -460,14 +460,12 @@ the rest a little. It adds to AdaptiveSize.
 
 Under **Mesh › ZRemesher › Symmetry**, choose **Force X**, **Force Y** or **Force Z** to
 mirror the remesh regardless of brush settings. **Brush symmetry** follows the first
-enabled brush mirror axis in X, Y, Z order. **Off** remeshes the entire shape. Turn on
-**SubTool Center** to use the midpoint of the SubTool's bounds on the selected axis.
-Clear it to use the scene origin.
+enabled brush mirror axis in X, Y, Z order. **Off** remeshes the entire shape.
+The mirror plane goes through the midpoint of the active SubTool's bounds.
 
 ZRemesher uses the positive side as the source, so differences on the negative side
 are replaced. The remesher holds a loop on the cut and welds it where the surface meets
-the plane. Guides on either side can steer the mirrored topology. If the positive half
-is empty, try **SubTool Center** or choose another axis.
+the plane. Guides on either side can steer the mirrored topology.
 
 **Plan Layout** (experimental, off) plans the whole quad layout before placing quads: lines
 from the direction field's poles cut the surface into patches, every patch side gets a whole
@@ -1083,8 +1081,10 @@ Export STL, Send to Slicer and Check Mesh can go on a shelf (Send to Strata cann
   **Group By Normals** starts a new group wherever the surface turns by more than **Max
   Angle** from where the group began (flat faces of a hard surface, patches of a curved one).
 - **Symmetry**: **X**, **Y** and **Z** mirrors and **Radial** about X, Y or Z with a
-  **RadialCount**, in any combination (up to 64 copies; the palette shows how many). Every
-  copy of a brush makes its own whole dab, one after another, so where copies overlap (a big
+  **RadialCount**, in any combination (up to 64 copies; the palette shows how many).
+  The axes pass through the active SubTool's bounds center, including hidden and disconnected
+  geometry. The center stays fixed for the duration of a stroke. Merge Down uses the bounds
+  of both parts. Every copy of a brush makes its own whole dab, one after another, so where copies overlap (a big
   brush, a stroke on a symmetry plane) both apply and the surface stays whole; drag brushes
   add up every copy's move there. Masks, mask shapes, curve reliefs and CurveTube follow
   every copy and the brush ring is drawn at each. Clip Line mirrors across X only.
@@ -1311,19 +1311,19 @@ the binary. The versioned AppDir bundles the executable, launcher, icon and docs
 | Selected Mask brush, left drag / Alt + left drag | Apply / erase the mask; Ctrl temporarily restores the last mask brush while sculpting |
 | Selected Clip Line, left drag | Push one side onto the guide on release. Space moves the line, Alt flips, Shift snaps, Escape cancels. |
 | `Q` `W` `E` `R` | Draw / Move / Scale / Rotate mode |
-| `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press (Shift snaps it to 45°) |
-| `W`, drag the line's middle circle | Move the active subtool in the view plane |
+| `W` / `E` / `R`, left drag on the active subtool | Draw a Transpose action line from the surface under the press. Shift snaps it to X, Y or Z. |
+| `W`, drag the line's middle circle | Move the active SubTool in the view plane. Hold Shift to follow an axis-aligned action line or lock to the axis closest to the drag. |
 | `E`, drag the line's end circle | Scale about the start circle by the change in distance to it (start circle: about the end) |
 | `R`, drag the line's end circle | Rotate about the start circle around the view axis (start circle: about the end) |
-| Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line; the model stays |
+| Drag a circle's outer ring / the line itself | Move that end of the action line / the whole line. Hold Shift to snap an end or move the whole line along one axis. |
 | `X` | Symmetry across X (Y, Z and Radial: Symmetry palette) |
 | `L` | LazyMouse |
-| `Y` | Gizmo 3D / action line in Move, Scale, Rotate |
+| `Y` | Gizmo 3D / action line in Move, Scale, Rotate. Shift + drag on the Gizmo’s free-move ring locks to one of its axes. |
 | Ctrl + `D` | Divide: add a subdivision level above the top one and show it |
 | `D` / Shift + `D` | Higher / lower subdivision level |
 | Alt + click another subtool | Select it (Alt + drag on the active one still carves) |
 | `F` | Frame the visible subtools (the shown part of the active one) |
-| `P` / Shift + `P` | Perspective toggle / floor grid |
+| `P` / Shift + `P` | Perspective toggle / floor grid. The grid meets the lowest visible SubTool, following visibility, Solo and transform previews. |
 | `Home` | Reset the view angle and frame |
 | `Tab` | Toggle canvas focus |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |

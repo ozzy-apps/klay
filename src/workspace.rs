@@ -1355,7 +1355,6 @@ pub struct Workspace {
     /// Geometry › ZRemesher settings.
     pub zremesh: crate::zremesh::Settings,
     pub zremesh_symmetry: RemeshSymmetry,
-    pub zremesh_local_plane: bool,
     /// Brush › ZModeler: the polygon action and target, the edge action and whether it
     /// takes the whole edge loop.
     pub zm_poly: crate::zmodeler::PolyAction,
@@ -1618,7 +1617,6 @@ impl Workspace {
             boolean_resolution: 400.0,
             zremesh: crate::zremesh::Settings::default(),
             zremesh_symmetry: RemeshSymmetry::default(),
-            zremesh_local_plane: false,
             zm_poly: Default::default(),
             zm_target: Default::default(),
             zm_edge: Default::default(),
@@ -2299,6 +2297,7 @@ impl Workspace {
             x: self.symmetry,
             y: self.symmetry_y,
             z: self.symmetry_z,
+            center: glam::Vec3::ZERO,
             radial: self.radial.then(|| (self.radial_axis, self.radial_count.round().clamp(2.0, 64.0) as u8)),
         }
     }
@@ -2316,12 +2315,7 @@ impl Workspace {
 
     pub fn zremesh_plane(&self, bounds: crate::mesh::Aabb) -> Option<crate::symmetry::MirrorPlane> {
         let axis = self.zremesh_axis()?;
-        let i = axis as usize;
-        let at = if self.zremesh_local_plane {
-            bounds.min[i] * 0.5 + bounds.max[i] * 0.5
-        } else {
-            0.0
-        };
+        let at = bounds.center()[axis as usize];
         Some(crate::symmetry::MirrorPlane { axis, at })
     }
 
@@ -4319,11 +4313,11 @@ impl Workspace {
                         }
                         a.mirror_copy |= ui
                             .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror Copy"))
-                            .on_hover_text("Reflect the shown mesh into a new SubTool below this one")
+                            .on_hover_text("Reflect across the world axis into a new SubTool below this one")
                             .shelf(ui, "cmd:mirror-copy").clicked();
                         if ui
                             .add_sized([ui.available_width(), CONTROL_H], egui::Button::new("Mirror And Weld"))
-                            .on_hover_text("Keep the positive half on the selected axis, mirror it, and weld the seam (no subdivision levels)")
+                            .on_hover_text("Keep the positive half of this SubTool, mirror it across its center, and weld the seam (no subdivision levels)")
                             .shelf(ui, "cmd:mirror-weld").clicked()
                         {
                             a.mirror_weld = true;
@@ -4714,10 +4708,8 @@ impl Workspace {
                                 for mode in RemeshSymmetry::ALL {
                                     ui.selectable_value(&mut ws.zremesh_symmetry, mode, mode.label());
                                 }
-                            }).response.on_hover_text("Mirror the positive half across one axis. Brush symmetry follows the first enabled mirror axis in X, Y, Z order.");
+                            }).response.on_hover_text("Mirror the positive half across the active SubTool center. Brush symmetry follows the first enabled mirror axis in X, Y, Z order.");
                     });
-                    ui.add_enabled(ws.zremesh_axis().is_some(), egui::Checkbox::new(&mut ws.zremesh_local_plane, "SubTool Center"))
-                        .on_hover_text("Put the mirror plane at the middle of the SubTool's bounds. Clear to use the scene origin.");
                     let label = match ws.guide_count {
                         0 => "No guides · draw them with ZRemesherGuide (B Z G)".to_string(),
                         1 => "1 guide · Alt + click to delete".to_string(),
@@ -5573,7 +5565,7 @@ impl Workspace {
                             ws.mode = modes[i];
                         }
                         ui.checkbox(&mut ws.gizmo, "Gizmo 3D")
-                            .on_hover_text("A manipulator instead of the action line in Move / Scale / Rotate · Y");
+                            .on_hover_text("Toggle the Gizmo and Transpose action line · Y. Shift locks free Gizmo movement or snaps the action line to an axis.");
                         if ws.gizmo {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;

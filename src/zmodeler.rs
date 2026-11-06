@@ -1582,7 +1582,7 @@ impl PolyMesh {
             for &v in points {
                 if let Some(w) = mirror(k, v) {
                     if done.insert(w) {
-                        out.push((w, images.map(k, m.apply(images.unmap(k, self.pos[w as usize])))));
+                        out.push((w, images.map_point(k, m.apply(images.unmap_point(k, self.pos[w as usize])))));
                     }
                 }
             }
@@ -2431,7 +2431,7 @@ mod tests {
         assert!(pts.len() == 4 && pts.iter().all(|&(v, p)| (p - c.pos[v as usize] - Vec3::Y * 0.5).length() < 1e-6));
         let images = crate::symmetry::Symmetry { x: true, ..Default::default() }.images();
         let mirror = |k: usize, v: u32| -> Option<u32> {
-            let want = images.map(k, c.pos[v as usize]);
+            let want = images.map_point(k, c.pos[v as usize]);
             (0..26u32).find(|&w| c.pos[w as usize].distance(want) < 1e-5)
         };
         let side = (0..24).find(|&f| c.normal(f).x > 0.9).unwrap();

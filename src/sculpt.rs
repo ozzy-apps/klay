@@ -791,6 +791,7 @@ struct GrabState {
     anchor: Vec3,
     /// Positions are moved on the GPU during the stroke; the CPU applies the final delta at the end.
     gpu: bool,
+    fixed_floor: Option<f32>,
     delta: Vec3,
     kind: BrushKind,
     radius: f32,
@@ -881,7 +882,7 @@ struct StampProjection {
 
 impl StampProjection {
     fn uv(self, images: &Images, copy: usize, position: Vec3) -> glam::Vec2 {
-        let offset = images.unmap(copy, position) - self.center;
+        let offset = images.unmap_point(copy, position) - self.center;
         let mut q = glam::Vec2::new(offset.dot(self.across), -offset.dot(self.up));
         if self.wrap > 0.0 {
             let height = offset.dot(self.normal);
@@ -1046,7 +1047,7 @@ fn grab_copies(g: &GrabState, i: usize) -> impl Iterator<Item = (usize, f32)> + 
 /// Offset of grabbed vertex `i`: each copy's image of the move times its weight (as
 /// grab.wgsl does for a vertex one copy reaches).
 fn grab_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
-    grab_copies(g, i).map(|(k, w)| images.map(k, g.delta) * w).sum()
+    grab_copies(g, i).map(|(k, w)| images.map_vector(k, g.delta) * w).sum()
 }
 
 fn drag_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
@@ -1056,19 +1057,19 @@ fn drag_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
         let angle = g.delta.length() / g.radius * 2.2 * g.turn;
         return grab_copies(g, i)
             .map(|(k, w)| {
-                let own = images.unmap(k, g.orig[i]);
+                let own = images.unmap_point(k, g.orig[i]);
                 let rel = own - g.anchor;
                 let turned = glam::Quat::from_axis_angle(g.axis, angle * w) * rel;
-                images.map(k, turned - rel + g.delta * (0.25 * w))
+                images.map_vector(k, turned - rel + g.delta * (0.25 * w))
             })
             .sum();
     }
     if g.kind != BrushKind::Elastic { return grab_offset(images, g, i); }
     grab_copies(g, i)
         .map(|(k, w)| {
-            let anchor = images.map(k, g.anchor);
+            let anchor = images.map_point(k, g.anchor);
             let relative = (g.orig[i] - anchor) / g.radius;
-            let direction = images.map(k, g.delta);
+            let direction = images.map_vector(k, g.delta);
             // Directional coupling gives broad surrounding clay a softer, lateral response.
             direction * w + relative * (relative.dot(direction) * 0.35 * w)
         })
@@ -1076,6 +1077,10 @@ fn drag_offset(images: &Images, g: &GrabState, i: usize) -> Vec3 {
 }
 
 impl Stroke {
+    pub fn symmetry_images(&self) -> &Images {
+        &self.images
+    }
+
     pub fn begin(invert: bool, gpu_grab: bool, symmetry: impl Into<Symmetry>) -> Self {
         Self {
             invert,
@@ -1211,7 +1216,7 @@ impl Stroke {
                     if !a.backface {
                         return 1.0;
                     }
-                    let view = self.images.map(sel.image(i), view);
+                    let view = self.images.map_vector(sel.image(i), view);
                     let facing = -mesh.normal_at(v).dot(view);
                     let t = ((facing + 0.05) / 0.25).clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
@@ -1375,6 +1380,36 @@ impl Stroke {
         })
     }
 
+    /// The GPU moves these vertices before the CPU mesh receives the stroke on release.
+    pub fn gpu_grab_floor_y(&mut self, mesh: &SculptMesh) -> Option<f32> {
+        let grab = self.grab.as_mut().filter(|g| g.gpu && g.delta != Vec3::ZERO)?;
+        let deltas: Vec<_> = (0..self.images.len()).map(|k| self.images.map_vector(k, grab.delta).y).collect();
+        if deltas.iter().all(|&y| y == 0.0) {
+            return None;
+        }
+        let fixed = *grab.fixed_floor.get_or_insert_with(|| {
+            let mut low = f32::INFINITY;
+            for chunk in &mesh.chunks {
+                if chunk.aabb.min.y >= low {
+                    continue;
+                }
+                for v in chunk.vert_start..chunk.vert_end {
+                    if mesh.shown.get(v as usize).is_none_or(|&shown| shown != 0)
+                        && mesh.positions[v as usize].y < low
+                        && grab.sel.verts.binary_search(&v).is_err()
+                    {
+                        low = mesh.positions[v as usize].y;
+                    }
+                }
+            }
+            low
+        });
+        let moving = grab.orig.par_iter().enumerate()
+            .map(|(i, p)| p.y + deltas[grab.sel.image(i)] * grab.weights[i])
+            .reduce(|| f32::INFINITY, f32::min);
+        Some(fixed.min(moving))
+    }
+
     /// The move the GPU should apply this frame for every symmetry image (index 0 the
     /// brush's own), if the grab moved.
     pub fn take_gpu_delta(&mut self) -> Option<Vec<Vec3>> {
@@ -1446,7 +1481,7 @@ impl Stroke {
         // plane) both apply, and the surface stays whole.
         let images = std::mem::replace(&mut self.images, Images::identity());
         for k in 0..images.len() {
-            self.view = images.map(k, view_dir);
+            self.view = images.map_vector(k, view_dir);
             self.dab_copy(mesh, brush, &images, k, hit, hit_normal, previous_hit, along);
         }
         self.images = images;
@@ -1467,9 +1502,9 @@ impl Stroke {
         own_previous: Option<Vec3>,
         along: Vec3,
     ) {
-        let hit = images.map(k, own_hit);
-        let hit_normal = images.map(k, own_normal);
-        let previous_hit = own_previous.map(|p| images.map(k, p));
+        let hit = images.map_point(k, own_hit);
+        let hit_normal = images.map_vector(k, own_normal);
+        let previous_hit = own_previous.map(|p| images.map_point(k, p));
         let sel = self.select(mesh, hit, brush.radius);
         if sel.is_empty() {
             return;
@@ -1483,7 +1518,7 @@ impl Stroke {
         let auto = self.auto_weights(mesh, &sel);
         let stamp = if self.wraps() {
             let (centre, normal) = self.rest_plane(mesh, &sel, hit, hit_normal, brush.radius);
-            self.stamp_projection(images.unmap(k, centre), images.unmap(k, normal), brush.radius)
+            self.stamp_projection(images.unmap_point(k, centre), images.unmap_vector(k, normal), brush.radius)
         } else {
             self.stamp_projection(own_hit, own_normal, brush.radius)
         };
@@ -1493,7 +1528,7 @@ impl Stroke {
         let mut weights=std::mem::take(&mut self.weights);
         self.apply_stamp(mesh, &sel, brush, stamp, auto.as_deref(), images, Some(k), sculpt.then_some(&mut weights), |falloff, p| {
             if square {
-                square_footprint(images.unmap(k, p), own_hit, own_normal, along, r, brush.kind == BrushKind::MalletFast)
+                square_footprint(images.unmap_point(k, p), own_hit, own_normal, along, r, brush.kind == BrushKind::MalletFast)
             } else {
                 falloff
             }
@@ -1520,7 +1555,7 @@ impl Stroke {
                 let images = &self.images;
                 let amount = brush.strength * r * match brush.kind {BrushKind::Blob=>0.13,BrushKind::FormSoft=>0.04,_=>0.06} * sign;
                 sel.par_map_into(new, |i, v| {
-                    let n = images.map(sel.image(i), n);
+                    let n = images.map_vector(sel.image(i), n);
                     let dome = if brush.kind==BrushKind::Blob {(1.0-(sel.dist[i]/r).powi(2)).max(0.0).sqrt()}else{1.0};
                     let p=mesh.positions[v as usize];
                     let relax=if brush.kind==BrushKind::FormSoft {
@@ -1534,7 +1569,7 @@ impl Stroke {
             }
             BrushKind::Layer => {
                 // The layer's normal is fixed by the first dab, in the brush's own frame.
-                let n = images.map(k, *self.layer_normal.get_or_insert(own_normal));
+                let n = images.map_vector(k, *self.layer_normal.get_or_insert(own_normal));
                 let snapshots = &self.snapshots;
                 let index = &self.snapshot_index;
                 sel.par_map_into(new, |i,v| {
@@ -1550,7 +1585,7 @@ impl Stroke {
                 let direction = (delta-hit_normal*delta.dot(hit_normal))*brush.strength*0.65*sign;
                 let images = &self.images;
                 sel.par_map_into(new,|i,v| {
-                    mesh.positions[v as usize]+images.map(sel.image(i),direction)*w[i]
+                    mesh.positions[v as usize]+images.map_vector(sel.image(i),direction)*w[i]
                 });
             }
             BrushKind::Sharpen => {
@@ -1619,7 +1654,7 @@ impl Stroke {
                     let old = snapshots[index[&c]].1[(v - mesh.chunks[c as usize].vert_start) as usize];
                     let p = mesh.positions[v as usize];
                     let n = mesh.normal_at(v);
-                    let q = copies.unmap(copy, old) * (3.0 / r.max(1e-6));
+                    let q = copies.unmap_point(copy, old) * (3.0 / r.max(1e-6));
                     let wave = (q.x * 1.3 + (q.y * 0.7).sin()).sin() * (q.y * 1.7 - q.z * 0.6).sin() * (q.z * 1.1 + q.x * 0.9).cos()
                         + 0.5 * (q.x * 3.1 - q.z * 2.3).sin() * (q.y * 2.9 + q.x * 1.7).sin();
                     let current = (p - old).dot(n);
@@ -1693,8 +1728,8 @@ impl Stroke {
                 // Planar keeps the plane of its first dab for the whole stroke.
                 let (c, n) = if brush.kind == BrushKind::Planar {
                     // Kept in the brush's own frame; every copy uses its image.
-                    let own = *self.plane.get_or_insert((images.unmap(k, c), images.unmap(k, n)));
-                    (images.map(k, own.0), images.map(k, own.1))
+                    let own = *self.plane.get_or_insert((images.unmap_point(k, c), images.unmap_vector(k, n)));
+                    (images.map_point(k, own.0), images.map_vector(k, own.1))
                 } else {
                     (c, n)
                 };
@@ -1708,7 +1743,7 @@ impl Stroke {
                 sel.par_map_into(new, |i, v| {
                     let p = mesh.positions[v as usize];
                     let img = sel.image(i);
-                    let (c, n) = (images.map(img, c), images.map(img, n));
+                    let (c, n) = (images.map_point(img, c), images.map_vector(img, n));
                     let d=(p-c).dot(n);
                     let amount=match kind {
                         BrushKind::FormHard => (r*0.18-d*sign).max(0.0).min(r*0.12)*sign*brush.strength*w[i],
@@ -1742,7 +1777,7 @@ impl Stroke {
                 sel.par_map_into(new,|i,v| {
                     let p=mesh.positions[v as usize];
                     let k=sel.image(i);
-                    let (c,n)=(images.map(k,hit),images.map(k,hit_normal));
+                    let (c,n)=(images.map_point(k,hit),images.map_vector(k,hit_normal));
                     let delta=c-p;let tangent=delta-n*delta.dot(n);
                     let width=match kind {BrushKind::OrbCracks=>0.13,BrushKind::Slash=>0.11,BrushKind::PenA=>0.14,BrushKind::PenS=>0.30,_=>0.24};
                     let tight=(-((sel.dist[i]/r)/width).powi(2)).exp();
@@ -1762,7 +1797,7 @@ impl Stroke {
                     // Orb Cracks: the depth wanders along the cut, so it reads as a crack,
                     // not a groove. Taken on the brush's own side so symmetry mirrors it.
                     let rough=if kind==BrushKind::OrbCracks {
-                        let q=copies.unmap(copy,p)*(9.0/r);
+                        let q=copies.unmap_point(copy,p)*(9.0/r);
                         0.7+0.3*((q.x*1.7+q.y).sin()*(q.y*1.3-q.z).sin()*(q.z*1.9+q.x*0.6).sin())
                     }else{1.0};
                     p+tangent*(pinch*brush.strength*w[i]*sign)
@@ -1795,7 +1830,7 @@ impl Stroke {
         let next=sel.par_map(|i,v| {
             let actual=mesh.positions[v as usize];
             let k=sel.image(i);
-            let p=self.images.unmap(k,actual);
+            let p=self.images.unmap_point(k,actual);
             let offset=p-start;let along=offset.dot(direction);let across=offset.dot(sideways);
             if along < -r*0.04 || along > length+r*0.04 || across.abs()>r || offset.dot(normal).abs()>r*0.65 {return actual;}
             let weight=focal_falloff(across.abs(),r,brush.focal_shift)
@@ -1805,7 +1840,7 @@ impl Stroke {
             let height=crate::detail_brush::profile(brush.kind,across/r,(phase+along)/r)*r*0.12*brush.strength*sign*weight;
             let chunk=mesh.vert_chunk[v as usize];
             let old=self.snapshots[self.snapshot_index[&chunk]].1[(v-mesh.chunks[chunk as usize].vert_start) as usize];
-            let n=self.images.map(k,normal);
+            let n=self.images.map_vector(k,normal);
             actual+n*(height-(actual-old).dot(n))
         });
         mesh.scatter_positions(&sel,&next);mesh.finish_edit(&chunks);
@@ -1983,6 +2018,7 @@ impl Stroke {
                 orig,
                 anchor: hit,
                 gpu,
+                fixed_floor: None,
                 delta: Vec3::ZERO,
                 kind: brush.kind,
                 radius: r,
@@ -2007,7 +2043,7 @@ impl Stroke {
         self.dabs += 1;
         if g.gpu {
             // Nothing to do on the CPU per frame: the GPU kernel moves the vertices.
-            self.pending_delta = Some((0..self.images.len()).map(|k| self.images.map(k, delta)).collect());
+            self.pending_delta = Some((0..self.images.len()).map(|k| self.images.map_vector(k, delta)).collect());
             return;
         }
         // Fused compute + write: no temporary buffer, one parallel pass per chunk.
@@ -2979,9 +3015,9 @@ mod symmetry_group_tests {
         let da = m.positions[a] - before[a];
         assert!(da.length() > 1e-3, "{sym:?}: the brush itself moved nothing");
         for k in 1..images.len() {
-            let b = nearest(&m, images.map(k, hit));
+            let b = nearest(&m, images.map_point(k, hit));
             let db = m.positions[b] - before[b];
-            let expect = images.map(k, da);
+            let expect = images.map_vector(k, da);
             assert!((db - expect).length() < da.length() * 0.25, "{sym:?} image {k}: {db:?} vs {expect:?}");
         }
     }
@@ -2991,7 +3027,7 @@ mod symmetry_group_tests {
         let hit = Vec3::new(0.45, 0.35, 0.82).normalize();
         check_draw(Symmetry { y: true, ..Default::default() }, hit);
         check_draw(Symmetry { z: true, ..Default::default() }, Vec3::new(0.3, 0.2, 0.93).normalize());
-        check_draw(Symmetry { x: true, y: true, z: true, radial: None }, hit);
+        check_draw(Symmetry { x: true, y: true, z: true, radial: None, ..Default::default() }, hit);
         check_draw(Symmetry { radial: Some((Axis::Z, 6)), ..Default::default() }, Vec3::new(0.6, 0.1, 0.79).normalize());
         check_draw(Symmetry { x: true, radial: Some((Axis::Y, 5)), ..Default::default() }, Vec3::new(0.3, 0.5, 0.81).normalize());
     }

@@ -53,6 +53,16 @@ impl Aabb {
         }
     }
 
+    pub fn center(&self) -> Vec3 {
+        if self.is_empty() { Vec3::ZERO } else { self.min * 0.5 + self.max * 0.5 }
+    }
+
+    /// Minimum dot product with a direction over this box.
+    pub fn min_projection(&self, direction: Vec3) -> f32 {
+        let corner = Vec3::select(direction.cmplt(Vec3::ZERO), self.max, self.min);
+        direction.dot(corner)
+    }
+
     pub fn intersects_sphere(&self, c: Vec3, r: f32) -> bool {
         let q = c.clamp(self.min, self.max);
         (q - c).length_squared() <= r * r
@@ -1325,6 +1335,51 @@ impl SculptMesh {
                 a.merge(b);
                 a
             })
+    }
+
+    /// Lowest visible point, including the weighted Transpose preview.
+    pub fn floor_y(&self, map: &crate::transform::Affine) -> f32 {
+        let bounds = self.bounds();
+        if bounds.is_empty() {
+            return f32::INFINITY;
+        }
+        let hidden = !self.hidden.is_empty();
+        let masked = !map.is_identity() && !self.mask.is_empty();
+        if !hidden && !masked && let Some(y) = map.floor_y(bounds) {
+            return y;
+        }
+        let row = map.linear().transpose().y_axis;
+        let shift = map.apply(Vec3::ZERO).y;
+        let partial = crate::transform::Partial::new(map);
+        let y = |v: u32| {
+            let p = self.positions[v as usize];
+            if masked {
+                partial.at(crate::mask::freedom(&self.mask, v)).apply(p).y
+            } else {
+                row.dot(p) + shift
+            }
+        };
+        if masked && !map.is_translation() {
+            return self.positions.par_iter().enumerate()
+                .filter(|(v, _)| self.shown.get(*v).is_none_or(|&shown| shown != 0))
+                .map(|(v, _)| y(v as u32))
+                .reduce(|| f32::INFINITY, f32::min);
+        }
+        // The chunk boxes let us skip the bulk of the mesh during a free rotation or when
+        // the lowest faces have been hidden. A mask on a translation can only reduce it.
+        let lower_shift = if masked { shift.min(0.0) } else { shift };
+        let mut low = f32::INFINITY;
+        for chunk in &self.chunks {
+            if chunk.aabb.is_empty() || chunk.aabb.min_projection(row) + lower_shift >= low {
+                continue;
+            }
+            for v in chunk.vert_start..chunk.vert_end {
+                if self.shown.get(v as usize).is_none_or(|&shown| shown != 0) {
+                    low = low.min(y(v));
+                }
+            }
+        }
+        low
     }
 
     pub fn bounds(&self) -> Aabb {

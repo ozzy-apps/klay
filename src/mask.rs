@@ -536,7 +536,7 @@ impl MaskStroke {
     /// One symmetry copy `k` of a dab at `hit` (the brush's own frame). Returns whether it
     /// reached any vertex.
     fn dab_copy(&mut self, mesh: &mut SculptMesh, brush: &Brush, k: usize, hit: Vec3, normal: Vec3) -> bool {
-        let sel = mesh.select_sphere(self.images.map(k, hit), brush.radius);
+        let sel = mesh.select_sphere(self.images.map_point(k, hit), brush.radius);
         if sel.is_empty() {
             return false;
         }
@@ -563,7 +563,7 @@ impl MaskStroke {
         let (u,tangent_v)=crate::sculpt::turned(base, angle);
         let values = sel.par_map(|i, v| {
             // The alpha is placed in the brush's own frame, so every copy shows it alike.
-            let p=self.images.unmap(k,mesh.positions[v as usize]);
+            let p=self.images.unmap_point(k,mesh.positions[v as usize]);
             let delta=p-hit;
             let uv=glam::Vec2::new(delta.dot(u),-delta.dot(tangent_v))/(2.0*r)+glam::Vec2::splat(0.5);
             let alpha=if self.assets.alpha==Pattern::Off {1.0}else{self.assets.alpha.alpha(uv)};

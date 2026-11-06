@@ -5,7 +5,7 @@
 //! action line: a start circle on the surface under the press, a middle circle and an end
 //! circle. Dragging inside a circle then acts on the subtool:
 //!
-//! - Move: the middle circle moves the subtool in the view plane.
+//! - Move: the middle circle moves the subtool in the view plane. Shift locks it to one axis.
 //! - Scale: the end circle scales about the start by the ratio of the cursor's distance to
 //!   the start over the press's (the start circle scales about the end); the middle circle
 //!   squashes or stretches along the line only (flatten a sphere).
@@ -16,6 +16,7 @@
 //! circles moves the whole line; neither touches the model.
 
 use crate::camera::Camera;
+use crate::symmetry::Axis;
 use glam::{Mat4, Quat, Vec2, Vec3};
 
 /// The map `p -> center + scale * rotation * stretch (p - center) + translate`: a stretch
@@ -142,6 +143,15 @@ impl Affine {
 
     pub fn is_identity(&self) -> bool {
         self.is_translation() && self.translate == Vec3::ZERO
+    }
+
+    /// The minimum Y of a transformed bounding box when world Y stays aligned with it.
+    pub fn floor_y(&self, bounds: crate::mesh::Aabb) -> Option<f32> {
+        if bounds.is_empty() {
+            return Some(f32::INFINITY);
+        }
+        let row = self.linear().transpose().y_axis;
+        (row.x == 0.0 && row.z == 0.0).then(|| bounds.min_projection(row) + self.apply(Vec3::ZERO).y)
     }
 
     /// The exact inverse, in the same form: `p = (c + t) + L⁻¹ (p' - (c + t)) - t`, where
@@ -293,16 +303,44 @@ pub fn rotate_map(view: &View, pivot: Vec3, from: Vec2, to: Vec2) -> Affine {
     Affine::rotation_about(pivot, Quat::from_axis_angle(axis, angle))
 }
 
-/// Shift while drawing the line: snap its direction on screen to 45° steps.
-pub fn snap_45(from: Vec2, to: Vec2) -> Vec2 {
-    let d = to - from;
-    let len = d.length();
-    if len < 1e-3 {
-        return to;
+/// Pick an axis from its direction in the viewport and keep it until Shift is released.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AxisLock(pub Option<Axis>);
+
+impl AxisLock {
+    pub fn constrain(
+        &mut self, view: &View, anchor: Vec3, delta: Vec2, axes: [Vec3; 3], preferred: Option<Axis>,
+    ) -> Vec3 {
+        let px = view.camera.pixel_size_at(anchor, view.size.y);
+        let screen = view.project(anchor);
+        let projected = |axis: Axis| view.project(anchor + axes[axis as usize] * px) - screen;
+        if self.0.is_none() && delta.length_squared() >= 9.0 {
+            self.0 = preferred.filter(|&axis| projected(axis).length_squared() >= 0.0225).or_else(|| {
+                Axis::ALL.into_iter()
+                    .map(|axis| (axis, projected(axis)))
+                    .filter(|(_, dir)| dir.length_squared() >= 0.0225)
+                    .max_by(|(_, a), (_, b)| delta.dot(a.normalize()).abs().total_cmp(&delta.dot(b.normalize()).abs()))
+                    .map(|(axis, _)| axis)
+            });
+        }
+        let Some(axis) = self.0 else { return Vec3::ZERO };
+        let direction = projected(axis);
+        if direction.length_squared() < 0.0225 {
+            return Vec3::ZERO;
+        }
+        let axis = axes[axis as usize];
+        let ratio = delta.dot(direction) / direction.length_squared();
+        // In perspective the pixel scale changes as the endpoint moves in depth.
+        let correction = if view.camera.ortho {
+            1.0
+        } else {
+            let forward = view.camera.forward();
+            let depth = (anchor - view.camera.eye()).dot(forward).max(view.camera.near);
+            let denom = depth + (1.0 - ratio) * px * axis.dot(forward);
+            depth / denom.max(depth * 0.1)
+        };
+        axis * (px * ratio * correction)
     }
-    let step = std::f32::consts::FRAC_PI_4;
-    let angle = (d.y.atan2(d.x) / step).round() * step;
-    from + Vec2::new(angle.cos(), angle.sin()) * len
 }
 
 /// The action line, in world space so it stays on the model while the view turns.
@@ -330,6 +368,12 @@ impl ActionLine {
             Part::Middle => self.mid(),
             Part::End => self.end,
         }
+    }
+
+    /// An action line already aligned with an axis can drive a constrained Move.
+    pub fn aligned_axis(&self) -> Option<Axis> {
+        let dir = (self.end - self.start).normalize_or_zero();
+        Axis::ALL.into_iter().find(|axis| dir.dot(axis.unit()).abs() >= 0.99999)
     }
 
     pub fn mapped(&self, m: &Affine) -> Self {
@@ -585,12 +629,4 @@ mod tests {
         assert_eq!(moved.end, line.end + Vec3::Y);
     }
 
-    #[test]
-    fn shift_snaps_the_line_to_45_degrees() {
-        let from = Vec2::new(100.0, 100.0);
-        let got = snap_45(from, Vec2::new(200.0, 110.0));
-        assert!((got.y - 100.0).abs() < 1e-3 && got.x > 199.0);
-        let got = snap_45(from, Vec2::new(170.0, 160.0)) - from;
-        assert!((got.x - got.y).abs() < 1e-3);
-    }
 }

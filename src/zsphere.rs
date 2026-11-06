@@ -94,15 +94,20 @@ impl Tree {
         true
     }
 
+    pub fn mirror_plane(&self) -> crate::symmetry::MirrorPlane {
+        crate::symmetry::MirrorPlane { axis: crate::symmetry::Axis::X, at: self.spheres[0].center.x }
+    }
+
     /// The sphere mirroring `i` across X: `i` itself when it sits on the plane, `None` when
     /// it has no counterpart.
     pub fn mirror_of(&self, i: u32) -> Option<u32> {
         let z = self.spheres[i as usize];
         let tol = 1e-3 * z.radius.max(1e-3);
-        if z.center.x.abs() <= tol {
+        let plane = self.mirror_plane();
+        if plane.distance(z.center).abs() <= tol {
             return Some(i);
         }
-        let image = Vec3::new(-z.center.x, z.center.y, z.center.z);
+        let image = plane.reflect(z.center);
         (0..self.spheres.len() as u32)
             .filter(|&j| j != i)
             .min_by(|&a, &b| self.spheres[a as usize].center.distance(image).total_cmp(&self.spheres[b as usize].center.distance(image)))

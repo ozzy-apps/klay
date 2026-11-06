@@ -110,7 +110,7 @@ pub fn tube(points: &[Vec3], up: Vec3, shape: Tube) -> (Vec<Vec3>, Vec<u32>) {
 /// the curve, as one mesh in polygroup `group`.
 pub fn tubes(curve: &Curve, shape: Tube, symmetry: impl Into<crate::symmetry::Symmetry>, group: u16) -> Option<SculptMesh> {
     let images = symmetry.into().images();
-    let others: Vec<Curve> = (1..images.len()).map(|k| curve.transformed(&images.0[k])).collect();
+    let others: Vec<Curve> = (1..images.len()).map(|k| curve.transformed(&images, k)).collect();
     let (mut positions, mut indices) = (Vec::new(), Vec::new());
     for c in std::iter::once(curve).chain(others.iter()) {
         for piece in &c.pieces {

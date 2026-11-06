@@ -70,6 +70,9 @@ Needs Rust, a C compiler for the FBX parser, and a Vulkan driver. `scripts/` bui
 | `,` | toggle LightBox. Double-click a thumbnail to load it |
 | Space | brush menu at the cursor |
 | Q W E R | sculpt, move, scale, rotate |
+| Shift + drag in Transpose | Snap the action line or lock Move to one axis |
+| Y | Switch between Transpose and the Gizmo. Shift locks the Gizmo’s free-move handle to one of its axes |
+| Shift + P | Toggle the floor grid at the lowest visible point |
 | F · Tab · F11 | frame the model · hide the interface · fullscreen |
 
 The full manual is in [docs/guide.md](docs/guide.md), and what changed in each version is in [CHANGELOG.md](CHANGELOG.md).
@@ -78,8 +81,11 @@ The full manual is in [docs/guide.md](docs/guide.md), and what changed in each v
 
 - Use **Document › Import › Import Models…** or double-click a model in **LightBox › User › Tools**. **Fit** centers and scales each file as a whole. Keep external glTF geometry buffers with the model.
 - For a ZBrush ZTool (`.ztl`), open it in ZBrush and export FBX, OBJ or GoZ. Klay imports the sculptable mesh data.
-- In **Mesh › Deformation**, choose **X**, **Y** or **Z** under **Mirror Axis**. **Mirror Copy** puts a reflected mesh below the source. **SubTool › Merge Down** joins them into one SubTool. **Mirror And Weld** builds a symmetric mesh with a welded seam.
+- In **Mesh › Deformation**, choose **X**, **Y** or **Z** under **Mirror Axis**. **Mirror Copy** reflects the mesh across the world axis and puts it below the source. **SubTool › Merge Down** joins them into one SubTool. **Mirror And Weld** mirrors around the active SubTool’s center and welds the seam.
+- Mirror and radial sculpting use the center of the active SubTool’s bounds. A merge uses the combined bounds, including disconnected pieces.
 - Double-click a SubTool row to rename it. Click **Fill Color** below the color picker or in the **Space** menu to apply the picked color to visible, unmasked areas of the active SubTool.
+
+![The Klay viewport with three visible SubTools and the floor grid aligned to the lowest sphere](docs/images/subtool-floor.png)
 
 ![LightBox Tools with FBX, GoZ, GLB and glTF model previews](docs/images/model-import.png)
 
@@ -94,9 +100,7 @@ The full manual is in [docs/guide.md](docs/guide.md), and what changed in each v
 ## ZRemesher guides and symmetry
 
 - **Ctrl + Z** undoes a guide stroke. With **ZRemesherGuide** selected (**B Z G**), **Alt + click** a line to remove it. **Delete guides** clears the active SubTool's guides in one undo step.
-- In **Mesh › ZRemesher**, set **Symmetry** to **Force X**, **Force Y** or **Force Z**. Enable **SubTool Center** for an off-center mesh. ZRemesher mirrors the positive half and welds the seam where it meets the plane.
-
-![ZRemesher symmetry controls and a guide curve on a sculpt](docs/images/zremesher-guides.png)
+- In **Mesh › ZRemesher**, set **Symmetry** to **Force X**, **Force Y** or **Force Z**. ZRemesher mirrors the positive half across the active SubTool’s center and welds the seam where it meets the plane.
 
 ## Clip brushes
 

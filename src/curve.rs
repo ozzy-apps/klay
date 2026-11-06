@@ -10,6 +10,7 @@
 //! nearest point on a smooth line. The curve stays on screen and can be bent.
 
 use crate::mesh::{Group, Selection, SculptMesh, split_ranges};
+use crate::symmetry::Images;
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 
@@ -275,13 +276,13 @@ impl Curve {
         self.tangents.iter_mut().for_each(|t| *t = map.apply_vector(*t).normalize_or(*t));
     }
 
-    /// The curve under an orthogonal map through the origin (a symmetry image).
-    pub fn transformed(&self, map: &glam::Mat3) -> Curve {
-        let m = |v: &Vec3| *map * *v;
+    /// The curve in one symmetry image.
+    pub fn transformed(&self, images: &Images, k: usize) -> Curve {
+        let direction = |&v: &Vec3| images.map_vector(k, v);
         Curve {
-            points: self.points.iter().map(m).collect(),
-            normals: self.normals.iter().map(m).collect(),
-            tangents: self.tangents.iter().map(m).collect(),
+            points: self.points.iter().map(|&p| images.map_point(k, p)).collect(),
+            normals: self.normals.iter().map(direction).collect(),
+            tangents: self.tangents.iter().map(direction).collect(),
             along: self.along.clone(),
             pieces: self.pieces.clone(),
         }
@@ -339,7 +340,7 @@ fn foot(curve: &Curve, segs: &[usize], p: Vec3, reach: f32, depth: f32, overhang
 /// segments near its chunk.
 pub fn band(mesh: &SculptMesh, curve: &Curve, reach: f32, images: &crate::symmetry::Images) -> (Selection, Vec<Foot>) {
     let curves: Vec<Curve> = std::iter::once(curve.clone())
-        .chain((1..images.len()).map(|k| curve.transformed(&images.0[k])))
+        .chain((1..images.len()).map(|k| curve.transformed(images, k)))
         .collect();
     let (depth, overhang) = (reach * 0.65, reach * 0.04);
     let shown = &mesh.shown;

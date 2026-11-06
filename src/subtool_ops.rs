@@ -278,9 +278,9 @@ fn swap_outer_bits(bits: u8) -> u8 {
     (bits & 1) << 2 | (bits & 2) | (bits & 4) >> 2
 }
 
-/// Keep the positive side of the selected axis, reflect it, and weld the plane.
+/// Keep the positive side of the SubTool center, reflect it, and weld the plane.
 pub fn mirrored_and_welded(mesh: &SculptMesh, axis: usize) -> Option<SculptMesh> {
-    let plane = MirrorPlane { axis: Axis::ALL[axis], at: 0.0 };
+    let plane = MirrorPlane { axis: Axis::ALL[axis], at: mesh.bounds().center()[axis] };
     positive_half(mesh, plane).map(|half| mirror_half(&half, plane))
 }
 
@@ -502,17 +502,19 @@ mod tests {
         // A sphere pushed out on +X only.
         let (p, i) = crate::mesh::cube_sphere(10, 1.0);
         let p: Vec<Vec3> = p.into_iter().map(|q| if q.x > 0.0 { q + Vec3::new(q.x * 0.4, 0.0, 0.0) } else { q }).collect();
+        let p = p.into_iter().map(|p| p + 4.0 * Vec3::X).collect();
         let m = SculptMesh::from_raw(p, i);
+        let plane = MirrorPlane { axis: Axis::X, at: m.bounds().center().x };
         let w = mirrored_and_welded(&m, 0).unwrap();
         assert!(edge_counts(&w).values().all(|&c| c == 2), "welded shut");
         assert!(volume(&w) > 0.0);
         // Every vertex has its mirror image.
         for q in &w.positions {
-            let mirror = Vec3::new(-q.x, q.y, q.z);
+            let mirror = plane.reflect(*q);
             assert!(w.positions.iter().any(|r| r.distance(mirror) < 1e-5), "{q:?}");
         }
         // The +X side kept its shape: the widest point is the pushed one.
         let max_x = w.positions.iter().map(|q| q.x).fold(f32::MIN, f32::max);
-        assert!(max_x > 1.3);
+        assert_eq!(max_x, m.bounds().max.x);
     }
 }

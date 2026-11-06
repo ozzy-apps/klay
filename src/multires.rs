@@ -1623,6 +1623,17 @@ pub struct StandIn {
     pub bounds: Aabb,
 }
 
+impl StandIn {
+    /// Vertices used by the drawn triangles, for measuring a transformed preview.
+    pub fn visible_positions(&self) -> Vec<Vec3> {
+        let mut used = vec![false; self.positions.len()];
+        for &v in &self.indices {
+            used[v as usize] = true;
+        }
+        self.positions.iter().zip(used).filter_map(|(&p, used)| used.then_some(p)).collect()
+    }
+}
+
 /// The level stack.
 pub struct Multires {
     levels: Vec<Level>,
@@ -2869,22 +2880,26 @@ impl Multires {
             .into_par_iter()
             .map(|v| pack_normal(vertex_normal(&positions, &m.indices, &m.vt_offsets, &m.vt_tris, v)))
             .collect();
-        let bounds = positions
-            .par_iter()
-            .fold(Aabb::empty, |mut b, &p| {
-                b.grow(p);
-                b
-            })
-            .reduce(Aabb::empty, |mut a, b| {
-                a.merge(b);
-                a
-            });
+        // Hidden parts stay hidden while the subtool is parked.
+        let indices = m.visible_indices().unwrap_or_else(|| m.indices.clone());
+        let bounds = if m.hidden.is_empty() && level == top {
+            m.bounds()
+        } else {
+            indices.par_iter()
+                .fold(Aabb::empty, |mut b, &v| {
+                    b.grow(positions[v as usize]);
+                    b
+                })
+                .reduce(Aabb::empty, |mut a, b| {
+                    a.merge(b);
+                    a
+                })
+        };
         StandIn {
             positions,
             normals,
             colors,
-            // Hidden parts stay hidden while the subtool is parked.
-            indices: m.visible_indices().unwrap_or_else(|| m.indices.clone()),
+            indices,
             level,
             bounds,
         }

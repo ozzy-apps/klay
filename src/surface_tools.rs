@@ -2,6 +2,7 @@
 use crate::mesh::SculptMesh;
 use crate::multires::ChunkData;
 use crate::sculpt::{BrushKind, Shape};
+use crate::symmetry::MirrorPlane;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 
@@ -212,7 +213,7 @@ fn rect_sections(mesh: &SculptMesh, screen: Screen, poly: &[Vec2], images: &crat
     let centre = (bounds.min + bounds.max) * 0.5;
     let half_size = (bounds.max - bounds.min) * 0.5;
     Some((0..images.len()).map(|k| {
-        let world = planes.map(|p| images.map(k, p.truncate()).extend(p.w));
+        let world = planes.map(|p| images.map_plane(k, p));
         std::array::from_fn(|edge| {
             let plane = world[edge];
             let n = plane.truncate();
@@ -273,11 +274,11 @@ pub fn clip_shape(
         // pressed the mirrored half across the model onto the other image's outline.
         let mut found: Vec<Vec3> = Vec::new();
         for k in 0..images.len() {
-            let own = images.unmap(k, p);
+            let own = images.unmap_point(k, p);
             let (Some(s), Some(z)) = (screen.project(own), screen.ndc_z(own)) else { continue };
             match target(s) {
                 Some((edge, t)) => {
-                    let q = images.map(k, screen.unproject(t, z));
+                    let q = images.map_point(k, screen.unproject(t, z));
                     let q = sections.as_ref().and_then(|sections| sections[k][edge].as_ref())
                         .map_or(q, |section| section.keep_inside(q));
                     found.push(q);
@@ -348,19 +349,18 @@ pub fn tris_in_gesture(mesh: &SculptMesh, screen: Screen, gesture: &Gesture) -> 
 /// the arrow's side (negative with Alt). The cut is the plane through the line along the
 /// view. With X symmetry, `side` is the half the line was drawn on: that half is cut by the
 /// line's plane and the other by its mirror image.
-pub fn line_distance(mesh: &SculptMesh, screen: Screen, gesture: &Gesture, side: Option<f32>) -> Option<Vec<f32>> {
+pub fn line_distance(mesh: &SculptMesh, screen: Screen, gesture: &Gesture, side: Option<(MirrorPlane, f32)>) -> Option<Vec<f32>> {
     let mut plane = screen.plane(gesture.start, gesture.end)?;
     // `plane` is positive on the side `clip_line` removes: the arrow's side.
     if gesture.alternate {
         plane = -plane;
     }
-    let mirrored = Vec4::new(-plane.x, plane.y, plane.z, plane.w);
     let at = |pl: Vec4, p: Vec3| pl.truncate().dot(p) + pl.w;
     Some(
         mesh.positions
             .par_iter()
             .map(|&p| match side {
-                Some(s) if plane.x.abs() > 1e-6 && p.x * s < 0.0 => at(mirrored, p),
+                Some((mirror, s)) if plane[mirror.axis as usize].abs() > 1e-6 && mirror.distance(p) * s < 0.0 => at(plane, mirror.reflect(p)),
                 _ => at(plane, p),
             })
             .collect(),
@@ -403,7 +403,7 @@ pub fn mask_shape(
             if !mesh.shown.is_empty() && mesh.shown[v] == 0 {
                 return old;
             }
-            let inside = (0..images.len()).any(|k| screen.project(images.unmap(k, p)).is_some_and(contains));
+            let inside = (0..images.len()).any(|k| screen.project(images.unmap_point(k, p)).is_some_and(contains));
             if inside {
                 (old as i16 + step).clamp(0, 255) as u8
             } else {
@@ -602,13 +602,14 @@ pub fn clip_line(
     mesh: &mut SculptMesh,
     screen: Screen,
     gesture: &Gesture,
-    symmetry: Option<f32>,
+    symmetry: Option<(MirrorPlane, f32)>,
 ) -> Option<ChunkData> {
     let mut plane = screen.plane(gesture.start, gesture.end)?;
     if gesture.alternate {
         plane = -plane;
     }
-    let mirrored = Vec4::new(-plane.x, plane.y, plane.z, plane.w);
+    let mirrored = symmetry.filter(|(mirror, _)| plane[mirror.axis as usize].abs() > 1e-6)
+        .map(|(mirror, side)| (mirror, side, mirror.reflect_plane(plane)));
     // A vertex on the removed side moves straight onto the plane. On a solid it must land
     // inside the model's cross-section there: where the cut crosses an earlier cut face (or
     // takes more than half of a round part), moving straight would put it outside, sticking
@@ -617,7 +618,7 @@ pub fn clip_line(
     let solid = crate::wedge::closed(mesh);
     let section = |plane: Vec4| solid.then(|| Section::new(mesh, plane)).flatten();
     let own = section(plane);
-    let other = symmetry.filter(|_| plane.x.abs() > 1e-6).and_then(|_| section(mirrored));
+    let other = mirrored.and_then(|(_, _, plane)| section(plane));
     let project = |v: usize, plane: Vec4, section: Option<&Section>, freedom: f32| {
         let p = mesh.positions[v];
         let n = plane.truncate();
@@ -643,14 +644,15 @@ pub fn clip_line(
                         return p;
                     }
                     let freedom = crate::mask::freedom(&mesh.mask, v as u32);
-                    match symmetry {
-                        Some(side) if plane.x.abs() > 1e-6 => {
+                    match mirrored {
+                        Some((mirror, side, mirrored)) => {
                             let (a, b) = (own.as_ref(), other.as_ref());
-                            if p.x.abs() <= 1e-6 {
+                            let distance = mirror.distance(p);
+                            if distance.abs() <= 1e-6 {
                                 // On the symmetry plane both halves meet: the mean of the two
                                 // keeps the vertex on it.
                                 (project(v, plane, a, freedom) + project(v, mirrored, b, freedom)) * 0.5
-                            } else if p.x * side > 0.0 {
+                            } else if distance * side > 0.0 {
                                 project(v, plane, a, freedom)
                             } else {
                                 project(v, mirrored, b, freedom)
@@ -716,7 +718,7 @@ mod tests {
             for (v, &p) in before.iter().enumerate() {
                 let w = index[&key(Vec3::new(-p.x, p.y, p.z))];
                 let (a, b) = (m.positions[v], m.positions[w]);
-                let covered = (0..images.len()).any(|k| screen.project(images.unmap(k, p)).is_some_and(|s| g.contains(s)));
+                let covered = (0..images.len()).any(|k| screen.project(images.unmap_point(k, p)).is_some_and(|s| g.contains(s)));
                 if alternate {
                     // Alt presses the inside out; what no image covers stays.
                     if !covered {
@@ -833,9 +835,9 @@ mod tests {
         m.mask = vec![255; m.vertex_count()];
         let mut g = Gesture::new(BrushKind::ClipLine, Vec2::new(0.0, 200.0), false);
         g.end = Vec2::new(400.0, 200.0);
-        assert!(clip_line(&mut m, screen(), &g, Some(1.0)).is_none());
+        assert!(clip_line(&mut m, screen(), &g, Some((MirrorPlane { axis: crate::symmetry::Axis::X, at: 0.0 }, 1.0))).is_none());
         m.mask.fill(128);
-        clip_line(&mut m, screen(), &g, Some(1.0)).unwrap();
+        clip_line(&mut m, screen(), &g, Some((MirrorPlane { axis: crate::symmetry::Axis::X, at: 0.0 }, 1.0))).unwrap();
         for (p, old) in m.positions.iter().zip(&before) {
             if old.y > 0.0 {
                 assert!((p.y - old.y * (128.0 / 255.0)).abs() < 1e-6);
@@ -862,7 +864,7 @@ mod tests {
         let side = -plane.x.signum();
         let mut m = mesh();
         let before = m.positions.clone();
-        clip_line(&mut m, s, &g, Some(side)).unwrap();
+        clip_line(&mut m, s, &g, Some((MirrorPlane { axis: crate::symmetry::Axis::X, at: 0.0 }, side))).unwrap();
         let at = |q: Vec4, p: Vec3| q.truncate().dot(p) + q.w;
         for (p, old) in m.positions.iter().zip(&before) {
             if old.x.abs() <= 1e-6 {

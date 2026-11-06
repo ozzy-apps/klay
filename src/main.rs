@@ -613,6 +613,7 @@ struct ZDrag {
     place: gizmo::Place,
     /// The gizmo handle being dragged (Transpose).
     handle: Option<gizmo::Handle>,
+    symmetry: symmetry::Symmetry,
     /// Once the action's polygons are built: where its points go per unit of the amount.
     linear: Option<ZLinear>,
     /// The points as they were when the subtool was last rebuilt in this drag (the
@@ -656,12 +657,13 @@ struct ZAim {
 #[derive(Clone, Copy, Debug)]
 enum TransposeDrag {
     /// Drawing a new action line from the point on the surface under the press.
-    Draw { start: Vec3 },
+    Draw { start: Vec3, lock: transform::AxisLock },
     /// Moving the line, or one end of it (`ends`: start, end), without touching the model.
     Line {
         line: ActionLine,
         press: Vec2,
         ends: [bool; 2],
+        lock: transform::AxisLock,
     },
     /// Moving, scaling or rotating the active subtool about `anchor` (`squash`: Scale's
     /// middle circle, along the line). `map` is only shown (the vertex shader applies it to
@@ -673,6 +675,7 @@ enum TransposeDrag {
         press: Vec2,
         line: ActionLine,
         map: Affine,
+        lock: transform::AxisLock,
     },
     /// Dragging a Gizmo 3D handle; `place` is where the gizmo stood at the press. `alone`
     /// (Alt): the drag moves or turns the gizmo, not the model.
@@ -682,6 +685,7 @@ enum TransposeDrag {
         press: Vec2,
         map: Affine,
         alone: bool,
+        lock: transform::AxisLock,
     },
 }
 
@@ -827,6 +831,8 @@ struct App {
     /// The Transpose action line, kept between drags (shown in Move / Scale / Rotate mode).
     action_line: Option<ActionLine>,
     transpose: Option<TransposeDrag>,
+    // A selected parked stand-in is rebuilt once if an oblique preview needs its vertices.
+    transpose_floor_points: std::collections::HashMap<u64, Vec<Vec3>>,
     insert: Option<InsertDrag>,
     zmodel: Option<ZModel>,
     zm_hover: Option<zmodeler::Hover>,
@@ -1073,6 +1079,7 @@ impl App {
             hover: None,
             action_line: None,
             transpose: None,
+            transpose_floor_points: Default::default(),
             insert: None,
             zmodel: None,
             zm_hover: None,
@@ -2774,8 +2781,7 @@ impl App {
             self.workspace.notify("Dynamics: skin the ZSpheres first (Make Adaptive Skin)");
             return;
         }
-        // Colliders: the other visible subtools as shown; the floor at the grid, or under
-        // the lowest of them.
+        // Colliders: the other visible subtools and the simulation's floor.
         let mut others = Vec::new();
         if !self.workspace.solo {
             for t in self.subtools.iter().filter(|t| t.visible) {
@@ -2972,7 +2978,7 @@ impl App {
         };
         let i = tree.sphere_of(self.mesh().group(hit.tri), hit.point);
         self.zs_selected = i;
-        let sym = self.workspace.sym().x;
+        let sym = self.workspace.symmetry;
         let mirror = if sym { tree.mirror_of(i).filter(|&m| m != i) } else { None };
         let before = self.doc.pack_copy();
         let (alt, shift) = (self.modifiers.alt_key(), self.modifiers.shift_key());
@@ -3007,7 +3013,7 @@ impl App {
         // by dragging, as ZBrush does.
         if let Some(c) = tree.link_of(self.mesh().group(hit.tri)).filter(|_| self.workspace.mode == Mode::Draw) {
             let point = hit.point;
-            let image = Vec3::new(-point.x, point.y, point.z);
+            let image = tree.mirror_plane().reflect(point);
             let (new, mirror_new) = match if sym { tree.mirror_of(c).filter(|&m| m != c) } else { None } {
                 // Inserting goes in before the link's child, shifting later indices by one.
                 Some(m) if m > c => {
@@ -3029,9 +3035,10 @@ impl App {
             Mode::Draw => {
                 let r = tree.spheres[i as usize].radius * 0.5;
                 let child = tree.add(i, hit.point, r);
-                let mirror_child = if sym && hit.point.x.abs() > 1e-4 * r {
+                let plane = tree.mirror_plane();
+                let mirror_child = if sym && plane.distance(hit.point).abs() > 1e-4 * r {
                     let j = tree.mirror_of(i).unwrap_or(i);
-                    Some(tree.add(j, Vec3::new(-hit.point.x, hit.point.y, hit.point.z), r))
+                    Some(tree.add(j, plane.reflect(hit.point), r))
                 } else {
                     None
                 };
@@ -3057,8 +3064,9 @@ impl App {
         let mirror_to = |tree: &mut zsphere::Tree, i: u32, m: Option<u32>| {
             if let Some(m) = m {
                 let z = tree.spheres[i as usize];
+                let image = tree.mirror_plane().reflect(z.center);
                 let w = &mut tree.spheres[m as usize];
-                w.center = Vec3::new(-z.center.x, z.center.y, z.center.z);
+                w.center = image;
                 w.radius = z.radius;
             }
         };
@@ -3170,7 +3178,7 @@ impl App {
                 if self.zs_round_before.is_none() {
                     self.zs_round_before = Some(self.doc.pack_copy());
                 }
-                let mirror = if self.workspace.sym().x { tree.mirror_of(i) } else { None };
+                let mirror = if self.workspace.symmetry { tree.mirror_of(i) } else { None };
                 for k in std::iter::once(i).chain(mirror) {
                     tree.spheres[k as usize].roundness = v;
                 }
@@ -3300,6 +3308,15 @@ impl App {
         self.subtools[self.active_tool].bounds = self.doc.bounds();
     }
 
+    /// Symmetry is centered on the entire active SubTool, including hidden pieces.
+    fn sculpt_symmetry(&self) -> symmetry::Symmetry {
+        let mut settings = self.workspace.sym();
+        if settings.is_on() {
+            settings.center = self.doc.bounds().center();
+        }
+        settings
+    }
+
     /// The canvas as the camera shows it, for the Transpose maths.
     fn view(&self) -> View<'_> {
         View {
@@ -3339,8 +3356,9 @@ impl App {
                     press,
                     line,
                     map: Affine::IDENTITY,
+                    lock: Default::default(),
                 };
-                let drag_line = |ends| TransposeDrag::Line { line, press, ends };
+                let drag_line = |ends| TransposeDrag::Line { line, press, ends, lock: Default::default() };
                 // ZBrush: the middle circle moves (Scale: squashes or stretches along the
                 // line), the end circle scales or rotates about the start (the start circle
                 // about the end); the rings and the line move the line itself.
@@ -3362,7 +3380,7 @@ impl App {
         let Some(hit) = self.mesh().raycast(o, d) else {
             return false;
         };
-        self.transpose = Some(TransposeDrag::Draw { start: hit.point });
+        self.transpose = Some(TransposeDrag::Draw { start: hit.point, lock: Default::default() });
         self.action_line = Some(ActionLine {
             start: hit.point,
             end: hit.point,
@@ -3381,27 +3399,50 @@ impl App {
         let Some(drag) = self.transpose.as_mut() else {
             return;
         };
+        let shift = self.modifiers.shift_key();
+        let world = symmetry::Axis::ALL.map(symmetry::Axis::unit);
+        let constrained = |lock: &mut transform::AxisLock, anchor, delta, axes, preferred| {
+            if shift {
+                Some(lock.constrain(&view, anchor, delta, axes, preferred))
+            } else {
+                lock.0 = None;
+                None
+            }
+        };
         match drag {
-            TransposeDrag::Draw { start } => {
-                let from = view.project(*start);
-                // ZBrush: Shift while drawing snaps the line to 45° steps.
-                let to = if self.modifiers.shift_key() { transform::snap_45(from, to) } else { to };
-                self.action_line = Some(ActionLine {
-                    start: *start,
-                    end: view.unproject_at(to, *start),
+            TransposeDrag::Draw { start, lock } => {
+                let end = constrained(lock, *start, to - view.project(*start), world, None)
+                    .map_or_else(|| view.unproject_at(to, *start), |delta| *start + delta);
+                self.action_line = Some(ActionLine { start: *start, end });
+            }
+            TransposeDrag::Line { line, press, ends, lock } => {
+                let drag = to - *press;
+                self.action_line = Some(match *ends {
+                    [true, true] => {
+                        let anchor = line.mid();
+                        if let Some(delta) = constrained(lock, anchor, drag, world, None) {
+                            line.mapped(&Affine::translation(delta))
+                        } else {
+                            let follow = |end| view.unproject_at(view.project(end) + drag, end);
+                            ActionLine { start: follow(line.start), end: follow(line.end) }
+                        }
+                    }
+                    [start, _] => {
+                        let (anchor, end) = if start { (line.end, line.start) } else { (line.start, line.end) };
+                        let end_px = view.project(end) + drag;
+                        let moved = constrained(lock, anchor, end_px - view.project(anchor), world, None)
+                            .map_or_else(|| view.unproject_at(end_px, end), |delta| anchor + delta);
+                        if start { ActionLine { start: moved, ..*line } } else { ActionLine { end: moved, ..*line } }
+                    }
                 });
             }
-            TransposeDrag::Line { line, press, ends } => {
-                let follow = |p: Vec3, on: bool| {
-                    if on { p + view.unproject_at(to, p) - view.unproject_at(*press, p) } else { p }
+            TransposeDrag::Gizmo { handle, place, press, map, alone, lock } => {
+                let delta = if *handle == gizmo::Handle::Free {
+                    constrained(lock, place.centre, to - *press, [0, 1, 2].map(|a| place.axis(a)), None)
+                } else {
+                    None
                 };
-                self.action_line = Some(ActionLine {
-                    start: follow(line.start, ends[0]),
-                    end: follow(line.end, ends[1]),
-                });
-            }
-            TransposeDrag::Gizmo { handle, place, press, map, alone } => {
-                *map = gizmo::drag_map(&view, place, *handle, *press, to);
+                *map = delta.map_or_else(|| gizmo::drag_map(&view, place, *handle, *press, to), Affine::translation);
                 if *alone {
                     // The gizmo alone only moves and turns, about its own centre.
                     map.scale = 1.0;
@@ -3415,9 +3456,11 @@ impl App {
                 press,
                 line,
                 map,
+                lock,
             } => {
                 *map = match mode {
-                    Mode::Move => transform::move_map(&view, *anchor, *press, to),
+                    Mode::Move => constrained(lock, *anchor, to - *press, world, line.aligned_axis())
+                        .map_or_else(|| transform::move_map(&view, *anchor, *press, to), Affine::translation),
                     Mode::Scale if *squash => transform::stretch_map(line, *press, to),
                     Mode::Scale => transform::scale_map(&view, *anchor, *press, to),
                     Mode::Rotate => transform::rotate_map(&view, *anchor, *press, to),
@@ -3431,6 +3474,7 @@ impl App {
     /// Release of a Transpose drag: a move / scale / rotate is applied to every level of
     /// the active subtool as one undo step. Returns the time the CPU transform took in ms.
     fn end_transpose(&mut self) -> Option<f32> {
+        self.transpose_floor_points.clear();
         match self.transpose.take()? {
             TransposeDrag::Draw { .. } => {
                 // A click without a drag leaves no line.
@@ -3547,7 +3591,7 @@ impl App {
             }
             return false;
         };
-        self.transpose = Some(TransposeDrag::Gizmo { handle, place, press, map: Affine::IDENTITY, alone });
+        self.transpose = Some(TransposeDrag::Gizmo { handle, place, press, map: Affine::IDENTITY, alone, lock: Default::default() });
         self.hover = None;
         true
     }
@@ -3670,6 +3714,12 @@ impl App {
         }
     }
 
+    const AXIS_COLORS: [egui::Color32; 3] = [
+        egui::Color32::from_rgb(232, 72, 64),
+        egui::Color32::from_rgb(110, 205, 90),
+        egui::Color32::from_rgb(70, 140, 240),
+    ];
+
     /// Draw Gizmo 3D: X red, Y green, Z blue; the handle under the cursor (or being dragged)
     /// is lit.
     fn paint_gizmo(&self, ctx: &egui::Context) {
@@ -3677,7 +3727,9 @@ impl App {
             return;
         }
         let (place, active) = match self.transpose {
-            Some(TransposeDrag::Gizmo { handle, place, map, .. }) => (place.mapped(&map), Some(handle)),
+            Some(TransposeDrag::Gizmo { handle, place, map, lock, .. }) => {
+                (place.mapped(&map), Some(lock.0.map_or(handle, |axis| gizmo::Handle::Move(axis as usize))))
+            }
             _ => (self.gizmo_place(), None),
         };
         let lit = active.or_else(|| gizmo::hit(&self.view(), &place, self.canvas_cursor()));
@@ -3700,7 +3752,7 @@ impl App {
         let painter = ctx
             .layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique(id)))
             .with_clip_rect(self.workspace.canvas);
-        let colors = [egui::Color32::from_rgb(232, 72, 64), egui::Color32::from_rgb(110, 205, 90), egui::Color32::from_rgb(70, 140, 240)];
+        let colors = Self::AXIS_COLORS;
         let width = |h: gizmo::Handle| if lit == Some(h) { 3.0 } else { 1.6 };
         let shade = |c: egui::Color32, h: gizmo::Handle| if lit == Some(h) { egui::Color32::from_rgb(255, 230, 120) } else { c };
         let line = |pts: Vec<Vec2>, stroke: egui::Stroke| {
@@ -3751,14 +3803,19 @@ impl App {
             .with_clip_rect(self.workspace.canvas);
         let (a, m, b) = (to_pos(line.start), to_pos(line.mid()), to_pos(line.end));
         let white = egui::Color32::from_rgb(232, 232, 232);
-        let accent = egui::Color32::from_rgb(227, 131, 79);
+        let lock = match self.transpose {
+            Some(TransposeDrag::Draw { lock, .. } | TransposeDrag::Line { lock, .. } | TransposeDrag::Act { lock, .. }) => lock.0,
+            _ => None,
+        };
+        let axis = lock.or_else(|| line.aligned_axis());
+        let accent = axis.map_or(egui::Color32::from_rgb(227, 131, 79), |axis| Self::AXIS_COLORS[axis as usize]);
         let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(140));
         let len = (b - a).length();
         if len > 2.0 * transform::OUTER {
             let dir = (b - a) / len;
             let (p, q) = (a + dir * transform::OUTER, b - dir * transform::OUTER);
             painter.line_segment([p, q], dark);
-            painter.line_segment([p, q], egui::Stroke::new(1.5, white));
+            painter.line_segment([p, q], egui::Stroke::new(1.5, if lock.is_some() { accent } else { white }));
         }
         for (c, color) in [(a, accent), (m, white), (b, white)] {
             for r in [transform::OUTER, transform::INNER] {
@@ -3853,6 +3910,44 @@ impl App {
         self.drawn_parked()
             .iter()
             .fold(self.doc.bounds(), |b, &(_, i)| subtool::union(b, self.subtools[i].bounds))
+    }
+
+    /// The floor meets the lowest visible point of the model, including a live transform.
+    fn floor_y(&mut self, preview: &Affine) -> f32 {
+        let mesh = self.doc.mesh();
+        let mut low = self.gfx.as_ref().and_then(|gfx| gfx.dynamic_floor_y(preview))
+            .or_else(|| self.stroke.as_mut().and_then(|stroke| stroke.gpu_grab_floor_y(mesh)))
+            .unwrap_or_else(|| mesh.floor_y(preview));
+        let multi = matches!(self.transpose, Some(TransposeDrag::Gizmo { alone: false, .. }));
+        for (_, i) in self.drawn_parked() {
+            let tool = &self.subtools[i];
+            let parked = tool.parked.as_ref().unwrap();
+            if parked.stand_in_vertices == 0 {
+                continue;
+            }
+            let y = if !multi || !tool.transpose_selected {
+                tool.bounds.min.y
+            } else if let Some(y) = preview.floor_y(tool.bounds) {
+                y
+            } else {
+                let row = preview.linear().transpose().y_axis;
+                let shift = preview.apply(Vec3::ZERO).y;
+                if tool.bounds.min_projection(row) + shift >= low {
+                    continue;
+                }
+                let points = self.transpose_floor_points.entry(tool.id).or_insert_with(|| {
+                    let Ok(mut doc) = parked.packed.clone().try_unpack() else { return Vec::new() };
+                    let stand_in = match tool.dynamic {
+                        Some(s) if doc.count() == 1 => dynamic::preview(doc.mesh(), &s),
+                        _ => doc.stand_in(STAND_IN_VERTICES),
+                    };
+                    stand_in.visible_positions()
+                });
+                points.par_iter().map(|p| row.dot(*p) + shift).reduce(|| f32::INFINITY, f32::min)
+            };
+            low = low.min(y);
+        }
+        if low.is_finite() { low } else { 0.0 }
     }
 
     /// Every subtool as `(name, visible, packed)` for a project file, with the active one
@@ -5387,7 +5482,8 @@ impl App {
         };
         let op = if g.alternate { boolean::BoolOp::Subtract } else { boolean::BoolOp::Intersect };
         let mirror = (g.alternate && self.workspace.symmetry).then(|| {
-            let positions: Vec<Vec3> = prism.positions.iter().map(|p| Vec3::new(-p.x, p.y, p.z)).collect();
+            let plane = symmetry::MirrorPlane { axis: symmetry::Axis::X, at: mesh.bounds().center().x };
+            let positions: Vec<Vec3> = prism.positions.iter().map(|&p| plane.reflect(p)).collect();
             let mut indices = prism.indices.clone();
             for t in indices.chunks_mut(3) {
                 t.swap(1, 2);
@@ -7524,7 +7620,7 @@ impl App {
         let gpu = self.gfx.is_some() && self.stroke_brush.kind.gpu_drag();
         // Alt is ZBrush's alternate (ZSub) modifier.
         let invert = self.modifiers.alt_key() ^ self.workspace.subtract;
-        let symmetry = self.workspace.sym();
+        let symmetry = self.sculpt_symmetry();
         log::trace!("stroke {:?} invert={invert} symmetry={}", self.stroke_brush.kind, symmetry.label());
         let mut assets = self.workspace.assets.clone();
         assets.spotlight = self.spotlight_projector();
@@ -7604,7 +7700,7 @@ impl App {
         if !fresh {
             return;
         }
-        let images = self.workspace.sym().images();
+        let images = self.stroke.as_ref().unwrap().symmetry_images();
         let centres: Vec<Vec3> = hits.iter().flat_map(|&h| images.of(h)).collect();
         let target = sculptris::target_edge(radius, self.workspace.sculptris_detail);
         self.sculptris_at = hits;
@@ -8097,7 +8193,7 @@ impl App {
             self.add_guide(curve);
             return;
         }
-        let (symmetry, assets) = (self.workspace.sym(), self.workspace.assets.clone());
+        let (symmetry, assets) = (self.sculpt_symmetry(), self.workspace.assets.clone());
         let mut stroke = Stroke::begin(d.invert, false, symmetry).with_assets(assets.clone()).with_morph(self.morph_target());
         let (fwd, step) = (self.camera.forward(), d.brush.radius * self.workspace.curve_step);
         apply_curve(&mut stroke, self.doc.mesh_mut(), &d.brush, &curve, fwd, step);
@@ -8128,10 +8224,10 @@ impl App {
     /// ZRemesherGuide release: the curve, with its symmetry images as pieces of the same
     /// guide, kept on the active subtool for ZRemesher to run edge loops along.
     fn add_guide(&mut self, curve: curve::Curve) {
-        let images = self.workspace.sym().images();
+        let images = self.sculpt_symmetry().images();
         let mut guide = curve.clone();
         for k in 1..images.len() {
-            guide.append(&curve.transformed(&images.0[k]));
+            guide.append(&curve.transformed(&images, k));
         }
         let guides = &mut self.subtools[self.active_tool].guides;
         let start = guides.len();
@@ -8328,7 +8424,7 @@ impl App {
             zmodeler::Hover::Point(v) => (Vec::new(), base.pos[v as usize], Vec3::Z, format!("ZModeler {} Point", ws.4.name()), vec![v]),
         };
         let place = gizmo::Place::on_surface(anchor, normal);
-        self.zm_drag = Some(ZDrag { hover, base, press: self.cursor, before, faces, anchor, normal, points, place, handle: None, linear: None, built: None, label, changed: false });
+        self.zm_drag = Some(ZDrag { hover, base, press: self.cursor, before, faces, anchor, normal, points, place, handle: None, symmetry: self.sculpt_symmetry(), linear: None, built: None, label, changed: false });
         self.hover = None;
         // Insert puts the loop where the press is at once.
         if matches!(hover, zmodeler::Hover::Edge(..)) && ws.2 == zmodeler::EdgeAction::Insert {
@@ -8445,12 +8541,12 @@ impl App {
         let view = self.view();
         let delta = self.cursor - d.press;
         let ws = &self.workspace;
-        let images = ws.sym().images();
+        let images = d.symmetry.images();
         let b = &d.base;
         // The vertex of `b` at the mirror image `k` of vertex `v`, if there is one.
-        let size = d.base.pos.iter().fold(0.0f32, |m, p| m.max(p.abs().max_element())).max(1e-6);
+        let size = d.base.pos.iter().fold(0.0f32, |m, p| m.max((*p - d.symmetry.center).abs().max_element())).max(1e-6);
         let mirror = |k: usize, v: u32| -> Option<u32> {
-            let want = images.map(k, b.pos[v as usize]);
+            let want = images.map_point(k, b.pos[v as usize]);
             let (best, dist) = b.pos.iter().enumerate().map(|(i, p)| (i as u32, p.distance(want))).min_by(|x, y| x.1.total_cmp(&y.1))?;
             (dist < size * 1e-4).then_some(best)
         };
@@ -8529,7 +8625,7 @@ impl App {
                             return None;
                         }
                         let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
-                        each_image(&|pts, k| b.moved_points(pts, images.map(k, m.translate)))
+                        each_image(&|pts, k| b.moved_points(pts, images.map_vector(k, m.translate)))
                     }
                     PolyAction::Scale => {
                         if delta.length() < 1.0 {
@@ -8537,7 +8633,7 @@ impl App {
                         }
                         let factor = (1.0 + delta.x / 150.0).max(0.05);
                         let c = points.iter().map(|&v| b.pos[v as usize]).sum::<Vec3>() / points.len().max(1) as f32;
-                        each_image(&|pts, k| b.scaled_points(pts, images.map(k, c), factor))
+                        each_image(&|pts, k| b.scaled_points(pts, images.map_point(k, c), factor))
                     }
                     PolyAction::Transpose => return None,
                     PolyAction::Split => ZResult::Mesh(b.split(&faces)),
@@ -8572,7 +8668,7 @@ impl App {
                         for k in 0..images.len() {
                             let fs = image_faces(k);
                             if !fs.is_empty() {
-                                out = out.aligned_faces(&fs, images.map(k, c), images.map(k, n));
+                                out = out.aligned_faces(&fs, images.map_point(k, c), images.map_vector(k, n));
                             }
                         }
                         ZResult::Mesh(out)
@@ -8588,7 +8684,7 @@ impl App {
                             // The copies come in image order, the target first.
                             let Some(g) = out.face_with(&verts) else { continue };
                             let image = if k == 0 { 0 } else { (1..images.len()).find(|&i| verts.iter().zip(&b.faces[f0 as usize]).all(|(&w, &v)| mirror(i, v) == Some(w))).unwrap_or(0) };
-                            out = out.point_in_face(g, images.map(image, p));
+                            out = out.point_in_face(g, images.map_point(image, p));
                         }
                         ZResult::Mesh(out)
                     }
@@ -8673,7 +8769,7 @@ impl App {
                         let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
                         let mut out = b.clone();
                         for ((x, y), k) in edges_k {
-                            out = out.extrude_edges(&[(x, y)], images.map(k, m.translate));
+                            out = out.extrude_edges(&[(x, y)], images.map_vector(k, m.translate));
                         }
                         ZResult::Mesh(out)
                     }
@@ -8686,7 +8782,7 @@ impl App {
                         let mut out = Vec::new();
                         for ((x, y), k) in edges_k {
                             let pts: Vec<u32> = widen(x, y).into_iter().flat_map(|(p, q)| [p, q]).filter(|&v| done.insert(v)).collect();
-                            out.extend(b.moved_points(&pts, images.map(k, m.translate)));
+                            out.extend(b.moved_points(&pts, images.map_vector(k, m.translate)));
                         }
                         ZResult::Points(out)
                     }
@@ -8790,7 +8886,7 @@ impl App {
                             return None;
                         }
                         let m = transform::move_map(&view, d.anchor, d.press - self.canvas_origin(), self.canvas_cursor());
-                        return Some(ZResult::Points(mirrors.iter().map(|&(w, k)| (w, b.pos[w as usize] + images.map(k, m.translate))).collect()));
+                        return Some(ZResult::Points(mirrors.iter().map(|&(w, k)| (w, b.pos[w as usize] + images.map_vector(k, m.translate))).collect()));
                     }
                     PointAction::Bevel => {
                         let t = t?;
@@ -9079,6 +9175,7 @@ impl App {
             normal: place.axis(1),
             place,
             handle: Some(handle),
+            symmetry: self.sculpt_symmetry(),
             linear: None,
             built: None,
             label,
@@ -9116,7 +9213,7 @@ impl App {
             group: mesh.max_group().saturating_add(1),
             edge: insert_mesh::mean_edge(mesh),
             shape: self.workspace.insert_shape,
-            symmetry: self.workspace.sym(),
+            symmetry: self.sculpt_symmetry(),
             mask: mesh.mask.clone(),
         });
         self.hover = None;
@@ -9183,7 +9280,7 @@ impl App {
             self.workspace.notify(why);
             return;
         }
-        let (symmetry, shape) = (self.workspace.sym(), self.tube_shape(d.brush.radius));
+        let (symmetry, shape) = (self.sculpt_symmetry(), self.tube_shape(d.brush.radius));
         let keep = self.mesh().extent();
         let group = self.mesh().max_group().saturating_add(1);
         let Some(part) = curve_tube::tubes(&curve, shape, symmetry, group) else {
@@ -9661,23 +9758,19 @@ impl App {
     /// The half (+1 or -1 along X) a Clip Line was drawn on, for X symmetry: the side of
     /// most of the surface under the guide line, or, with no surface under it or as much on
     /// each side, the side the camera is on.
-    fn clip_side(&self, g: &surface_tools::Gesture) -> f32 {
+    fn clip_symmetry(&self, g: &surface_tools::Gesture) -> (symmetry::MirrorPlane, f32) {
         let (vp, cam, mesh) = (self.viewport(), &self.camera, self.mesh());
+        let plane = symmetry::MirrorPlane { axis: symmetry::Axis::X, at: self.doc.bounds().center().x };
         let sum: f32 = (0..=64)
             .into_par_iter()
             .filter_map(|k| {
                 let p = g.start.lerp(g.end, k as f32 / 64.0);
                 let (o, d) = cam.ray(p.x, p.y, vp.x, vp.y);
-                mesh.raycast(o, d).map(|h| h.point.x.signum())
+                mesh.raycast(o, d).map(|h| plane.distance(h.point).signum())
             })
             .sum();
-        if sum != 0.0 {
-            sum.signum()
-        } else if self.camera.eye().x < 0.0 {
-            -1.0
-        } else {
-            1.0
-        }
+        let side = if sum != 0.0 { sum } else { plane.distance(self.camera.eye()) };
+        (plane, if side < 0.0 { -1.0 } else { 1.0 })
     }
 
     fn surface_screen(&self) -> surface_tools::Screen {
@@ -9724,7 +9817,7 @@ impl App {
         let screen=self.surface_screen();let level=self.doc.active();
         match g.kind {
             BrushKind::ClipLine => {
-                let symmetry=self.workspace.symmetry.then(||self.clip_side(&g));
+                let symmetry=self.workspace.symmetry.then(||self.clip_symmetry(&g));
                 if let Some(before)=surface_tools::clip_line(self.doc.mesh_mut(),screen,&g,symmetry) {
                     let chunks=self.doc.finish_stroke(level,before);
                     self.history.push(UndoStep::Stroke {level,chunks});
@@ -9733,7 +9826,8 @@ impl App {
                 }
             }
             BrushKind::ClipRect | BrushKind::ClipCircle => {
-                if let Some(before)=surface_tools::clip_shape(self.doc.mesh_mut(),screen,&g,self.workspace.sym()) {
+                let symmetry = self.sculpt_symmetry();
+                if let Some(before)=surface_tools::clip_shape(self.doc.mesh_mut(),screen,&g,symmetry) {
                     let chunks=self.doc.finish_stroke(level,before);
                     self.history.push(UndoStep::Stroke {level,chunks});
                     self.history.name_last(g.kind.name());
@@ -9755,7 +9849,7 @@ impl App {
             }
             BrushKind::TrimCurve | BrushKind::SliceCurve | BrushKind::KnifeCurve => {
                 if !g.tiny() {
-                    let side=self.workspace.symmetry.then(||self.clip_side(&g));
+                    let side=self.workspace.symmetry.then(||self.clip_symmetry(&g));
                     let what=match g.kind {
                         BrushKind::TrimCurve=>cut::LineCut::Trim,
                         BrushKind::SliceCurve=>cut::LineCut::Slice,
@@ -9768,7 +9862,7 @@ impl App {
             }
             BrushKind::TrimRect | BrushKind::TrimCircle | BrushKind::TrimLasso => self.trim_shape(&g),
             _ => {
-                if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.workspace.sym()) {
+                if let Some(new)=surface_tools::mask_shape(self.doc.mesh(),screen,&g,self.workspace.settings_of(&self.brush,g.kind).strength,self.sculpt_symmetry()) {
                     let old=mask::replace(self.doc.mesh_mut(),new);
                     self.history.push(UndoStep::Mask {level,data:MaskData::Whole(old)});
                 }
@@ -9834,7 +9928,7 @@ impl App {
         }
         // A drag on the model: paint from the press point on.
         self.mask_press = None;
-        let mut stroke = mask::MaskStroke::begin(press.alt, self.workspace.sym())
+        let mut stroke = mask::MaskStroke::begin(press.alt, self.sculpt_symmetry())
             .with_brush(press.kind,self.workspace.assets.clone());
         let brush = self.at_pressure(self.workspace.brush_for(&self.brush, press.kind));
         stroke.dab_normal(self.doc.mesh_mut(), &brush, hit, press.normal);
@@ -9856,7 +9950,7 @@ impl App {
         };
         if press.direct && !press.moved {
             if let Some(hit)=press.hit {
-                let mut stroke=mask::MaskStroke::begin(press.alt,self.workspace.sym())
+                let mut stroke=mask::MaskStroke::begin(press.alt,self.sculpt_symmetry())
                     .with_brush(press.kind,self.workspace.assets.clone());
                 stroke.dab_normal(self.doc.mesh_mut(),&self.brush,hit,press.normal);
                 if let Some(chunks)=stroke.end() {self.history.push(UndoStep::Mask {level:self.doc.active(),data:MaskData::Chunks(chunks)});}
@@ -9981,7 +10075,9 @@ impl App {
             self.brush.kind
         };
         // Select Rect on Ctrl + Shift keeps its own press (a click on a polygroup isolates it).
-        if free && tool.is_shape() && !(ctrl && shift && tool == BrushKind::SelectRect) {
+        if free && (ctrl || self.workspace.mode == Mode::Draw)
+            && tool.is_shape() && !(ctrl && shift && tool == BrushKind::SelectRect)
+        {
             self.begin_gesture(tool);return;
         }
         if self.modifiers.control_key() && self.modifiers.shift_key() {
@@ -10019,7 +10115,7 @@ impl App {
             // action line; on empty canvas it rotates, with Alt it moves, and releasing Alt
             // turns it into a zoom. The border outside the document frame is always canvas.
             // Ctrl masks (see `begin_mask_press`).
-            if self.modifiers.control_key() || self.brush.kind.is_mask() {
+            if ctrl || (self.workspace.mode == Mode::Draw && self.brush.kind.is_mask()) {
                 if !self.modifiers.control_key() && (border || self.mesh().raycast(self.cursor_ray().0,self.cursor_ray().1).is_none()) {
                     self.begin_nav(MouseButton::Left);return;
                 }
@@ -11108,6 +11204,11 @@ impl App {
         let light = (self.camera.right() * place.x + self.camera.up() * place.y - self.camera.forward() * toward).normalize_or(-self.camera.forward());
         let preview = self.preview_map();
         let (preview_axis, preview_angle) = preview.rotation.to_axis_angle();
+        self.update_dynamic();
+        self.update_fibers();
+        let settings = self.sculpt_symmetry();
+        let sym_center = self.stroke.as_ref().map_or(settings.center, |s| s.symmetry_images().center());
+        let floor = if self.workspace.grid { self.floor_y(&preview) } else { 0.0 };
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
             inv_view_proj: self.camera.view_proj().inverse().to_cols_array_2d(),
@@ -11128,7 +11229,7 @@ impl App {
             ],
             display: [
                 if self.workspace.grid { 1.0 } else { 0.0 },
-                if self.workspace.sym().is_on() { 1.0 } else { 0.0 },
+                if settings.is_on() { 1.0 } else { 0.0 },
                 if self.workspace.show_mask { 1.0 } else { 0.0 },
                 if self.doc.mesh().mask.is_empty() { 0.0 } else { 1.0 },
             ],
@@ -11152,8 +11253,9 @@ impl App {
                 let c = self.workspace.layout.document.border.map(|c| c as f32 / 255.0);
                 [c[0], c[1], c[2], 1.0]
             },
+            scene: sym_center.extend(floor).to_array(),
             sym: {
-                let s = self.workspace.sym();
+                let s = settings;
                 let bits = s.x as u32 | (s.y as u32) << 1 | (s.z as u32) << 2;
                 let (axis, count) = s.radial.map_or((-1.0, 1.0), |(a, n)| (symmetry::Axis::ALL.iter().position(|x| *x == a).unwrap() as f32, n as f32));
                 // w: Transp, how opaque the other subtools are (0 when off).
@@ -11180,9 +11282,6 @@ impl App {
         if self.selftest_cull.is_none() && self.selftest_splat.is_none() {
             gfx.splatting = self.workspace.layout.dense_points && !self.render_triangles;
         }
-        self.update_dynamic();
-        self.update_fibers();
-        let Some(gfx) = self.gfx.as_mut() else { return };
         gfx.set_reference(self.workspace.reference.as_ref().filter(|r| r.shown).map(|r| (&*r.picture, r.corners(), r.opacity)));
         let t = Instant::now();
         gfx.upload_dirty(self.doc.mesh_mut(), self.workspace.polyframe);
@@ -11334,7 +11433,11 @@ impl ApplicationHandler for App {
                 self.set_clip_positioning(false);
             }
             WindowEvent::ModifiersChanged(m) => {
+                let shift_changed = self.modifiers.shift_key() != m.state().shift_key();
                 self.modifiers = m.state();
+                if shift_changed && self.transpose.is_some() {
+                    self.transpose_move();
+                }
                 if self.gesture.is_some() {self.update_gesture();}
                 // Alt during a Ctrl + Shift drag turns the rectangle into a hide (red) one.
                 if self.select.is_some() {
@@ -13474,7 +13577,6 @@ mod subtool_tests {
             app.workspace.zremesh.target_k = 0.6;
             app.workspace.zremesh.adaptive = 0.0;
             app.workspace.zremesh_symmetry = workspace::RemeshSymmetry::Force(axis);
-            app.workspace.zremesh_local_plane = true;
             assert!(!app.workspace.symmetry && !app.workspace.symmetry_y && !app.workspace.symmetry_z);
             // Leave the negative half different and offset the whole mesh from the origin.
             let positions: Vec<_> = app.mesh().positions.iter().map(|&p| {
@@ -14394,6 +14496,122 @@ mod transpose_tests {
     }
 
     #[test]
+    fn shift_snaps_the_transpose_line_and_locks_move_to_one_axis() {
+        let mut app = App::new(12, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.on_key(KeyCode::KeyW);
+        app.modifiers = ModifiersState::SHIFT;
+        let c = app.project(Vec3::ZERO);
+        drag(&mut app, c, c + Vec2::new(40.0, -140.0));
+        let line = app.action_line.unwrap();
+        assert_eq!(line.aligned_axis(), Some(symmetry::Axis::Y));
+
+        let middle = app.project(line.mid());
+        app.cursor_moved(middle, false);
+        app.left_press(false, false);
+        app.cursor_moved(middle + Vec2::new(80.0, -50.0), false);
+        let map = app.preview_map();
+        assert!(map.translate.y > 0.0);
+        assert_eq!(map.translate.x, 0.0);
+        assert_eq!(map.translate.z, 0.0);
+        app.modifiers = ModifiersState::empty();
+        app.transpose_move();
+        assert!(app.preview_map().translate.x > 0.0);
+        app.modifiers = ModifiersState::SHIFT;
+        app.transpose_move();
+        app.left_release();
+        assert!(centre(&app).abs_diff_eq(map.translate, 1e-5));
+        app.history_jump(-1);
+        assert!(centre(&app).abs_diff_eq(Vec3::ZERO, 1e-5));
+    }
+
+    #[test]
+    fn shift_locks_the_gizmo_free_handle_in_its_own_axes() {
+        let mut app = App::new(12, false, usize::MAX);
+        app.camera.aspect = 1.6;
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.on_key(KeyCode::KeyW);
+        app.workspace.gizmo = true;
+        app.modifiers = ModifiersState::SHIFT;
+        let place = gizmo::Place { centre: Vec3::ZERO, rotation: glam::Quat::from_rotation_z(0.2) };
+        app.gizmo_place = Some((app.subtools[0].id, place));
+        let press = app.project(place.centre) + Vec2::X * gizmo::FREE_RING;
+        app.cursor_moved(press, false);
+        app.left_press(false, false);
+        app.cursor_moved(press + Vec2::new(35.0, -7.0), false);
+        // A later swing toward the other screen direction keeps the first chosen axis.
+        app.cursor_moved(press + Vec2::new(40.0, -100.0), false);
+        let delta = app.preview_map().translate;
+        assert!(delta.dot(place.axis(0)) > 0.0);
+        assert!(delta.cross(place.axis(0)).length() < 1e-5);
+        app.left_release();
+        assert!(centre(&app).abs_diff_eq(delta, 1e-5));
+    }
+
+    #[test]
+    fn floor_tracks_visible_subtools_hidden_polygons_and_the_transform_preview() {
+        let mut app = App::new(12, false, usize::MAX);
+        let shift = Affine::translation(Vec3::new(0.0, -4.0, 0.0));
+        let mut parked = Multires::new(app.mesh().clone(), usize::MAX);
+        parked.transform(&shift);
+        let low = parked.bounds().min.y;
+        let tool = app.parked_subtool("Lower".to_string(), true, parked);
+        app.subtools.push(tool);
+        assert_eq!(app.floor_y(&Affine::IDENTITY), low);
+        app.workspace.solo = true;
+        assert_eq!(app.floor_y(&Affine::IDENTITY), app.doc.bounds().min.y);
+
+        let mesh = app.mesh();
+        let hidden = mesh.indices.chunks_exact(3)
+            .map(|tri| tri.iter().any(|&v| mesh.positions[v as usize].y < 0.0) as u8).collect();
+        app.doc.set_hidden(0, hidden);
+        let initial = app.mesh().visible_bounds().min.y;
+        assert!(initial >= 0.0);
+        assert_eq!(app.floor_y(&Affine::IDENTITY), initial);
+
+        let preview = Affine::rotation_about(Vec3::ZERO, glam::Quat::from_rotation_z(0.43));
+        let expected = app.mesh().positions.iter().zip(&app.mesh().shown)
+            .filter(|(_, shown)| **shown != 0)
+            .map(|(&p, _)| preview.apply(p).y).fold(f32::INFINITY, f32::min);
+        assert!((app.floor_y(&preview) - expected).abs() < 1e-5);
+        app.apply_transform(preview);
+        assert!((app.floor_y(&Affine::IDENTITY) - expected).abs() < 1e-5);
+        app.history_jump(-1);
+        assert!((app.floor_y(&Affine::IDENTITY) - initial).abs() < 1e-5);
+    }
+
+    #[test]
+    fn merged_disconnected_parts_sculpt_across_their_shared_subtool_center() {
+        let mut app = App::new(24, false, usize::MAX);
+        let center = Vec3::new(4.0, 1.0, 0.0);
+        let left = center - 1.5 * Vec3::X;
+        let right = center + 1.5 * Vec3::X;
+        let mut other = Multires::new(app.mesh().clone(), usize::MAX);
+        other.transform(&Affine::translation(left));
+        let tool = app.parked_subtool("Left".to_string(), true, other);
+        app.subtools.push(tool);
+        app.apply_transform(Affine::translation(right));
+        app.merge_down();
+        app.workspace.symmetry = true;
+        assert!(app.sculpt_symmetry().center.abs_diff_eq(center, 1e-6));
+        app.camera.target = center;
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.camera.distance = 7.0;
+        app.camera.aspect = 1.6;
+        app.brush.radius = 0.35;
+        let start = app.project(right + Vec3::Z);
+        let before = app.mesh().positions.clone();
+        drag(&mut app, start, start + Vec2::Y * 30.0);
+        let edited = |on_right| before.iter().zip(&app.mesh().positions)
+            .any(|(p, q)| (p.x > center.x) == on_right && p.distance(*q) > 1e-3);
+        assert!(edited(true) && edited(false));
+    }
+
+    #[test]
     fn scale_middle_circle_squashes_along_the_line() {
         let mut app = App::new(24, false, usize::MAX);
         app.camera.aspect = 1.6;
@@ -15058,7 +15276,7 @@ mod surface_input_tests {
         let before=a.mesh().positions.clone();
         let (s,e)=(c+Vec2::new(-400.0,-150.0),c+Vec2::new(400.0,-150.0));
         let plane=a.surface_screen().plane(s,e).unwrap();
-        let side=a.clip_side(&surface_tools::Gesture{end:e,..surface_tools::Gesture::new(BrushKind::ClipLine,s,false)});
+        let (_, side)=a.clip_symmetry(&surface_tools::Gesture{end:e,..surface_tools::Gesture::new(BrushKind::ClipLine,s,false)});
         a.cursor_moved(s,false);a.left_press(false,false);a.cursor_moved(e,false);a.left_release();
         // On the half under the line nothing below the guide moves (before the fix the
         // mirrored plane cut this half too, 0.56 deep).
@@ -15451,10 +15669,12 @@ mod curve_input_tests {
         // With symmetry a second tube on the other side, in the same polygroup.
         a.on_key(KeyCode::Escape);
         a.workspace.symmetry = true;
+        let plane = symmetry::MirrorPlane { axis: symmetry::Axis::X, at: a.doc.bounds().center().x };
         let (start, groups) = (a.mesh().vertex_count(), a.mesh().group_count());
         drag(&mut a, centre + Vec2::new(60.0, -150.0), 120.0, true);
         let part = &a.mesh().positions[start..];
-        assert!(part.iter().any(|p| p.x > 0.1) && part.iter().any(|p| p.x < -0.1));
+        assert!(part.iter().any(|p| plane.distance(*p) > 0.1));
+        assert!(part.iter().any(|p| plane.distance(*p) < -0.1));
         assert_eq!(a.mesh().group_count(), groups + 1);
     }
 

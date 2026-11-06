@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.49.0
+## Latest implementation — 0.50.0
 
-See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+See Step 107 for Transpose axis snapping, the floor grid and SubTool symmetry. See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 fo
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.49.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.50.0**. Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -1032,3 +1032,13 @@ The user shared four reference images of hand-made / Quad Remesher-quality chara
   - Next: better first positions for fill points (the Tutte map of a curved patch onto a convex outline squeezes its insides; a relax that also evens angles, or flattening that keeps angles), so fewer passes are needed.
 - Smoothing (2026-11-06): the planned path's relax now moves each point a whole step to the mean of its quads' middles (was half a step to the mean of its neighbours); the plain remesher keeps the old one. `ZR_SMOOTH=half|full|faces|faces,full` overrides. Bust at 30 passes: half 17.2%, full 16.1%, faces 17.2%, **faces+full 14.9%**. With it: bust 17.7% → **14.9%**, bust with eye/mouth loops 23.0% → 19.4%, T-pose 21.7% → **17.3%**, blob with eye loops 4.2% → **1.7%**; ball, cube, torus, blob 0–0.3%, vase 0.2%, rook 0.4% (was 0.2%); cube edges kept (152 points on its edges as before). For reference the old method: bust ~13–14%, T-pose 4.5%.
   - Note: while this was being done other edits appeared in this checkout (curve, sculpt, symmetry, transform, main …, not compiling at the time); the remesher work was tested in a scratch worktree (`git worktree` at 39d92fd plus the three remesher files) and only `src/zremesh.rs`, `src/zremesh/layout.rs` and `handoff.md` were touched here.
+
+## Step 107 — Axis snapping, model floor and SubTool symmetry (2026-11-06)
+
+- Klay is a Rust desktop sculpting app using winit, egui, wgpu/WGSL, glam and rayon. This step sets Cargo semver to 0.50.0 and keeps the existing project reader and file format.
+- Transpose in `main.rs` and `transform.rs` picks a projected X/Y/Z direction when Shift is held and holds the axis until release. Move follows an aligned action line. A free Move drag or action line uses the projected world axes. The Gizmo’s free-move ring uses the Gizmo’s own axes, including its rotation. The preview and undo step use the same affine map.
+- `mesh.rs` measures the lowest visible vertex. `main.rs` combines that with the drawn SubTools and dynamic preview. Transforms use a bounding-box shortcut when they preserve vertical alignment and inspect the surface for oblique transforms. Selected parked SubTools cache their drawn points for the duration of an oblique drag. The result goes to `shader.wgsl` as the floor Y. Live Boolean uses the operand mesh geometry until the result is baked.
+- Symmetry uses the active mesh bounds center, including hidden geometry. Merge Down gets the combined bounds automatically. `symmetry.rs` separates position, normal/direction and plane transforms. Strokes keep their symmetry center for the gesture, and the viewport brush rings use that center. ZSphere symmetry uses its root. Mirror Copy reflects across the world axis for placement. Mirror And Weld, Smart ReSym and ZRemesher center on the SubTool.
+- Reference behavior from Maxon’s [Transpose Move documentation](https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/posing-your-model/transpose/moving/moving.html) and [Local Symmetry documentation](https://help.maxon.net/zbr/en-us/Content/html/reference-guide/transform/transform.html).
+- Verified with `cargo build --release --offline` and `cargo test --release --offline` (454 passed, 15 ignored). On Wayland/Vulkan, `--selftest-transpose` passed at 2,457,602 vertices with Move, Scale, Rotate, GPU readback and undo. `--selftest-symmetry` passed off-center Y mirror and radial Z for Draw, Grab, Snake Hook and Inflate, with GPU readback and undo/redo. The viewport screenshot in `docs/images/subtool-floor.png` shows the floor beneath three SubTools in Graphite Blue.
+- Next independent work is the planned ZRemesher layout from Step 106.
