@@ -2567,11 +2567,34 @@ mod shape_tests {
             }
             write_obj(&m, &dir.join(format!("{name}-input.obj")));
             let mirrored = std::env::var_os("ZR_MIRROR").is_some();
+            // ZR_EYELOOPS: closed guide loops round the blob's eye sockets and nose (directions
+            // round each feature, cast onto the surface).
+            let mut guides: Vec<Vec<Vec3>> = Vec::new();
+            if name == "blob" && std::env::var_os("ZR_EYELOOPS").is_some() {
+                for (c, ang) in [(Vec3::new(0.35, 0.25, 0.85), 0.24f32), (Vec3::new(-0.35, 0.25, 0.85), 0.24), (Vec3::new(0.0, -0.05, 1.0), 0.16)] {
+                    let d0 = c.normalize();
+                    let e1 = d0.any_orthonormal_vector();
+                    let e2 = d0.cross(e1);
+                    let mut loop_pts = Vec::new();
+                    for i in 0..64 {
+                        let t = std::f32::consts::TAU * i as f32 / 64.0;
+                        let dir = (d0 * ang.cos() + (e1 * t.cos() + e2 * t.sin()) * ang.sin()).normalize();
+                        if let Some(h) = m.raycast(dir * 10.0, -dir) {
+                            loop_pts.push(h.point);
+                        }
+                    }
+                    if let Some(&p0) = loop_pts.first() {
+                        loop_pts.push(p0);
+                    }
+                    eprintln!("eye loop: {} points, {:.3} long", loop_pts.len(), loop_pts.windows(2).map(|e| e[0].distance(e[1])).sum::<f32>());
+                    guides.push(loop_pts);
+                }
+            }
             for planned in [false, true] {
                 let follow: f32 = std::env::var("ZR_FOLLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
                 let detect = std::env::var("ZR_EDGES").map(|v| v != "0").unwrap_or(true);
                 let s = Settings { target_k: k, keep_groups: false, layout: planned, mirror: mirrored.then_some(TEST_X_PLANE), follow_shape: follow, detect_edges: detect, ..Settings::default() };
-                let (out, st) = match zremesh(&m, &s, &[]) {
+                let (out, st) = match zremesh(&m, &s, &guides) {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("{name:6} {}: error {e}", if planned { "new" } else { "old" });

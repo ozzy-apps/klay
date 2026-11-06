@@ -4696,6 +4696,8 @@ impl Workspace {
                             .on_hover_text(format!("Edge loops run exactly along sharp edges (turning more than {:.0}°)", crate::zremesh::EDGE_ANGLE));
                         ui.checkbox(&mut ws.zremesh.freeze_border, "FreezeBorder")
                             .on_hover_text("Open borders keep every vertex where it is, so the result welds back to what it was cut from");
+                        ui.checkbox(&mut ws.zremesh.layout, "Plan Layout")
+                            .on_hover_text("Experimental: plan the whole quad layout first (long loops, few poles). Closed ZRemesherGuide loops become edge loops with their inside as a cap. Slower; falls back to the usual remesh when it cannot plan");
                     });
                     zslider(ui, "Curves Strength", &mut ws.zremesh.curves_strength, 0.0..=100.0, false, false, 0);
                     ui.checkbox(&mut ws.zremesh.use_polypaint, "Use Polypaint")

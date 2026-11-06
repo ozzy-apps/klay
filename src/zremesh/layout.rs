@@ -350,6 +350,19 @@ fn feature_loops(w: &mut Work, quad: f32, enclosed: &mut Vec<bool>) -> usize {
         let b = n.cross(u);
         0.5 * (u.dot(t * u) + b.dot(t * b))
     }).collect();
+    // How lopsided the bending is at each vertex: 0 bends alike both ways (a ball, a
+    // socket), 1 bends one way only (a cylinder, a rim) or saddles.
+    let lopsided: Vec<f32> = (0..nv).map(|v| {
+        let n = w.vnrm[v];
+        let t = tensors[v];
+        let u = n.any_orthonormal_vector();
+        let b = n.cross(u);
+        let (a, bb, c) = (u.dot(t * u), u.dot(t * b), b.dot(t * b));
+        let mean = 0.5 * (a + c);
+        let half = (0.25 * (a - c) * (a - c) + bb * bb).sqrt();
+        let (k1, k2) = (mean + half, mean - half);
+        ((k1 - k2) / (k1.abs() + k2.abs()).max(1e-12)).clamp(0.0, 1.0)
+    }).collect();
     // Smoothed at about a quad, and at about four (the surroundings).
     let edge = (0..nv.min(2000)).filter_map(|v| w.neighbours(v as u32).first().map(|&u| w.p[v].distance(w.p[u as usize]))).sum::<f32>() / nv.min(2000).max(1) as f32;
     let blur = |x: &[f32], radius: f32| -> Vec<f32> {
@@ -456,6 +469,19 @@ fn feature_loops(w: &mut Work, quad: f32, enclosed: &mut Vec<bool>) -> usize {
         for faces in &regions {
             let a: f32 = faces.iter().map(|&f| area(f)).sum();
             if a < quad * quad * 4.0 || a > quad * quad * 400.0 {
+                continue;
+            }
+            // A bump or socket bends both ways over most of it; a rim or crease one way.
+            let verts: HashSet<u32> = faces.iter().flat_map(|&f| w.t[f]).collect();
+            let round = verts.iter().map(|&v| lopsided[v as usize]).sum::<f32>() / verts.len().max(1) as f32;
+            let max_lop: f32 = std::env::var("ZR_ROUND").ok().and_then(|v| v.parse().ok()).unwrap_or(1.01);
+            // It must actually curve (a flat cap inside a rim stands out but is no feature).
+            let curves = verts.iter().map(|&v| mean[v as usize].abs()).sum::<f32>() / verts.len().max(1) as f32 * quad;
+            let near_hard = faces.iter().any(|&f| (0..3).any(|k| w.hard[f * 3 + k] && !w.soft[f * 3 + k]));
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("    feature region {:.1} quads²: lopsided {round:.2}, curvature × quad {curves:.3}{}", a / (quad * quad), if near_hard { ", on a sharp edge" } else { "" });
+            }
+            if round > max_lop || near_hard || curves < 0.08 {
                 continue;
             }
             let Some(c) = faces.iter().flat_map(|&f| w.t[f]).max_by(|&x, &y| d[x as usize].abs().total_cmp(&d[y as usize].abs())) else { continue };
@@ -577,6 +603,207 @@ fn feature_loops(w: &mut Work, quad: f32, enclosed: &mut Vec<bool>) -> usize {
         if made {
             count += 1;
         }
+    }
+    count
+}
+
+/// Closed guides (end within about a quad of the start, at least four quads long) are put
+/// on the working mesh as closed edge paths, made hard and soft; the smaller side is marked
+/// enclosed. Returns how many.
+fn guide_loops(w: &mut Work, guides: &[Vec<Vec3>], quad: f32, enclosed: &mut Vec<bool>) -> usize {
+    let nv = w.p.len();
+    let nf = w.t.len();
+    if guides.is_empty() || nv == 0 {
+        return 0;
+    }
+    // Nearest working vertex, by grid cell.
+    let cell = quad.max(1e-6);
+    let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
+    let cell_of = |p: Vec3| { let c = (p / cell).floor(); (c.x as i32, c.y as i32, c.z as i32) };
+    for v in 0..nv as u32 {
+        grid.entry(cell_of(w.p[v as usize])).or_default().push(v);
+    }
+    let nearest = |w: &Work, p: Vec3| -> Option<u32> {
+        let c = cell_of(p);
+        let mut best: Option<(f32, u32)> = None;
+        for r in 1..4i32 {
+            for dx in -r..=r {
+                for dy in -r..=r {
+                    for dz in -r..=r {
+                        for &v in grid.get(&(c.0 + dx, c.1 + dy, c.2 + dz)).into_iter().flatten() {
+                            let d = w.p[v as usize].distance_squared(p);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, v));
+                            }
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        best.map(|b| b.1)
+    };
+    // Shortest edge path between two vertices (Dijkstra, bounded).
+    let path = |w: &Work, a: u32, b: u32| -> Option<Vec<u32>> {
+        if a == b {
+            return Some(vec![a]);
+        }
+        let reach = w.p[a as usize].distance(w.p[b as usize]) * 3.0 + quad;
+        let mut dist: HashMap<u32, f32> = HashMap::default();
+        let mut from: HashMap<u32, u32> = HashMap::default();
+        let mut heap = std::collections::BinaryHeap::new();
+        dist.insert(a, 0.0);
+        heap.push((std::cmp::Reverse(0f32.to_bits()), a));
+        while let Some((std::cmp::Reverse(db), v)) = heap.pop() {
+            let dv = f32::from_bits(db);
+            if v == b {
+                let mut out = vec![b];
+                let mut x = b;
+                while x != a {
+                    x = from[&x];
+                    out.push(x);
+                }
+                out.reverse();
+                return Some(out);
+            }
+            if dv > dist[&v] {
+                continue;
+            }
+            for &u in w.neighbours(v) {
+                let nd = dv + w.p[v as usize].distance(w.p[u as usize]);
+                if nd <= reach && dist.get(&u).is_none_or(|&x| nd < x) {
+                    dist.insert(u, nd);
+                    from.insert(u, v);
+                    heap.push((std::cmp::Reverse(nd.to_bits()), u));
+                }
+            }
+        }
+        None
+    };
+    let mut count = 0;
+    for g in guides {
+        let length: f32 = g.windows(2).map(|e| e[0].distance(e[1])).sum();
+        if g.len() < 4 || length < quad * 4.0 || g[0].distance(*g.last().unwrap()) > quad.max(length * 0.08) {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("    guide: not closed ({} points, {:.1} quads long, ends {:.2} quads apart)", g.len(), length / quad, g[0].distance(*g.last().unwrap()) / quad);
+            }
+            continue;
+        }
+        // Points about a third of a quad apart, snapped; consecutive ones joined by paths.
+        let mut samples: Vec<Vec3> = vec![g[0]];
+        let mut acc = 0.0;
+        for e in g.windows(2) {
+            acc += e[0].distance(e[1]);
+            if acc >= quad * 0.33 {
+                samples.push(e[1]);
+                acc = 0.0;
+            }
+        }
+        let mut snapped: Vec<u32> = samples.iter().filter_map(|&p| nearest(w, p)).collect();
+        snapped.dedup();
+        if snapped.len() > 1 && snapped.first() == snapped.last() {
+            snapped.pop();
+        }
+        if snapped.len() < 4 {
+            continue;
+        }
+        let m = snapped.len();
+        let mut lp: Vec<u32> = Vec::new();
+        let mut ok = true;
+        for k in 0..m {
+            let Some(seg) = path(w, snapped[k], snapped[(k + 1) % m]) else { ok = false; break };
+            for &v in &seg[..seg.len() - 1] {
+                lp.push(v);
+            }
+        }
+        // A loop must not cross itself: cut out any repeated stretch.
+        let mut seen: HashMap<u32, usize> = HashMap::default();
+        let mut clean: Vec<u32> = Vec::new();
+        for v in lp {
+            if let Some(&at) = seen.get(&v) {
+                for x in clean.drain(at + 1..) {
+                    seen.remove(&x);
+                }
+            } else {
+                seen.insert(v, clean.len());
+                clean.push(v);
+            }
+        }
+        if !ok || clean.len() < 6 {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("    guide: no path (ok {ok}, {} vertices)", clean.len());
+            }
+            continue;
+        }
+        // Mark the loop's half-edges hard and soft.
+        let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        let edges: HashSet<(u32, u32)> = (0..clean.len()).map(|k| key(clean[k], clean[(k + 1) % clean.len()])).collect();
+        let mut marked = 0;
+        for h in 0..nf * 3 {
+            let (a, b) = (w.from(h as u32), w.to(h as u32));
+            if edges.contains(&key(a, b)) {
+                w.hard[h] = true;
+                w.soft[h] = true;
+                marked += 1;
+            }
+        }
+        if marked < edges.len() {
+            continue;
+        }
+        // Inside: the smaller of the regions the loop splits the faces into.
+        let crosses = |f: usize, k: usize| edges.contains(&key(w.t[f][k], w.t[f][(k + 1) % 3]));
+        let mut comp = vec![u32::MAX; nf];
+        let mut sizes: Vec<f32> = Vec::new();
+        for f0 in 0..nf {
+            if comp[f0] != u32::MAX {
+                continue;
+            }
+            let id = sizes.len() as u32;
+            let mut q = vec![f0];
+            comp[f0] = id;
+            let mut area = 0.0;
+            while let Some(f) = q.pop() {
+                let t = w.t[f];
+                area += (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length();
+                for k in 0..3 {
+                    let o = w.twin[f * 3 + k];
+                    if o == NONE || crosses(f, k) {
+                        continue;
+                    }
+                    let g2 = o as usize / 3;
+                    if comp[g2] == u32::MAX {
+                        comp[g2] = id;
+                        q.push(g2);
+                    }
+                }
+            }
+            sizes.push(area);
+        }
+        if sizes.len() < 2 {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("    guide: the loop does not split the surface");
+            }
+            continue;
+        }
+        // The loop's two sides: the components of faces along it.
+        let mut sides: Vec<u32> = Vec::new();
+        for f in 0..nf {
+            if (0..3).any(|k| crosses(f, k)) && !sides.contains(&comp[f]) {
+                sides.push(comp[f]);
+            }
+        }
+        let Some(&inner) = sides.iter().min_by(|&&a, &&b| sizes[a as usize].total_cmp(&sizes[b as usize])) else { continue };
+        if enclosed.len() != nf {
+            *enclosed = vec![false; nf];
+        }
+        for f in 0..nf {
+            if comp[f] == inner {
+                enclosed[f] = true;
+            }
+        }
+        count += 1;
     }
     count
 }
@@ -2369,7 +2596,7 @@ fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, 
             }));
         let thin = 2.0 * area / perimeter.max(1e-12) < quad * 1.2 && perimeter > quad * 6.0;
         // A big patch with many corners is cut in two (deleting its lines only grows it).
-        if real > 8 && area > quad * quad * 150.0 && std::env::var_os("ZR_NOBIGSPLIT").is_none() {
+        if real > 8 && area > quad * quad * 40.0 && std::env::var_os("ZR_NOBIGSPLIT").is_none() {
             if std::env::var_os("KLAY_ZR_DEBUG").is_some() { eprintln!("    fault ({} faces): {} corners over {:.0} quads², split", faces.len(), real, area / (quad * quad)); }
             faulty.extend(faces.iter().copied());
             faults.push(Fault::Split(inside()));
@@ -3711,6 +3938,14 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             eprintln!("  feature loops: {loops}");
         }
     }
+    // Closed guide loops (a ZRemesherGuide stroke that ends where it began): each becomes a
+    // hard, corner-less loop with its inside as a cap and four lines leaving it.
+    {
+        let loops = guide_loops(&mut w, guides, quad, &mut enclosed);
+        if std::env::var_os("KLAY_ZR_DEBUG").is_some() && loops > 0 {
+            eprintln!("  guide loops: {loops}");
+        }
+    }
     let nv = w.p.len();
 
     // 2. Cross field and poles.
@@ -3946,7 +4181,13 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 cur = nx;
             }
             if cur != v0 || lp.len() < 8 {
+                if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                    eprintln!("    spokes: loop from {v0} not closed ({} vertices, stopped at a vertex with {} soft edges)", lp.len(), soft_nb.get(&cur).map_or(0, |x| x.len()));
+                }
                 continue;
+            }
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("    spokes: loop of {} vertices", lp.len());
             }
             let m = lp.len();
             let mut cum = vec![0.0f32];

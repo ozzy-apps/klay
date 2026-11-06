@@ -2447,7 +2447,15 @@ impl App {
             let (out, stats) = zremesh::zremesh(&mesh, &settings, &guides)?;
             log::info!("ZRemesher: {stats:?}");
             let mirror = settings.mirror.map_or(String::new(), |plane| format!(" · {} symmetry", plane.axis.name()));
-            Ok(GeoDone::Topology { mesh: out, detail: format!(" · {} quads{mirror}", fmt_count(stats.quads)) })
+            // With Plan Layout: whether it was planned, or why it fell back.
+            let plan = if !settings.layout {
+                String::new()
+            } else if stats.planned {
+                " · planned layout".to_string()
+            } else {
+                format!(" · layout not planned ({})", stats.fallback.as_deref().unwrap_or("unknown"))
+            };
+            Ok(GeoDone::Topology { mesh: out, detail: format!(" · {} quads{mirror}{plan}", fmt_count(stats.quads)) })
         });
     }
 

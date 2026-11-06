@@ -469,6 +469,15 @@ are replaced. The remesher holds a loop on the cut and welds it where the surfac
 the plane. Guides on either side can steer the mirrored topology. If the positive half
 is empty, try **SubTool Center** or choose another axis.
 
+**Plan Layout** (experimental, off) plans the whole quad layout before placing quads: lines
+from the direction field's poles cut the surface into patches, every patch side gets a whole
+number of quads that its neighbours agree on, and each patch is filled with a regular grid.
+It gives long loops and very few poles on clean forms (a ball gets its 8, a torus none). A
+ZRemesherGuide stroke drawn as a closed loop (ending where it began) becomes an edge loop,
+with its inside filled as a cap and four loops leaving it, for eyes, mouths and sockets. It
+is slower, still rough on very detailed sculpts, and falls back to the usual remesh when it
+cannot plan; the notice says which happened.
+
 **KeepCreases** (on by default) runs an edge loop exactly along every creased edge (see
 Crease below) and creases the new edges there again, so the next Divide keeps them sharp.
 **Detect Edges** (on by default) does the same along sharp edges, where the surface turns by more than 40°,
