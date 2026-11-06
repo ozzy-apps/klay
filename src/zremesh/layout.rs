@@ -265,6 +265,41 @@ fn refined(mesh: &SculptMesh, edge: f32) -> Result<SculptMesh, String> {
             idx = m.indices;
         }
     }
+    // Handles about a quad across (a tunnel between fingers, a speck of a loop) would each
+    // need cuts across the whole model: they are closed instead.
+    // Passes out to 1.5, 3 and 5 quads (scaled by ZR_HANDLE, 0 = off), each on the mesh the
+    // last one left.
+    let scale: f32 = std::env::var("ZR_HANDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    if scale > 0.0 {
+        let mut n = 0;
+        for r in std::env::var("ZR_HANDLERADII").ok().map(|v| v.split(',').filter_map(|x| x.parse::<f32>().ok()).collect::<Vec<_>>()).unwrap_or(vec![1.5, 3.0, 5.0]) {
+            for _ in 0..3 {
+                let k = close_small_handles(&mut p, &mut idx, &mut grp, edge * DENSITY * r * scale);
+                n += k;
+                if k == 0 {
+                    break;
+                }
+            }
+        }
+        // Handles with a short ring but a long way through (a tunnel): cut round the ring.
+        if std::env::var_os("ZR_NOLOOPCUT").is_none() {
+            let around: f32 = std::env::var("ZR_LOOPCUT").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+            n += cut_short_loops(&mut p, &mut idx, &mut grp, edge * DENSITY * around * scale);
+        }
+        if n > 0 && std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+            eprintln!("  closed {n} small handles");
+        }
+        if let Some(path) = std::env::var_os("ZR_HANDLEDUMP") {
+            let mut t = String::new();
+            for q in &p {
+                t.push_str(&format!("v {} {} {}\n", q.x, q.y, q.z));
+            }
+            for f in idx.chunks_exact(3) {
+                t.push_str(&format!("f {} {} {}\n", f[0] + 1, f[1] + 1, f[2] + 1));
+            }
+            let _ = std::fs::write(path, t);
+        }
+    }
     for _ in 0..16 {
         let key = |a: u32, b: u32| (a.min(b), a.max(b));
         let mut mid: HashMap<(u32, u32), u32> = HashMap::default();
@@ -329,6 +364,511 @@ fn refined(mesh: &SculptMesh, edge: f32) -> Result<SculptMesh, String> {
         grp = og;
     }
     Ok(SculptMesh::from_raw_with_groups(p, idx, grp))
+}
+
+/// Directed boundary cycles of the faces `fs` (each edge a→b of a face whose b→a is not in
+/// `fs`), or None if a boundary vertex is passed twice (the region pinches there).
+fn boundary_cycles(idx: &[u32], fs: &HashSet<u32>) -> Option<Vec<Vec<u32>>> {
+    let mut inside: HashSet<(u32, u32)> = HashSet::default();
+    for &f in fs {
+        let t = &idx[f as usize * 3..f as usize * 3 + 3];
+        for k in 0..3 {
+            inside.insert((t[k], t[(k + 1) % 3]));
+        }
+    }
+    let mut next: HashMap<u32, u32> = HashMap::default();
+    for &(a, b) in &inside {
+        if !inside.contains(&(b, a)) && next.insert(a, b).is_some() {
+            return None;
+        }
+    }
+    let mut cycles = Vec::new();
+    let mut done: HashSet<u32> = HashSet::default();
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
+    for s in starts {
+        if done.contains(&s) {
+            continue;
+        }
+        let mut c = vec![s];
+        done.insert(s);
+        let mut v = next[&s];
+        while v != s {
+            if !done.insert(v) {
+                return None;
+            }
+            c.push(v);
+            v = *next.get(&v)?;
+        }
+        cycles.push(c);
+    }
+    Some(cycles)
+}
+
+/// Genus of the faces `fs` from their Euler number alone (boundary loops counted as edge
+/// components), for reporting a ball whose border pinches.
+fn genus_hint(idx: &[u32], fs: &HashSet<u32>) -> i64 {
+    let mut e: HashMap<(u32, u32), u32> = HashMap::default();
+    let mut v: HashSet<u32> = HashSet::default();
+    for &f in fs {
+        let t = &idx[f as usize * 3..f as usize * 3 + 3];
+        for k in 0..3 {
+            v.insert(t[k]);
+            *e.entry((t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]))).or_default() += 1;
+        }
+    }
+    let chi = v.len() as i64 - e.len() as i64 + fs.len() as i64;
+    let bedges: Vec<(u32, u32)> = e.iter().filter(|x| *x.1 == 1).map(|x| *x.0).collect();
+    let mut par: HashMap<u32, u32> = HashMap::default();
+    fn find(par: &mut HashMap<u32, u32>, x: u32) -> u32 {
+        let mut r = x;
+        while let Some(&q) = par.get(&r) {
+            if q == r {
+                break;
+            }
+            r = q;
+        }
+        r
+    }
+    for &(a, b) in &bedges {
+        par.entry(a).or_insert(a);
+        par.entry(b).or_insert(b);
+        let (ra, rb) = (find(&mut par, a), find(&mut par, b));
+        par.insert(ra, rb);
+    }
+    let comps: HashSet<u32> = par.keys().copied().collect::<Vec<_>>().into_iter().map(|x| find(&mut par, x)).collect();
+    (2 - chi - comps.len() as i64) / 2
+}
+
+/// Euler number left over by the pieces of a closed mesh: 2 per piece minus V − E + F (twice
+/// the handles), or None if an edge is not in exactly two triangles.
+fn handles_left(nv: usize, idx: &[u32]) -> Option<i64> {
+    let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+    for t in idx.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    if edges.values().any(|&c| c != 2) {
+        return None;
+    }
+    let mut parent: Vec<u32> = (0..nv as u32).collect();
+    fn root(par: &mut [u32], mut x: u32) -> u32 {
+        while par[x as usize] != x {
+            par[x as usize] = par[par[x as usize] as usize];
+            x = par[x as usize];
+        }
+        x
+    }
+    for t in idx.chunks_exact(3) {
+        let a = root(&mut parent, t[0]);
+        for &v in &t[1..] {
+            let b = root(&mut parent, v);
+            parent[b as usize] = a;
+        }
+    }
+    let used: HashSet<u32> = idx.iter().copied().collect();
+    let pieces: HashSet<u32> = used.iter().map(|&v| root(&mut parent, v)).collect();
+    let chi = used.len() as i64 - edges.len() as i64 + (idx.len() / 3) as i64;
+    Some(2 * pieces.len() as i64 - chi)
+}
+
+/// The shortest loop round a handle through `root` (shortest-path tree, then the edges whose
+/// loop does not cut the surface in two: those on a cycle of the dual graph of the edges off
+/// the tree). The loop's own part (without the way out from `root`) and its length.
+fn handle_loop(p: &[Vec3], idx: &[u32], nb: &[Vec<u32>], edge_faces: &HashMap<(u32, u32), [u32; 2]>, root: u32) -> Option<(Vec<u32>, f32)> {
+    let nv = p.len();
+    let mut dist = vec![f32::INFINITY; nv];
+    let mut parent = vec![NONE; nv];
+    dist[root as usize] = 0.0;
+    let mut heap = std::collections::BinaryHeap::new();
+    heap.push((std::cmp::Reverse(0u32), root));
+    while let Some((std::cmp::Reverse(db), v)) = heap.pop() {
+        let d = f32::from_bits(db);
+        if d > dist[v as usize] {
+            continue;
+        }
+        for &u in &nb[v as usize] {
+            let nd = d + p[v as usize].distance(p[u as usize]);
+            if nd < dist[u as usize] {
+                dist[u as usize] = nd;
+                parent[u as usize] = v;
+                heap.push((std::cmp::Reverse(nd.to_bits()), u));
+            }
+        }
+    }
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let in_tree = |a: u32, b: u32| parent[a as usize] == b || parent[b as usize] == a;
+    // Dual tree over the edges off the tree, from a face at the root.
+    let nf = idx.len() / 3;
+    let f0 = (0..nf).find(|&f| idx[f * 3..f * 3 + 3].contains(&root))? as u32;
+    let mut dpar = vec![NONE; nf];
+    let mut dedge: Vec<(u32, u32)> = vec![(NONE, NONE); nf];
+    let mut depth = vec![0u32; nf];
+    let mut seen = vec![false; nf];
+    seen[f0 as usize] = true;
+    let mut q = VecDeque::from([f0]);
+    let mut crossed: HashSet<(u32, u32)> = HashSet::default();
+    let mut extra: Vec<((u32, u32), u32, u32)> = Vec::new();
+    while let Some(f) = q.pop_front() {
+        let t = &idx[f as usize * 3..f as usize * 3 + 3];
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if in_tree(a, b) || !crossed.insert(key(a, b)) {
+                continue;
+            }
+            let fs = edge_faces.get(&key(a, b))?;
+            let g = if fs[0] == f { fs[1] } else { fs[0] };
+            if seen[g as usize] {
+                extra.push((key(a, b), f, g));
+            } else {
+                seen[g as usize] = true;
+                dpar[g as usize] = f;
+                dedge[g as usize] = key(a, b);
+                depth[g as usize] = depth[f as usize] + 1;
+                q.push_back(g);
+            }
+        }
+    }
+    // Candidates: the extra dual edges and the dual-tree edges on their cycles.
+    let mut cand: Vec<(u32, u32)> = Vec::new();
+    for &(e, f, g) in &extra {
+        cand.push(e);
+        let (mut a, mut b) = (f, g);
+        while a != b {
+            if depth[a as usize] >= depth[b as usize] {
+                cand.push(dedge[a as usize]);
+                a = dpar[a as usize];
+            } else {
+                cand.push(dedge[b as usize]);
+                b = dpar[b as usize];
+            }
+        }
+    }
+    let (u, v) = cand.into_iter().filter(|&(a, b)| dist[a as usize].is_finite() && dist[b as usize].is_finite()).min_by(|&(a, b), &(c, d)| {
+        (dist[a as usize] + dist[b as usize] + p[a as usize].distance(p[b as usize])).total_cmp(&(dist[c as usize] + dist[d as usize] + p[c as usize].distance(p[d as usize])))
+    })?;
+    let path = |mut x: u32| {
+        let mut out = vec![x];
+        while parent[x as usize] != NONE {
+            x = parent[x as usize];
+            out.push(x);
+        }
+        out
+    };
+    let (mut pu, mut pv) = (path(u), path(v));
+    // Drop the shared way back to the root, keeping the vertex where they part.
+    while pu.len() > 1 && pv.len() > 1 && pu[pu.len() - 2] == pv[pv.len() - 2] {
+        pu.pop();
+        pv.pop();
+    }
+    pv.pop();
+    pu.reverse();
+    let mut cycle = pu;
+    cycle.extend(pv);
+    // u ... w ... v: as a loop, w → u then v → (back to w).
+    let len: f32 = (0..cycle.len()).map(|i| p[cycle[i] as usize].distance(p[cycle[(i + 1) % cycle.len()] as usize])).sum();
+    let mut seen_v: HashSet<u32> = HashSet::default();
+    if cycle.len() < 3 || !cycle.iter().all(|&x| seen_v.insert(x)) {
+        return None;
+    }
+    Some((cycle, len))
+}
+
+/// Cut a closed mesh round its handles' short loops (under `max_len` round) and cap both
+/// sides of each cut. Returns how many were cut.
+fn cut_short_loops(p: &mut Vec<Vec3>, idx: &mut Vec<u32>, grp: &mut Vec<u16>, max_len: f32) -> usize {
+    let dbg = std::env::var_os("KLAY_ZR_DEBUG").is_some();
+    let mut cut = 0;
+    for _ in 0..16 {
+        if handles_left(p.len(), idx).is_none_or(|h| h <= 0) {
+            break;
+        }
+        let nv = p.len();
+        let mut nb: Vec<Vec<u32>> = vec![Vec::new(); nv];
+        let mut edge_faces: HashMap<(u32, u32), [u32; 2]> = HashMap::default();
+        for (f, t) in idx.chunks_exact(3).enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                nb[a as usize].push(b);
+                let e = edge_faces.entry((a.min(b), a.max(b))).or_insert([NONE, NONE]);
+                if e[0] == NONE { e[0] = f as u32 } else { e[1] = f as u32 }
+            }
+        }
+        // Roots: a few vertices spread over the model; the best loop, then once more from a
+        // point on it (the shortest loop through that point).
+        let used: Vec<u32> = (0..nv as u32).filter(|&v| !nb[v as usize].is_empty()).collect();
+        // Roots spread evenly (farthest points first), so one lands near every short loop.
+        let roots_n: usize = std::env::var("ZR_LOOPROOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+        let mut roots = vec![used[0]];
+        let mut far: Vec<f32> = used.iter().map(|&v| p[v as usize].distance_squared(p[used[0] as usize])).collect();
+        while roots.len() < roots_n {
+            let Some(i) = (0..used.len()).max_by(|&a, &b| far[a].total_cmp(&far[b])) else { break };
+            if far[i] <= 0.0 {
+                break;
+            }
+            let r = used[i];
+            roots.push(r);
+            for (j, &v) in used.iter().enumerate() {
+                far[j] = far[j].min(p[v as usize].distance_squared(p[r as usize]));
+            }
+        }
+        let mut best: Option<(Vec<u32>, f32)> = None;
+        for &r in &roots {
+            if let Some(l) = handle_loop(p, idx, &nb, &edge_faces, r) {
+                if best.as_ref().is_none_or(|b| l.1 < b.1) {
+                    best = Some(l);
+                }
+            }
+        }
+        let Some((c0, _)) = best else { break };
+        let Some((cycle, len)) = handle_loop(p, idx, &nb, &edge_faces, c0[c0.len() / 2]) else { break };
+        if dbg {
+            let mid = cycle.iter().map(|&v| p[v as usize]).sum::<Vec3>() / cycle.len() as f32;
+            eprintln!("    handle loop at {mid:.3}: {:.3} round ({} points){}", len, cycle.len(), if len > max_len { ", too long to cut" } else { ", cut" });
+        }
+        if len > max_len {
+            break;
+        }
+        // Split each loop vertex: the faces on the right of the loop (from the edge to the
+        // next loop vertex round to the edge from the previous one, clockwise) take a copy.
+        let m = cycle.len();
+        let mut fan_of: HashMap<u32, Vec<u32>> = HashMap::default();
+        for (f, t) in idx.chunks_exact(3).enumerate() {
+            for &v in t {
+                if cycle.contains(&v) {
+                    fan_of.entry(v).or_default().push(f as u32);
+                }
+            }
+        }
+        let mut new_idx = idx.clone();
+        let mut ok = true;
+        for i in 0..m {
+            let (c, next, prev) = (cycle[i], cycle[(i + 1) % m], cycle[(i + m - 1) % m]);
+            let copy = p.len() as u32;
+            // Counter-clockwise round c: face (c, a, b) is followed by the face (c, b, ·).
+            let fan = &fan_of[&c];
+            let corner = |f: u32| -> (u32, u32) {
+                let t = &idx[f as usize * 3..f as usize * 3 + 3];
+                let k = t.iter().position(|&x| x == c).unwrap();
+                (t[(k + 1) % 3], t[(k + 2) % 3])
+            };
+            let Some(mut f) = fan.iter().copied().find(|&f| corner(f).0 == next) else { ok = false; break };
+            let mut side = Vec::new();
+            for _ in 0..fan.len() {
+                side.push(f);
+                let (_, b) = corner(f);
+                if b == prev {
+                    break;
+                }
+                let Some(g) = fan.iter().copied().find(|&g| corner(g).0 == b) else { ok = false; break };
+                f = g;
+            }
+            if !ok || corner(*side.last().unwrap()).1 != prev || side.len() == fan.len() {
+                ok = false;
+                break;
+            }
+            p.push(p[c as usize]);
+            for &f in &side {
+                for k in 0..3 {
+                    if new_idx[f as usize * 3 + k] == c {
+                        new_idx[f as usize * 3 + k] = copy;
+                    }
+                }
+            }
+        }
+        if !ok {
+            p.truncate(nv);
+            if dbg {
+                eprintln!("    handle loop: could not split its fans");
+            }
+            break;
+        }
+        // Cap the two holes.
+        let all: HashSet<u32> = (0..(new_idx.len() / 3) as u32).collect();
+        let Some(holes) = boundary_cycles(&new_idx, &all) else {
+            p.truncate(nv);
+            break;
+        };
+        let group = grp.first().copied().unwrap_or(0);
+        for h in holes {
+            let mid = h.iter().map(|&v| p[v as usize]).sum::<Vec3>() / h.len() as f32;
+            let mc = p.len() as u32;
+            p.push(mid);
+            for i in 0..h.len() {
+                new_idx.extend_from_slice(&[h[(i + 1) % h.len()], h[i], mc]);
+                grp.push(group);
+            }
+        }
+        *idx = new_idx;
+        cut += 1;
+    }
+    cut
+}
+
+/// Close handles that fit in a ball of radius `r` (geodesic): the ball's faces go and each
+/// hole left is capped with a fan round its middle. Returns how many were closed.
+fn close_small_handles(p: &mut Vec<Vec3>, idx: &mut Vec<u32>, grp: &mut Vec<u16>, r: f32) -> usize {
+    let nv = p.len();
+    let nf = idx.len() / 3;
+    // Whole-mesh genus first: nothing to do on a sphere-like model.
+    let mut edges: HashSet<(u32, u32)> = HashSet::default();
+    for t in idx.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edges.insert((a.min(b), a.max(b)));
+        }
+    }
+    let used: HashSet<u32> = idx.iter().copied().collect();
+    let mut parent: Vec<u32> = (0..nv as u32).collect();
+    fn root(par: &mut [u32], mut x: u32) -> u32 {
+        while par[x as usize] != x {
+            par[x as usize] = par[par[x as usize] as usize];
+            x = par[x as usize];
+        }
+        x
+    }
+    for t in idx.chunks_exact(3) {
+        let a = root(&mut parent, t[0]);
+        for &v in &t[1..] {
+            let b = root(&mut parent, v);
+            parent[b as usize] = a;
+        }
+    }
+    let pieces: HashSet<u32> = used.iter().map(|&v| root(&mut parent, v)).collect();
+    let chi = used.len() as i64 - edges.len() as i64 + nf as i64;
+    if chi >= 2 * pieces.len() as i64 {
+        return 0;
+    }
+    let mut vf: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let mut nb: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    for (f, t) in idx.chunks_exact(3).enumerate() {
+        for k in 0..3 {
+            vf[t[k] as usize].push(f as u32);
+            nb[t[k] as usize].push(t[(k + 1) % 3]);
+            nb[t[k] as usize].push(t[(k + 2) % 3]);
+        }
+    }
+    for n in &mut nb {
+        n.sort_unstable();
+        n.dedup();
+    }
+    // Seeds about r/2 apart (a grid hash), each a ball of radius r.
+    let cell = (r * 0.5).max(1e-9);
+    let mut taken: HashSet<(i32, i32, i32)> = HashSet::default();
+    let mut removed: HashSet<u32> = HashSet::default();
+    let mut caps: Vec<(Vec<u32>, u16)> = Vec::new();
+    let mut closed = 0;
+    for s in 0..nv as u32 {
+        if nb[s as usize].is_empty() {
+            continue;
+        }
+        let q = p[s as usize] / cell;
+        let key = (q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32);
+        if !taken.insert(key) {
+            continue;
+        }
+        // Dijkstra out to r.
+        let mut dist: HashMap<u32, f32> = HashMap::default();
+        dist.insert(s, 0.0);
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push((std::cmp::Reverse(0u32), s));
+        while let Some((std::cmp::Reverse(dbits), v)) = heap.pop() {
+            let d = f32::from_bits(dbits);
+            if d > dist[&v] {
+                continue;
+            }
+            for &u in &nb[v as usize] {
+                let nd = d + p[v as usize].distance(p[u as usize]);
+                if nd < r && dist.get(&u).is_none_or(|&o| nd < o) {
+                    dist.insert(u, nd);
+                    heap.push((std::cmp::Reverse(nd.to_bits()), u));
+                }
+            }
+            if dist.len() > 20_000 {
+                break;
+            }
+        }
+        let mut fs: HashSet<u32> = dist.keys().flat_map(|&v| vf[v as usize].iter().copied()).filter(|&f| (0..3).all(|k| dist.contains_key(&idx[f as usize * 3 + k]))).collect();
+        if fs.is_empty() || fs.iter().any(|f| removed.contains(f)) {
+            continue;
+        }
+        let genus = |fs: &HashSet<u32>| -> Option<i64> {
+            let cycles = boundary_cycles(idx, fs)?;
+            let mut e: HashSet<(u32, u32)> = HashSet::default();
+            let mut v: HashSet<u32> = HashSet::default();
+            for &f in fs {
+                let t = &idx[f as usize * 3..f as usize * 3 + 3];
+                for k in 0..3 {
+                    v.insert(t[k]);
+                    e.insert((t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])));
+                }
+            }
+            let chi = v.len() as i64 - e.len() as i64 + fs.len() as i64;
+            let b = cycles.len() as i64;
+            Some((2 - chi - b) / 2)
+        };
+        // A pinched ball grows by the faces round its pinch points (a few times).
+        let mut g = genus(&fs);
+        for _ in 0..3 {
+            if g.is_some() {
+                break;
+            }
+            let ring: Vec<u32> = fs.iter().flat_map(|&f| (0..3).map(move |k| (f, k))).flat_map(|(f, k)| vf[idx[f as usize * 3 + k] as usize].clone()).collect();
+            fs.extend(ring);
+            g = genus(&fs);
+        }
+        let dbg = std::env::var_os("KLAY_ZR_DEBUG").is_some();
+        let Some(g) = g else {
+            if dbg && (genus_hint(idx, &fs) > 0 || std::env::var_os("ZR_HANDLEPINCH").is_some()) {
+                eprintln!("    handle at {:.3} (r {r:.3}): ball pinched", p[s as usize]);
+            }
+            continue;
+        };
+        if g < 1 {
+            continue;
+        }
+        if fs.iter().any(|f| removed.contains(f)) {
+            if dbg {
+                eprintln!("    handle at {:.3} (r {r:.3}): overlaps one closed", p[s as usize]);
+            }
+            continue;
+        }
+        let Some(cycles) = boundary_cycles(idx, &fs) else { continue };
+        if dbg {
+            eprintln!("    handle at {:.3} (r {r:.3}): genus {g}, {} holes, closed", p[s as usize], cycles.len());
+        }
+        let group = grp.get(*fs.iter().next().unwrap() as usize).copied().unwrap_or(0);
+        removed.extend(fs.iter().copied());
+        for c in cycles {
+            caps.push((c, group));
+        }
+        closed += 1;
+    }
+    if closed == 0 {
+        return 0;
+    }
+    let mut out = Vec::with_capacity(idx.len());
+    let mut og = Vec::with_capacity(nf);
+    for f in 0..nf {
+        if !removed.contains(&(f as u32)) {
+            out.extend_from_slice(&idx[f * 3..f * 3 + 3]);
+            og.push(grp.get(f).copied().unwrap_or(0));
+        }
+    }
+    for (c, group) in caps {
+        let mid = c.iter().map(|&v| p[v as usize]).sum::<Vec3>() / c.len() as f32;
+        let m = p.len() as u32;
+        p.push(mid);
+        for i in 0..c.len() {
+            out.extend_from_slice(&[c[i], c[(i + 1) % c.len()], m]);
+            og.push(group);
+        }
+    }
+    *idx = out;
+    *grp = og;
+    closed
 }
 
 /// Feature loops: sockets and bumps (where the surface bends clearly more, or less, than
@@ -2412,8 +2952,21 @@ fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, 
                 let (la, lb) = (length(&l0), length(&l1));
                 let free_at: f32 = std::env::var("ZR_BANDFREE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.5);
                 let free = (la.max(lb) / la.min(lb).max(1e-9) > free_at).then_some(0);
-                patches.push(Patch { faces, lp: l0, sides: vec![a, b], corner_at: vec![0], real: 0, messy: false, free, band: true, lp2: l1 });
-                continue;
+                // Loops far apart in size (a big ring round a spot): not a band; traced across
+                // like any other ring.
+                let ratio_max: f32 = std::env::var("ZR_BANDRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+                let lopsided = ratio_max > 0.0 && la.max(lb) > la.min(lb) * ratio_max;
+                if std::env::var_os("KLAY_ZR_DEBUG").is_some() && la.min(lb) < quad * 4.0 && la.max(lb) > la.min(lb) * 6.0 {
+                    let small = if la <= lb { &l0 } else { &l1 };
+                    let mid = small.iter().map(|&v| w.p[v as usize]).sum::<Vec3>() / small.len() as f32;
+                    let ids: HashSet<u32> = (0..small.len()).map(|i| line_of(small[i], small[(i + 1) % small.len()])).collect();
+                    let poles_in = small.iter().filter(|&&v| is_pole[v as usize]).count();
+                    eprintln!("    band round a tiny loop at {mid:.3}: {:.1} / {:.1} quads, lines {ids:?}, {} points, {poles_in} poles on it, nodes on it {}", la.min(lb) / quad, la.max(lb) / quad, small.len(), small.iter().filter(|v| is_node.contains(v)).count());
+                }
+                if !lopsided {
+                    patches.push(Patch { faces, lp: l0, sides: vec![a, b], corner_at: vec![0], real: 0, messy: false, free, band: true, lp2: l1 });
+                    continue;
+                }
             }
         }
         if bad_loop || loops.len() != 1 || chi != 1 {
@@ -3494,7 +4047,7 @@ fn ring_fill(mut ids: Vec<u32>, mut pos: Vec<Vec2>, mut corners: Vec<usize>, poi
         }
         // Corners that leave a side shorter than three are dropped (the side joins the next),
         // unless the four corners make an exact rectangle (a grid finishes it below).
-        let exact = corners.len() == 4 && {
+        let exact = corners.len() == 4 && std::env::var_os("ZR_NOEXACT").is_none() && {
             let side = |i: usize| -> usize { (corners[(i + 1) % 4] + len - corners[i]) % len };
             side(0) == side(2) && side(1) == side(3) && side(0).min(side(1)) <= 4 && side(0).min(side(1)) >= 2
         };
@@ -5108,6 +5661,29 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         arc_pts.push(ids);
         arc_place.push(cum.iter().map(|&x| x / total * k as f32).collect());
     }
+    // A model whose handles were cut open by long slits leaves big pinched patches, which the
+    // general fill makes a mess of: past a tenth of the model, the plan is given up (the
+    // plain remesher does better there).
+    {
+        let tri_area = |f: u32| { let t = w.t[f as usize]; (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length() * 0.5 };
+        let mut pinched_area = 0.0f32;
+        let mut all = 0.0f32;
+        for pa in &c.patches {
+            let a: f32 = pa.faces.iter().map(|&f| tri_area(f)).sum();
+            all += a;
+            let mut seen = HashSet::default();
+            if !pa.band && !pa.lp.iter().all(|v| seen.insert(*v)) && pa.lp.len() - seen.len() > 8 {
+                pinched_area += a;
+            }
+        }
+        let limit: f32 = std::env::var("ZR_PINCHLIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
+        if debug {
+            eprintln!("  pinched patches: {:.0}% of the area", pinched_area / all.max(1e-12) * 100.0);
+        }
+        if pinched_area > all * limit {
+            return Err(format!("{:.0}% of the model in pinched patches", pinched_area / all.max(1e-12) * 100.0));
+        }
+    }
     // Fill each patch.
     let mut quads_out: Vec<[u32; 4]> = Vec::new();
     let mut made_by: Vec<(usize, u8)> = Vec::new();
@@ -5300,7 +5876,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 tl.lerp(Vec2::ZERO, (s - a - h - c) / h)
             }
         };
-        let on_side = |s: usize, u: f32| -> Vec2 { if strip.is_some() { rect(base[s] + u) } else if pattern == 2 || pattern == 5 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
+        // A general fill with real corners: its border on the polygon those corners make on
+        // the circle (straight sides, so the rings keep their corners square-ish).
+        let polygon = pattern == 2 && !pinched && pa.real >= 3 && k >= 3 && std::env::var_os("ZR_POLYFILL").is_some();
+        let on_side = |s: usize, u: f32| -> Vec2 { if strip.is_some() { rect(base[s] + u) } else if polygon { circle(base[s]).lerp(circle(base[s] + l[s] as f32), u / l[s].max(1) as f32) } else if pattern == 2 || pattern == 5 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
         // Loop vertices onto the polygon; side points' ids by (side, offset). A vertex the
         // loop passes twice (a pinch) is a second, separate vertex on its second pass, for
         // the faces on that side of it.
@@ -5651,11 +6230,19 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 let mut u = ids.clone();
                 u.sort_unstable();
                 u.dedup();
+                if std::env::var("ZR_RINGDBG").ok().and_then(|v| v.parse::<usize>().ok()) == Some(pi) {
+                    eprintln!("  ring input {pi}: ids {ids:?} corners {cs:?} pos {:?}", pos.iter().map(|q| [q.x, q.y]).collect::<Vec<_>>());
+                }
                 if u.len() != ids.len() || pi == 8 || pi == 12 {
                     eprintln!("  ring patch {pi}: {} points ({} distinct), corners {:?}, real {}, sides {:?}, ids {:?}", ids.len(), u.len(), cs, pa.real, l, if ids.len() < 40 { ids.clone() } else { Vec::new() });
                 }
             }
-            ring_fill(ids, pos, cs, &mut |q| point(q, &mut out_p), &mut quads_out);
+            // Fresh points (not merged by flat position: a ring's inner corner can land on
+            // a point of the ring before).
+            ring_fill(ids, pos, cs, &mut |q| {
+                out_p.push(loc.at(q));
+                (out_p.len() - 1) as u32
+            }, &mut quads_out);
         }
         // Slit points (an arc the border runs both ways) are welded, so each slit edge gets
         // one quad from each side; a pinch node (the border passing a corner twice) stays
@@ -5680,6 +6267,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             used.values().any(|&u| u > 2)
         };
         let weld: HashMap<u32, u32> = if over(&weld_all) { weld_all.into_iter().filter(|(_, o)| !node_ids.contains(o)).collect() } else { weld_all };
+        if std::env::var("ZR_RINGDBG").ok().and_then(|v| v.parse::<usize>().ok()) == Some(pi) {
+            eprintln!("  weld {pi}: {weld:?}");
+            eprintln!("  quads {pi}: {:?}", &quads_out[before..]);
+        }
         for q in &mut quads_out[before..] {
             let welded: [u32; 4] = std::array::from_fn(|k| weld.get(&q[k]).copied().unwrap_or(q[k]));
             let repeats = (0..4).any(|k| welded[k] == welded[(k + 1) % 4] || welded[k] == welded[(k + 2) % 4]);
@@ -6014,6 +6605,10 @@ mod ring_tests {
         }, &mut quads);
         let mut used: HashMap<(u32, u32), u32> = HashMap::default();
         for q in &quads {
+            let mut c = q.to_vec();
+            c.sort_unstable();
+            c.dedup();
+            assert_eq!(c.len(), 4, "sides {sides:?}: quad {q:?} repeats a corner");
             for k in 0..4 {
                 let (a, b) = (q[k], q[(k + 1) % 4]);
                 *used.entry((a.min(b), a.max(b))).or_default() += 1;
@@ -6047,7 +6642,7 @@ mod ring_tests {
 
     #[test]
     fn ring_fill_keeps_every_edge_manifold() {
-        for sides in [vec![1, 4, 9, 4, 9, 5], vec![3, 15, 3, 1, 4, 1, 15], vec![4, 4, 4, 4], vec![6, 3, 5], vec![2, 2], vec![10], vec![30, 9, 3, 31, 3], vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] {
+        for sides in [vec![1, 4, 9, 4, 9, 5], vec![3, 15, 3, 1, 4, 1, 15], vec![4, 4, 4, 4], vec![6, 3, 5], vec![2, 2], vec![10], vec![30, 9, 3, 31, 3], vec![4, 6, 2, 5, 1, 3, 5], vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] {
             check(&sides);
         }
     }

@@ -717,6 +717,11 @@ fn shape_pulls(g: &Graph, tensors: &[glam::Mat3], quad: f32, strength: f32) -> V
         .collect()
 }
 
+/// A point with as many quads round it as neighbours (not on an open border).
+fn w_is_interior(adj: &[Vec<u32>], vq: &[Vec<u32>], v: usize) -> bool {
+    adj[v].len() == vq[v].len()
+}
+
 /// Union-find.
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
@@ -795,6 +800,13 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         crease_along(&mut out, &lines, quad, s.mirror);
     }
     if let Some(why) = out.subdivision_blocker() {
+        // A planned layout that came out broken: the plain remesher instead.
+        if stats.planned {
+            let plain = Settings { layout: false, ..*s };
+            let (out, mut stats) = zremesh(mesh, &plain, guides)?;
+            stats.fallback = Some(format!("the planned result {why}"));
+            return Ok((out, stats));
+        }
         return Err(format!("the result {why} · change Target Polygons Count"));
     }
     Ok((out, stats))
@@ -924,20 +936,25 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     if s.layout && !s.freeze_border {
         // The smoothest field first (cleanest quads); if that cannot be planned, the field
         // pulled along the curvature by Follow Shape.
-        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0).or_else(|why| {
-            if s.follow_shape > 0.0 {
-                layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape)
-            } else {
-                Err(why)
-            }
-        });
+        // A gentle pull in between: on limbs the smoothest field can sit at a slant to the
+        // limb, so its lines wind round it; a little pull rings them.
+        let gentle: f32 = std::env::var("ZR_RETRYPULL").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
+        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0)
+            .or_else(|why| if gentle > 0.0 { layout::quads(mesh, s, guides, seams, features, cut, quad, gentle) } else { Err(why) })
+            .or_else(|why| {
+                if s.follow_shape > gentle {
+                    layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape)
+                } else {
+                    Err(why)
+                }
+            });
         match planned {
             Ok((out_p, quads)) => {
                 stats.planned = true;
                 let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
                 let g = Guides::new(guides, quad);
                 let closed = crate::wedge::closed(mesh);
-                return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12), closed, cut, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
+                return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30), closed, cut, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
             }
             Err(why) => stats.fallback = Some(why),
         }
@@ -1488,6 +1505,21 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             }
         }
     }
+    // The planned layout's points go to the middle of their quads' middles, a whole step
+    // (evens quads out faster than half a step toward the neighbours); the plain remesher
+    // keeps half a step toward the neighbours. ZR_SMOOTH=half|full|faces|faces,full overrides.
+    let smooth_mode = std::env::var("ZR_SMOOTH").unwrap_or_else(|_| if stats.planned { "faces,full".into() } else { "half".into() });
+    let (by_faces, step) = (smooth_mode.contains("faces"), if smooth_mode.contains("full") { 1.0 } else { 0.5 });
+    let mut vq: Vec<Vec<u32>> = vec![Vec::new(); out_p.len()];
+    if by_faces {
+        for (qi, q4) in quads.iter().enumerate() {
+            for (k, &v) in q4.iter().enumerate() {
+                if !q4[..k].contains(&v) {
+                    vq[v as usize].push(qi as u32);
+                }
+            }
+        }
+    }
     for pass in 0..passes {
         normals(&out_p, &mut vnorm);
         if pass > 0 {
@@ -1498,10 +1530,18 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
                     if a.is_empty() || pinned[v] {
                         return out_p[v];
                     }
-                    let c = a.iter().map(|&w| out_p[w as usize]).sum::<Vec3>() / a.len() as f32;
+                    let c = if by_faces && !vq[v].is_empty() && w_is_interior(&adj, &vq, v) {
+                        vq[v].iter().map(|&qi| {
+                            let q4 = quads[qi as usize];
+                            let n = if q4[2] == q4[3] { 3 } else { 4 };
+                            q4[..n].iter().map(|&x| out_p[x as usize]).sum::<Vec3>() / n as f32
+                        }).sum::<Vec3>() / vq[v].len() as f32
+                    } else {
+                        a.iter().map(|&w| out_p[w as usize]).sum::<Vec3>() / a.len() as f32
+                    };
                     let n = vnorm[v];
                     let d = c - out_p[v];
-                    out_p[v] + (d - n * n.dot(d)) * 0.5
+                    out_p[v] + (d - n * n.dot(d)) * step
                 })
                 .collect();
             out_p = relaxed;
