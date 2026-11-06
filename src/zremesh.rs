@@ -922,7 +922,16 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let quad = (area / target).sqrt();
     let scale = quad * 2.0;
     if s.layout && !s.freeze_border {
-        match layout::quads(mesh, s, guides, seams, features, cut, quad) {
+        // The smoothest field first (cleanest quads); if that cannot be planned, the field
+        // pulled along the curvature by Follow Shape.
+        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0).or_else(|why| {
+            if s.follow_shape > 0.0 {
+                layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape)
+            } else {
+                Err(why)
+            }
+        });
+        match planned {
             Ok((out_p, quads)) => {
                 stats.planned = true;
                 let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);

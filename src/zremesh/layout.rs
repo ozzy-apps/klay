@@ -413,36 +413,132 @@ fn feature_loops(w: &mut Work, quad: f32, enclosed: &mut Vec<bool>) -> usize {
         areas.sort_by(|a, b| b.0.total_cmp(&a.0));
         eprintln!("  features: sd {sd:.3} tau {tau:.3} (1/quad {:.2}), {} regions, areas in quads² {:?}", 1.0 / quad, regions.len(), &areas[..areas.len().min(12)]);
     }
-    for (id, faces) in regions.iter().enumerate() {
+    // The kept regions (about 2 × 2 to 20 × 20 quads) as one inside/outside field on the
+    // vertices, blurred at about a quad and cut at the halfway level: outlines come out round,
+    // and features closer than about a quad merge into one loop. ZR_RAWFEATURES keeps the
+    // raw outlines (each region grown half a quad).
+    let raw = std::env::var_os("ZR_RAWFEATURES").is_some();
+    let mut field = vec![0.0f32; nv];
+    let mut any = false;
+    for faces in &regions {
         let a: f32 = faces.iter().map(|&f| area(f)).sum();
-        // Big enough to ring (about 2 × 2 quads), small enough to be a feature.
         if a < quad * quad * 4.0 || a > quad * quad * 400.0 {
             continue;
         }
-        // Grow by half a quad.
-        let mut inside: HashSet<usize> = faces.iter().copied().collect();
-        let mut front: Vec<usize> = faces.clone();
-        let steps = ((quad * 0.5) / edge.max(1e-9)).ceil() as usize;
+        any = true;
+        for &f in faces {
+            for &v in &w.t[f] {
+                field[v as usize] = 1.0;
+            }
+        }
+    }
+    if !any {
+        return 0;
+    }
+    let blur_r: f32 = std::env::var("ZR_FEATBLUR").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let (grow, cutoff) = if raw { (quad * 0.5, 0.5) } else { (0.0, 0.5) };
+    let mut field = if raw { field } else { blur(&field, quad * blur_r) };
+    // Raw: grow the regions by `grow` (a vertex within that distance of a region).
+    if raw && grow > 0.0 {
+        let steps = (grow / edge.max(1e-9)).ceil() as usize;
         for _ in 0..steps {
-            let mut next = Vec::new();
-            for &f in &front {
-                for k in 0..3 {
-                    let o = w.twin[f * 3 + k];
-                    if o != NONE && !w.hard[f * 3 + k] {
-                        let g = o as usize / 3;
-                        if inside.insert(g) {
-                            next.push(g);
-                        }
+            field = (0..nv).map(|v| if field[v] >= 1.0 || w.neighbours(v as u32).iter().any(|&u| field[u as usize] >= 1.0) { 1.0 } else { 0.0 }).collect();
+        }
+    }
+    // Inside faces: the mean of their corners over the cut-off.
+    let mut inside_face: Vec<bool> = (0..nf).map(|f| w.t[f].iter().map(|&v| field[v as usize]).sum::<f32>() / 3.0 > cutoff).collect();
+    // Rings round centres (the default; ZR_BLOBLOOPS keeps the blurred regions): per feature,
+    // its strongest point, a radius from its area, rings kept two quads apart; the ring is
+    // every face within that surface distance of the centre.
+    if std::env::var_os("ZR_BLOBLOOPS").is_none() {
+        let peak_min: f32 = std::env::var("ZR_PEAK").ok().and_then(|v| v.parse().ok()).unwrap_or(2.5);
+        let mut feats: Vec<(u32, f32, f32)> = Vec::new(); // centre, radius, strength
+        for faces in &regions {
+            let a: f32 = faces.iter().map(|&f| area(f)).sum();
+            if a < quad * quad * 4.0 || a > quad * quad * 400.0 {
+                continue;
+            }
+            let Some(c) = faces.iter().flat_map(|&f| w.t[f]).max_by(|&x, &y| d[x as usize].abs().total_cmp(&d[y as usize].abs())) else { continue };
+            let strength = d[c as usize].abs();
+            if strength < sd * peak_min {
+                continue;
+            }
+            feats.push((c, (a / std::f32::consts::PI).sqrt() + quad * 0.5, strength));
+        }
+        // Keep apart: strongest first; a weaker one shrinks to leave two quads, or goes.
+        feats.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let mut kept: Vec<(u32, f32)> = Vec::new();
+        for &(c, r, _) in &feats {
+            let mut r = r;
+            for &(c2, r2) in &kept {
+                let dc = w.p[c as usize].distance(w.p[c2 as usize]);
+                r = r.min(dc - r2 - quad * 2.0);
+            }
+            if r >= quad * 1.5 {
+                kept.push((c, r));
+            }
+        }
+        if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+            eprintln!("  feature rings: {} of {} features, radii in quads {:?}", kept.len(), feats.len(), kept.iter().map(|k| (k.1 / quad * 10.0).round() / 10.0).collect::<Vec<_>>());
+        }
+        // Surface distance from each centre (Dijkstra over edges), out to its radius.
+        let mut ring_dist = vec![f32::INFINITY; nv];
+        for &(c, r) in &kept {
+            let mut dist: HashMap<u32, f32> = HashMap::default();
+            let mut heap = std::collections::BinaryHeap::new();
+            dist.insert(c, 0.0);
+            heap.push((std::cmp::Reverse(0f32.to_bits()), c));
+            while let Some((std::cmp::Reverse(db), v)) = heap.pop() {
+                let dv = f32::from_bits(db);
+                if dv > dist[&v] {
+                    continue;
+                }
+                let rel = dv / r;
+                if rel < ring_dist[v as usize] {
+                    ring_dist[v as usize] = rel;
+                }
+                for &u in w.neighbours(v) {
+                    let nd = dv + w.p[v as usize].distance(w.p[u as usize]);
+                    if nd <= r * 1.2 && dist.get(&u).is_none_or(|&x| nd < x) {
+                        dist.insert(u, nd);
+                        heap.push((std::cmp::Reverse(nd.to_bits()), u));
                     }
                 }
             }
-            front = next;
         }
-        // Holes inside are filled: everything not reachable from outside the region.
-        let _ = id;
+        inside_face = (0..nf).map(|f| w.t[f].iter().all(|&v| ring_dist[v as usize] <= 1.0)).collect();
+    }
+    // Each connected inside region, its holes filled, becomes a loop (if still a feature's size).
+    let mut seen = vec![false; nf];
+    for f0 in 0..nf {
+        if !inside_face[f0] || seen[f0] {
+            continue;
+        }
+        let mut comp = vec![f0];
+        seen[f0] = true;
+        let mut i = 0;
+        while i < comp.len() {
+            let f = comp[i];
+            i += 1;
+            for k in 0..3 {
+                let o = w.twin[f * 3 + k];
+                if o == NONE || w.hard[f * 3 + k] {
+                    continue;
+                }
+                let g = o as usize / 3;
+                if inside_face[g] && !seen[g] {
+                    seen[g] = true;
+                    comp.push(g);
+                }
+            }
+        }
+        let a: f32 = comp.iter().map(|&f| area(f)).sum();
+        if a < quad * quad * 4.0 || a > quad * quad * 600.0 {
+            continue;
+        }
+        let inside: HashSet<usize> = comp.iter().copied().collect();
         let mut outside: HashSet<usize> = HashSet::default();
-        let seed = (0..nf).find(|f| !inside.contains(f));
-        if let Some(s0) = seed {
+        if let Some(s0) = (0..nf).find(|f| !inside.contains(f)) {
             let mut q = vec![s0];
             outside.insert(s0);
             while let Some(f) = q.pop() {
@@ -457,7 +553,6 @@ fn feature_loops(w: &mut Work, quad: f32, enclosed: &mut Vec<bool>) -> usize {
                 }
             }
         }
-        // Its border edges become hard (the loop).
         let mut made = false;
         if enclosed.len() != nf {
             *enclosed = vec![false; nf];
@@ -2028,7 +2123,8 @@ fn cut(w: &Work, z: &[Vec2], is_pole: &[bool], cut_edges: &HashSet<(u32, u32)>, 
                 // merge quads where it narrows.
                 let length = |l: &[u32]| -> f32 { (0..l.len()).map(|i| w.p[l[i] as usize].distance(w.p[l[(i + 1) % l.len()] as usize])).sum() };
                 let (la, lb) = (length(&l0), length(&l1));
-                let free = (la.max(lb) / la.min(lb).max(1e-9) > 2.5).then_some(0);
+                let free_at: f32 = std::env::var("ZR_BANDFREE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.5);
+                let free = (la.max(lb) / la.min(lb).max(1e-9) > free_at).then_some(0);
                 patches.push(Patch { faces, lp: l0, sides: vec![a, b], corner_at: vec![0], real: 0, messy: false, free, band: true, lp2: l1 });
                 continue;
             }
@@ -2727,6 +2823,79 @@ fn strip_from(cut: &Cut, a0: u32, p0: usize, side: usize) -> Option<Vec<u32>> {
     None
 }
 
+/// Whether a cycle of sides under a step of two has an odd total (no centre split then).
+fn odd_cycle(l: &[i64]) -> bool {
+    let k = l.len();
+    (0..k).any(|c0| {
+        let mut sum = 0;
+        let mut i = c0;
+        loop {
+            sum += l[i];
+            i = (i + 2) % k;
+            if i == c0 {
+                break;
+            }
+        }
+        sum % 2 != 0
+    })
+}
+
+/// How far side counts `l` are from a centre split, for cycles of odd length (k = 3, 5, 6,
+/// 7): the least part of any side in the real-valued split (at least 1 to split).
+fn split_margin(l: &[i64]) -> f64 {
+    split_measure(l).0
+}
+
+/// How short side counts `l` are of a centre split, summed over every part (0 when it
+/// splits): unlike the margin, it drops when any one cycle gets closer.
+fn split_shortfall(l: &[i64]) -> f64 {
+    split_measure(l).1
+}
+
+fn split_measure(l: &[i64]) -> (f64, f64) {
+    let k = l.len();
+    let mut worst = f64::INFINITY;
+    let mut short = 0.0f64;
+    let mut done = vec![false; k];
+    for c in 0..k {
+        if done[c] {
+            continue;
+        }
+        let mut cyc = vec![c];
+        let mut i = (c + 2) % k;
+        while i != c {
+            cyc.push(i);
+            i = (i + 2) % k;
+        }
+        for &j in &cyc {
+            done[j] = true;
+        }
+        let m = cyc.len();
+        if m % 2 == 0 {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        // y_t = s_t · y0 + r_t along the cycle; the closing equation fixes y0.
+        let (mut sgn, mut r) = (1.0f64, 0.0f64);
+        let mut coef = vec![(1.0, 0.0)];
+        for t in 1..m {
+            sgn = -sgn;
+            r = l[cyc[t]] as f64 - r;
+            coef.push((sgn, r));
+            // (y_t = l - y_{t-1}: sign flips, offset l - previous offset.)
+        }
+        let (sl, rl) = coef[m - 1];
+        // l[cyc0] = y_{m-1} + y0 = (sl + 1) y0 + rl
+        let y0 = (l[cyc[0]] as f64 - rl) / (sl + 1.0);
+        for t in 0..m {
+            let y = coef[t].0 * y0 + coef[t].1;
+            let part = y.min(l[cyc[t]] as f64 - y);
+            worst = worst.min(part);
+            short += (1.0 - part).max(0.0);
+        }
+    }
+    (worst, short)
+}
+
 /// A vertex of patch `pa` as far inside it as there is.
 fn middle(w: &Work, pa: &Patch) -> u32 {
     let verts: HashSet<u32> = pa.faces.iter().flat_map(|&f| w.t[f as usize]).collect();
@@ -3024,6 +3193,9 @@ fn band_fill(w: &Work, pa: &Patch, c: &Cut, n: &[i64], arc_pts: &[Vec<u32>], arc
 /// corners at `corners`) with quads: rings peeled inward (each corner takes two border
 /// edges), then, once a side is too short, quads clipped off the border.
 fn ring_fill(mut ids: Vec<u32>, mut pos: Vec<Vec2>, mut corners: Vec<usize>, point: &mut dyn FnMut(Vec2) -> u32, quads: &mut Vec<[u32; 4]>) {
+    if std::env::var_os("ZR_TRIFILL").is_some() && tri_fill(&ids, &pos, point, quads) {
+        return;
+    }
     loop {
         let len = ids.len();
         if len < 4 {
@@ -3315,18 +3487,33 @@ fn flatten(w: &Work, pa: &Patch, boundary: &HashMap<u32, Vec2>, alias: &HashMap<
     verts.sort_unstable();
     verts.dedup();
     let index: HashMap<u32, usize> = verts.iter().enumerate().map(|(i, &v)| (v, i)).collect();
-    let mut nb: Vec<Vec<usize>> = vec![Vec::new(); verts.len()];
+    // Edge weights: cotangent weights (the flattening that keeps angles best), clamped
+    // positive so the system stays positive definite; uniform with ZR_UNIFORM.
+    let uniform = std::env::var_os("ZR_UNIFORM").is_some();
+    let mut wmap: HashMap<(usize, usize), f64> = HashMap::default();
     for &f in &pa.faces {
-        let t = w.t[f as usize].map(|v| corner(f, v));
+        let t0 = w.t[f as usize];
+        let t = t0.map(|v| corner(f, v));
         for k in 0..3 {
             let (a, b) = (index[&t[k]], index[&t[(k + 1) % 3]]);
-            if !nb[a].contains(&b) {
-                nb[a].push(b);
-            }
-            if !nb[b].contains(&a) {
-                nb[b].push(a);
-            }
+            let wt = if uniform {
+                0.5
+            } else {
+                // The angle opposite edge k, at corner k + 2.
+                let (pa3, pb3, pc3) = (w.p[t0[k] as usize], w.p[t0[(k + 1) % 3] as usize], w.p[t0[(k + 2) % 3] as usize]);
+                let (u, v) = ((pa3 - pc3).as_dvec3(), (pb3 - pc3).as_dvec3());
+                let cr = u.cross(v).length().max(1e-30);
+                0.5 * u.dot(v) / cr
+            };
+            *wmap.entry((a.min(b), a.max(b))).or_default() += wt;
         }
+    }
+    let mean_w = if wmap.is_empty() { 1.0 } else { wmap.values().map(|x| x.abs()).sum::<f64>() / wmap.len() as f64 };
+    let mut nb: Vec<Vec<(usize, f64)>> = vec![Vec::new(); verts.len()];
+    for (&(a, b), &wt) in &wmap {
+        let wt = wt.max(mean_w * 0.02);
+        nb[a].push((b, wt));
+        nb[b].push((a, wt));
     }
     let fixed: Vec<Option<Vec2>> = verts.iter().map(|v| boundary.get(v).copied()).collect();
     let centre = boundary.values().copied().sum::<Vec2>() / boundary.len().max(1) as f32;
@@ -3341,16 +3528,17 @@ fn flatten(w: &Work, pa: &Patch, boundary: &HashMap<u32, Vec2>, alias: &HashMap<
         use glam::DVec2;
         let apply = |v: &[DVec2]| -> Vec<DVec2> {
             free.iter().map(|&i| {
-                let mut s = v[fi[&i]] * nb[i].len() as f64;
-                for &j in &nb[i] {
+                let deg: f64 = nb[i].iter().map(|x| x.1).sum();
+                let mut s = v[fi[&i]] * deg;
+                for &(j, wt) in &nb[i] {
                     if let Some(&k) = fi.get(&j) {
-                        s -= v[k];
+                        s -= v[k] * wt;
                     }
                 }
                 s
             }).collect()
         };
-        let b: Vec<DVec2> = free.iter().map(|&i| nb[i].iter().filter_map(|&j| fixed[j]).map(|q| q.as_dvec2()).sum()).collect();
+        let b: Vec<DVec2> = free.iter().map(|&i| nb[i].iter().filter_map(|&(j, wt)| fixed[j].map(|q| q.as_dvec2() * wt)).sum()).collect();
         let mut u: Vec<DVec2> = free.iter().map(|&i| x[i].as_dvec2()).collect();
         let au = apply(&u);
         let mut r: Vec<DVec2> = b.iter().zip(&au).map(|(b, a)| *b - *a).collect();
@@ -3497,7 +3685,7 @@ impl<'a> Locate<'a> {
 }
 
 /// The layout's quads and their points, or why it could not be made.
-pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, cut_plane: Option<MirrorPlane>, quad: f32) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
+pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, cut_plane: Option<MirrorPlane>, quad: f32, field: f32) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
     // 1. The working mesh: the plain remesher at four times the quads.
     // The working mesh: the model itself (exact edge lines and polygroup borders), decimated
     // if far too dense, then its long edges split until every edge is under a quarter quad.
@@ -3517,7 +3705,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     // Feature loops: experimental (needs a band fill for the rings between loops), off unless
     // KLAY_ZR_FEATURES is set.
     let mut enclosed: Vec<bool> = Vec::new();
-    if s.follow_shape > 0.0 && std::env::var_os("KLAY_ZR_FEATURES").is_some() {
+    if std::env::var_os("KLAY_ZR_FEATURES").is_some() {
         let loops = feature_loops(&mut w, quad, &mut enclosed);
         if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
             eprintln!("  feature loops: {loops}");
@@ -3556,7 +3744,9 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
         }
         dir
     };
-    let z = cross_field(&w, (s.follow_shape / 100.0).clamp(0.0, 1.0), quad, &grid);
+    // The field's curvature pull (ZR_FIELD overrides Follow Shape, 0..100, for experiments).
+    let field_follow = std::env::var("ZR_FIELD").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(field);
+    let z = cross_field(&w, (field_follow / 100.0).clamp(0.0, 1.0), quad, &grid);
     crate::jobs::check()?;
     let mut index = poles(&w, &z);
     // A pole next to one of the opposite sign cancels it: both are dropped.
@@ -3722,6 +3912,81 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             }
         }
     }
+    // Feature rings send lines outward from four points spaced evenly round them (edge flow
+    // leaving an eye loop); those points are corners for the cap inside and the patches out.
+    if !enclosed.is_empty() && std::env::var_os("ZR_NOSPOKES").is_none() {
+        let key2 = |a: u32, b: u32| (a.min(b), a.max(b));
+        let mut soft_nb: HashMap<u32, Vec<u32>> = HashMap::default();
+        let mut seen_e: HashSet<(u32, u32)> = HashSet::default();
+        for h in 0..w.t.len() as u32 * 3 {
+            if w.soft[h as usize] && seen_e.insert(key2(w.from(h), w.to(h))) {
+                soft_nb.entry(w.from(h)).or_default().push(w.to(h));
+                soft_nb.entry(w.to(h)).or_default().push(w.from(h));
+            }
+        }
+        let mut done: HashSet<u32> = HashSet::default();
+        let mut starts: Vec<u32> = soft_nb.keys().copied().collect();
+        starts.sort_unstable();
+        for v0 in starts {
+            if done.contains(&v0) || soft_nb[&v0].len() != 2 {
+                continue;
+            }
+            // Walk the loop.
+            let mut lp = vec![v0];
+            done.insert(v0);
+            let (mut prev, mut cur) = (v0, soft_nb[&v0][0]);
+            while cur != v0 && lp.len() < 100_000 {
+                if soft_nb[&cur].len() != 2 {
+                    break;
+                }
+                lp.push(cur);
+                done.insert(cur);
+                let nx = if soft_nb[&cur][0] != prev { soft_nb[&cur][0] } else { soft_nb[&cur][1] };
+                prev = cur;
+                cur = nx;
+            }
+            if cur != v0 || lp.len() < 8 {
+                continue;
+            }
+            let m = lp.len();
+            let mut cum = vec![0.0f32];
+            for k in 0..m {
+                cum.push(cum[k] + w.p[lp[k] as usize].distance(w.p[lp[(k + 1) % m] as usize]));
+            }
+            let total = cum[m];
+            for q in 0..4 {
+                let goal = total * q as f32 / 4.0;
+                let k = cum.partition_point(|&x| x < goal).min(m - 1);
+                let v = lp[k];
+                let (pv, nv2) = (lp[(k + m - 1) % m], lp[(k + 1) % m]);
+                let n = w.vnrm[v as usize];
+                let t = (w.p[nv2 as usize] - w.p[pv as usize]).normalize_or_zero();
+                let mut out = n.cross(t).normalize_or_zero();
+                // Outward: away from the enclosed faces round v.
+                let fan = w.fan(v);
+                let inside_c: Vec<Vec3> = fan.iter().filter(|&&h| enclosed[h as usize / 3]).map(|&h| {
+                    let tt = w.t[h as usize / 3];
+                    (w.p[tt[0] as usize] + w.p[tt[1] as usize] + w.p[tt[2] as usize]) / 3.0
+                }).collect();
+                if let Some(ci) = inside_c.first() {
+                    if out.dot(*ci - w.p[v as usize]) > 0.0 {
+                        out = -out;
+                    }
+                }
+                let Some(&h0) = fan.iter().find(|&&h| !enclosed[h as usize / 3]) else { continue };
+                marks[v as usize] = NODE;
+                nodes.insert(v);
+                protected.insert(traces.len() as u32);
+                let mut tr = Trace::new(&w, &z, v, h0 as usize / 3, out);
+                // Keep to the outside: start in the outside face the direction points into.
+                if enclosed[tr.face] {
+                    tr = Trace::new(&w, &z, v, h0 as usize / 3, out);
+                    tr.face = h0 as usize / 3;
+                }
+                traces.push(tr);
+            }
+        }
+    }
     run(&mut traces, 0, &w, &z, &mut marks, quad, &pole_list);
     if debug {
         let mut hd: HashMap<u32, usize> = HashMap::default();
@@ -3816,6 +4081,39 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             }
             nodes.insert(t.path[0]);
             nodes.insert(*t.path.last().unwrap());
+        }
+        // Spurs: line pieces that end loose inside a patch lead nowhere and pinch the patch
+        // round them: pruned back to where they meet something.
+        if std::env::var_os("ZR_NOSPURPRUNE").is_none() {
+            let mut deg: HashMap<u32, u32> = HashMap::default();
+            for &(a, b) in &cut_edges {
+                *deg.entry(a).or_default() += 1;
+                *deg.entry(b).or_default() += 1;
+            }
+            let mut nbrs: HashMap<u32, Vec<u32>> = HashMap::default();
+            for &(a, b) in &cut_edges {
+                nbrs.entry(a).or_default().push(b);
+                nbrs.entry(b).or_default().push(a);
+            }
+            let mut stack: Vec<u32> = deg.iter().filter(|(_, d)| **d == 1).map(|(v, _)| *v).collect();
+            while let Some(v) = stack.pop() {
+                if deg.get(&v).copied() != Some(1) {
+                    continue;
+                }
+                let Some(&u) = nbrs[&v].iter().find(|&&u| cut_edges.contains(&key(v, u))) else { continue };
+                if edge_line.get(&key(v, u)) == Some(&HARD) {
+                    continue;
+                }
+                cut_edges.remove(&key(v, u));
+                edge_line.remove(&key(v, u));
+                *deg.get_mut(&v).unwrap() -= 1;
+                let du = deg.get_mut(&u).unwrap();
+                *du -= 1;
+                if *du == 1 {
+                    stack.push(u);
+                }
+                nodes.remove(&v);
+            }
         }
         (cut_edges, edge_line, same, nodes)
     };
@@ -4299,25 +4597,46 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             // two quads, which keep every four-sided patch on the way even.
             for p in 0..c.patches.len() {
                 let pa = &c.patches[p];
-                if !(pa.sides.len() == 3 || pa.sides.len() == 5) || pa.band || (pa.messy && std::env::var_os("ZR_NOMESSYWIDEN").is_some()) {
+                let k = pa.sides.len();
+                let wide = std::env::var_os("ZR_NARROWWIDEN").is_none();
+                let ok_k = if wide { k == 3 || k == 5 || k == 6 || k == 7 } else { k == 3 || k == 5 };
+                if !ok_k || pa.band || (pa.messy && std::env::var_os("ZR_NOMESSYWIDEN").is_some()) {
                     continue;
                 }
-                for _ in 0..12 {
+                // Widening keeps every cycle's parity, so a patch with an odd cycle is left.
+                if k == 6 && odd_cycle(&lens(&n, pa)) {
+                    continue;
+                }
+                let rounds_max: usize = std::env::var("ZR_WIDEN").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+                for round in 0..rounds_max {
                     let l = lens(&n, pa);
                     if split_sides(&l).is_some() {
                         break;
                     }
-                    let now = slack(&l);
+                    if debug && round == 39 {
+                        eprintln!("    widen p{p}: {l:?} still short after 39 rounds");
+                    }
+                    // Least total shortfall after +2 on one side (negated, so larger is better).
+                    let measure = |l: &[i64]| if std::env::var_os("ZR_MARGIN").is_some() { split_margin(l) } else { -split_shortfall(l) };
+                    let now = measure(&l);
                     let best = (0..l.len()).map(|s| {
                         let mut l2 = l.clone();
                         l2[s] += 2;
-                        (slack(&l2), s)
+                        (measure(&l2), s)
                     }).max_by(|a, b| a.0.total_cmp(&b.0));
                     let Some((gain, side)) = best else { break };
                     if gain <= now {
+                        if debug && k >= 5 {
+                            eprintln!("    widen p{p}: {l:?} margin {now:.2}, best +2 on side {side} gives {gain:.2}: stop");
+                        }
                         break;
                     }
-                    let Some(path) = strip(&c, p, side) else { break };
+                    let Some(path) = strip(&c, p, side) else {
+                        if debug && k >= 5 {
+                            eprintln!("    widen p{p}: {l:?} no strip from side {side}");
+                        }
+                        break;
+                    };
                     for a in path {
                         n[a as usize] += 2;
                     }
@@ -4461,8 +4780,12 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             ok.then_some(sb)
         });
         let pinched = { let mut seen = HashSet::default(); !pa.lp.iter().all(|v| seen.insert(*v)) };
+        // A cap: a disc inside one closed loop with no corners (a feature loop's inside).
+        let cap = k == 1 && pa.real == 0 && !pinched && total >= 4 && total % 2 == 0 && std::env::var_os("ZR_NOCAP5").is_none();
         let pattern = if pinched {
             2
+        } else if cap {
+            5
         } else if k == 4 && !pa.messy && pa.real == 4 && l[0] == l[2] && l[1] == l[3] {
             0
         } else if trap.is_some() {
@@ -4487,6 +4810,20 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             cs[(sb + 2) % 4] = Vec2::new((a + c) * 0.5, h);
             cs[(sb + 3) % 4] = Vec2::new((a - c) * 0.5, h);
             cs
+        } else if k == 3 && pattern == 1 && std::env::var_os("ZR_REGTRI").is_none() {
+            // A triangle with its own proportions (a thin wedge stays thin, so the flattening
+            // and the corner grids are not stretched), counter-clockwise.
+            let mut e: Vec<f32> = l.iter().map(|&x| x.max(1) as f32).collect();
+            for i in 0..3 {
+                let others = e[(i + 1) % 3] + e[(i + 2) % 3];
+                if e[i] >= others * 0.98 {
+                    e[i] = others * 0.98;
+                }
+            }
+            let (a, b, c) = (e[0], e[1], e[2]);
+            let x = (a * a + c * c - b * b) / (2.0 * a);
+            let y = (c * c - x * x).max(1e-6).sqrt();
+            vec![Vec2::ZERO, Vec2::new(a, 0.0), Vec2::new(x, y)]
         } else {
             let r = l.iter().sum::<i64>() as f32 / (2.0 * k as f32 * (std::f32::consts::PI / k as f32).sin());
             (0..k).map(|i| {
@@ -4500,7 +4837,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             let a = std::f32::consts::TAU * t / total as f32;
             Vec2::new(a.cos(), a.sin()) * radius
         };
-        let on_side = |s: usize, u: f32| -> Vec2 { if pattern == 2 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
+        let on_side = |s: usize, u: f32| -> Vec2 { if pattern == 2 || pattern == 5 { circle(base[s] + u) } else { corners[s].lerp(corners[(s + 1) % k], u / l[s] as f32) } };
         // Loop vertices onto the polygon; side points' ids by (side, offset). A vertex the
         // loop passes twice (a pinch) is a second, separate vertex on its second pass, for
         // the faces on that side of it.
@@ -4752,10 +5089,55 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 row = top;
                 n0 = n1;
             }
+        } else if pattern == 5 {
+            // Four corners on the loop, evenly round it (a, b, a, b), and a grid between them
+            // laid as a Coons patch on the flat circle.
+            drop(grid);
+            let t = total as usize;
+            let a = ((t as f32 / 4.0).round() as usize).clamp(1, t / 2 - 1);
+            let b = t / 2 - a;
+            let ring: Vec<u32> = side_ids[0][..t].to_vec();
+            let at = |i: usize| -> Vec2 { on_side(0, (i % t) as f32) };
+            // Sides as index runs round the loop: bottom 0..a, right a..a+b, top (reversed)
+            // a+b..2a+b, left (reversed) 2a+b..t.
+            let bottom = |i: usize| i;
+            let right = |j: usize| a + j;
+            let top = |i: usize| (2 * a + b - i) % t;
+            let left = |j: usize| (t - j) % t;
+            let mut g = vec![vec![0u32; a + 1]; b + 1];
+            for j in 0..=b {
+                for i in 0..=a {
+                    g[j][i] = if j == 0 {
+                        ring[bottom(i)]
+                    } else if j == b {
+                        ring[top(i)]
+                    } else if i == 0 {
+                        ring[left(j)]
+                    } else if i == a {
+                        ring[right(j)]
+                    } else {
+                        let (u, v) = (i as f32 / a as f32, j as f32 / b as f32);
+                        let q = at(bottom(i)) * (1.0 - v) + at(top(i)) * v + at(left(j)) * (1.0 - u) + at(right(j)) * u
+                            - (at(0) * (1.0 - u) * (1.0 - v) + at(a) * u * (1.0 - v) + at(a + b) * u * v + at(2 * a + b) * (1.0 - u) * v);
+                        point(q, &mut out_p)
+                    };
+                }
+            }
+            for j in 0..b {
+                for i in 0..a {
+                    quads_out.push([g[j][i], g[j][i + 1], g[j + 1][i + 1], g[j + 1][i]]);
+                }
+            }
         } else if pattern == 1 {
             let y = split_sides(&l).ok_or("a patch has no even split")?;
             let x: Vec<i64> = (0..k).map(|i| l[i] - y[i]).collect();
-            let centre = Vec2::ZERO;
+            // The middle: the regular polygon's centre, or for a triangle laid out with its own
+            // proportions, the mean of its split points.
+            let centre = if k == 3 && corners[0] == Vec2::ZERO && corners[1].y == 0.0 && std::env::var_os("ZR_REGTRI").is_none() {
+                (0..k).map(|i| on_side(i, x[i] as f32)).sum::<Vec2>() / k as f32
+            } else {
+                Vec2::ZERO
+            };
             for i in 0..k {
                 let j = (i + 1) % k;
                 // Quad at corner j: S_i → C_j → S_j → centre.
@@ -4943,6 +5325,102 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 eprintln!("  long edge {l:.1} quads: {a} ({}) - {b} ({}), patch {pi} pattern {pat}, {} sides, messy {}, band {}, {} faces", kind(a), kind(b), pa.sides.len(), pa.messy, pa.band, pa.faces.len());
             }
         }
+        // Badly shaped quads (an angle under 45° or over 135°, or a side over 3× another),
+        // straight from the fill: by pattern, and by how stretched the patch's counts are.
+        {
+            let bad_quad = |q: &[u32; 4]| -> bool {
+                let p: Vec<Vec3> = q.iter().map(|&v| out_p[v as usize]).collect();
+                let l: Vec<f32> = (0..4).map(|k| p[k].distance(p[(k + 1) % 4])).collect();
+                let (mn, mx) = (l.iter().cloned().fold(f32::INFINITY, f32::min), l.iter().cloned().fold(0.0, f32::max));
+                if mn <= 0.0 || mx / mn > 3.0 {
+                    return true;
+                }
+                (0..4).any(|k| {
+                    let (a, b) = (p[(k + 3) % 4] - p[k], p[(k + 1) % 4] - p[k]);
+                    let ang = a.angle_between(b).to_degrees();
+                    !(45.0..=135.0).contains(&ang)
+                })
+            };
+            let mut by_pat: HashMap<u8, (usize, usize)> = HashMap::default();
+            let mut by_stretch: Vec<(usize, usize)> = vec![(0, 0); 4];
+            let mut stretch_of: HashMap<usize, f32> = HashMap::default();
+            for (pi, pa) in c.patches.iter().enumerate() {
+                let mut worst = 1.0f32;
+                for sd in &pa.sides {
+                    let cnt: i64 = sd.iter().map(|&(a, _)| n[a as usize]).sum();
+                    let len: f32 = sd.iter().map(|&(a, _)| c.arcs[a as usize].windows(2).map(|e| w.p[e[0] as usize].distance(w.p[e[1] as usize])).sum::<f32>() / quad).sum();
+                    if cnt > 0 && len > 0.3 {
+                        let r = cnt as f32 / len;
+                        worst = worst.max(r.max(1.0 / r));
+                    }
+                }
+                stretch_of.insert(pi, worst);
+            }
+            for (q, quad4) in quads_out.iter().enumerate() {
+                let (pi, pat) = made_by[q];
+                let bad = bad_quad(quad4);
+                let e = by_pat.entry(pat).or_default();
+                e.0 += 1;
+                e.1 += bad as usize;
+                let st = stretch_of[&pi];
+                let bin = if st < 1.5 { 0 } else if st < 2.0 { 1 } else if st < 3.0 { 2 } else { 3 };
+                by_stretch[bin].0 += 1;
+                by_stretch[bin].1 += bad as usize;
+            }
+            let mut pats: Vec<_> = by_pat.into_iter().collect();
+            pats.sort();
+            eprintln!("  bad quads by pattern (pattern: total, bad): {pats:?}");
+            // Why patches go to the general fill.
+            let mut why: HashMap<String, (usize, usize)> = HashMap::default();
+            for (pi, pa) in c.patches.iter().enumerate() {
+                if pa.band {
+                    continue;
+                }
+                let l: Vec<i64> = pa.sides.iter().map(|sd| sd.iter().map(|&(a, _)| n[a as usize]).sum()).collect();
+                let k = l.len();
+                let quads_here = made_by.iter().filter(|m| m.0 == pi).count();
+                let general = made_by.iter().any(|m| m.0 == pi && m.1 == 2);
+                if !general {
+                    continue;
+                }
+                let mut times: HashMap<u32, u32> = HashMap::default();
+                for &v in &pa.lp {
+                    *times.entry(v).or_default() += 1;
+                }
+                let pinches = times.values().filter(|&&t| t > 1).count();
+                let reason = if pinches > 0 {
+                    format!("pinched ({} pinches)", if pinches > 3 { "4+".to_string() } else { pinches.to_string() })
+                } else if pa.real < 3 {
+                    format!("{} corners", pa.real)
+                } else if k > 8 {
+                    "over 8 sides".to_string()
+                } else if k == 4 {
+                    if l[0] != l[2] || l[1] != l[3] { "4 sides, unequal".to_string() } else { "4 sides, messy".to_string() }
+                } else {
+                    // Parity of each cycle under a step of two, and positivity.
+                    let odd_cycle = (0..k).any(|c0| {
+                        let mut sum = 0;
+                        let mut i = c0;
+                        loop {
+                            sum += l[i];
+                            i = (i + 2) % k;
+                            if i == c0 {
+                                break;
+                            }
+                        }
+                        sum % 2 != 0
+                    });
+                    if k % 2 == 0 && odd_cycle { format!("{k} sides, odd cycle") } else { format!("{k} sides, no positive split") }
+                };
+                let e = why.entry(reason).or_default();
+                e.0 += 1;
+                e.1 += quads_here;
+            }
+            let mut why: Vec<_> = why.into_iter().collect();
+            why.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            eprintln!("  general fill, why (patches, quads): {why:?}");
+            eprintln!("  bad quads by count stretch (<1.5, <2, <3, more): {by_stretch:?}");
+        }
         let dup: usize = quads_out.iter().filter(|q| (0..4).any(|k| q[k] == q[(k + 1) % 4] || q[k] == q[(k + 2) % 4])).count();
         for (q, quad4) in quads_out.iter().enumerate().filter(|(_, q)| (0..4).any(|k| q[k] == q[(k + 1) % 4] || q[k] == q[(k + 2) % 4])).take(4) {
             let (pi, pat) = made_by[q];
@@ -5057,6 +5535,13 @@ mod ring_tests {
             }
         }
         assert!(split_sides(&[3, 3, 3, 3, 3, 4]).is_none() || true);
+        // The margin matches the real split: [4, 4, 4] splits 2 / 2; [14, 2, 14] does not.
+        assert!((split_margin(&[4, 4, 4]) - 2.0).abs() < 1e-9);
+        assert!((split_margin(&[14, 2, 14]) - 1.0).abs() < 1e-9);
+        assert!((split_margin(&[4; 6]) - 2.0).abs() < 1e-9);
+        for l in [vec![3i64, 5, 4], vec![4, 4, 4, 4, 4], vec![3, 5, 4, 6, 5, 3], vec![4; 7]] {
+            assert_eq!(split_margin(&l) >= 1.0, split_sides(&l).is_some(), "{l:?}");
+        }
     }
 
     #[test]
