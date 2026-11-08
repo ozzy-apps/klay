@@ -742,7 +742,58 @@ fn symmetrize(p: &mut [Vec3], plane: MirrorPlane, quad: f32) -> usize {
 /// them are built on one half and mirrored. `feats`: the hard edges of `w` (see
 /// [`BodyFeatures`]): a hard loop round a part becomes one of its rings, rows snap to hard
 /// lines; empty, the part function alone decides.
+/// How the head is built: as the rest of the body; only far enough to find the neck (its
+/// distance down from the top is written to the cell); or finer above `below` (in `phi` as
+/// given, already stretched; half a band past the neck, so the neck ring is measured with
+/// the head), its rings' girths measured in quads `f` the size.
+#[derive(Clone, Copy)]
+enum Head<'a> {
+    Plain,
+    Probe(&'a std::cell::Cell<f32>),
+    Fine { below: f32, f: f32 },
+}
+
+/// The body built from `phi` (see `sweep_body_with`), with the head (on a model with a mirror
+/// plane) at `ZR_HEADQUAD` (0.6) of the quad: a first pass finds the neck, then `phi` is
+/// stretched by 1 / 0.6 down to it so its rings come that much closer, and their counts are
+/// taken at the finer quad; the trunk's count is stepped down to under the neck. 1.0 builds
+/// the head as the body, as does a head that fails at the finer quad.
 pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<MirrorPlane>, feats: &BodyFeatures) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
+    let f: f32 = std::env::var("ZR_HEADQUAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    if plane.is_none() || !(0.2..1.0).contains(&f) {
+        return sweep_body_with(w, phi, quad, src, plane, feats, Head::Plain);
+    }
+    let neck = std::cell::Cell::new(f32::NAN);
+    let _ = sweep_body_with(w, phi, quad, src, plane, feats, Head::Probe(&neck));
+    let d = neck.get();
+    if !d.is_finite() || d <= 0.0 {
+        return sweep_body_with(w, phi, quad, src, plane, feats, Head::Plain);
+    }
+    let lo = phi[src as usize];
+    // The head's length stretched by a whole number of bands, so every band below the neck
+    // lies where it did (the trunk and limbs are built as without the finer head).
+    let step = body_step(quad);
+    let extra = ((d / f - d) / step).round().max(1.0) * step;
+    let f = d / (d + extra);
+    let stretched: Vec<f32> = phi.iter().map(|&x| {
+        if !x.is_finite() {
+            return x;
+        }
+        let t = x - lo;
+        lo + if t < d { t / f } else { t + extra }
+    }).collect();
+    match sweep_body_with(w, &stretched, quad, src, plane, feats, Head::Fine { below: lo + d / f + step * 0.5, f }) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("  body: the finer head failed ({e}); built as the body");
+            }
+            sweep_body_with(w, phi, quad, src, plane, feats, Head::Plain)
+        }
+    }
+}
+
+fn sweep_body_with(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<MirrorPlane>, feats: &BodyFeatures, head_mode: Head) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
     let debug = std::env::var_os("KLAY_ZR_DEBUG").is_some();
     let nv = w.p.len();
     let step = body_step(quad);
@@ -870,7 +921,14 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let pts: Vec<Vec3> = order.iter().map(|k| at[k].0).collect();
         let near: Vec<u32> = order.iter().map(|k| at[k].1).collect();
         let far: Vec<u32> = order.iter().map(|k| at[k].2).collect();
-        let girth = (0..pts.len()).map(|i| pts[i].distance(pts[(i + 1) % pts.len()])).sum::<f32>() / quad;
+        let mut girth = (0..pts.len()).map(|i| pts[i].distance(pts[(i + 1) % pts.len()])).sum::<f32>() / quad;
+        // A ring of the finer head is measured in its finer quads.
+        if let Head::Fine { below, f } = head_mode {
+            let at = near.iter().map(|&v| phi[v as usize] as f64).sum::<f64>() / near.len().max(1) as f64;
+            if (at as f32) < below {
+                girth /= f;
+            }
+        }
         let level = (sg[0].0).2;
         rings.push(Ring { pts, near, far, from: x, to: y, girth, level, hard: false });
     }
@@ -1933,10 +1991,27 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             break;
         }
     }
+    // A finer head keeps the neck its first pass found (past it the rings are measured in
+    // the body's coarser quads and look narrower): the ring at that level, the widest above.
+    if let Head::Fine { below, .. } = head_mode {
+        let level = below - body_step(quad) * 0.5;
+        let at = |r: usize| rings[r].near.iter().map(|&v| phi[v as usize] as f64).sum::<f64>() / rings[r].near.len().max(1) as f64;
+        if let Some(i) = (0..hg.len()).min_by(|&a, &b| (at(head_run[a]) - level as f64).abs().total_cmp(&(at(head_run[b]) - level as f64).abs())) {
+            neck = i;
+            widest = (0..=i).max_by(|&a, &b| hg[a].total_cmp(&hg[b])).unwrap_or(0);
+        }
+    }
     let cap_frac: f32 = std::env::var("ZR_CAPFRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6);
     let first = (0..=widest).find(|&i| hg[i] >= hg[widest] * cap_frac && hg[i] >= 4.0).ok_or("no ring to cap the head")?;
     if debug {
         eprintln!("  body: head widest {:.1} quads, neck {:.1}, capped at {:.1} ({} rings down)", hg[widest], hg[neck], hg[first], first);
+    }
+    // The probe for a finer head: how far down the neck ring is, then stop.
+    if let Head::Probe(cell) = head_mode {
+        let r = head_run[neck];
+        let at = rings[r].near.iter().map(|&v| phi[v as usize] as f64).sum::<f64>() / rings[r].near.len().max(1) as f64;
+        cell.set(at as f32 - phi[src as usize]);
+        return Err("the neck found".into());
     }
     let mut counts: HashMap<usize, usize> = HashMap::default();
     let head_counts = plan(&head_run[first..=neck.max(first)]);
@@ -2875,9 +2950,15 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         if made > 0 {
             orient(&mut quads, &out_p);
         }
+        // The face as nested loops (opt-in, `ZR_FACE=1`): a mask round both eyes, the eyes
+        // inside it, a loop round nose and mouth, the nose and the mouth inside that.
+        let nested = std::env::var_os("ZR_FACE").is_some() && {
+            let ctx = super::face::Ctx { plane: pl, quad, debug, surface: &surface };
+            super::face::nest(&ctx, &mut out_p, &mut quads, &head, &lower_face, &|q: &mut [[u32; 4]], p: &[Vec3]| orient(q, p))
+        };
         // Eyes (`ZR_NOEYES` off): the sockets, the deepest dips on the front of the head,
         // ringed the same way.
-        if std::env::var_os("ZR_NOEYES").is_none() {
+        if !nested && std::env::var_os("ZR_NOEYES").is_none() {
             let eyes = bumps(&head, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface, -1.0, ("ZR_EYE", 0.4, 0.5, 4.0, 0.5, 1.0));
             if debug {
                 eprintln!("  body: {eyes} eye sockets ringed");
@@ -2887,7 +2968,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             }
         }
         // The mouth (`ZR_NOMOUTH` off): one ring across the centre line.
-        if std::env::var_os("ZR_NOMOUTH").is_none() && mouth(&lower_face, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface) {
+        if !nested && std::env::var_os("ZR_NOMOUTH").is_none() && mouth(&lower_face, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface) {
             orient(&mut quads, &out_p);
         }
     }
