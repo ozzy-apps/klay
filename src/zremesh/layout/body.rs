@@ -1221,15 +1221,13 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     let old_tips = std::env::var_os("ZR_OLDTIPS").is_some();
     let flat_aspect: f32 = std::env::var("ZR_FLATASPECT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.3);
     // How far past its ring's girth a split's bridged count may be for the band above to
-    // step up to it (fingers of 8 bridge to about twice the palm's girth).
+    // step up to it: 1.8 times, as before, or `ZR_SPLITRATIO` (2.2) when one of the split's
+    // runs is a thin tube lifted to the `ZR_MINTUBE` floor (fingers of 8 bridge to about
+    // twice the palm's girth).
     let split_ratio: f32 = std::env::var("ZR_SPLITRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(2.2);
-    // The cap at the end of a limb, on `row`, the tip past it at `tip`. A flat end (the toe
-    // end of a foot, a mitten) goes on in rows a quad apart keeping the row's shape (shrunk
-    // only near the end), the last half a quad or more short of the tip, then a grid laid
-    // straight across, more quads along its long side, its inside lifted toward the tip by
-    // at most half a quad and put on the surface. A round end (a finger) goes on in rows
-    // shrinking toward the tip like a sphere, half a quad apart while they are wider than
-    // 0.6 quad, then a grid domed toward the tip by at most half a quad.
+    let floored = |rs: &[usize]| tubular(rs) && rs.iter().any(|&r| even(rings[r].girth) < min_tube);
+    // Whether rings join at piece `p` (more than one kept ring comes in).
+    let joins_at = |p: u32| ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count()) > 1;
     // Whether a row lies on the far side of the plane, where it runs the other way round
     // from its twin (`ZR_NOCAPMIRROR`: no row does, the caps then differ).
     let far_side = |row_sym: bool, row_pos: &[Vec3]| {
@@ -1237,10 +1235,17 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             && std::env::var_os("ZR_NOCAPMIRROR").is_none()
             && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0)
     };
+    // The cap at the end of a limb, on `row`, the tip past it at `tip`. A flat end (the toe
+    // end of a foot, a mitten) goes on in rows a quad apart keeping the row's shape (shrunk
+    // only near the end), the last half a quad or more short of the tip, then a grid laid
+    // straight across, more quads along its long side, its inside lifted toward the tip by
+    // at most half a quad and put on the surface. A round end (a finger) goes on in rows
+    // shrinking toward the tip like a sphere, half a quad apart while they are wider than
+    // 0.6 quad, then a grid domed toward the tip by at most half a quad.
     let end_cap = |row: &[u32], row_sym: bool, tip: Vec3, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>| {
         let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
         let n = row.len();
-        let (c, ax_u, ax_v, big, small) = row_axes(&row_pos);
+        let (c, _, _, big, small) = row_axes(&row_pos);
         let dist = tip.distance(c);
         if !old_tips && n >= 6 && big >= small * flat_aspect {
             let extra = (dist / quad).floor() as usize;
@@ -1345,7 +1350,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // piece also splits or ends, goes on as the ring into it. If the strips cannot be
         // found, the body is not built (planned instead).
         let in_k = ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count());
-        let (row, row_sym) = if in_k > 1 {
+        let (row, row_sym) = if joins_at(p) {
             let waiting = pending.entry(p).or_default();
             waiting.push((row, in_ring));
             if waiting.len() < in_k {
@@ -1501,10 +1506,12 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let r = k[0];
                 // At the end of a limb whose last rings close round the tip (the toes of a
                 // foot): when this row is flat and the rings left (three at most) are all
-                // under 0.85 of its girth, the cap goes on this row and they are dropped.
+                // under 0.85 of its girth, the cap goes on this row and they are dropped. Not
+                // when another part joins at one of them (a hand resting on a thigh): the
+                // other row would wait for this one for ever.
                 if !old_tips && row.len() >= 6 {
                     let rest = chain_from(r);
-                    if rest.len() <= 3 && kept(rings[rest[rest.len() - 1]].to).is_empty() {
+                    if rest.len() <= 3 && kept(rings[rest[rest.len() - 1]].to).is_empty() && !rest.iter().any(|&q| joins_at(rings[q].to)) {
                         let aspect = |pts: &[Vec3]| { let (_, _, _, b, s) = row_axes(pts); b / s.max(1e-9) };
                         let here = aspect(&row_pos);
                         let ahead: Vec<f32> = rest.iter().map(|&q| aspect(&rings[q].pts)).collect();
@@ -1535,11 +1542,13 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     }
                 };
                 // Before a split, the count it bridges into (the merges go in this band, not
-                // in the split's) when within `ZR_SPLITRATIO` (2.2) times the girth.
+                // in the split's) when within 1.8 times the girth (`ZR_SPLITRATIO`, 2.2, when
+                // a part of the split is a thin tube given the `ZR_MINTUBE` floor).
                 let nk = kept(rings[r].to);
                 if nk.len() >= 2 {
                     if let Ok(sp) = split_plan(rings[r].to, &nk, &totals) {
-                        if (sp.total as f32) < g * split_ratio && (sp.total as f32) > g / split_ratio {
+                        let ratio = if nk.iter().any(|&q| floored(&chain_from(q))) { split_ratio } else { 1.8 };
+                        if (sp.total as f32) < g * ratio && (sp.total as f32) > g / ratio {
                             n = sp.total;
                         }
                     }
