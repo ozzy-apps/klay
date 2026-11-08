@@ -177,10 +177,37 @@ pub(super) fn settle_cap(row: &[u32], a: usize, plane: MirrorPlane, patch: &Patc
             out_p[v] = q;
         }
     }
-    for j in 1..b {
-        for i in (1..a).filter(|&i| !on_plus(i) && i != a / 2) {
-            out_p[ids[j][i] as usize] = plane.reflect(out_p[ids[j][a - i] as usize]);
+    let mirror = |out_p: &mut Vec<Vec3>| {
+        for j in 1..b {
+            for i in (1..a).filter(|&i| !on_plus(i) && i != a / 2) {
+                out_p[ids[j][i] as usize] = plane.reflect(out_p[ids[j][a - i] as usize]);
+            }
         }
+    };
+    mirror(out_p);
+    // Relaxed (`ZR_YOKERELAX` passes, 30; 0 leaves the grid where it settled): each inside
+    // point to the middle of its four neighbours, back onto the surface, the border (the
+    // trunk's ring) held. Settling straight up lands the rows next to the trunk's side walls
+    // on top of the shoulders, leaving one tall cell down each wall; relaxing spreads the
+    // rows down the walls.
+    let passes: usize = std::env::var("ZR_YOKERELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    for _ in 0..passes {
+        let mut next: Vec<(usize, Vec3)> = Vec::new();
+        for j in 1..b {
+            for i in (1..a).filter(|&i| on_plus(i) || i == a / 2) {
+                let v = ids[j][i] as usize;
+                let m = (out_p[ids[j - 1][i] as usize] + out_p[ids[j + 1][i] as usize] + out_p[ids[j][i - 1] as usize] + out_p[ids[j][i + 1] as usize]) * 0.25;
+                let mut q = patch.nearest(p, m).map_or(m, |(c, _)| c);
+                if i == a / 2 {
+                    q = plane.project(q);
+                }
+                next.push((v, q));
+            }
+        }
+        for (v, q) in next {
+            out_p[v] = q;
+        }
+        mirror(out_p);
     }
     Ok((ids, cells, plus_high))
 }

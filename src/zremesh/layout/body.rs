@@ -2421,8 +2421,26 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let i_n = a / 2 - a_n / 2;
                 let j_n = ((b - b_n) / 2).clamp(1, b - 1 - b_n);
                 let c_arm = rings[y.plus].pts.iter().copied().sum::<Vec3>() / rings[y.plus].pts.len().max(1) as f32;
-                let (i_plus, i_minus) = if plus_high { (a - a_a, 0) } else { (0, a - a_a) };
-                let j_a = row_near(i_plus + a_a / 2, c_arm, &out_p).saturating_sub(b_a / 2).clamp(1, b - 1 - b_a);
+                // The arm holes `ZR_ARMIN` (1) columns in from the grid's sides, so a strip of
+                // grid runs under the arm (at 0 the hole's outer edge is the trunk's ring and the
+                // arm's underside joins the trunk's side wall with no rows).
+                let arm_in: usize = std::env::var("ZR_ARMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+                if 2 * (a_a + arm_in) + a_n + 2 > a {
+                    return Err(format!("arm holes {arm_in} in from the sides do not fit"));
+                }
+                let (i_plus, i_minus) = if plus_high { (a - a_a - arm_in, arm_in) } else { (arm_in, a - a_a - arm_in) };
+                // The arm hole's rows: centred front to back on the arm ring's centre (the
+                // grid rows run from the chest over the shoulder to the back, so the row
+                // nearest it in space can be one on the back slope, and the arm's row then
+                // twists into the hole; `ZR_ARMNEAR`: the nearest row).
+                let row_fwd = |col: usize, c: Vec3, out_p: &[Vec3]| (0..=b).min_by(|&x, &y| (out_p[ids[x][col] as usize][fwd] - c[fwd]).abs().total_cmp(&(out_p[ids[y][col] as usize][fwd] - c[fwd]).abs())).unwrap_or(0);
+                let j_c = match std::env::var("ZR_ARMROW").as_deref() {
+                    Ok("near") => row_near(i_plus + a_a / 2, c_arm, &out_p),
+                    Ok("fwd") => row_fwd(i_plus + a_a / 2, c_arm, &out_p),
+                    Ok("mid") => b / 2,
+                    _ => row_fwd(i_plus + a_a / 2, c_arm, &out_p),
+                };
+                let j_a = (j_c + 1).saturating_sub(b_a.div_ceil(2)).clamp(1, b - 1 - b_a);
                 let mut holes: Vec<usize> = yoke::hole_cells(a, i_n, j_n, a_n, b_n);
                 holes.extend(yoke::hole_cells(a, i_plus, j_a, a_a, b_a));
                 holes.extend(yoke::hole_cells(a, i_minus, j_a, a_a, b_a));
