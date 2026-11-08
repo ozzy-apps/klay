@@ -1331,8 +1331,11 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     last = next;
                 }
                 // A row on the far side of the plane runs the other way round from its
-                // twin's: capped reversed, so the cap is the twin's mirror image.
-                let far_side = !row_sym && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0);
+                // twin's: capped reversed, so the cap is the twin's mirror image
+                // (`ZR_NOCAPMIRROR`: capped as laid out, the caps then differ).
+                let far_side = !row_sym
+                    && std::env::var_os("ZR_NOCAPMIRROR").is_none()
+                    && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0);
                 let nl = last.len();
                 let capped: Vec<u32> = if far_side { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
                 let from = out_p.len();
