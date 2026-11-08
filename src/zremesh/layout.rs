@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 
 mod body;
 mod rect;
+mod yoke;
 
 pub(super) use body::mirror_pairs;
 

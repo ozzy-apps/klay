@@ -243,6 +243,19 @@ struct Split {
     total: usize,
 }
 
+/// The shoulders as a yoke: the ring whose row the neck hole takes (`m` in the head run), the
+/// trunk ring and the arm rings (+ side first) past the split, their counts, and the grid.
+#[derive(Clone, Copy)]
+struct YokePlan {
+    m: usize,
+    trunk: usize,
+    plus: usize,
+    minus: usize,
+    n_trunk: usize,
+    n_arm: usize,
+    dims: yoke::Yoke,
+}
+
 fn even(g: f32) -> usize {
     ((g * 0.5).round() as usize * 2).max(4)
 }
@@ -1890,6 +1903,161 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             counts.insert(head_run[neck + 1 + i], c);
         }
     }
+    // Which side of the plane a ring lies on (the sum of its points' distances), and its
+    // extents across the plane and front to back.
+    let side_of = |r: usize| -> f32 { plane.map_or(0.0, |pl| rings[r].pts.iter().map(|&q| pl.distance(q)).sum::<f32>()) };
+    let extents = |r: usize| -> (f32, f32) {
+        let ax = plane.map_or(0, |pl| pl.axis as usize);
+        let span = |k: usize| {
+            let (lo, hi) = rings[r].pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), q| (lo.min(q[k]), hi.max(q[k])));
+            hi - lo
+        };
+        (span(ax), span(fwd))
+    };
+    // A piece where the ring parts into two legs: two kept rings past it, neither cut by the
+    // plane, one each side.
+    let two_legs = |p: u32| -> Option<(usize, usize)> {
+        let ks = kept(p);
+        if ks.len() != 2 || ring_cross[ks[0]].is_some() || ring_cross[ks[1]].is_some() || side_of(ks[0]) * side_of(ks[1]) >= 0.0 {
+            return None;
+        }
+        Some(if side_of(ks[0]) > 0.0 { (ks[0], ks[1]) } else { (ks[1], ks[0]) })
+    };
+    // The crotch as a cap with leg holes (`ZR_CROTCHHOLES=1`; off unless asked for: the
+    // piece between the hips and the legs is one band deep, and a grid over the hips with
+    // holes for the legs has far more cells than fit in it).
+    let crotch_on = plane.is_some() && std::env::var("ZR_CROTCHHOLES").is_ok_and(|v| v != "0");
+    // How many of a cap's grid quads may face inward (`ZR_YOKEINWARD`, percent, 10) before
+    // the cap is given up.
+    let inward_most: usize = std::env::var("ZR_YOKEINWARD").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    // Under a yoke the trunk keeps one count down to the crotch, as a box modeller's does
+    // (its ratio rule, not the ankle rule, which would give the hips their own count);
+    // `ZR_TRUNKSTEP` plans it as before.
+    let yoke_on = plane.is_some() && std::env::var_os("ZR_YOKE").is_some();
+    let trunk_one = yoke_on && std::env::var_os("ZR_TRUNKSTEP").is_none();
+    let trunk_plan = |rs: &[usize]| -> Vec<usize> {
+        if trunk_one && rs.last().is_some_and(|&r| two_legs(rings[r].to).is_some()) {
+            plan_one(rs)
+        } else {
+            plan(rs)
+        }
+    };
+    // The count a run past a split takes: the next split's bridged count when it splits
+    // again at once, else its run's first.
+    let run_count = |r: usize| -> usize {
+        let run = chain_from(r);
+        match totals.get(&rings[r].to) {
+            Some(&t) if run.len() == 1 => t,
+            _ => trunk_plan(&run)[0],
+        }
+    };
+    // The ring a hole is bridged to: the limb's first, or with `ZR_YOKESECOND` the second of
+    // its run when there is one with the same count. The first ring (an arm's at the armpit,
+    // a leg's at the perineum) touches the trunk's ring at the saddle between them, and the
+    // band to it has no height there (two slivers at the armpits, which the relax does not
+    // open); a band to the second ring is a quad tall all round but comes out more stretched
+    // under the arm (on the T-pose 46 badly shaped quads at the shoulders against 36).
+    let yoke_second = std::env::var_os("ZR_YOKESECOND").is_some();
+    let past_saddle = |r: usize, n: usize| -> usize {
+        let run = chain_from(r);
+        if yoke_second && run.len() >= 2 && plan(&run)[1] == n { run[1] } else { r }
+    };
+    // The crotch cap's legs and grid for the split piece `p` entered over ring `in_ring` with
+    // a row of `n_in`: None if the piece is not a crotch or the grid does not fit.
+    let crotch_candidate = |p: u32, in_ring: usize, n_in: usize| -> Option<(usize, usize, usize, yoke::Crotch)> {
+        if !crotch_on || !pinned(in_ring, n_in) {
+            return None;
+        }
+        let (r_plus, r_minus) = two_legs(p)?;
+        let n_leg = run_count(r_plus);
+        if run_count(r_minus) != n_leg {
+            return None;
+        }
+        let (wd, dp) = extents(in_ring);
+        yoke::crotch_dims(n_in, n_leg, wd, dp).map(|c| (r_plus, r_minus, n_leg, c))
+    };
+    // The shoulders as a yoke (opt-in, `ZR_YOKE=1`: on the T-pose it removes the ring of poles
+    // at the neck base but the breasts are then not found and the shoulders come out coarser): with a plane, when the head run ends at a
+    // piece with three rings past it (the trunk, cut by the plane, and an arm each side), a
+    // grid over the trunk's ring with holes for the neck and the arms takes the place of the
+    // rings between the neck and that piece. The neck hole takes the row of the ring after
+    // the neck (the neck's own if there is none), its count the largest in fours, down from
+    // its planned one, that fits the grid and is under half the trunk's count by 4 or more
+    // (a box modeller's neck takes under half the trunk's loops; the rest of the grid's
+    // depth then climbs the chest and the back); the band from the neck to it is the one
+    // reduction.
+    let yoke_plan: Option<YokePlan> = (|| {
+        if !yoke_on {
+            return None;
+        }
+        let p_s = rings[*head_run.last()?].to;
+        let ks = kept(p_s);
+        if ks.len() != 3 || ring_cross[ks[0]].is_none() || ring_cross[ks[1]].is_some() || ring_cross[ks[2]].is_some() || side_of(ks[1]) * side_of(ks[2]) >= 0.0 {
+            return None;
+        }
+        let (trunk, plus, minus) = if side_of(ks[1]) > 0.0 { (ks[0], ks[1], ks[2]) } else { (ks[0], ks[2], ks[1]) };
+        let (n_trunk, n_arm) = (run_count(trunk), run_count(plus));
+        if run_count(minus) != n_arm {
+            return None;
+        }
+        let (wd, dp) = extents(trunk);
+        let m = (neck + 1).min(head_run.len() - 1);
+        let r = head_run[m];
+        let planned = counts[&r];
+        // The grid's cells should cover the surface it replaces (the pieces from under the
+        // neck row to the split) at about a quad each: the trunk's ring under the grid takes
+        // the smallest count in fours, from the trunk's own up to twice it, whose grid has
+        // `ZR_YOKEFILL` (0.3) of those cells; the trunk steps back to its own count on the
+        // next band, with diamonds (`ZR_YOKEPLAIN`: the trunk's own count, a coarser grid).
+        let covered: HashSet<u32> = head_run[m..].iter().map(|&r| rings[r].to).collect();
+        let area: f64 = w.t.iter().filter(|t| t.iter().all(|&v| covered.contains(&comp[v as usize]))).map(|t| {
+            let (a, b, c) = (w.p[t[0] as usize], w.p[t[1] as usize], w.p[t[2] as usize]);
+            (b - a).cross(c - a).length() as f64 * 0.5
+        }).sum();
+        let fill: f64 = std::env::var("ZR_YOKEFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+        let target = area / (quad as f64 * quad as f64) * fill;
+        let plain = std::env::var_os("ZR_YOKEPLAIN").is_some();
+        let top = if plain { n_trunk } else { n_trunk * 2 };
+        let mut best: Option<(usize, YokePlan)> = None;
+        let mut n_y = n_trunk.div_ceil(4) * 4;
+        while n_y <= top {
+            // The largest neck hole that fits this grid: the band from the neck to it is the
+            // one reduction under the jaw.
+            let mut n = planned.min((n_y / 2).saturating_sub(4)) / 4 * 4;
+            while n >= 12 && n * 2 >= planned {
+                if pinned(r, n) && pinned(trunk, n_y) {
+                    if let Some(dims) = yoke::yoke_dims(n_y, n, n_arm, wd, dp) {
+                        let cells = dims.a * dims.b - dims.neck.0 * dims.neck.1 - 2 * dims.arm.0 * dims.arm.1;
+                        let y = YokePlan { m, trunk, plus, minus, n_trunk: n_y, n_arm, dims };
+                        if cells as f64 >= target || plain {
+                            if debug {
+                                eprintln!("  body: yoke ring {n_y} (trunk {n_trunk}): {cells} cells for {:.0} quads of surface", area / (quad as f64 * quad as f64));
+                            }
+                            return Some(y);
+                        }
+                        if best.as_ref().is_none_or(|(c, _)| cells > *c) {
+                            best = Some((cells, y));
+                        }
+                        break;
+                    }
+                }
+                n -= 4;
+            }
+            n_y += 4;
+        }
+        if best.is_none() && debug {
+            eprintln!("  body: yoke does not fit (trunk {n_trunk}, neck {planned}, arms {n_arm}, ring {:.2} by {:.2})", wd, dp);
+        }
+        best.map(|b| b.1)
+    })();
+    if let Some(y) = yoke_plan {
+        let r = head_run[y.m];
+        let n = 2 * (y.dims.neck.0 + y.dims.neck.1);
+        if debug && counts[&r] != n {
+            eprintln!("  body: neck row {} instead of {} for the yoke", n, counts[&r]);
+        }
+        counts.insert(r, n);
+    }
     let first = head_run[first];
     let row0 = make_row(first, counts[&first], None, None, &mut out_p);
     let cap_from = out_p.len();
@@ -2017,6 +2185,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     let mut joins = 0;
     let mut splits = 0;
     let mut caps = 1;
+    let mut yokes = 0;
     // Points of the torso's rows (rings the plane cuts, below the neck): where bumps (breasts)
     // are looked for.
     let mut torso: HashSet<u32> = HashSet::default();
@@ -2177,6 +2346,88 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         if quads.len() > 4_000_000 {
             return Err("too many quads".into());
         }
+        // The yoke, from the neck row: the trunk's row and a grid over it settled onto the
+        // shoulders, the neck hole in its middle bridged to this row, an arm hole at each
+        // side bridged to the arm's row; the trunk and the arms go on from there. If the grid
+        // does not lie on the surface, the rings below are built as before.
+        if let Some(y) = yoke_plan.filter(|y| head_run[y.m] == in_ring && yokes == 0) {
+            let pl = plane.unwrap();
+            let (np0, nq0) = (out_p.len(), quads.len());
+            let built = (|| -> Result<(), String> {
+                let yoke::Yoke { a, b, neck: (a_n, b_n), arm: (a_a, b_a) } = y.dims;
+                if row.len() != 2 * (a_n + b_n) {
+                    return Err(format!("the neck row has {} points, the hole {}", row.len(), 2 * (a_n + b_n)));
+                }
+                let row_t = make_row(y.trunk, y.n_trunk, None, None, &mut out_p);
+                let centroid = |ids: &[u32], out_p: &[Vec3]| ids.iter().map(|&v| out_p[v as usize]).sum::<Vec3>() / ids.len().max(1) as f32;
+                let (c_neck, c_trunk) = (centroid(&row, &out_p), centroid(&row_t, &out_p));
+                // The shoulders' surface: the pieces from under the neck row to the split.
+                let covered: HashSet<u32> = head_run[y.m..].iter().map(|&r| rings[r].to).collect();
+                let patch = yoke::Patch::new(&w.p, &w.t, &w.fnrm, &|v| covered.contains(&comp[v as usize]), quad).ok_or("no surface under the yoke")?;
+                let up = c_neck - c_trunk;
+                let (ids, cells, plus_high) = yoke::settle_cap(&row_t, a, pl, &patch, &w.p, up.normalize_or(Vec3::Y), up.length() * 1.5 + quad, quad, &mut out_p, &mut quads)?;
+                // The neck hole in the middle of the grid's rows (the chest and the back climb
+                // as far, and the rows in front and behind must cover both); the arm holes at
+                // the sides, by row round the point nearest the + arm's ring.
+                let row_near = |col: usize, c: Vec3, out_p: &[Vec3]| (0..=b).min_by(|&x, &y| out_p[ids[x][col] as usize].distance(c).total_cmp(&out_p[ids[y][col] as usize].distance(c))).unwrap_or(0);
+                let i_n = a / 2 - a_n / 2;
+                let j_n = ((b - b_n) / 2).clamp(1, b - 1 - b_n);
+                let c_arm = rings[y.plus].pts.iter().copied().sum::<Vec3>() / rings[y.plus].pts.len().max(1) as f32;
+                let (i_plus, i_minus) = if plus_high { (a - a_a, 0) } else { (0, a - a_a) };
+                let j_a = row_near(i_plus + a_a / 2, c_arm, &out_p).saturating_sub(b_a / 2).clamp(1, b - 1 - b_a);
+                let mut holes: Vec<usize> = yoke::hole_cells(a, i_n, j_n, a_n, b_n);
+                holes.extend(yoke::hole_cells(a, i_plus, j_a, a_a, b_a));
+                holes.extend(yoke::hole_cells(a, i_minus, j_a, a_a, b_a));
+                let skip: HashSet<usize> = holes.into_iter().collect();
+                let (bad, total) = yoke::inward(&cells, &skip, &patch, &w.p, &out_p, quad);
+                if bad * 100 > total * inward_most {
+                    return Err(format!("{bad} of {total} grid quads face inward"));
+                }
+                quads.extend(cells.iter().enumerate().filter(|(k, _)| !skip.contains(k)).map(|(_, c)| *c));
+                // The neck row into its hole: the border from the front plane point, toward
+                // the side the row's point 1 is on, half joined and mirrored.
+                let lp = yoke::hole_border(&ids, i_n, j_n, a_n, b_n);
+                let side1 = pl.distance(out_p[row[1] as usize]) > 0.0;
+                let border = yoke::turned(&lp, a_n / 2, side1 != plus_high);
+                if !join_sym(&row, &border, &mut out_p, &mut quads, pl) {
+                    return Err("the neck row does not join its hole".into());
+                }
+                // The + arm's row into its hole, and the - arm as the mirror image.
+                let grid_mirror: HashMap<u32, u32> = ids.iter().flat_map(|r| (0..=a).map(move |i| (r[i], r[a - i]))).collect();
+                let bp = yoke::hole_border(&ids, i_plus, j_a, a_a, b_a);
+                let bm: Vec<u32> = bp.iter().map(|v| grid_mirror[v]).collect();
+                let (arm_plus, arm_minus) = (past_saddle(y.plus, y.n_arm), past_saddle(y.minus, y.n_arm));
+                let row_plus = make_row(arm_plus, y.n_arm, None, None, &mut out_p);
+                let row_minus = yoke::bridge_mirrored(&bp, &bm, &row_plus, pl, &mut out_p, &mut quads);
+                if debug {
+                    eprintln!("  body: yoke {a}x{b} on trunk {}, neck hole {a_n}x{b_n} at row {j_n}, arm holes {a_a}x{b_a} at row {j_a} ({} of {} grid quads inward{})", y.n_trunk, bad, total, if arm_plus != y.plus { "; arms from their second ring" } else { "" });
+                }
+                for r in [y.trunk, y.plus, y.minus] {
+                    let run = chain_from(r);
+                    for (k, c) in trunk_plan(&run).into_iter().enumerate() {
+                        counts.insert(run[k], c);
+                    }
+                }
+                torso.extend(row_t.iter().copied());
+                stack.push((rings[y.trunk].to, row_t, true, y.trunk));
+                stack.push((rings[arm_plus].to, row_plus, false, arm_plus));
+                stack.push((rings[arm_minus].to, row_minus, false, arm_minus));
+                Ok(())
+            })();
+            match built {
+                Ok(()) => {
+                    yokes += 1;
+                    continue;
+                }
+                Err(e) => {
+                    out_p.truncate(np0);
+                    quads.truncate(nq0);
+                    if debug {
+                        eprintln!("  body: yoke not built ({e}); the rings below instead");
+                    }
+                }
+            }
+        }
         let k = kept(p);
         let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
         match k.len() {
@@ -2227,9 +2478,10 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 };
                 // Before a split, the count it bridges into (the merges go in this band, not
                 // in the split's) when within 1.8 times the girth (`ZR_SPLITRATIO`, 2.2, when
-                // a part of the split is a thin tube given the `ZR_MINTUBE` floor).
+                // a part of the split is a thin tube given the `ZR_MINTUBE` floor). Not where a
+                // yoke or a crotch cap takes the row: those keep the trunk's count.
                 let nk = kept(rings[r].to);
-                if nk.len() >= 2 {
+                if nk.len() >= 2 && yoke_plan.is_none_or(|y| head_run[y.m] != r) && crotch_candidate(rings[r].to, r, n).is_none() {
                     if let Ok(sp) = split_plan(rings[r].to, &nk, &totals) {
                         let ratio = if nk.iter().any(|&q| floored(&chain_from(q))) { split_ratio } else { 1.8 };
                         if (sp.total as f32) < g * ratio && (sp.total as f32) > g / ratio {
@@ -2280,6 +2532,67 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 stack.push((rings[r].to, next, next_sym, r));
             }
             _ => {
+                // The crotch as a cap with leg holes: a grid over this row settled down onto
+                // the crotch, a hole each side bridged to the leg's row, the perineum strip
+                // between them. If it does not lie on the surface, the split's strips as
+                // before.
+                if let Some((r_plus, r_minus, n_leg, dims)) = crotch_candidate(p, in_ring, row.len()) {
+                    let pl = plane.unwrap();
+                    let (np0, nq0) = (out_p.len(), quads.len());
+                    let built = (|| -> Result<(), String> {
+                        let yoke::Crotch { a, b, leg: (a_l, b_l) } = dims;
+                        let ring_c = |r: usize| rings[r].pts.iter().copied().sum::<Vec3>() / rings[r].pts.len().max(1) as f32;
+                        let c_in = row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32;
+                        let down = (ring_c(r_plus) + ring_c(r_minus)) * 0.5 - c_in;
+                        let patch = yoke::Patch::new(&w.p, &w.t, &w.fnrm, &|v| comp[v as usize] == p, quad).ok_or("no surface under the crotch cap")?;
+                        let (ids, cells, plus_high) = yoke::settle_cap(&row, a, pl, &patch, &w.p, down.normalize_or(Vec3::NEG_Y), down.length() * 1.5 + quad, quad, &mut out_p, &mut quads)?;
+                        // The holes a column in from the sides, by row round the point nearest
+                        // the + leg's ring.
+                        let (i_plus, i_minus) = if plus_high { (a - 1 - a_l, 1) } else { (1, a - 1 - a_l) };
+                        let c_leg = ring_c(r_plus);
+                        let col = i_plus + a_l / 2;
+                        let j_l = (0..=b).min_by(|&x, &y| out_p[ids[x][col] as usize].distance(c_leg).total_cmp(&out_p[ids[y][col] as usize].distance(c_leg))).unwrap_or(0).saturating_sub(b_l / 2).clamp(1, b - 1 - b_l);
+                        let mut holes = yoke::hole_cells(a, i_plus, j_l, a_l, b_l);
+                        holes.extend(yoke::hole_cells(a, i_minus, j_l, a_l, b_l));
+                        let skip: HashSet<usize> = holes.into_iter().collect();
+                        let (bad, total) = yoke::inward(&cells, &skip, &patch, &w.p, &out_p, quad);
+                        if bad * 100 > total * inward_most {
+                            return Err(format!("{bad} of {total} grid quads face inward"));
+                        }
+                        quads.extend(cells.iter().enumerate().filter(|(k, _)| !skip.contains(k)).map(|(_, c)| *c));
+                        let grid_mirror: HashMap<u32, u32> = ids.iter().flat_map(|r| (0..=a).map(move |i| (r[i], r[a - i]))).collect();
+                        let bp = yoke::hole_border(&ids, i_plus, j_l, a_l, b_l);
+                        let bm: Vec<u32> = bp.iter().map(|v| grid_mirror[v]).collect();
+                        let (leg_plus, leg_minus) = (past_saddle(r_plus, n_leg), past_saddle(r_minus, n_leg));
+                        let row_plus = make_row(leg_plus, n_leg, None, None, &mut out_p);
+                        let row_minus = yoke::bridge_mirrored(&bp, &bm, &row_plus, pl, &mut out_p, &mut quads);
+                        if debug {
+                            eprintln!("  body: crotch cap {a}x{b} on trunk {}, leg holes {a_l}x{b_l} at row {j_l} ({bad} of {total} grid quads inward{})", row.len(), if leg_plus != r_plus { "; legs from their second ring" } else { "" });
+                        }
+                        for r in [r_plus, r_minus] {
+                            let run = chain_from(r);
+                            for (k, c) in plan(&run).into_iter().enumerate() {
+                                counts.insert(run[k], c);
+                            }
+                        }
+                        stack.push((rings[leg_plus].to, row_plus, false, leg_plus));
+                        stack.push((rings[leg_minus].to, row_minus, false, leg_minus));
+                        Ok(())
+                    })();
+                    match built {
+                        Ok(()) => {
+                            yokes += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            out_p.truncate(np0);
+                            quads.truncate(nq0);
+                            if debug {
+                                eprintln!("  body: crotch cap not built near {:.3} ({e}); split instead", w.p[p as usize]);
+                            }
+                        }
+                    }
+                }
                 let sp = split_plan(p, &k, &totals)?;
                 splits += 1;
                 let nr = sp.rings.len();
@@ -2450,7 +2763,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         }
     }
     if debug {
-        eprintln!("  body: {} quads, {} splits, {} joins, {} caps, {} rings", quads.len(), splits, joins, caps, rings.len());
+        eprintln!("  body: {} quads, {} splits, {} yokes, {} joins, {} caps, {} rings", quads.len(), splits, yokes, joins, caps, rings.len());
         if !line_grid.is_empty() || hard_rings > 0 {
             eprintln!("  body: {} rows snapped to hard lines", snapped_rows.get());
         }
@@ -3001,7 +3314,9 @@ fn mouth(face: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, 
     if debug {
         eprintln!("    mouth: {} face points, the centre line down the front (y, dip): {:?}", face.len(), line.iter().map(|&v| ((pos0[v].y * 1000.0).round() / 1000.0, (h[v] * 100.0).round() / 100.0)).collect::<Vec<_>>());
     }
-    let Some(nose) = (0..line.len()).min_by(|&a, &b| h[line[a]].total_cmp(&h[line[b]])) else { return false };
+    // (Not the line's last point: smoothed against neighbours above only, it stands out
+    // nearly as far as the nose, and more once the neck below is stretched.)
+    let Some(nose) = (0..line.len().saturating_sub(1)).min_by(|&a, &b| h[line[a]].total_cmp(&h[line[b]])) else { return false };
     // (The first such pause below the nose: the next one down is the crease above the chin.)
     let pause = (nose + 1..line.len().saturating_sub(1)).find(|&i| h[line[i]] > h[line[i - 1]] && h[line[i]] >= h[line[i + 1]]);
     let Some(pause) = pause else { return false };
