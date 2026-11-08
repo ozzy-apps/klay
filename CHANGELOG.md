@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Plan Layout: face loops**: on a symmetric character the head is built finer than the body (0.6 of the quad) and the face is laid out as nested loops, as in a hand-made base mesh: a mask loop round both eyes from above the brows to the top of the nose, four rings round each eye (placed by the face's proportions), a loop round the nose and nostrils, and three rings round the mouth from under the nose to the chin; each a rectangle of the head's grid ringed in and capped, with poles only at its corners, exactly mirrored. If the eyes do not fit, the face is left as before. On a stylized T-pose base mesh at 10k quads: 0.8% badly shaped quads (0.5% before), no folded quads.
+
 ## 0.50.0 — 2026-11-08
 
 - Hold **Shift** to snap the Transpose action line or constrain **Move** to one axis. In Gizmo 3D, Shift locks the free-move ring to one of the Gizmo’s axes.

@@ -1066,6 +1066,8 @@ The user shared four reference images of hand-made / Quad Remesher-quality chara
 
 - **More eye and mouth loops**: inset rings do not use up a rectangle's rows (each is an extra loop between the border and the inner grid), so the ring count is limited only by crowding: rings are spaced a cell apart or, when more are asked, evenly over 0.85 of the way in (`straddle`, `paired`). Eyes up to `ZR_EYEK` (4) rings (half the block's longer side), mouth up to `ZR_MOUTHK` (3): a fourth crowds the lip line and folded 2 quads at 10k and 8 at 20k, all at the lower mouth corner. T-pose with `ZR_FACE=1`: 10k 4 eye rings, 3 mouth rings, 0.8% bad, 0 folded, exact mirror; 20k 0.7%, 0 folded; 5k 3 eye rings, 1.7% (`face-more-loops.png`).
 
+- **Face loops on by default** (the user's call after the four-ring pass): `ZR_NOFACE=1` turns off both the nest and the finer head (`ZR_HEADQUAD` then defaults to 1.0) and gives exactly the 0.50.0 output. Regression with them on: six shapes, bust, bust with loops, blob with eye loops, alien (no plane: unaffected) identical; T-pose 5k 1.6% / 10k 0.8% / 20k 0.7% bad, 0 folded at all three; 33 unit tests. CHANGELOG has an "Unreleased" entry and the guide's Plan Layout paragraph describes the face.
+
 ## Step 109 — Release 0.50.0 (2026-11-08)
 
 - Published as tag `v0.50.0` with a GitHub release (AppImage, Flatpak, .deb). 0.50.0 had been set in Step 107 but never tagged or pushed, so it carries Step 107 (Transpose axis snapping, model floor, SubTool symmetry) and Step 108 (ZRemesher Plan Layout with the box-modeller body builder, experimental and off; Follow Shape and Detect Edges on by default). `zremesh-topology` was fast-forwarded into `main`; the unfinished shoulder-yoke branch `worktree-wf_9af7fe95-f0a-3` is not in it.

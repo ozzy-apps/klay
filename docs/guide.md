@@ -476,8 +476,11 @@ with its inside filled as a cap and four loops leaving it, for eyes, mouths and 
 a character with arms and legs it builds the mesh the way a box modeller would: rings a quad
 apart from the top of the head, a quad-sphere head on a cylinder neck, cylinders for the
 trunk, limbs and fingers bridged where they branch, grid caps on hands and feet, and ringed
-insets with four corner poles for the eyes, mouth and breasts. A symmetric character comes
-out as an exact mirror image with a centre line. Planning is slower on other models, still
+insets with four corner poles for the breasts. A symmetric character's head is built finer
+than the body and its face as nested loops, the way the face of a base mesh is laid out: a
+mask loop round both eyes from above the brows to the top of the nose, four rings round each
+eye, a loop round the nose and nostrils, and three rings round the mouth from under the nose
+to the chin. A symmetric character comes out as an exact mirror image with a centre line. Planning is slower on other models, still
 rough on very detailed sculpts, and falls back to the usual remesh when it cannot plan; the
 notice says which happened.
 

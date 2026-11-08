@@ -754,13 +754,14 @@ enum Head<'a> {
 }
 
 /// The body built from `phi` (see `sweep_body_with`), with the head (on a model with a mirror
-/// plane) at `ZR_HEADQUAD` (0.6) of the quad: a first pass finds the neck, then `phi` is
-/// stretched by 1 / 0.6 down to it so its rings come that much closer, and their counts are
-/// taken at the finer quad; the trunk's count is stepped down to under the neck. 1.0 builds
-/// the head as the body, as does a head that fails at the finer quad.
+/// plane) at `ZR_HEADQUAD` of the quad (0.6; 1.0 with `ZR_NOFACE`): a first pass finds the
+/// neck, then `phi` is stretched over the head by a whole number of bands so its rings come
+/// about that much closer, and their counts are taken at the finer quad; the trunk's count is
+/// stepped down under the neck. 1.0 builds the head as the body, as does a head that fails at
+/// the finer quad.
 pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<MirrorPlane>, feats: &BodyFeatures) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
-    // (The face loops need the finer head: with `ZR_FACE` it defaults to 0.6.)
-    let f: f32 = std::env::var("ZR_HEADQUAD").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var_os("ZR_FACE").is_some() { 0.6 } else { 1.0 });
+    // (The face loops need the finer head: 0.6 unless they are off, `ZR_NOFACE`.)
+    let f: f32 = std::env::var("ZR_HEADQUAD").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var_os("ZR_NOFACE").is_none() { 0.6 } else { 1.0 });
     if plane.is_none() || !(0.2..1.0).contains(&f) {
         return sweep_body_with(w, phi, quad, src, plane, feats, Head::Plain);
     }
@@ -2951,9 +2952,9 @@ fn sweep_body_with(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<Mir
         if made > 0 {
             orient(&mut quads, &out_p);
         }
-        // The face as nested loops (opt-in, `ZR_FACE=1`): a mask round both eyes, the eyes
+        // The face as nested loops (`ZR_NOFACE` off): a mask round both eyes, the eyes
         // inside it, a loop round nose and mouth, the nose and the mouth inside that.
-        let nested = std::env::var_os("ZR_FACE").is_some() && {
+        let nested = std::env::var_os("ZR_NOFACE").is_none() && {
             let ctx = super::face::Ctx { plane: pl, quad, debug, surface: &surface };
             super::face::nest(&ctx, &mut out_p, &mut quads, &head, &lower_face, &|q: &mut [[u32; 4]], p: &[Vec3]| orient(q, p))
         };
