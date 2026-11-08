@@ -344,12 +344,13 @@ fn join_sym(lo: &[u32], hi: &[u32], out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32;
 }
 
 /// Where a band's reductions are gathered, as a box modeller hides them: on the back, on the
-/// inside of a limb, or on the sole.
+/// inside of a limb, on the sole, or (under a yoke) at the sides, under the armpits.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Pref {
     Back,
     Inside,
     Sole,
+    Sides,
 }
 
 /// A strip of quads between `b` (the longer row) and `t` with a diamond at each index in
@@ -518,6 +519,8 @@ fn reduce_cols(row_pos: &[Vec3], d: usize, prefer: Pref, plane: Option<MirrorPla
             (Pref::Inside, Some(pl)) => pl.distance(row_pos[i]).abs(),
             (Pref::Inside, None) => row_pos[i][fwd],
             (Pref::Sole, _) => row_pos[i].y,
+            (Pref::Sides, Some(pl)) => -pl.distance(row_pos[i]).abs(),
+            (Pref::Sides, None) => row_pos[i][fwd],
         }
     };
     if d == 0 {
@@ -1370,6 +1373,8 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // parts it as before). A neck widening into the shoulders also parts here, and keeps its
     // own counts.
     let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
+    // The rings the trunk steps down from under a yoke: their bands' diamonds go at the sides.
+    let yoke_steps: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
     let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
     let ankle_diff: usize = std::env::var("ZR_ANKLEDIFF").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let plan = |rs: &[usize]| -> Vec<usize> {
@@ -1736,7 +1741,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 (if d <= n0.min(n1) / 4 { reduce_cols(&long_pos, dk, prefer, plane, fwd, pinned) } else { None }, fan_cols(&long_pos, &short_pos, dk, pinned))
             };
             let costs = (cols_g.as_ref().map(|c| kite_cost(&long_pos, &short_pos, c, pinned)), cols_s.as_ref().map(|c| kite_cost(&long_pos, &short_pos, c, pinned)));
-            let gather = match costs {
+            let gather = (prefer == Pref::Sides && cols_g.is_some()) || match costs {
                 (Some(g), Some(s)) => g <= s * gather_most,
                 (Some(_), None) => true,
                 _ => false,
@@ -1977,7 +1982,8 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         yoke::crotch_dims(n_in, n_leg, wd, dp).map(|c| (r_plus, r_minus, n_leg, c))
     };
     // The shoulders as a yoke (opt-in, `ZR_YOKE=1`: on the T-pose it removes the ring of poles
-    // at the neck base but the breasts are then not found and the shoulders come out coarser): with a plane, when the head run ends at a
+    // at the neck base and the Y-junctions over the shoulders, but the breasts fall where the
+    // trunk steps down from the yoke's ring and their insets come out long and pinched): with a plane, when the head run ends at a
     // piece with three rings past it (the trunk, cut by the plane, and an arm each side), a
     // grid over the trunk's ring with holes for the neck and the arms takes the place of the
     // rings between the neck and that piece. The neck hole takes the row of the ring after
@@ -2007,14 +2013,14 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // The grid's cells should cover the surface it replaces (the pieces from under the
         // neck row to the split) at about a quad each: the trunk's ring under the grid takes
         // the smallest count in fours, from the trunk's own up to twice it, whose grid has
-        // `ZR_YOKEFILL` (0.3) of those cells; the trunk steps back to its own count on the
+        // `ZR_YOKEFILL` (0.45) of those cells; the trunk steps back to its own count on the
         // next band, with diamonds (`ZR_YOKEPLAIN`: the trunk's own count, a coarser grid).
         let covered: HashSet<u32> = head_run[m..].iter().map(|&r| rings[r].to).collect();
         let area: f64 = w.t.iter().filter(|t| t.iter().all(|&v| covered.contains(&comp[v as usize]))).map(|t| {
             let (a, b, c) = (w.p[t[0] as usize], w.p[t[1] as usize], w.p[t[2] as usize]);
             (b - a).cross(c - a).length() as f64 * 0.5
         }).sum();
-        let fill: f64 = std::env::var("ZR_YOKEFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+        let fill: f64 = std::env::var("ZR_YOKEFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.45);
         let target = area / (quad as f64 * quad as f64) * fill;
         let plain = std::env::var_os("ZR_YOKEPLAIN").is_some();
         let top = if plain { n_trunk } else { n_trunk * 2 };
@@ -2408,6 +2414,28 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                         counts.insert(run[k], c);
                     }
                 }
+                // The trunk steps down from the yoke's ring over as many bands as it takes for
+                // each step's diamonds to gather under the armpits (a third of the count at
+                // most), in fours.
+                {
+                    let run = chain_from(y.trunk);
+                    let mut c = y.n_trunk;
+                    let mut steps = yoke_steps.borrow_mut();
+                    steps.insert(y.trunk);
+                    for &q in run.iter().skip(1) {
+                        let want = counts[&q];
+                        if want >= c {
+                            break;
+                        }
+                        let next = want.max((2 * c).div_ceil(3).div_ceil(4) * 4);
+                        counts.insert(q, next);
+                        if next == want {
+                            break;
+                        }
+                        steps.insert(q);
+                        c = next;
+                    }
+                }
                 torso.extend(row_t.iter().copied());
                 stack.push((rings[y.trunk].to, row_t, true, y.trunk));
                 stack.push((rings[arm_plus].to, row_plus, false, arm_plus));
@@ -2512,7 +2540,11 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let next_sym = pinned(r, n);
                 // Where this band's reductions go: the back of the head, neck and trunk, the
                 // inside of a limb, the sole of a foot or hand.
-                let prefer = if plane.is_none() || ring_cross[r].is_some() || head_run.contains(&r) {
+                let prefer = if yoke_steps.borrow().contains(&in_ring) && std::env::var_os("ZR_YOKESPREAD").is_none() {
+                    // The trunk steps down from the yoke's ring under the armpits
+                    // (`ZR_YOKESPREAD`: as any band, spread round the chest).
+                    Pref::Sides
+                } else if plane.is_none() || ring_cross[r].is_some() || head_run.contains(&r) {
                     Pref::Back
                 } else if after_ankle.borrow().contains(&r) {
                     Pref::Sole
