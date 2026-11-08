@@ -137,7 +137,8 @@ pub(super) fn straddle(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>
         return None;
     }
     remove(quads, &block);
-    let step = 1.0 / (half.min(b.div_ceil(2)) as f32 + 1.0);
+    // A cell a ring, or closer when more rings than that are asked: all within 0.85 of the way in.
+    let step = (1.0 / (half.min(b.div_ceil(2)) as f32 + 1.0)).min(0.85 / (k as f32 + 0.5));
     let rings = rings_in(&border, k, step, round, tip, c.surface, out_p, quads);
     let last = rings.last().cloned().unwrap_or_else(|| border.clone());
     let from = out_p.len();
@@ -256,7 +257,7 @@ pub(super) fn paired(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, 
     let both: Vec<usize> = block.iter().chain(block2.iter()).copied().collect();
     remove(quads, &both);
     let (p0, q0) = (out_p.len(), quads.len());
-    let step = 1.0 / (corners[1].min(nbd / 2 - corners[1]).div_ceil(2) as f32 + 1.0);
+    let step = (1.0 / (corners[1].min(nbd / 2 - corners[1]).div_ceil(2) as f32 + 1.0)).min(0.85 / (k as f32 + 0.5));
     let rings = rings_in(&border, k, step, round, tip, c.surface, out_p, quads);
     let last = rings.last().cloned().unwrap_or_else(|| border.clone());
     let from = out_p.len();
@@ -491,7 +492,8 @@ pub(super) fn nest(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, up
         let a_e = (2 * rx + 1).min(mask_half.saturating_sub(bridge + 1)).saturating_sub(shrink).max(2);
         let b_e = ((2 * a_e).div_ceil(3)).min(rows.saturating_sub(2)).saturating_sub(shrink / 2).max(1);
         // Its middle: the mask's grid point that far out on the + side, half way down.
-        let k = (a_e.min(b_e) / 2).clamp(1, 3);
+        // Rings (`ZR_EYEK`, 4): as many as half the block's longer side allows.
+        let k = (a_e.max(b_e) / 2).clamp(1, env("ZR_EYEK", 4));
         // (On the surface, not lifted toward the socket: the lift dug channels by the nose.)
         if paired(c, out_p, quads, &among, m.eye, a_e, b_e, k, 1.0, None, "eyes") {
             eyes = true;
@@ -516,7 +518,9 @@ pub(super) fn nest(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, up
     let top = nose_bot + 1;
     let rows_m = m.chin.saturating_sub(top);
     let mouth_half = env("ZR_MOUTHW", col_eye + 1).max(2);
-    let k_m = (rows_m.saturating_sub(1) / 2).clamp(1, env("ZR_MOUTHK", 3));
+    // Rings (`ZR_MOUTHK`, 3; a fourth crowds the lip line and folds quads there): as many as
+    // half the block's longer side allows.
+    let k_m = (mouth_half.max(rows_m / 2)).clamp(1, env("ZR_MOUTHK", 3));
     if rows_m >= 2 {
         // (Rounded all the way: the mouth's loops are ovals.)
         if straddle(c, out_p, quads, line[top], mouth_half, rows_m, k_m, 1.0, None, "mouth").is_some() {
