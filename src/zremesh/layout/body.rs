@@ -93,6 +93,9 @@ fn join_open(b: &[u32], t: &[u32], out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 
 fn join_sym(lo: &[u32], hi: &[u32], out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, plane: MirrorPlane) -> bool {
     let (n0, n1) = (lo.len(), hi.len());
     if n0 % 2 != 0 || n1 % 2 != 0 || (n0 / 2).abs_diff(n1 / 2) % 2 != 0 {
+        if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+            eprintln!("    join_sym refused ({n0}, {n1})");
+        }
         return false;
     }
     let mut mir: HashMap<u32, u32> = HashMap::default();
@@ -392,33 +395,56 @@ fn fan_cols(long_pos: &[Vec3], short_pos: &[Vec3], d: usize, pinned: bool) -> Op
     Some(cols)
 }
 
-/// Points paired with their mirror images moved to agree exactly (a point that is its own
-/// image onto the plane).
-fn symmetrize(p: &mut [Vec3], plane: MirrorPlane, quad: f32) -> usize {
+/// Each point's mirror image among `p`: the point nearest its reflection within 0.35 quad (a
+/// point on the plane is its own), or None. The pairs are mutual, and a point is the image
+/// of one point only, so two points at one place get two images (the nearest free point, if
+/// it is as near as the nearest).
+pub(in crate::zremesh) fn mirror_pairs(p: &[Vec3], plane: MirrorPlane, quad: f32) -> Vec<Option<u32>> {
     let cell = quad.max(1e-6);
     let key = |q: Vec3| { let c = (q / cell).floor(); (c.x as i32, c.y as i32, c.z as i32) };
     let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
     for (v, &q) in p.iter().enumerate() {
         grid.entry(key(q)).or_default().push(v as u32);
     }
-    let nearest = |q: Vec3, p: &[Vec3]| -> Option<u32> {
+    // The points within reach of `q`, nearest first.
+    let near = |q: Vec3| -> Vec<(f32, u32)> {
         let c = key(q);
-        let mut best: Option<(f32, u32)> = None;
+        let mut found: Vec<(f32, u32)> = Vec::new();
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
                     for &u in grid.get(&(c.0 + dx, c.1 + dy, c.2 + dz)).into_iter().flatten() {
                         let d = p[u as usize].distance(q);
-                        if best.is_none_or(|b| d < b.0) {
-                            best = Some((d, u));
+                        if d < quad * 0.35 {
+                            found.push((d, u));
                         }
                     }
                 }
             }
         }
-        best.filter(|b| b.0 < quad * 0.35).map(|b| b.1)
+        found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        found
     };
-    let partner: Vec<Option<u32>> = (0..p.len()).map(|v| nearest(plane.reflect(p[v]), p)).collect();
+    let mut partner: Vec<Option<u32>> = vec![None; p.len()];
+    for v in 0..p.len() {
+        if partner[v].is_some() {
+            continue;
+        }
+        let cands = near(plane.reflect(p[v]));
+        if let Some(&(d0, _)) = cands.first() {
+            if let Some(&(_, u)) = cands.iter().find(|&&(d, u)| partner[u as usize].is_none() && d <= d0 + quad * 0.02) {
+                partner[v] = Some(u);
+                partner[u as usize] = Some(v as u32);
+            }
+        }
+    }
+    partner
+}
+
+/// Points paired with their mirror images moved to agree exactly (a point that is its own
+/// image onto the plane).
+fn symmetrize(p: &mut [Vec3], plane: MirrorPlane, quad: f32) -> usize {
+    let partner = mirror_pairs(p, plane, quad);
     let mut lonely = 0;
     for v in 0..p.len() {
         match partner[v] {
@@ -634,18 +660,24 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // along a limb or the trunk; else stepping where the girth drifts past 1.5 times.
     let ratio: f32 = std::env::var("ZR_BODYRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
     let drift: f32 = std::env::var("ZR_BODYDRIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5);
+    // A ring the plane cuts takes its count in fours (its row is pinned front and back);
+    // a run with one count takes fours when any of its rings is cut (harmless on the rest).
     let plan_one = |rs: &[usize]| -> Vec<usize> {
         let gs: Vec<f32> = rs.iter().map(|&r| rings[r].girth.max(1e-3)).collect();
-        let q = |g: f32| if ring_cross[rs[0]].is_some() { even4(g) } else { even(g) };
+        let q = |g: f32, r: usize| if ring_cross[r].is_some() { even4(g) } else { even(g) };
         let (mn, mx) = gs.iter().fold((f32::INFINITY, 0.0f32), |m, &g| (m.0.min(g), m.1.max(g)));
         if mx <= mn * ratio {
             let gm = (gs.iter().map(|g| g.ln()).sum::<f32>() / gs.len() as f32).exp();
-            return vec![q(gm); gs.len()];
+            let n = if rs.iter().any(|&r| ring_cross[r].is_some()) { even4(gm) } else { even(gm) };
+            return vec![n; gs.len()];
         }
-        let mut n = q(gs[0]);
-        gs.iter().map(|&g| {
+        let mut n = q(gs[0], rs[0]);
+        rs.iter().zip(&gs).map(|(&r, &g)| {
             if g > n as f32 * drift || g < n as f32 / drift {
-                n = q(g);
+                n = q(g, r);
+            } else if ring_cross[r].is_some() && n % 4 != 0 {
+                // The count carried from an uncut ring onto a cut one: to the nearest fours.
+                n = even4(n as f32);
             }
             n
         }).collect()
@@ -809,7 +841,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                             if dv > d[&v] {
                                 continue;
                             }
-                            if pl.distance(w.p[v as usize]) == 0.0 {
+                            if pl.distance(w.p[v as usize]).abs() < quad * 1e-3 {
                                 hit = Some(v);
                                 break;
                             }
@@ -1054,11 +1086,14 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // before it narrows to the neck; the cap is the grid inside the first ring past
     // `ZR_CAPFRAC` (0.6) of that (the top of a quad sphere); one count from there to the neck,
     // then the neck widening into the shoulders.
+    // (Thin rings past a piece beside the one kept, an ear or a wisp of hair, do not end the
+    // run; the thin rings at the crown, before the first kept one, are the run's start.)
     let head_run: Vec<usize> = {
         let mut out = Vec::new();
         let mut p = comp[src as usize];
         loop {
-            let k: Vec<usize> = outs.get(&p).cloned().unwrap_or_default();
+            let all: Vec<usize> = outs.get(&p).cloned().unwrap_or_default();
+            let k = if all.len() == 1 { all } else { kept(p) };
             if k.len() != 1 || out.len() > 1_000_000 {
                 break;
             }
@@ -1295,19 +1330,29 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     join_band(&last, &next, &mut out_p, &mut quads);
                     last = next;
                 }
+                // A row on the far side of the plane runs the other way round from its
+                // twin's: capped reversed, so the cap is the twin's mirror image.
+                let far_side = !row_sym && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0);
+                let nl = last.len();
+                let capped: Vec<u32> = if far_side { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
                 let from = out_p.len();
-                cap(&last, row_sym, &mut out_p, &mut quads);
+                cap(&capped, row_sym, &mut out_p, &mut quads);
                 dome(&last, from, tip, &mut out_p);
                 caps += 1;
             }
             1 => {
                 let r = k[0];
                 let g = rings[r].girth;
+                let cut = ring_cross[r].is_some();
                 let mut n = match counts.get(&r) {
                     Some(&c) => c,
                     None => {
                         let n0 = row.len();
-                        if g > n0 as f32 * drift || g < n0 as f32 / drift { even(g) } else { n0 }
+                        if g > n0 as f32 * drift || g < n0 as f32 / drift {
+                            if cut { even4(g) } else { even(g) }
+                        } else {
+                            n0
+                        }
                     }
                 };
                 // Before a split, the count it bridges into (the merges go in this band, not
@@ -1318,6 +1363,25 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                         if (sp.total as f32) < g * 1.8 && (sp.total as f32) > g / 1.8 {
                             n = sp.total;
                         }
+                    }
+                }
+                // A band's merges take three edges each: a row over three times the other's
+                // count would leave triangles, so the count is moved to the nearest it can
+                // be, in the row's parity (`ZR_NOBANDGUARD` leaves it).
+                if std::env::var_os("ZR_NOBANDGUARD").is_none() {
+                    let (n0, step) = (row.len(), if cut { 4 } else { 2 });
+                    let fixed = if n0 > 3 * n {
+                        Some(n0.div_ceil(3).div_ceil(step) * step)
+                    } else if n > 3 * n0 {
+                        Some((3 * n0 / step * step).max(4))
+                    } else {
+                        None
+                    };
+                    if let Some(m) = fixed {
+                        if debug {
+                            eprintln!("    body: band {n0} -> {n} near {:.3} would need triangles, {m} instead", row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32);
+                        }
+                        n = m;
                     }
                 }
                 let next = make_row(r, n, Some(&row_pos), &mut out_p);
@@ -1552,6 +1616,10 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let lonely = symmetrize(&mut out_p, pl, quad);
         if debug {
             eprintln!("  body: mirrored, {lonely} of {} points without a mirror image", out_p.len());
+            let pairs = mirror_pairs(&out_p, pl, quad);
+            for v in (0..out_p.len()).filter(|&v| pairs[v].is_none()).take(12) {
+                eprintln!("    lonely point at {:.3}", out_p[v]);
+            }
         }
     }
     Ok((out_p, quads))

@@ -1114,7 +1114,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
                 }
             });
         match planned {
-            Ok((out_p, quads)) => {
+            Ok((out_p, quads, mirrored)) => {
                 stats.planned = true;
                 let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
                 let g = Guides::new(guides, quad);
@@ -1122,7 +1122,10 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
                 if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
                     eprintln!("  time: layout done at {:.1} s", start.elapsed().as_secs_f32());
                 }
-                return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30), closed, cut, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
+                // A body built as its own mirror image stays one through the finish
+                // (`ZR_NOCUT`: left to drift, as before).
+                let mirrored = mirrored.filter(|_| std::env::var_os("ZR_NOCUT").is_none());
+                return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30), closed, cut, mirrored, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
             }
             // With Symmetry the caller plans the half instead of the plain remesher here.
             Err(why) if s.mirror.is_some() => return Err(why),
@@ -1618,7 +1621,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
             quads.push([f[i], ms[i], c, ms[(i + k - 1) % k]]);
         }
     }
-    finish(mesh, s, out_p, quads, &Finish { passes: 4, closed, cut, biggest, guides: &guides, strength, quad, features, start }, stats)
+    finish(mesh, s, out_p, quads, &Finish { passes: 4, closed, cut, mirrored: None, biggest, guides: &guides, strength, quad, features, start }, stats)
 }
 
 /// What the last stage needs from the one before.
@@ -1627,6 +1630,8 @@ struct Finish<'a> {
     passes: usize,
     closed: bool,
     cut: Option<MirrorPlane>,
+    /// The plane the quads are their own mirror image in (a body built on one): they stay so.
+    mirrored: Option<MirrorPlane>,
     /// The longest lattice step: how far a vertex may be from the old surface.
     biggest: f32,
     guides: &'a Guides,
@@ -1639,7 +1644,7 @@ struct Finish<'a> {
 /// The last stage: quads `quads` on points `out_p` are put onto the old surface, spaced
 /// evenly along it, put on guides, edge lines and polygroup borders, and triangulated.
 fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<[u32; 4]>, f: &Finish, mut stats: Stats) -> Result<(SculptMesh, Stats), String> {
-    let Finish { passes, closed, cut, biggest, guides, strength, quad, features, start } = *f;
+    let Finish { passes, closed, cut, mirrored, biggest, guides, strength, quad, features, start } = *f;
     // FreezeBorder: the old open borders come back exactly, each joined to the new border
     // nearest it by a strip. A triangle is kept as a quad with its last corner repeated.
     // Doublets (planned layout): a point inside only two quads collapses them when relaxed;
@@ -1659,6 +1664,16 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
     let is_tri = |q4: &[u32; 4]| q4[2] == q4[3];
     stats.quads = quads.iter().filter(|q| !is_tri(q)).count();
     stats.odd_faces += quads.len() - stats.quads;
+    // Mirrored quads: each point's mirror image and which side it is on, paired now while
+    // the two sides agree exactly. The points on the plane are held there through the
+    // relax, and at the end the - side is set to the reflection of the + side, so the relax
+    // and the projection onto the old, not quite symmetric, surface cannot part the halves.
+    let mirror = mirrored.map(|pl| {
+        let pairs = layout::mirror_pairs(&out_p, pl, quad);
+        let on_plane: Vec<bool> = out_p.iter().map(|&p| pl.distance(p).abs() < quad * 0.05).collect();
+        let plus: Vec<bool> = out_p.iter().map(|&p| pl.distance(p) >= 0.0).collect();
+        (pl, pairs, on_plane, plus)
+    });
 
     // Onto the old surface, then even spacing along it.
     let reach = biggest * 1.5;
@@ -1738,6 +1753,13 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
                 }
             }
         }
+        if let Some((pl, _, on_plane, _)) = &mirror {
+            for (v, p) in out_p.iter_mut().enumerate() {
+                if on_plane[v] {
+                    *p = pl.project(*p);
+                }
+            }
+        }
     }
     // Untangle (planned layout): quads still folded or collapsed get their points and the
     // points round them smoothed a few more rounds, onto the nearest surface each time.
@@ -1810,6 +1832,30 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
                     }
                 }
             }
+        }
+    }
+    // Mirrored quads: the - side set to the reflection of the + side, the plane's points
+    // onto it.
+    if let Some((pl, pairs, on_plane, plus)) = &mirror {
+        let (mut drift, mut lonely) = ((0.0f32, Vec3::ZERO), 0usize);
+        for v in 0..pairs.len().min(out_p.len()) {
+            match pairs[v] {
+                Some(u) if u as usize == v || on_plane[v] => out_p[v] = pl.project(out_p[v]),
+                Some(u) => {
+                    if !plus[v] {
+                        let want = pl.reflect(out_p[u as usize]);
+                        let d = want.distance(out_p[v]);
+                        if d > drift.0 {
+                            drift = (d, want);
+                        }
+                        out_p[v] = want;
+                    }
+                }
+                _ => lonely += 1,
+            }
+        }
+        if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+            eprintln!("  finish: mirrored, {lonely} of {} points without a mirror image, the halves had drifted up to {:.3} quad (at {:.3})", pairs.len(), drift.0 / quad.max(1e-12), drift.1);
         }
     }
     // The loop that came out on a guide goes onto it.
@@ -2765,6 +2811,44 @@ mod shape_tests {
         (poles.len(), on_plane)
     }
 
+    /// How far `m` is from its own mirror image in X: of the vertices over 0.05 quad on the
+    /// + side, how many were checked, how many have no vertex within 0.02 quad of their
+    /// reflection, and the worst distance in quads.
+    pub fn mirror_check(m: &SculptMesh) -> (usize, usize, f32) {
+        let quad = stats_quad(m).max(1e-9);
+        let plane = TEST_X_PLANE;
+        let key = |q: Vec3| { let c = (q / quad).floor(); (c.x as i32, c.y as i32, c.z as i32) };
+        let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
+        for (v, &q) in m.positions.iter().enumerate() {
+            grid.entry(key(q)).or_default().push(v as u32);
+        }
+        let (mut checked, mut over, mut worst) = (0usize, 0usize, 0.0f32);
+        for &p in &m.positions {
+            if plane.distance(p) <= 0.05 * quad {
+                continue;
+            }
+            checked += 1;
+            let r = plane.reflect(p);
+            let c = key(r);
+            let mut best = f32::INFINITY;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &u in grid.get(&(c.0 + dx, c.1 + dy, c.2 + dz)).into_iter().flatten() {
+                            best = best.min(m.positions[u as usize].distance(r));
+                        }
+                    }
+                }
+            }
+            let d = best / quad;
+            worst = worst.max(d);
+            if d > 0.02 {
+                over += 1;
+            }
+        }
+        (checked, over, worst)
+    }
+
     /// A hard-surface test shape: a 30 x 4 x 20 plate in cells of 0.1, with a two-step flange
     /// along one long side (the steps three cells apart, one cell tall) and three square
     /// through-holes of four cells with a one-cell chamfer round the rim. Built as a grid of
@@ -3191,6 +3275,11 @@ mod shape_tests {
                 eprintln!("{name:6} {tag}: {} quads, {irr} poles of {inner} ({:.1}%), misaligned {mis:.1}°, {:.0} ms, planned {} {:?}", st.quads, irr as f32 * 100.0 / inner.max(1) as f32, st.ms, st.planned, st.fallback);
                 let (total, on_plane) = poles_on_plane(&out);
                 eprintln!("poles: {total}, on plane {on_plane}");
+                // ZR_MIRRORCHECK: how far the result is from its own mirror image in X.
+                if std::env::var_os("ZR_MIRRORCHECK").is_some() {
+                    let (checked, over, worst) = mirror_check(&out);
+                    eprintln!("mirror check {tag}: {over} of {checked} vertices over 0.02 quad from a mirror image, worst {worst:.3} quad");
+                }
                 let follow = if planned { 1 } else { 0 };
                 write_obj(&out, &dir.join(format!("{name}-{}.obj", ["old", "new"][follow])));
             }

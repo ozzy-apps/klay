@@ -26,6 +26,9 @@ use std::collections::VecDeque;
 
 mod body;
 mod rect;
+
+pub(super) use body::mirror_pairs;
+
 type HashSet<T> = crate::fx::FxHashSet<T>;
 
 const NONE: u32 = u32::MAX;
@@ -5939,11 +5942,12 @@ impl<'a> Locate<'a> {
     }
 }
 
-/// The layout's quads and their points, or why it could not be made.
+/// The layout's quads and their points, and the plane a body was built as its own mirror
+/// image in (None: not a body, or built without one), or why it could not be made.
 /// `reflex_area`: a concave corner on a patch over this many quads² gets a line traced from
 /// it (0: none).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, cut_plane: Option<MirrorPlane>, quad: f32, field: f32, reflex_area: f32) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
+pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Vec3>], features: &Features, cut_plane: Option<MirrorPlane>, quad: f32, field: f32, reflex_area: f32) -> Result<(Vec<Vec3>, Vec<[u32; 4]>, Option<MirrorPlane>), String> {
     // 1. The working mesh: the plain remesher at four times the quads.
     // The working mesh: the model itself (exact edge lines and polygroup borders), decimated
     // if far too dense, then its long edges split until every edge is under a quarter quad.
@@ -6021,7 +6025,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                     }
                     };
                     match built {
-                        Ok(r) => return Ok(r),
+                        Ok((p, q)) => return Ok((p, q, plane)),
                         Err(e) => {
                             if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
                                 eprintln!("  body: {e}; planned instead");
@@ -8626,7 +8630,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
             return Err(format!("{} of {} limb tubes could not be swept", tubes.len() - n, tubes.len()));
         }
     }
-    Ok((out_p, quads_out))
+    Ok((out_p, quads_out, None))
 }
 
 /// Debugging: the working mesh with the lines as thin ribbons, as an OBJ.
