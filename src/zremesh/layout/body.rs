@@ -22,6 +22,215 @@ struct Ring {
     to: u32,
     /// Length in quads.
     girth: f32,
+    /// The level it was cut at (the farther piece's band).
+    level: i64,
+    /// On a hard loop of the working mesh (a crease): its row lies on the crease.
+    hard: bool,
+}
+
+/// The rings' spacing along the part function: a quad (`ZR_BODYSTEP` times it).
+pub(super) fn body_step(quad: f32) -> f32 {
+    quad * std::env::var("ZR_BODYSTEP").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0)
+}
+
+/// Segments of lines by the cells their boxes cover, for the nearest point on a line.
+struct SegGrid {
+    cell: f32,
+    segs: Vec<(Vec3, Vec3, u32)>,
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl SegGrid {
+    fn new(cell: f32) -> Self {
+        Self { cell: cell.max(1e-6), segs: Vec::new(), grid: HashMap::default() }
+    }
+    fn key(&self, q: Vec3) -> (i32, i32, i32) {
+        let c = (q / self.cell).floor();
+        (c.x as i32, c.y as i32, c.z as i32)
+    }
+    /// A segment of line `id`.
+    fn add(&mut self, a: Vec3, b: Vec3, id: u32) {
+        let s = self.segs.len() as u32;
+        self.segs.push((a, b, id));
+        let (ka, kb) = (self.key(a), self.key(b));
+        for x in ka.0.min(kb.0)..=ka.0.max(kb.0) {
+            for y in ka.1.min(kb.1)..=ka.1.max(kb.1) {
+                for z in ka.2.min(kb.2)..=ka.2.max(kb.2) {
+                    self.grid.entry((x, y, z)).or_default().push(s);
+                }
+            }
+        }
+    }
+    /// A closed line's segments.
+    fn add_loop(&mut self, pts: &[Vec3], id: u32) {
+        for i in 0..pts.len() {
+            self.add(pts[i], pts[(i + 1) % pts.len()], id);
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+    /// The nearest point on a line within `reach` of `q`: its distance, the point, the line.
+    fn nearest(&self, q: Vec3, reach: f32) -> Option<(f32, Vec3, u32)> {
+        let r = (reach / self.cell).ceil() as i32;
+        let k = self.key(q);
+        let mut best: Option<(f32, Vec3, u32)> = None;
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    for &s in self.grid.get(&(k.0 + dx, k.1 + dy, k.2 + dz)).into_iter().flatten() {
+                        let (a, b, id) = self.segs[s as usize];
+                        let ab = b - a;
+                        let t = ((q - a).dot(ab) / ab.length_squared().max(1e-24)).clamp(0.0, 1.0);
+                        let p = a + ab * t;
+                        let d = p.distance(q);
+                        if d <= reach && best.is_none_or(|x| d < x.0) {
+                            best = Some((d, p, id));
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// What a closed hard line of the working mesh is to the body.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum LoopKind {
+    /// Round a part, the way the level rings run (a collar, a cuff): it becomes a ring.
+    Transverse,
+    /// The outline of a plate, or a loop that cuts nothing off.
+    Plate,
+}
+
+/// A closed hard line of the working mesh.
+pub(super) struct HardLoop {
+    /// Its vertices round once.
+    pub(super) verts: Vec<u32>,
+    pub(super) kind: LoopKind,
+    /// A plate's faces: the smaller side of the surface the loop cuts off (empty when it cuts
+    /// nothing off).
+    pub(super) inside: Vec<usize>,
+}
+
+/// The hard edges of the working mesh sorted for the body builder: closed loops, open lines
+/// (as vertex chains), and the corners of the edge lines. Empty: the body built by the part
+/// function alone.
+#[derive(Default)]
+pub(super) struct BodyFeatures {
+    pub(super) loops: Vec<HardLoop>,
+    pub(super) lines: Vec<Vec<u32>>,
+    pub(super) corners: Vec<Vec3>,
+    /// Detect Edges is on: creases are also looked for in the surface itself.
+    pub(super) detect: bool,
+}
+
+impl BodyFeatures {
+    /// From the hard edges of `w` (its open border is not one), `phi` the part function and
+    /// `step` the rings' spacing. A closed chain whose span of `phi` is under 1.5 steps and
+    /// that cuts the surface in two, the lower-phi side from the higher, is transverse; any
+    /// other closed chain is a plate.
+    pub(super) fn new(w: &Work, phi: &[f32], step: f32, corners: Vec<Vec3>, detect: bool) -> Self {
+        let mut edges: Vec<(u32, u32)> = (0..w.hard.len() as u32)
+            .filter(|&h| w.hard[h as usize] && w.twin[h as usize] != NONE)
+            .map(|h| {
+                let (a, b) = (w.from(h), w.to(h));
+                (a.min(b), a.max(b))
+            })
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        let (chains, _) = crate::crease::chains(&edges);
+        let mut out = Self { loops: Vec::new(), lines: Vec::new(), corners, detect };
+        let nf = w.t.len();
+        for c in chains {
+            if !(c.len() > 3 && c.first() == c.last()) {
+                if c.len() >= 2 {
+                    out.lines.push(c);
+                }
+                continue;
+            }
+            let verts: Vec<u32> = c[..c.len() - 1].to_vec();
+            let n = verts.len();
+            let (lo, hi) = verts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |m, &v| (m.0.min(phi[v as usize]), m.1.max(phi[v as usize])));
+            // The faces either side: connected parts of the surface not crossing the loop.
+            let on: HashSet<(u32, u32)> = (0..n).map(|i| { let (a, b) = (verts[i], verts[(i + 1) % n]); (a.min(b), a.max(b)) }).collect();
+            let crosses = |f: usize, k: usize| { let (a, b) = (w.t[f][k], w.t[f][(k + 1) % 3]); on.contains(&(a.min(b), a.max(b))) };
+            let mut comp = vec![u32::MAX; nf];
+            let mut sizes: Vec<f32> = Vec::new();
+            let mut sides: Vec<u32> = Vec::new();
+            // Per side: loop edges whose third vertex has a lower phi, and a higher.
+            let mut lower: Vec<usize> = Vec::new();
+            let mut higher: Vec<usize> = Vec::new();
+            for f0 in 0..nf {
+                if comp[f0] != u32::MAX || !(0..3).any(|k| crosses(f0, k)) {
+                    continue;
+                }
+                let id = sizes.len() as u32;
+                let mut q = vec![f0];
+                comp[f0] = id;
+                let mut area = 0.0;
+                while let Some(f) = q.pop() {
+                    let t = w.t[f];
+                    area += (w.p[t[1] as usize] - w.p[t[0] as usize]).cross(w.p[t[2] as usize] - w.p[t[0] as usize]).length();
+                    for k in 0..3 {
+                        let o = w.twin[f * 3 + k];
+                        if o == NONE || crosses(f, k) {
+                            continue;
+                        }
+                        let g = o as usize / 3;
+                        if comp[g] == u32::MAX {
+                            comp[g] = id;
+                            q.push(g);
+                        }
+                    }
+                }
+                sizes.push(area);
+                sides.push(id);
+                lower.push(0);
+                higher.push(0);
+            }
+            for f in 0..nf {
+                let id = comp[f];
+                if id == u32::MAX {
+                    continue;
+                }
+                for k in 0..3 {
+                    if crosses(f, k) {
+                        let t = w.t[f];
+                        let mid = (phi[t[k] as usize] + phi[t[(k + 1) % 3] as usize]) * 0.5;
+                        let third = phi[t[(k + 2) % 3] as usize];
+                        if third < mid {
+                            lower[id as usize] += 1;
+                        } else {
+                            higher[id as usize] += 1;
+                        }
+                    }
+                }
+            }
+            let separates = sides.len() >= 2;
+            // Transverse: one side (nearly) all lower, the other (nearly) all higher.
+            let mostly = |a: usize, b: usize| a * 5 >= (a + b) * 4;
+            let across = separates && (mostly(lower[0], higher[0]) && mostly(higher[1], lower[1]) || mostly(higher[0], lower[0]) && mostly(lower[1], higher[1]));
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                let c = verts.iter().map(|&v| w.p[v as usize]).sum::<Vec3>() / n as f32;
+                eprintln!("    hard loop near {c:.3}: {n} vertices, {:.2} steps of the part function, {} sides, lower/higher {:?}", (hi - lo) / step, sides.len(), lower.iter().zip(&higher).collect::<Vec<_>>());
+            }
+            if across && lo.is_finite() && hi - lo < 1.5 * step {
+                out.loops.push(HardLoop { verts, kind: LoopKind::Transverse, inside: Vec::new() });
+            } else {
+                let inside = if separates {
+                    let inner = *sides.iter().min_by(|&&a, &&b| sizes[a as usize].total_cmp(&sizes[b as usize])).unwrap();
+                    (0..nf).filter(|&f| comp[f] == inner).collect()
+                } else {
+                    Vec::new()
+                };
+                out.loops.push(HardLoop { verts, kind: LoopKind::Plate, inside });
+            }
+        }
+        out
+    }
 }
 
 /// How a piece where the ring splits is bridged: the rings past it it keeps, the strips
@@ -408,6 +617,54 @@ fn fan_cols(long_pos: &[Vec3], short_pos: &[Vec3], d: usize, pinned: bool) -> Op
     Some(cols)
 }
 
+/// A row's spread in its own plane (the plane of the row as a polygon): its centroid, the
+/// long and short axes (unit vectors), and the semi-axes of the ellipse with the same second
+/// moments. Sums in f64, so a row and its mirror image agree.
+fn row_axes(pts: &[Vec3]) -> (Vec3, Vec3, Vec3, f32, f32) {
+    use glam::DVec3;
+    let n = pts.len().max(1) as f64;
+    let d: Vec<DVec3> = pts.iter().map(|p| p.as_dvec3()).collect();
+    let c = d.iter().fold(DVec3::ZERO, |s, &q| s + q) / n;
+    let mut nrm = DVec3::ZERO;
+    for i in 0..d.len() {
+        nrm += (d[i] - c).cross(d[(i + 1) % d.len()] - c);
+    }
+    let nrm = nrm.normalize_or(DVec3::Z);
+    let seed = d.first().map_or(DVec3::X, |&q| q - c);
+    let e1 = (seed - nrm * seed.dot(nrm)).normalize_or(nrm.any_orthonormal_vector());
+    let e2 = nrm.cross(e1);
+    let (mut a, mut b, mut cc) = (0.0f64, 0.0f64, 0.0f64);
+    for &q in &d {
+        let (x, y) = ((q - c).dot(e1), (q - c).dot(e2));
+        a += x * x;
+        b += x * y;
+        cc += y * y;
+    }
+    let mid = (a + cc) * 0.5;
+    let half = (((a - cc) * 0.5).powi(2) + b * b).sqrt();
+    let (l1, l2) = (mid + half, (mid - half).max(0.0));
+    let (vx, vy) = if b.abs() > 1e-18 { (l1 - cc, b) } else if a >= cc { (1.0, 0.0) } else { (0.0, 1.0) };
+    let u = (e1 * vx + e2 * vy).normalize_or(e1);
+    let v = nrm.cross(u);
+    (c.as_vec3(), u.as_vec3(), v.as_vec3(), (2.0 * l1 / n).sqrt() as f32, (2.0 * l2 / n).sqrt() as f32)
+}
+
+/// Where a row with axes `u`, `v` (semi-axes `big`, `small`) should start so that a grid's
+/// first side runs along its long axis: the point nearest the corner at 135° behind the
+/// long axis, going the row's way round. The points' angles are taken on the ellipse
+/// squashed to a circle, so the four corners are the quarter points of the row.
+fn corner_start(pts: &[Vec3], c: Vec3, u: Vec3, v: Vec3, big: f32, small: f32) -> usize {
+    let n = pts.len();
+    let xy: Vec<(f32, f32)> = pts.iter().map(|&p| ((p - c).dot(u) / big.max(1e-9), (p - c).dot(v) / small.max(1e-9))).collect();
+    let area: f32 = (0..n).map(|i| { let (p, q) = (xy[i], xy[(i + 1) % n]); p.0 * q.1 - q.0 * p.1 }).sum();
+    let goal = if area >= 0.0 { -0.75 * std::f32::consts::PI } else { -0.25 * std::f32::consts::PI };
+    let off = |i: usize| {
+        let t = xy[i].1.atan2(xy[i].0) - goal;
+        (t - (t / std::f32::consts::TAU).round() * std::f32::consts::TAU).abs()
+    };
+    (0..n).min_by(|&i, &j| off(i).total_cmp(&off(j))).unwrap_or(0)
+}
+
 /// Each point's mirror image among `p`: the point nearest its reflection within 0.35 quad (a
 /// point on the plane is its own), or None. The pairs are mutual, and a point is the image
 /// of one point only, so two points at one place get two images (the nearest free point, if
@@ -477,11 +734,18 @@ fn symmetrize(p: &mut [Vec3], plane: MirrorPlane, quad: f32) -> usize {
 
 /// With `plane`, `w` and `phi` are their own mirror images in it and the result is too: rings
 /// it cuts get counts in fours, pinned to it front and back (the centre line); bands between
-/// them are built on one half and mirrored.
-pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<MirrorPlane>) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
+/// them are built on one half and mirrored. `feats`: the hard edges of `w` (see
+/// [`BodyFeatures`]): a hard loop round a part becomes one of its rings, rows snap to hard
+/// lines; empty, the part function alone decides.
+pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<MirrorPlane>, feats: &BodyFeatures) -> Result<(Vec<Vec3>, Vec<[u32; 4]>), String> {
     let debug = std::env::var_os("KLAY_ZR_DEBUG").is_some();
     let nv = w.p.len();
-    let step = quad * std::env::var("ZR_BODYSTEP").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+    let step = body_step(quad);
+    if debug && (!feats.loops.is_empty() || !feats.lines.is_empty()) {
+        let transverse = feats.loops.iter().filter(|l| l.kind == LoopKind::Transverse).count();
+        let plates: Vec<usize> = feats.loops.iter().filter(|l| l.kind == LoopKind::Plate).map(|l| l.inside.len()).collect();
+        eprintln!("  body: {} hard loops ({transverse} transverse, {} plates of {:?} faces), {} lines, {} corners", feats.loops.len(), plates.len(), plates, feats.lines.len(), feats.corners.len());
+    }
     let lo = phi[src as usize];
     let band = |v: u32| -> i64 {
         let x = phi[v as usize];
@@ -602,7 +866,398 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let near: Vec<u32> = order.iter().map(|k| at[k].1).collect();
         let far: Vec<u32> = order.iter().map(|k| at[k].2).collect();
         let girth = (0..pts.len()).map(|i| pts[i].distance(pts[(i + 1) % pts.len()])).sum::<f32>() / quad;
-        rings.push(Ring { pts, near, far, from: x, to: y, girth });
+        let level = (sg[0].0).2;
+        rings.push(Ring { pts, near, far, from: x, to: y, girth, level, hard: false });
+    }
+    let min_girth: f32 = std::env::var("ZR_BODYMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+    // Creases round a part become its rings (HARD-1: every crease a mesh edge loop): a
+    // crease replaces the level ring of its link nearest it, so the ring's row lies on the
+    // crease; and (`ZR_SUPPORT`, off with 0) a ring 0.4 step either side of it, cut from the
+    // part function within the link, holds the crease's shape (HARD-2). Pieces between the
+    // new rings are virtual (ids past the vertices): one ring in, one out. Two sources:
+    // the transverse hard loops of `feats` (closed chains of hard edges: polygroup borders,
+    // creases, clean edge lines), and (`ZR_FOLDLOOPS`, off with 0, only with Detect Edges)
+    // creases found from the surface itself, as the edge lines of a voxel model are too
+    // broken to chain: along each link the level sets a tenth of a step apart are cut, and
+    // where the surface's fold across them (the angle between its normals 0.3 step before
+    // and after) peaks over `ZR_FOLDMIN` (50°) a crease runs round the part.
+    let n_level = rings.len();
+    let mut hard_rings = 0usize;
+    let mut support_rings = 0usize;
+    let fold_loops = feats.detect && std::env::var("ZR_FOLDLOOPS").map(|v| v != "0").unwrap_or(true);
+    if fold_loops || feats.loops.iter().any(|l| l.kind == LoopKind::Transverse) {
+        let support = std::env::var("ZR_SUPPORT").map(|v| v != "0").unwrap_or(true);
+        // Every face by the pieces its vertices are in.
+        let mut piece_faces: HashMap<u32, Vec<u32>> = HashMap::default();
+        for (f, t) in w.t.iter().enumerate() {
+            let mut cs: Vec<u32> = t.iter().map(|&v| comp[v as usize]).collect();
+            cs.sort_unstable();
+            cs.dedup();
+            for c in cs {
+                piece_faces.entry(c).or_default().push(f as u32);
+            }
+        }
+        let link_faces = |link: (u32, u32)| -> Vec<u32> {
+            let mut fs: Vec<u32> = piece_faces.get(&link.0).cloned().unwrap_or_default();
+            fs.extend(piece_faces.get(&link.1).into_iter().flatten());
+            fs.sort_unstable();
+            fs.dedup();
+            fs
+        };
+        // Whether every point of `a` lies within `reach` of the closed line `b` and the
+        // other way round.
+        let runs_along = |a: &[Vec3], b: &[Vec3], reach: f32| -> bool {
+            let mut gb = SegGrid::new(quad);
+            gb.add_loop(b, 0);
+            let mut ga = SegGrid::new(quad);
+            ga.add_loop(a, 0);
+            a.iter().all(|&q| gb.nearest(q, reach).is_some()) && b.iter().all(|&q| ga.nearest(q, reach).is_some())
+        };
+        // The level sets of the part function at `lv` over `faces`: each closed loop as its
+        // points in ring order and each point's lower and higher vertex. None if a level
+        // set there is not a set of simple loops.
+        let level_loops = |lv: f32, faces: &[u32]| -> Option<Vec<(Vec<Vec3>, Vec<u32>, Vec<u32>)>> {
+            let mut at: HashMap<(u32, u32), (Vec3, u32, u32)> = HashMap::default();
+            let mut sg: Vec<((u32, u32), (u32, u32), usize)> = Vec::new();
+            for &f in faces {
+                let t = w.t[f as usize];
+                let fv = t.map(|v| phi[v as usize]);
+                if fv.iter().any(|x| !x.is_finite()) {
+                    continue;
+                }
+                let mut keys: Vec<(u32, u32)> = Vec::new();
+                for e in 0..3 {
+                    let (a, b) = (t[e], t[(e + 1) % 3]);
+                    let (fa, fb) = (fv[e], fv[(e + 1) % 3]);
+                    if (fa < lv) != (fb < lv) {
+                        let key = (a.min(b), a.max(b));
+                        at.entry(key).or_insert_with(|| {
+                            let s = ((lv - fa) / (fb - fa)).clamp(0.0, 1.0);
+                            (w.p[a as usize].lerp(w.p[b as usize], s), if fa < lv { a } else { b }, if fa < lv { b } else { a })
+                        });
+                        keys.push(key);
+                    }
+                }
+                if keys.len() == 2 {
+                    sg.push((keys[0], keys[1], f as usize));
+                }
+            }
+            let mut adj: HashMap<(u32, u32), Vec<usize>> = HashMap::default();
+            for (i, s) in sg.iter().enumerate() {
+                adj.entry(s.0).or_default().push(i);
+                adj.entry(s.1).or_default().push(i);
+            }
+            if adj.values().any(|v| v.len() > 2) {
+                return None;
+            }
+            let mut used = vec![false; sg.len()];
+            let mut out = Vec::new();
+            for s0 in 0..sg.len() {
+                if used[s0] {
+                    continue;
+                }
+                let mut order: Vec<(u32, u32)> = vec![sg[s0].0];
+                let mut cur = s0;
+                let mut sense = 0.0f32;
+                let mut closed = false;
+                loop {
+                    used[cur] = true;
+                    let s = sg[cur];
+                    let last = *order.last().unwrap();
+                    let next = if s.0 == last { s.1 } else { s.0 };
+                    sense += w.fnrm[s.2].cross(at[&next].0 - at[&last].0).dot(face_grad(s.2));
+                    if next == order[0] {
+                        closed = true;
+                        break;
+                    }
+                    order.push(next);
+                    let Some(&ns) = adj[&next].iter().find(|&&i| !used[i]) else { break };
+                    cur = ns;
+                }
+                if !closed {
+                    continue;
+                }
+                if sense < 0.0 {
+                    order.reverse();
+                }
+                out.push((order.iter().map(|k| at[k].0).collect(), order.iter().map(|k| at[k].1).collect(), order.iter().map(|k| at[k].2).collect()));
+            }
+            Some(out)
+        };
+        // The one level loop at `lv` within the link running along `along`.
+        let level_loop = |lv: f32, faces: &[u32], along: &[Vec3]| -> Option<(Vec<Vec3>, Vec<u32>, Vec<u32>)> {
+            let mut found: Option<(Vec<Vec3>, Vec<u32>, Vec<u32>)> = None;
+            for l in level_loops(lv, faces)? {
+                if runs_along(&l.0, along, quad) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(l);
+                }
+            }
+            found
+        };
+        // A vertex of a crease point in `piece`: itself when it is there, else a neighbour
+        // within three steps, else the vertex of the ring's `old` slice nearest it.
+        let pick = |v: u32, piece: u32, ring: &Ring, old: &[u32]| -> u32 {
+            if comp[v as usize] == piece {
+                return v;
+            }
+            let mut seen = vec![v];
+            let mut frontier = vec![v];
+            for _ in 0..3 {
+                let mut next = Vec::new();
+                for &x in &frontier {
+                    for &u in w.neighbours(x) {
+                        if comp[u as usize] == piece {
+                            return u;
+                        }
+                        if !seen.contains(&u) {
+                            seen.push(u);
+                            next.push(u);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+            let q = w.p[v as usize];
+            (0..old.len()).min_by(|&a, &b| ring.pts[a].distance(q).total_cmp(&ring.pts[b].distance(q))).map_or(v, |i| old[i])
+        };
+        // Each crease point's vertex in the ring's nearer piece and in its farther piece,
+        // from the vertices `vs` the crease was cut on (a level set between two rings has
+        // both its vertices in one band: the ring's split or join needs them in its pieces).
+        let pick_sides = |vs: &[u32], ring: &Ring| -> (Vec<u32>, Vec<u32>) {
+            (vs.iter().map(|&v| pick(v, ring.from, ring, &ring.near)).collect(), vs.iter().map(|&v| pick(v, ring.to, ring, &ring.far)).collect())
+        };
+        // The creases to place: (ring, level in steps, points, vertices in the nearer
+        // piece, vertices in the farther piece, where from).
+        let mut creases: Vec<(usize, f32, Vec<Vec3>, Vec<u32>, Vec<u32>, &str)> = Vec::new();
+        for lp in feats.loops.iter().filter(|l| l.kind == LoopKind::Transverse) {
+            let verts = &lp.verts;
+            let n = verts.len();
+            let m = verts.iter().map(|&v| (phi[v as usize] - lo) / step).sum::<f32>() / n as f32;
+            let k = m.round() as i64;
+            let lpos: Vec<Vec3> = verts.iter().map(|&v| w.p[v as usize]).collect();
+            let centroid = lpos.iter().copied().sum::<Vec3>() / n as f32;
+            let mut lgrid = SegGrid::new(quad);
+            lgrid.add_loop(&lpos, 0);
+            // The level ring at k whose points lie along the loop.
+            let near_loop = |r: usize| rings[r].pts.iter().filter(|&&q| lgrid.nearest(q, quad).is_some()).count() as f32 / rings[r].pts.len() as f32;
+            let ring_centroid = |r: usize| rings[r].pts.iter().copied().sum::<Vec3>() / rings[r].pts.len() as f32;
+            let cand = (0..n_level)
+                .filter(|&r| rings[r].level == k && ring_centroid(r).distance(centroid) < quad * 2.0)
+                .map(|r| (r, near_loop(r)))
+                .filter(|x| x.1 >= 0.9)
+                .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
+            let Some((r, _)) = cand else {
+                if debug {
+                    eprintln!("    hard loop near {centroid:.3} ({:.1} quads, level {m:.1}): no level ring runs along it; left", lgrid.segs.iter().map(|s| s.0.distance(s.1)).sum::<f32>() / quad);
+                }
+                continue;
+            };
+            // Every point of the loop near the ring: else it runs into another link too.
+            let rp = &rings[r].pts;
+            if lpos.iter().any(|&q| rp.iter().all(|&x| x.distance(q) > quad * 1.5)) {
+                if debug {
+                    eprintln!("    hard loop near {centroid:.3} (level {m:.1}): spans more than one link; left");
+                }
+                continue;
+            }
+            // The loop's way round: the same sense as a level ring (the part function
+            // increasing on the left, seen from outside).
+            let mut sense = 0.0f32;
+            for i in 0..n {
+                let (a, b) = (verts[i], verts[(i + 1) % n]);
+                if let Some(h) = w.fan(a).into_iter().find(|&h| w.to(h) == b) {
+                    let f = h as usize / 3;
+                    sense += w.fnrm[f].cross(w.p[b as usize] - w.p[a as usize]).dot(face_grad(f));
+                }
+            }
+            let mut order = verts.clone();
+            if sense < 0.0 {
+                order.reverse();
+            }
+            let (near, far) = pick_sides(&order, &rings[r]);
+            let pts: Vec<Vec3> = order.iter().map(|&v| w.p[v as usize]).collect();
+            creases.push((r, m, pts, near, far, "hard loop"));
+        }
+        if fold_loops {
+            // The fold across the part function at each vertex: the angle between the
+            // surface's normals 0.3 step down and up the function from it (along the
+            // neighbours lowest and highest in it).
+            let reach = step * 0.3;
+            let walk = |v: u32, up: bool| -> u32 {
+                let mut x = v;
+                for _ in 0..12 {
+                    if (phi[x as usize] - phi[v as usize]).abs() >= reach {
+                        break;
+                    }
+                    let next = w.neighbours(x).iter().copied().filter(|&u| phi[u as usize].is_finite()).min_by(|&a, &b| {
+                        let (fa, fb) = (phi[a as usize], phi[b as usize]);
+                        if up { fb.total_cmp(&fa) } else { fa.total_cmp(&fb) }
+                    });
+                    match next {
+                        Some(u) if (up && phi[u as usize] > phi[x as usize]) || (!up && phi[u as usize] < phi[x as usize]) => x = u,
+                        _ => break,
+                    }
+                }
+                x
+            };
+            let fold: Vec<f32> = (0..nv as u32).map(|v| if phi[v as usize].is_finite() { w.vnrm[walk(v, false) as usize].angle_between(w.vnrm[walk(v, true) as usize]).to_degrees() } else { 0.0 }).collect();
+            let fold_min: f32 = std::env::var("ZR_FOLDMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(50.0);
+            // Only rings round a part of some size (`ZR_FOLDGIRTH`, 8 quads): the level sets
+            // round a plate standing out from the body are not its creases.
+            let fold_girth: f32 = std::env::var("ZR_FOLDGIRTH").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+            let bend = |near: &[u32], far: &[u32]| -> f32 { (near.iter().chain(far).map(|&v| fold[v as usize]).sum::<f32>()) / (near.len() + far.len()).max(1) as f32 };
+            // The run each ring is on: rings in a row through pieces with one ring in and one
+            // out (a limb, the trunk). A short run is a plate or a boss standing out from the
+            // body, whose edge is not a crease round a part (`ZR_FOLDRUN`, 8 rings).
+            let fold_run: usize = std::env::var("ZR_FOLDRUN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let mut outs: HashMap<u32, Vec<usize>> = HashMap::default();
+            let mut ins: HashMap<u32, Vec<usize>> = HashMap::default();
+            for (i, r) in rings.iter().enumerate().filter(|x| x.1.girth >= min_girth) {
+                outs.entry(r.from).or_default().push(i);
+                ins.entry(r.to).or_default().push(i);
+            }
+            let run_len = |r: usize| -> usize {
+                let mut n = 1;
+                for forward in [true, false] {
+                    let mut p = if forward { rings[r].to } else { rings[r].from };
+                    for _ in 0..n_level {
+                        let (one_in, one_out) = (ins.get(&p).map_or(0, |v| v.len()), outs.get(&p).map_or(0, |v| v.len()));
+                        if one_in != 1 || one_out != 1 {
+                            break;
+                        }
+                        let next = if forward { outs[&p][0] } else { ins[&p][0] };
+                        n += 1;
+                        p = if forward { rings[next].to } else { rings[next].from };
+                    }
+                }
+                n
+            };
+            let mut found: Vec<(usize, f32, f32)> = Vec::new();
+            for r in 0..n_level {
+                if creases.iter().any(|c| c.0 == r) || rings[r].girth < min_girth.max(fold_girth) || run_len(r) < fold_run {
+                    continue;
+                }
+                let k = rings[r].level as f32;
+                let faces = link_faces((rings[r].from, rings[r].to));
+                // The fold along the level sets from half a step below the ring to just
+                // under half a step above (the next ring claims the rest).
+                let samples: Vec<(f32, Option<(Vec<Vec3>, Vec<u32>, Vec<u32>)>)> = (-5..5).map(|j| {
+                    let t = k + j as f32 * 0.1;
+                    (t, if j == 0 { Some((rings[r].pts.clone(), rings[r].near.clone(), rings[r].far.clone())) } else { level_loop(lo + t * step, &faces, &rings[r].pts) })
+                }).collect();
+                let bends: Vec<f32> = samples.iter().map(|s| s.1.as_ref().map_or(0.0, |l| bend(&l.1, &l.2))).collect();
+                let Some(best) = (0..bends.len()).filter(|&i| samples[i].1.is_some()).max_by(|&a, &b| bends[a].total_cmp(&bends[b]).then(b.cmp(&a))) else { continue };
+                // A crease: the fold peaks over the bar and is well above the link's quietest
+                // level set (a tube bent all along is not a crease). Levels with no single
+                // loop have no fold measured and do not count.
+                let quiet = (0..bends.len()).filter(|&i| samples[i].1.is_some()).map(|i| bends[i]).fold(f32::INFINITY, f32::min);
+                if bends[best] < fold_min || bends[best] < quiet + 15.0 {
+                    continue;
+                }
+                let (t, lp) = (samples[best].0, samples[best].1.clone().unwrap());
+                found.push((r, t, bends[best]));
+                // Its lower vertices into the ring's nearer piece, its higher into the farther.
+                let near: Vec<u32> = lp.1.iter().map(|&v| pick(v, rings[r].from, &rings[r], &rings[r].near)).collect();
+                let far: Vec<u32> = lp.2.iter().map(|&v| pick(v, rings[r].to, &rings[r], &rings[r].far)).collect();
+                creases.push((r, t, lp.0, near, far, "fold"));
+            }
+            if debug {
+                let mut at: Vec<(f32, f32, Vec3)> = found.iter().map(|f| ((f.1 * 10.0).round() / 10.0, f.2.round(), rings[f.0].pts.iter().copied().sum::<Vec3>() / rings[f.0].pts.len() as f32)).collect();
+                at.sort_by(|a, b| a.0.total_cmp(&b.0));
+                eprintln!("  body: {} creases found by fold (level, degrees, where):", found.len());
+                for (t, d, c) in at {
+                    eprintln!("    crease at level {t:.1}: {d:.0}°, round {c:.2}");
+                }
+            }
+        }
+        // Each crease into its ring.
+        creases.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut placed: Vec<(usize, f32, (u32, u32), Vec<Vec3>)> = Vec::new();
+        for (r, m, pts, near, far, how) in creases {
+            if rings[r].hard {
+                if debug {
+                    eprintln!("    crease ({how}) at level {m:.1}: its ring is taken by another; left");
+                }
+                continue;
+            }
+            let n = pts.len();
+            let girth = (0..n).map(|i| pts[i].distance(pts[(i + 1) % n])).sum::<f32>() / quad;
+            if girth < min_girth {
+                continue;
+            }
+            let link = (rings[r].from, rings[r].to);
+            let ring = &mut rings[r];
+            ring.pts = pts.clone();
+            ring.near = near;
+            ring.far = far;
+            ring.girth = girth;
+            ring.hard = true;
+            hard_rings += 1;
+            placed.push((r, m, link, pts));
+        }
+        if support {
+            let mut next_piece = nv as u32;
+            // Where rings now lie along each link, in steps: the hard rings; supports keep
+            // 0.3 step from them and from the level rings either side.
+            let mut taken: Vec<((u32, u32), f32)> = placed.iter().map(|p| (p.2, p.1)).collect();
+            for &(r, m, link, ref pts) in &placed {
+                let k = rings[r].level as f32;
+                let faces = link_faces(link);
+                for (side, t) in [(-1, m - 0.4), (1, m + 0.4)] {
+                    let clear = t > k - 1.0 + 0.3 && t < k + 1.0 - 0.3 && taken.iter().all(|&(l, x)| l != link || (x - t).abs() >= 0.3);
+                    if !clear {
+                        continue;
+                    }
+                    let Some((spts, near, far)) = level_loop(lo + t * step, &faces, pts) else {
+                        if debug {
+                            eprintln!("    hard ring at level {m:.1}: no support ring at {t:.1} (the level set there is not one loop along it)");
+                        }
+                        continue;
+                    };
+                    let girth = (0..spts.len()).map(|i| spts[i].distance(spts[(i + 1) % spts.len()])).sum::<f32>() / quad;
+                    if girth < min_girth {
+                        continue;
+                    }
+                    let vp = next_piece;
+                    next_piece += 1;
+                    let level = rings[r].level;
+                    if side < 0 {
+                        rings.push(Ring { pts: spts, near, far, from: rings[r].from, to: vp, girth, level, hard: false });
+                        rings[r].from = vp;
+                    } else {
+                        rings.push(Ring { pts: spts, near, far, from: vp, to: rings[r].to, girth, level, hard: false });
+                        rings[r].to = vp;
+                    }
+                    taken.push((link, t));
+                    support_rings += 1;
+                }
+            }
+        }
+        if debug {
+            eprintln!("  body: {hard_rings} hard loops became rings, {support_rings} support rings beside them");
+        }
+        // KLAY_ZR_HARDRINGS=file.obj: the hard rings and their support rings as OBJ polylines
+        // (`l` records), for levels.py.
+        if let Some(path) = std::env::var_os("KLAY_ZR_HARDRINGS") {
+            use std::fmt::Write;
+            let mut s = String::new();
+            let mut n = 0usize;
+            for r in rings.iter().filter(|r| r.hard).chain(rings[n_level..].iter()) {
+                for q in &r.pts {
+                    writeln!(s, "v {} {} {}", q.x, q.y, q.z).unwrap();
+                }
+                s.push('l');
+                for k in 0..=r.pts.len() {
+                    write!(s, " {}", n + k % r.pts.len() + 1).unwrap();
+                }
+                s.push('\n');
+                n += r.pts.len();
+            }
+            std::fs::write(path, s).ok();
+        }
     }
     // Arc length along each ring, and with a plane where it crosses it: (front, back) arc
     // positions, front the crossing further forward (+Z, or +X for a Z plane); None if it
@@ -647,7 +1302,6 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         outs.entry(r.from).or_default().push(i);
         ins.entry(r.to).or_default().push(i);
     }
-    let min_girth: f32 = std::env::var("ZR_BODYMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
     // The rings past a piece that are kept (thin ones, fingers and ears, are left off).
     let kept = |p: u32| -> Vec<usize> {
         let mut v: Vec<usize> = outs.get(&p).map(|v| v.iter().copied().filter(|&r| rings[r].girth >= min_girth).collect()).unwrap_or_default();
@@ -673,15 +1327,21 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // along a limb or the trunk; else stepping where the girth drifts past 1.5 times.
     let ratio: f32 = std::env::var("ZR_BODYRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
     let drift: f32 = std::env::var("ZR_BODYDRIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5);
+    // A thin tube (a finger: two rings or more, all under 8 quads round) gets at least
+    // `ZR_MINTUBE` (8) points round it, so its tip cap is a 2 × 2 grid (0 for the girth's own
+    // count).
+    let min_tube: usize = std::env::var("ZR_MINTUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let tubular = |rs: &[usize]| rs.len() >= 2 && rs.iter().all(|&r| rings[r].girth < 8.0);
     // A ring the plane cuts takes its count in fours (its row is pinned front and back);
     // a run with one count takes fours when any of its rings is cut (harmless on the rest).
     let plan_one = |rs: &[usize]| -> Vec<usize> {
         let gs: Vec<f32> = rs.iter().map(|&r| rings[r].girth.max(1e-3)).collect();
-        let q = |g: f32, r: usize| if ring_cross[r].is_some() { even4(g) } else { even(g) };
+        let floor = if tubular(rs) { min_tube } else { 0 };
+        let q = |g: f32, r: usize| (if ring_cross[r].is_some() { even4(g) } else { even(g) }).max(floor);
         let (mn, mx) = gs.iter().fold((f32::INFINITY, 0.0f32), |m, &g| (m.0.min(g), m.1.max(g)));
         if mx <= mn * ratio {
             let gm = (gs.iter().map(|g| g.ln()).sum::<f32>() / gs.len() as f32).exp();
-            let n = if rs.iter().any(|&r| ring_cross[r].is_some()) { even4(gm) } else { even(gm) };
+            let n = (if rs.iter().any(|&r| ring_cross[r].is_some()) { even4(gm) } else { even(gm) }).max(floor);
             return vec![n; gs.len()];
         }
         let mut n = q(gs[0], rs[0]);
@@ -704,10 +1364,14 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // ankle band is then an equal join, and the step down to the foot's count lies between
     // two rings round the whole foot, gathered on the sole, not under the heel where a ring
     // round the whole foot meets one round the forefoot (`ZR_NOCARRY` or `ZR_OLDMERGE` gives
-    // the foot its own count from its first ring, as before). A neck widening into the
-    // shoulders also parts here, and keeps its own counts.
+    // the foot its own count from its first ring, as before). When the limb's count at the
+    // ankle and the foot's first differ by less than `ZR_ANKLEDIFF` (8) the run is not parted
+    // at all: planned as one, the heel keeps the leg's columns and no merge ring forms (0
+    // parts it as before). A neck widening into the shoulders also parts here, and keeps its
+    // own counts.
     let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
     let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
+    let ankle_diff: usize = std::env::var("ZR_ANKLEDIFF").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let plan = |rs: &[usize]| -> Vec<usize> {
         let n = rs.len();
         if n >= 8 && std::env::var_os("ZR_NOANKLE").is_none() {
@@ -719,6 +1383,12 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     after_ankle.borrow_mut().extend(rs[e + 1..].iter().copied());
                     let mut out = plan_one(&rs[..=e]);
                     let mut foot = plan_one(&rs[e + 1..]);
+                    if out[e].abs_diff(foot[0]) < ankle_diff {
+                        if debug {
+                            eprintln!("    plan: ankle at ring {e} of {n} (girth {:.1}) kept in its run: {} above, {} below", gs[e], out[e], foot[0]);
+                        }
+                        return plan_one(rs);
+                    }
                     if carry && out[e] > foot[0] {
                         let widest = (e + 1..n).max_by(|&a, &b| gs[a].total_cmp(&gs[b]).then(b.cmp(&a))).unwrap_or(e + 1);
                         for c in &mut foot[..widest - e - 1] {
@@ -913,13 +1583,31 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     };
     let mut out_p: Vec<Vec3> = Vec::new();
     let mut quads: Vec<[u32; 4]> = Vec::new();
+    // The open hard lines, for rows to snap to (`ZR_NOHARDROWS`: off), and the corners of
+    // the hard lines, for the rows of hard rings to hold.
+    let hard_rows = std::env::var_os("ZR_NOHARDROWS").is_none();
+    let mut line_grid = SegGrid::new(quad);
+    if hard_rows {
+        for (i, line) in feats.lines.iter().enumerate() {
+            for e in line.windows(2) {
+                line_grid.add(w.p[e[0] as usize], w.p[e[1] as usize], i as u32);
+            }
+        }
+    }
+    // Per ring, the columns of its row snapped to a line: (column, line, rings running).
+    let snapped_cols: std::cell::RefCell<HashMap<usize, Vec<(usize, u32, u32)>>> = std::cell::RefCell::new(HashMap::default());
+    let snapped_rows = std::cell::Cell::new(0usize);
     // A row: `n` points evenly round ring `r`. With a plane: a ring it cuts has points on it
     // front (0) and back (n/2) and each half spaced evenly, the halves mirror images; any
     // other starts at its frontmost point (so a ring and its mirror image agree). Without:
-    // turned to lie against `prev` (if any).
-    let make_row = |r: usize, n: usize, prev: Option<&[Vec3]>, out_p: &mut Vec<Vec3>| -> Vec<u32> {
+    // turned to lie against `prev` (if any), the row of ring `prev_ring`. A point within 0.3
+    // quad of a hard line moves onto it (one point per place on a line), and a line snapped on
+    // three rings running keeps its column: the turn against `prev` holds those columns and
+    // fits the rest. On a hard ring the point nearest each corner of the loop takes it.
+    let make_row = |r: usize, n: usize, prev: Option<&[Vec3]>, prev_ring: Option<usize>, out_p: &mut Vec<Vec3>| -> Vec<u32> {
         let pts = &rings[r].pts;
         let mut row = resample_loop(pts, n);
+        let is_pinned = plane.is_some() && ring_cross[r].is_some() && n % 2 == 0;
         if let (Some(pl), Some((f, b))) = (plane, ring_cross[r]) {
             if n % 2 == 0 {
                 let total = ring_cum[r][pts.len()];
@@ -937,14 +1625,74 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             let k = (0..pts.len()).max_by(|&a, &b| pts[a][fwd].total_cmp(&pts[b][fwd])).unwrap_or(0);
             let rot: Vec<Vec3> = (0..pts.len()).map(|i| pts[(i + k) % pts.len()]).collect();
             row = resample_loop(&rot, n);
-        } else if let Some(prev) = prev {
+        }
+        // The points that may move: not the two on the plane of a pinned row; its first half
+        // moves and the other half mirrors it.
+        let free: Vec<usize> = if is_pinned { (1..n / 2).collect() } else { (0..n).collect() };
+        if hard_rows && rings[r].hard && !feats.corners.is_empty() {
+            for &c in &feats.corners {
+                if let Some(i) = free.iter().copied().filter(|&i| row[i].distance(c) < quad * 0.5).min_by(|&a, &b| row[a].distance(c).total_cmp(&row[b].distance(c))) {
+                    row[i] = c;
+                    if is_pinned {
+                        row[n - i] = plane.unwrap().reflect(c);
+                    }
+                }
+            }
+        }
+        // (index, line) of the points snapped.
+        let mut snapped: Vec<(usize, u32)> = Vec::new();
+        if !line_grid.is_empty() {
+            let mut cands: Vec<(usize, u32, Vec3, f32)> = free.iter().filter_map(|&i| line_grid.nearest(row[i], quad * 0.3).map(|(d, q, l)| (i, l, q, d))).collect();
+            cands.sort_by(|a, b| a.3.total_cmp(&b.3).then(a.0.cmp(&b.0)));
+            let mut taken: Vec<(usize, u32, Vec3)> = Vec::new();
+            for c in cands {
+                if taken.iter().any(|t| t.1 == c.1 && t.2.distance(c.2) < quad * 0.5) {
+                    continue;
+                }
+                taken.push((c.0, c.1, c.2));
+            }
+            for (i, l, q) in taken {
+                row[i] = q;
+                if is_pinned {
+                    row[n - i] = plane.unwrap().reflect(q);
+                }
+                snapped.push((i, l));
+            }
+        }
+        if let (false, None, Some(prev)) = (is_pinned, plane, prev) {
             let against = if prev.len() == n { prev.to_vec() } else { resample_loop(prev, n) };
-            let sh = (0..n).min_by(|&a, &b| {
-                let ca: f32 = (0..n).map(|i| against[i].distance_squared(row[(i + a) % n])).sum();
-                let cb: f32 = (0..n).map(|i| against[i].distance_squared(row[(i + b) % n])).sum();
-                ca.total_cmp(&cb)
-            }).unwrap_or(0);
+            let cost = |a: usize| -> f32 { (0..n).map(|i| against[i].distance_squared(row[(i + a) % n])).sum() };
+            // The turns that put a snapped point in the column its line held on the ring
+            // before (when it has run three rings), by how many columns each holds.
+            let held: Vec<(usize, u32)> = prev_ring.and_then(|pr| snapped_cols.borrow().get(&pr).map(|v| v.iter().filter(|x| x.2 >= 2).map(|x| (x.0, x.1)).collect())).unwrap_or_default();
+            let mut votes: Vec<(usize, usize)> = Vec::new();
+            for &(i, l) in &snapped {
+                for &(c, hl) in &held {
+                    if hl == l {
+                        let sh = (i + n - c) % n;
+                        match votes.iter_mut().find(|v| v.0 == sh) {
+                            Some(v) => v.1 += 1,
+                            None => votes.push((sh, 1)),
+                        }
+                    }
+                }
+            }
+            let most = votes.iter().map(|v| v.1).max().unwrap_or(0);
+            let sh = if most > 0 {
+                votes.iter().filter(|v| v.1 == most).map(|v| v.0).min_by(|&a, &b| cost(a).total_cmp(&cost(b)).then(a.cmp(&b))).unwrap_or(0)
+            } else {
+                (0..n).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).unwrap_or(0)
+            };
             row = (0..n).map(|i| row[(i + sh) % n]).collect();
+            for s in &mut snapped {
+                s.0 = (s.0 + n - sh) % n;
+            }
+        }
+        if !snapped.is_empty() {
+            snapped_rows.set(snapped_rows.get() + 1);
+            let runs: Vec<(u32, u32)> = prev_ring.and_then(|pr| snapped_cols.borrow().get(&pr).map(|v| v.iter().map(|x| (x.1, x.2)).collect())).unwrap_or_default();
+            let rec: Vec<(usize, u32, u32)> = snapped.iter().map(|&(i, l)| (i, l, 1 + runs.iter().find(|x| x.0 == l).map_or(0, |x| x.1))).collect();
+            snapped_cols.borrow_mut().insert(r, rec);
         }
         row.into_iter().map(|q| { out_p.push(q); (out_p.len() - 1) as u32 }).collect()
     };
@@ -1043,13 +1791,16 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         rect::cap_dims(row, a, sym, out_p, quads);
     };
     // A cap's inner points lifted toward the end beyond its row (a dome: all the way at its
-    // middle, none at the row), so it reaches the tip of a finger, a toe or the head instead
-    // of lying flat across the last ring.
-    let dome = |row: &[u32], from: usize, tip: Vec3, out_p: &mut Vec<Vec3>| {
+    // middle, none at the row, but no further than `most`), so it reaches the tip of a
+    // finger, a toe or the head instead of lying flat across the last ring.
+    let dome = |row: &[u32], from: usize, tip: Vec3, most: f32, out_p: &mut Vec<Vec3>| {
         let pts: Vec<Vec3> = row.iter().map(|&v| out_p[v as usize]).collect();
         let c = pts.iter().copied().sum::<Vec3>() / pts.len().max(1) as f32;
         let rr = pts.iter().map(|q| q.distance(c)).sum::<f32>() / pts.len().max(1) as f32;
-        let lift = tip - c;
+        let mut lift = tip - c;
+        if lift.length() > most {
+            lift *= most / lift.length();
+        }
         for v in from..out_p.len() {
             let d = out_p[v].distance(c) / rr.max(1e-9);
             out_p[v] += lift * (1.0 - d * d).max(0.0);
@@ -1182,7 +1933,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // Under a yoke the trunk keeps one count down to the crotch, as a box modeller's does
     // (its ratio rule, not the ankle rule, which would give the hips their own count);
     // `ZR_TRUNKSTEP` plans it as before.
-    let yoke_on = plane.is_some() && std::env::var_os("ZR_NOYOKE").is_none();
+    let yoke_on = plane.is_some() && std::env::var_os("ZR_YOKE").is_some();
     let trunk_one = yoke_on && std::env::var_os("ZR_TRUNKSTEP").is_none();
     let trunk_plan = |rs: &[usize]| -> Vec<usize> {
         if trunk_one && rs.last().is_some_and(|&r| two_legs(rings[r].to).is_some()) {
@@ -1225,7 +1976,8 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let (wd, dp) = extents(in_ring);
         yoke::crotch_dims(n_in, n_leg, wd, dp).map(|c| (r_plus, r_minus, n_leg, c))
     };
-    // The shoulders as a yoke (`ZR_NOYOKE` off): with a plane, when the head run ends at a
+    // The shoulders as a yoke (opt-in, `ZR_YOKE=1`: on the T-pose it removes the ring of poles
+    // at the neck base but the breasts are then not found and the shoulders come out coarser): with a plane, when the head run ends at a
     // piece with three rings past it (the trunk, cut by the plane, and an arm each side), a
     // grid over the trunk's ring with holes for the neck and the arms takes the place of the
     // rings between the neck and that piece. The neck hole takes the row of the ring after
@@ -1252,19 +2004,51 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let m = (neck + 1).min(head_run.len() - 1);
         let r = head_run[m];
         let planned = counts[&r];
-        let mut n = planned.min((n_trunk / 2).saturating_sub(4)) / 4 * 4;
-        while n >= 12 && n * 2 >= planned {
-            if pinned(r, n) {
-                if let Some(dims) = yoke::yoke_dims(n_trunk, n, n_arm, wd, dp) {
-                    return Some(YokePlan { m, trunk, plus, minus, n_trunk, n_arm, dims });
+        // The grid's cells should cover the surface it replaces (the pieces from under the
+        // neck row to the split) at about a quad each: the trunk's ring under the grid takes
+        // the smallest count in fours, from the trunk's own up to twice it, whose grid has
+        // `ZR_YOKEFILL` (0.3) of those cells; the trunk steps back to its own count on the
+        // next band, with diamonds (`ZR_YOKEPLAIN`: the trunk's own count, a coarser grid).
+        let covered: HashSet<u32> = head_run[m..].iter().map(|&r| rings[r].to).collect();
+        let area: f64 = w.t.iter().filter(|t| t.iter().all(|&v| covered.contains(&comp[v as usize]))).map(|t| {
+            let (a, b, c) = (w.p[t[0] as usize], w.p[t[1] as usize], w.p[t[2] as usize]);
+            (b - a).cross(c - a).length() as f64 * 0.5
+        }).sum();
+        let fill: f64 = std::env::var("ZR_YOKEFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+        let target = area / (quad as f64 * quad as f64) * fill;
+        let plain = std::env::var_os("ZR_YOKEPLAIN").is_some();
+        let top = if plain { n_trunk } else { n_trunk * 2 };
+        let mut best: Option<(usize, YokePlan)> = None;
+        let mut n_y = n_trunk.div_ceil(4) * 4;
+        while n_y <= top {
+            // The largest neck hole that fits this grid: the band from the neck to it is the
+            // one reduction under the jaw.
+            let mut n = planned.min((n_y / 2).saturating_sub(4)) / 4 * 4;
+            while n >= 12 && n * 2 >= planned {
+                if pinned(r, n) && pinned(trunk, n_y) {
+                    if let Some(dims) = yoke::yoke_dims(n_y, n, n_arm, wd, dp) {
+                        let cells = dims.a * dims.b - dims.neck.0 * dims.neck.1 - 2 * dims.arm.0 * dims.arm.1;
+                        let y = YokePlan { m, trunk, plus, minus, n_trunk: n_y, n_arm, dims };
+                        if cells as f64 >= target || plain {
+                            if debug {
+                                eprintln!("  body: yoke ring {n_y} (trunk {n_trunk}): {cells} cells for {:.0} quads of surface", area / (quad as f64 * quad as f64));
+                            }
+                            return Some(y);
+                        }
+                        if best.as_ref().is_none_or(|(c, _)| cells > *c) {
+                            best = Some((cells, y));
+                        }
+                        break;
+                    }
                 }
+                n -= 4;
             }
-            n -= 4;
+            n_y += 4;
         }
-        if debug {
+        if best.is_none() && debug {
             eprintln!("  body: yoke does not fit (trunk {n_trunk}, neck {planned}, arms {n_arm}, ring {:.2} by {:.2})", wd, dp);
         }
-        None
+        best.map(|b| b.1)
     })();
     if let Some(y) = yoke_plan {
         let r = head_run[y.m];
@@ -1275,10 +2059,124 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         counts.insert(r, n);
     }
     let first = head_run[first];
-    let row0 = make_row(first, counts[&first], None, &mut out_p);
+    let row0 = make_row(first, counts[&first], None, None, &mut out_p);
     let cap_from = out_p.len();
     cap(&row0, pinned(first, row0.len()), &mut out_p, &mut quads);
-    dome(&row0, cap_from, w.p[src as usize], &mut out_p);
+    dome(&row0, cap_from, w.p[src as usize], f32::INFINITY, &mut out_p);
+    // The working surface, for cap points to be put on.
+    let tg = crate::zremesh::TriGrid::from_tris(&w.p, &w.t, quad);
+    let surface = |q: Vec3| tg.closest_tris(&w.p, &w.t, q).map_or(q, |c| c.0);
+    // How a limb's end is capped (`ZR_OLDTIPS`: rows a quad apart shrinking like a sphere,
+    // then a grid domed all the way to the tip, as before): a row whose long radius is
+    // `ZR_FLATASPECT` (1.3) times its short one is a flat end (a foot's last rows, slanting
+    // over the toes, are 1.35 to 1.45; a thumb's 1.27).
+    let old_tips = std::env::var_os("ZR_OLDTIPS").is_some();
+    let flat_aspect: f32 = std::env::var("ZR_FLATASPECT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.3);
+    // How far past its ring's girth a split's bridged count may be for the band above to
+    // step up to it: 1.8 times, as before, or `ZR_SPLITRATIO` (2.2) when one of the split's
+    // runs is a thin tube lifted to the `ZR_MINTUBE` floor (fingers of 8 bridge to about
+    // twice the palm's girth).
+    let split_ratio: f32 = std::env::var("ZR_SPLITRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(2.2);
+    let floored = |rs: &[usize]| tubular(rs) && rs.iter().any(|&r| even(rings[r].girth) < min_tube);
+    // Whether rings join at piece `p` (more than one kept ring comes in).
+    let joins_at = |p: u32| ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count()) > 1;
+    // Whether a row lies on the far side of the plane, where it runs the other way round
+    // from its twin (`ZR_NOCAPMIRROR`: no row does, the caps then differ).
+    let far_side = |row_sym: bool, row_pos: &[Vec3]| {
+        !row_sym
+            && std::env::var_os("ZR_NOCAPMIRROR").is_none()
+            && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0)
+    };
+    // The cap at the end of a limb, on `row`, the tip past it at `tip`. A flat end (the toe
+    // end of a foot, a mitten) goes on in rows a quad apart keeping the row's shape (shrunk
+    // only near the end), the last half a quad or more short of the tip, then a grid laid
+    // straight across, more quads along its long side, its inside lifted toward the tip by
+    // at most half a quad and put on the surface. A round end (a finger) goes on in rows
+    // shrinking toward the tip like a sphere, half a quad apart while they are wider than
+    // 0.6 quad, then a grid domed toward the tip by at most half a quad.
+    let end_cap = |row: &[u32], row_sym: bool, tip: Vec3, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>| {
+        let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
+        let n = row.len();
+        let (c, _, _, big, small) = row_axes(&row_pos);
+        let dist = tip.distance(c);
+        if !old_tips && n >= 6 && big >= small * flat_aspect {
+            let extra = (dist / quad).floor() as usize;
+            let mut last = row.to_vec();
+            let mut rows = 0;
+            for k in 1..=extra.min(8) {
+                let t = k as f32 / (extra as f32 + 1.0);
+                let s = (1.0 - t.powi(4)).max(0.0).powf(0.25);
+                let cc = c.lerp(tip, t);
+                let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
+                join_band(&last, &next, out_p, quads);
+                last = next;
+                rows += 1;
+            }
+            let last_pos: Vec<Vec3> = last.iter().map(|&i| out_p[i as usize]).collect();
+            let (c, ax_u, ax_v, big, small) = row_axes(&last_pos);
+            let half = n / 2;
+            let mut a = ((half as f32 * big / (big + small)).round() as usize).clamp(1, half - 1);
+            if row_sym && a % 2 == 1 {
+                a = if a + 1 < half { a + 1 } else { a - 1 };
+            }
+            let a = a.max(1);
+            // A row on the far side of the plane runs the other way round from its twin's:
+            // reversed, then started at the corner where its long side begins, so the cap is
+            // the twin's mirror image (a pinned row keeps its start: the grid line along the
+            // plane). cap_dims winds its quads the row's way, so the reversed row's cap comes
+            // out inside out until orient() at the end of the build turns it.
+            if far_side(row_sym, &row_pos) {
+                last = (0..n).map(|i| last[(n - i) % n]).collect();
+            }
+            if !row_sym {
+                let last_pos: Vec<Vec3> = last.iter().map(|&i| out_p[i as usize]).collect();
+                let k = corner_start(&last_pos, c, ax_u, ax_v, big, small);
+                last = (0..n).map(|i| last[(i + k) % n]).collect();
+            }
+            let from = out_p.len();
+            rect::cap_dims(&last, a, row_sym, out_p, quads);
+            let dir = (tip - c).normalize_or_zero();
+            let lift = tip.distance(c).min(quad * 0.5);
+            let (eu, ev) = last_pos.iter().fold((0.0f32, 0.0f32), |m, &q| (m.0.max((q - c).dot(ax_u).abs()), m.1.max((q - c).dot(ax_v).abs())));
+            for v in from..out_p.len() {
+                let q = out_p[v] - c;
+                let (x, y) = (q.dot(ax_u) / eu.max(1e-9), q.dot(ax_v) / ev.max(1e-9));
+                out_p[v] += dir * (lift * (1.0 - x * x - y * y).max(0.0));
+                out_p[v] = surface(out_p[v]);
+            }
+            if debug {
+                eprintln!("    cap flat {a} x {} after {rows} rows near {:.3}: row of {n}, radii {:.2} x {:.2} quads, tip {:.2} quads past", half - a, c, big / quad, small / quad, dist / quad);
+            }
+        } else {
+            let rr = row_pos.iter().map(|q| q.distance(c)).sum::<f32>() / n as f32;
+            let extra = if old_tips { (dist / quad).round() as usize } else { (dist / (quad * 0.5)).floor() as usize };
+            let mut last = row.to_vec();
+            let mut rows = 0;
+            for k in 1..=extra.min(if old_tips { 8 } else { 16 }) {
+                let t = k as f32 / (extra as f32 + 1.0);
+                let s = (1.0 - t * t).max(0.0).sqrt();
+                if !old_tips && rr * s < quad * 0.6 {
+                    break;
+                }
+                let cc = c.lerp(tip, t);
+                let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
+                join_band(&last, &next, out_p, quads);
+                last = next;
+                rows += 1;
+            }
+            // Reversed on the far side of the plane, so the cap is the twin's mirror image
+            // (the dome only reads the row's centre and radius).
+            let nl = last.len();
+            let capped: Vec<u32> = if far_side(row_sym, &row_pos) { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
+            let from = out_p.len();
+            cap(&capped, row_sym, out_p, quads);
+            dome(&last, from, tip, if old_tips { f32::INFINITY } else { quad * 0.5 }, out_p);
+            if debug {
+                let a = (n / 4).max(1) + usize::from(row_sym && (n / 4).max(1) % 2 == 1 && n >= 8);
+                eprintln!("    cap round {rows} rows, {a} x {} near {:.3}: row of {n}, radii {:.2} x {:.2} quads, tip {:.2} quads past", n / 2 - a, c, big / quad, small / quad, dist / quad);
+            }
+        }
+    };
     // Points of the head (its cap and rows down to the neck): where the eyes are looked for.
     let mut head: HashSet<u32> = row0.iter().copied().chain(cap_from as u32..out_p.len() as u32).collect();
     let mut stack: Vec<(u32, Vec<u32>, bool, usize)> = vec![(rings[first].to, row0.clone(), pinned(first, row0.len()), first)];
@@ -1305,7 +2203,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // piece also splits or ends, goes on as the ring into it. If the strips cannot be
         // found, the body is not built (planned instead).
         let in_k = ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count());
-        let (row, row_sym) = if in_k > 1 {
+        let (row, row_sym) = if joins_at(p) {
             let waiting = pending.entry(p).or_default();
             waiting.push((row, in_ring));
             if waiting.len() < in_k {
@@ -1426,7 +2324,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 }
                 let seq_pos: Vec<Vec3> = seq.iter().map(|&i| out_p[i as usize]).collect();
                 let r = out[0];
-                let next = make_row(r, seq.len(), Some(&seq_pos), &mut out_p);
+                let next = make_row(r, seq.len(), Some(&seq_pos), None, &mut out_p);
                 join_band(&seq, &next, &mut out_p, &mut quads);
                 if debug {
                     eprintln!("    body join near {:.3}: rows {:?} bridged into {} round", w.p[p as usize], rows_in.iter().map(|r| r.len()).collect::<Vec<_>>(), seq.len());
@@ -1460,7 +2358,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 if row.len() != 2 * (a_n + b_n) {
                     return Err(format!("the neck row has {} points, the hole {}", row.len(), 2 * (a_n + b_n)));
                 }
-                let row_t = make_row(y.trunk, y.n_trunk, None, &mut out_p);
+                let row_t = make_row(y.trunk, y.n_trunk, None, None, &mut out_p);
                 let centroid = |ids: &[u32], out_p: &[Vec3]| ids.iter().map(|&v| out_p[v as usize]).sum::<Vec3>() / ids.len().max(1) as f32;
                 let (c_neck, c_trunk) = (centroid(&row, &out_p), centroid(&row_t, &out_p));
                 // The shoulders' surface: the pieces from under the neck row to the split.
@@ -1499,7 +2397,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let bp = yoke::hole_border(&ids, i_plus, j_a, a_a, b_a);
                 let bm: Vec<u32> = bp.iter().map(|v| grid_mirror[v]).collect();
                 let (arm_plus, arm_minus) = (past_saddle(y.plus, y.n_arm), past_saddle(y.minus, y.n_arm));
-                let row_plus = make_row(arm_plus, y.n_arm, None, &mut out_p);
+                let row_plus = make_row(arm_plus, y.n_arm, None, None, &mut out_p);
                 let row_minus = yoke::bridge_mirrored(&bp, &bm, &row_plus, pl, &mut out_p, &mut quads);
                 if debug {
                     eprintln!("  body: yoke {a}x{b} on trunk {}, neck hole {a_n}x{b_n} at row {j_n}, arm holes {a_a}x{b_a} at row {j_a} ({} of {} grid quads inward{})", y.n_trunk, bad, total, if arm_plus != y.plus { "; arms from their second ring" } else { "" });
@@ -1534,56 +2432,59 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
         match k.len() {
             0 => {
-                // Rows on to the tip (a finger's end is thinner than the rings kept), shrinking
-                // toward it like the end of a sphere, then the cap.
-                let tip = tip_past(p);
-                let c = row_pos.iter().copied().sum::<Vec3>() / row_pos.len() as f32;
-                let extra = (tip.distance(c) / quad).round() as usize;
-                let mut last = row.clone();
-                for k in 1..=extra.min(8) {
-                    let t = k as f32 / (extra as f32 + 1.0);
-                    let s = (1.0 - t * t).max(0.0).sqrt();
-                    let cc = c.lerp(tip, t);
-                    let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
-                    join_band(&last, &next, &mut out_p, &mut quads);
-                    last = next;
-                }
-                // A row on the far side of the plane runs the other way round from its
-                // twin's: capped reversed, so the cap is the twin's mirror image
-                // (`ZR_NOCAPMIRROR`: capped as laid out, the caps then differ).
-                let far_side = !row_sym
-                    && std::env::var_os("ZR_NOCAPMIRROR").is_none()
-                    && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0);
-                let nl = last.len();
-                let capped: Vec<u32> = if far_side { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
-                let from = out_p.len();
-                cap(&capped, row_sym, &mut out_p, &mut quads);
-                dome(&last, from, tip, &mut out_p);
+                // The end of a limb: the tip past the rings kept (a finger's end is thinner
+                // than they are).
+                end_cap(&row, row_sym, tip_past(p), &mut out_p, &mut quads);
                 caps += 1;
             }
             1 => {
                 let r = k[0];
+                // At the end of a limb whose last rings close round the tip (the toes of a
+                // foot): when this row is flat and the rings left (three at most) are all
+                // under 0.85 of its girth, the cap goes on this row and they are dropped. Not
+                // when another part joins at one of them (a hand resting on a thigh): the
+                // other row would wait for this one for ever.
+                if !old_tips && row.len() >= 6 {
+                    let rest = chain_from(r);
+                    if rest.len() <= 3 && kept(rings[rest[rest.len() - 1]].to).is_empty() && !rest.iter().any(|&q| joins_at(rings[q].to)) {
+                        let aspect = |pts: &[Vec3]| { let (_, _, _, b, s) = row_axes(pts); b / s.max(1e-9) };
+                        let here = aspect(&row_pos);
+                        let ahead: Vec<f32> = rest.iter().map(|&q| aspect(&rings[q].pts)).collect();
+                        let closing = rest.iter().all(|&q| rings[q].girth < rings[in_ring].girth * 0.85);
+                        let early = here >= flat_aspect && closing;
+                        if debug {
+                            eprintln!("    limb end near {:.3}: row of {} (girth {:.1}, aspect {here:.2}), {} rings left (girths {:?}, aspects {:?}){}", row_pos[0], row.len(), rings[in_ring].girth, rest.len(), rest.iter().map(|&q| (rings[q].girth * 10.0).round() / 10.0).collect::<Vec<_>>(), ahead.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>(), if early { ": capped here" } else { "" });
+                        }
+                        if early {
+                            end_cap(&row, row_sym, tip_past(p), &mut out_p, &mut quads);
+                            caps += 1;
+                            continue;
+                        }
+                    }
+                }
                 let g = rings[r].girth;
                 let cut = ring_cross[r].is_some();
                 let mut n = match counts.get(&r) {
                     Some(&c) => c,
                     None => {
                         let n0 = row.len();
-                        if g > n0 as f32 * drift || g < n0 as f32 / drift {
+                        let c = if g > n0 as f32 * drift || g < n0 as f32 / drift {
                             if cut { even4(g) } else { even(g) }
                         } else {
                             n0
-                        }
+                        };
+                        if tubular(&chain_from(r)) { c.max(min_tube) } else { c }
                     }
                 };
                 // Before a split, the count it bridges into (the merges go in this band, not
-                // in the split's).
-                // (Not where a yoke or a crotch cap takes the row: those keep the trunk's
-                // count.)
+                // in the split's) when within 1.8 times the girth (`ZR_SPLITRATIO`, 2.2, when
+                // a part of the split is a thin tube given the `ZR_MINTUBE` floor). Not where a
+                // yoke or a crotch cap takes the row: those keep the trunk's count.
                 let nk = kept(rings[r].to);
                 if nk.len() >= 2 && yoke_plan.is_none_or(|y| head_run[y.m] != r) && crotch_candidate(rings[r].to, r, n).is_none() {
                     if let Ok(sp) = split_plan(rings[r].to, &nk, &totals) {
-                        if (sp.total as f32) < g * 1.8 && (sp.total as f32) > g / 1.8 {
+                        let ratio = if nk.iter().any(|&q| floored(&chain_from(q))) { split_ratio } else { 1.8 };
+                        if (sp.total as f32) < g * ratio && (sp.total as f32) > g / ratio {
                             n = sp.total;
                         }
                     }
@@ -1607,7 +2508,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                         n = m;
                     }
                 }
-                let next = make_row(r, n, Some(&row_pos), &mut out_p);
+                let next = make_row(r, n, Some(&row_pos), Some(in_ring), &mut out_p);
                 let next_sym = pinned(r, n);
                 // Where this band's reductions go: the back of the head, neck and trunk, the
                 // inside of a limb, the sole of a foot or hand.
@@ -1663,7 +2564,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                         let bp = yoke::hole_border(&ids, i_plus, j_l, a_l, b_l);
                         let bm: Vec<u32> = bp.iter().map(|v| grid_mirror[v]).collect();
                         let (leg_plus, leg_minus) = (past_saddle(r_plus, n_leg), past_saddle(r_minus, n_leg));
-                        let row_plus = make_row(leg_plus, n_leg, None, &mut out_p);
+                        let row_plus = make_row(leg_plus, n_leg, None, None, &mut out_p);
                         let row_minus = yoke::bridge_mirrored(&bp, &bm, &row_plus, pl, &mut out_p, &mut quads);
                         if debug {
                             eprintln!("  body: crotch cap {a}x{b} on trunk {}, leg holes {a_l}x{b_l} at row {j_l} ({bad} of {total} grid quads inward{})", row.len(), if leg_plus != r_plus { "; legs from their second ring" } else { "" });
@@ -1715,7 +2616,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     // A ring the plane cuts: its pinned row, each strip end moved onto the
                     // row point nearest it.
                     if pinned(sp.rings[i], sp.counts[i]) {
-                        let ids = make_row(sp.rings[i], sp.counts[i], None, &mut out_p);
+                        let ids = make_row(sp.rings[i], sp.counts[i], None, None, &mut out_p);
                         let mut amap: HashMap<usize, usize> = HashMap::default();
                         for &c in &a {
                             let q = ring.pts[c];
@@ -1791,7 +2692,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let mut seq: Vec<u32> = Vec::new();
                 tour(0, 0, None, &rows, &att_row, &sp.strips, &strip_pts, &mut seq, true);
                 if debug {
-                    eprintln!("    body split near {:.3}: ring {} round into {:?} (strips {:?}), bridged loop {}", w.p[p as usize], row.len(), sp.counts, strip_pts.iter().map(|s| s.len() + 1).collect::<Vec<_>>(), seq.len());
+                    eprintln!("    body split near {:.3}: ring {} round into {:?} (strips {:?}), bridged loop {}; runs of {:?} rings, girths {:?}", w.p[p as usize], row.len(), sp.counts, strip_pts.iter().map(|s| s.len() + 1).collect::<Vec<_>>(), seq.len(), sp.rings.iter().map(|&r| chain_from(r).len()).collect::<Vec<_>>(), sp.rings.iter().map(|&r| (rings[r].girth * 10.0).round() / 10.0).collect::<Vec<_>>());
                 }
                 // The ring above against the bridged loop, turned to lie best against it.
                 let seq_pos: Vec<Vec3> = seq.iter().map(|&i| out_p[i as usize]).collect();
@@ -1863,6 +2764,9 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     }
     if debug {
         eprintln!("  body: {} quads, {} splits, {} yokes, {} joins, {} caps, {} rings", quads.len(), splits, yokes, joins, caps, rings.len());
+        if !line_grid.is_empty() || hard_rings > 0 {
+            eprintln!("  body: {} rows snapped to hard lines", snapped_rows.get());
+        }
     }
     // Breasts (`ZR_NOBUMPS` off): on each run of mirrored rows of one count (the trunk), a bump
     // standing out from the grid smoothed is cut out as a rectangle of quads and capped like a
@@ -1870,9 +2774,6 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // mirror image.
     orient(&mut quads, &out_p);
     if let (Some(pl), None) = (plane, std::env::var_os("ZR_NOBUMPS")) {
-        // The working surface, for the inset's rings and grids to lie on.
-        let tg = crate::zremesh::TriGrid::from_tris(&w.p, &w.t, quad);
-        let surface = |q: Vec3| tg.closest_tris(&w.p, &w.t, q).map_or(q, |c| c.0);
         let made = bumps(&torso, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface, 1.0, ("ZR_BUMP", 1.5, 0.4, 8.0, 0.6, 1.0));
         if debug {
             eprintln!("  body: {made} bumps capped");
@@ -2611,6 +3512,35 @@ fn tour(i: usize, start: usize, parent: Option<usize>, rows: &[Vec<u32>], att_ro
 mod reduce_tests {
     use super::*;
 
+    /// An ellipse 3 by 1 in a tilted plane: axes along its long and short sides, the aspect
+    /// 3, and the grid's first side (the point nearest the corner) starting on the long
+    /// side whichever way round the points go.
+    #[test]
+    fn row_axes_and_corner_of_a_flat_ellipse() {
+        let tilt = glam::Quat::from_axis_angle(Vec3::new(1.0, 2.0, 0.5).normalize(), 0.7);
+        for reverse in [false, true] {
+            let mut pts: Vec<Vec3> = (0..32).map(|i| {
+                let a = std::f32::consts::TAU * i as f32 / 32.0;
+                tilt * Vec3::new(3.0 * a.cos(), 0.0, a.sin()) + Vec3::new(5.0, -2.0, 1.0)
+            }).collect();
+            if reverse {
+                pts.reverse();
+            }
+            let (c, u, v, big, small) = row_axes(&pts);
+            assert!(c.distance(Vec3::new(5.0, -2.0, 1.0)) < 1e-3, "centroid {c:?}");
+            assert!((big / small - 3.0).abs() < 0.05, "aspect {}", big / small);
+            assert!(u.dot(tilt * Vec3::X).abs() > 0.999, "long axis {u:?}");
+            assert!(v.dot(tilt * Vec3::Z).abs() > 0.999, "short axis {v:?}");
+            let k = corner_start(&pts, c, u, v, big, small);
+            let n = pts.len();
+            let (x0, x1) = ((pts[k] - c).dot(u).abs(), (pts[(k + n / 4) % n] - c).dot(u).abs());
+            let (y0, y1) = ((pts[k] - c).dot(v).abs(), (pts[(k + n / 4) % n] - c).dot(v).abs());
+            assert!((x0 - x1).abs() < 0.05 && (y0 - y1).abs() < 0.05, "a quarter of the row from the corner is the next corner: {x0} {x1} {y0} {y1}");
+            let mid = pts[(k + n / 8) % n] - c;
+            assert!(mid.dot(u).abs() < 0.2 && mid.dot(v).abs() > 0.9, "the first side runs along the long axis: {mid:?}");
+        }
+    }
+
     /// Each vertex's valence in the band with the edge it has into the row before or after
     /// (one per row point) counted in, and a check that the band is a manifold strip of
     /// quads: row edges used once, inner edges twice, four distinct corners, no corner
@@ -2721,5 +3651,213 @@ mod reduce_tests {
         let mut p2 = Vec::new();
         let (a, b) = (circle(28, 0.0, &mut p2), circle(26, 1.0, &mut p2));
         assert!(!reduce_sym(&a, &b, &[], plane, &mut p2, &mut Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod hard_tests {
+    use super::*;
+    use crate::mesh::SculptMesh;
+
+    /// A small figure: a trunk of radius 0.6 from y = 2 (round top) down to the crotch at
+    /// y = 0, two legs of radius 0.28 round x = ±0.32 down to y = −2 with round ends. Rows
+    /// 0.1 apart, 36 points round the trunk, 21 round each leg (the trunk's half plus two
+    /// crotch points shared by both legs). Its own mirror image in X.
+    fn figure() -> SculptMesh {
+        let (m, rt, rl, cx) = (36usize, 0.6f32, 0.28f32, 0.32f32);
+        let n = m / 2 + 3;
+        let mut p: Vec<Vec3> = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+        let snap = |x: f32| if x.abs() < 1e-6 { 0.0 } else { x };
+        let add = |p: &mut Vec<Vec3>, q: Vec3| -> u32 {
+            p.push(Vec3::new(snap(q.x), q.y, snap(q.z)));
+            (p.len() - 1) as u32
+        };
+        // A band of quads between rows `a` (above) and `b` (below), the same count, the
+        // diagonals alternating (one way throughout, the smoothing of the part function
+        // would skew round the trunk).
+        let band = |idx: &mut Vec<u32>, a: &[u32], b: &[u32], row: usize| {
+            let k = a.len();
+            for s in 0..k {
+                let (a0, a1, b0, b1) = (a[s], a[(s + 1) % k], b[s], b[(s + 1) % k]);
+                if (s + row) % 2 == 0 {
+                    idx.extend([a0, b0, b1, a0, b1, a1]);
+                } else {
+                    idx.extend([a0, b0, a1, a1, b0, b1]);
+                }
+            }
+        };
+        let trunk_ring = |p: &mut Vec<Vec3>, r: f32, y: f32| -> Vec<u32> {
+            (0..m).map(|s| {
+                let a = std::f32::consts::TAU * s as f32 / m as f32;
+                add(p, Vec3::new(r * a.sin(), y, r * a.cos()))
+            }).collect()
+        };
+        // The round top: a pole, then rings down to the trunk's first.
+        let top = add(&mut p, Vec3::new(0.0, 2.0 + rt, 0.0));
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for k in (0..5).rev() {
+            let th = k as f32 / 5.0 * std::f32::consts::FRAC_PI_2;
+            rows.push(trunk_ring(&mut p, rt * th.cos(), 2.0 + rt * th.sin()));
+        }
+        for s in 0..m {
+            idx.extend([top, rows[0][s], rows[0][(s + 1) % m]]);
+        }
+        for i in 1..=20 {
+            rows.push(trunk_ring(&mut p, rt, 2.0 - 0.1 * i as f32));
+        }
+        for (i, w) in rows.windows(2).enumerate() {
+            band(&mut idx, &w[0], &w[1], i);
+        }
+        let split = rows.last().unwrap().clone();
+        let c_front = add(&mut p, Vec3::new(0.0, -0.03, 0.1));
+        let c_back = add(&mut p, Vec3::new(0.0, -0.03, -0.1));
+        // Each leg: its first ring is the trunk's half with the crotch points; the rings
+        // below keep its points' angles round the leg, eased to even spacing over six rows.
+        for right in [true, false] {
+            let sign = if right { 1.0 } else { -1.0 };
+            let first: Vec<u32> = if right {
+                (0..=m / 2).map(|s| split[s]).chain([c_back, c_front]).collect()
+            } else {
+                (m / 2..=m).map(|s| split[s % m]).chain([c_front, c_back]).collect()
+            };
+            let centre = Vec3::new(sign * cx, 0.0, 0.0);
+            // Angles round the leg's centre, unwrapped to increase from the first point.
+            let mut ang: Vec<f32> = first.iter().map(|&v| { let d = p[v as usize] - centre; (sign * d.x).atan2(sign * d.z) }).collect();
+            for j in 1..n {
+                while ang[j] < ang[j - 1] {
+                    ang[j] += std::f32::consts::TAU;
+                }
+            }
+            let at = |j: usize, i: usize, y: f32| -> Vec3 {
+                let even = ang[0] + std::f32::consts::TAU * j as f32 / n as f32;
+                let b = ang[j] + (even - ang[j]) * (i as f32 / 6.0).min(1.0);
+                centre + Vec3::new(sign * rl * b.sin(), y, sign * rl * b.cos())
+            };
+            let mut lrows: Vec<Vec<u32>> = vec![first];
+            for i in 1..=20 {
+                lrows.push((0..n).map(|j| add(&mut p, at(j, i, -0.1 * i as f32))).collect());
+            }
+            for k in 1..5 {
+                let th = k as f32 / 5.0 * std::f32::consts::FRAC_PI_2;
+                lrows.push((0..n).map(|j| {
+                    let q = at(j, 20, -2.0 - rl * th.sin());
+                    add(&mut p, centre + (q - centre - Vec3::new(0.0, q.y, 0.0)) * th.cos() + Vec3::new(0.0, q.y, 0.0))
+                }).collect());
+            }
+            for (i, w) in lrows.windows(2).enumerate() {
+                band(&mut idx, &w[0], &w[1], i);
+            }
+            let pole = add(&mut p, centre + Vec3::new(0.0, -2.0 - rl, 0.0));
+            let last = lrows.last().unwrap();
+            for j in 0..n {
+                idx.extend([last[j], pole, last[(j + 1) % n]]);
+            }
+        }
+        SculptMesh::from_raw(p, idx)
+    }
+
+    /// Whether an edge of the figure is hard: on one of the creased rings (the trunk at
+    /// y = 1 and at the crotch y = 0; the right leg at y = −1, both legs when `both`), or on
+    /// the outline of a plate on the back of the trunk (three rows by four columns of its
+    /// grid, between y = 1.3 and 1.6 and 160° and 200° round).
+    fn is_hard(a: Vec3, b: Vec3, both: bool) -> bool {
+        let on = |q: Vec3, y: f32| (q.y - y).abs() < 1e-4;
+        let ring = |y: f32| on(a, y) && on(b, y);
+        let leg = ring(-1.0) && (both || (a.x > 0.02 && b.x > 0.02));
+        let angle = |q: Vec3| q.x.atan2(q.z).to_degrees().rem_euclid(360.0);
+        let in_plate = |q: Vec3| (1.3 - 1e-4..=1.6 + 1e-4).contains(&q.y) && (159.0..=201.0).contains(&angle(q));
+        let column = |d: f32| (angle(a) - d).abs() < 0.5 && (angle(b) - d).abs() < 0.5;
+        let plate = in_plate(a) && in_plate(b) && (ring(1.3) || ring(1.6) || column(160.0) || column(200.0));
+        ring(1.0) || ring(0.0) || leg || plate
+    }
+
+    /// The output points on the ring at `y` (and on the side `side` of x, if any) form one
+    /// closed loop of the output's edges: at least eight points, each with two edges to the
+    /// others.
+    fn ring_row(p: &[Vec3], quads: &[[u32; 4]], y: f32, side: Option<f32>) -> usize {
+        let on: Vec<bool> = p.iter().map(|q| (q.y - y).abs() < 1e-4 && side.is_none_or(|s| q.x * s > 0.02)).collect();
+        let count = on.iter().filter(|&&b| b).count();
+        let mut deg = vec![0usize; p.len()];
+        let mut edges: HashSet<(u32, u32)> = HashSet::default();
+        for q in quads {
+            for k in 0..4 {
+                let (a, b) = (q[k], q[(k + 1) % 4]);
+                if a != b && on[a as usize] && on[b as usize] && edges.insert((a.min(b), a.max(b))) {
+                    deg[a as usize] += 1;
+                    deg[b as usize] += 1;
+                }
+            }
+        }
+        assert!(count >= 8, "{count} points on the ring at y = {y}");
+        assert_eq!(edges.len(), count, "the points on the ring at y = {y} are not one loop");
+        assert!((0..p.len()).all(|v| !on[v] || deg[v] == 2), "a point on the ring at y = {y} has not two ring edges");
+        count
+    }
+
+    #[test]
+    fn creased_rings_of_a_figure_become_its_rows() {
+        let m = figure();
+        let quad = 0.2;
+        let hard = |a: Vec3, b: Vec3, _: u16, _: u16| is_hard(a, b, false);
+        let w = Work::new(&m, &hard, None).unwrap();
+        let src = (0..w.p.len() as u32).max_by(|&a, &b| w.p[a as usize].y.total_cmp(&w.p[b as usize].y)).unwrap();
+        let phi = part_distance(&w, src);
+        let bf = BodyFeatures::new(&w, &phi, body_step(quad), Vec::new(), false);
+        let kinds: Vec<LoopKind> = bf.loops.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Transverse).count(), 3, "{kinds:?}");
+        let plates: Vec<&HardLoop> = bf.loops.iter().filter(|l| l.kind == LoopKind::Plate).collect();
+        assert_eq!(plates.len(), 1, "{kinds:?}");
+        assert_eq!(plates[0].inside.len(), 24, "the plate's inside is three rows of four quads");
+        assert!(bf.lines.is_empty());
+        // Without the features the figure builds, and no row happens to lie on a crease.
+        let (p0, q0) = sweep_body(&w, &phi, quad, src, None, &BodyFeatures::default()).unwrap();
+        assert!(q0.len() > 300);
+        let stray = p0.iter().filter(|q| (q.y - 1.0).abs() < 1e-4).count();
+        assert!(stray < 4, "{stray} points on y = 1 by chance");
+        // With them every creased ring is a row of the output, the crotch one included (its
+        // ring borders the piece where the trunk splits).
+        let (p, q) = sweep_body(&w, &phi, quad, src, None, &bf).unwrap();
+        assert!(q.len() > 300);
+        let trunk = ring_row(&p, &q, 1.0, None);
+        let crotch = ring_row(&p, &q, 0.0, None);
+        let leg = ring_row(&p, &q, -1.0, Some(1.0));
+        eprintln!("rows of {trunk}, {crotch} and {leg} points on the creases; {} quads", q.len());
+        assert!(trunk >= 12 && crotch >= 12 && leg >= 8);
+        // The left leg has no crease: no row on it at y = −1.
+        assert!(p.iter().filter(|q| (q.y + 1.0).abs() < 1e-4 && q.x < -0.02).count() < 4);
+    }
+
+    #[test]
+    fn creased_rings_of_a_mirrored_figure_become_mirrored_rows() {
+        let m = figure();
+        let quad = 0.2;
+        let pl = MirrorPlane { axis: Axis::X, at: 0.0 };
+        let ms = mirrored_mesh(&m, pl);
+        let hard = |a: Vec3, b: Vec3, _: u16, _: u16| is_hard(a, b, true);
+        let w = Work::new(&ms, &hard, None).unwrap();
+        let top = m.positions.iter().copied().max_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
+        let src = (0..w.p.len() as u32).filter(|&v| pl.distance(w.p[v as usize]) == 0.0 && !w.neighbours(v).is_empty()).min_by(|&a, &b| w.p[a as usize].distance(top).total_cmp(&w.p[b as usize].distance(top))).unwrap();
+        let phi = part_distance(&w, src);
+        let bf = BodyFeatures::new(&w, &phi, body_step(quad), Vec::new(), false);
+        let kinds: Vec<LoopKind> = bf.loops.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Transverse).count(), 4, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Plate).count(), 1, "{kinds:?}");
+        let (p, q) = sweep_body(&w, &phi, quad, src, Some(pl), &bf).unwrap();
+        assert!(q.len() > 300);
+        ring_row(&p, &q, 1.0, None);
+        ring_row(&p, &q, 0.0, None);
+        let right = ring_row(&p, &q, -1.0, Some(1.0));
+        let left = ring_row(&p, &q, -1.0, Some(-1.0));
+        assert_eq!(right, left);
+        // Its own mirror image: every point has its reflection among the points.
+        let mut lonely = 0;
+        for &a in &p {
+            let want = pl.reflect(a);
+            if !p.iter().any(|&b| b.distance(want) < 1e-5) {
+                lonely += 1;
+            }
+        }
+        assert_eq!(lonely, 0, "{lonely} of {} points without a mirror image", p.len());
     }
 }
