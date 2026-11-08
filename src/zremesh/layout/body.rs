@@ -213,6 +213,10 @@ impl BodyFeatures {
             // Transverse: one side (nearly) all lower, the other (nearly) all higher.
             let mostly = |a: usize, b: usize| a * 5 >= (a + b) * 4;
             let across = separates && (mostly(lower[0], higher[0]) && mostly(higher[1], lower[1]) || mostly(higher[0], lower[0]) && mostly(lower[1], higher[1]));
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                let c = verts.iter().map(|&v| w.p[v as usize]).sum::<Vec3>() / n as f32;
+                eprintln!("    hard loop near {c:.3}: {n} vertices, {:.2} steps of the part function, {} sides, lower/higher {:?}", (hi - lo) / step, sides.len(), lower.iter().zip(&higher).collect::<Vec<_>>());
+            }
             if across && lo.is_finite() && hi - lo < 1.5 * step {
                 out.loops.push(HardLoop { verts, kind: LoopKind::Transverse, inside: Vec::new() });
             } else {
@@ -932,8 +936,40 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             }
             found
         };
-        // The creases to place: (ring, level in steps, points, lower vertices, higher
-        // vertices, where from).
+        // A vertex of a crease point in `piece`: itself when it is there, else a neighbour
+        // within three steps, else the vertex of the ring's `old` slice nearest it.
+        let pick = |v: u32, piece: u32, ring: &Ring, old: &[u32]| -> u32 {
+            if comp[v as usize] == piece {
+                return v;
+            }
+            let mut seen = vec![v];
+            let mut frontier = vec![v];
+            for _ in 0..3 {
+                let mut next = Vec::new();
+                for &x in &frontier {
+                    for &u in w.neighbours(x) {
+                        if comp[u as usize] == piece {
+                            return u;
+                        }
+                        if !seen.contains(&u) {
+                            seen.push(u);
+                            next.push(u);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+            let q = w.p[v as usize];
+            (0..old.len()).min_by(|&a, &b| ring.pts[a].distance(q).total_cmp(&ring.pts[b].distance(q))).map_or(v, |i| old[i])
+        };
+        // Each crease point's vertex in the ring's nearer piece and in its farther piece,
+        // from the vertices `vs` the crease was cut on (a level set between two rings has
+        // both its vertices in one band: the ring's split or join needs them in its pieces).
+        let pick_sides = |vs: &[u32], ring: &Ring| -> (Vec<u32>, Vec<u32>) {
+            (vs.iter().map(|&v| pick(v, ring.from, ring, &ring.near)).collect(), vs.iter().map(|&v| pick(v, ring.to, ring, &ring.far)).collect())
+        };
+        // The creases to place: (ring, level in steps, points, vertices in the nearer
+        // piece, vertices in the farther piece, where from).
         let mut creases: Vec<(usize, f32, Vec<Vec3>, Vec<u32>, Vec<u32>, &str)> = Vec::new();
         for lp in feats.loops.iter().filter(|l| l.kind == LoopKind::Transverse) {
             let verts = &lp.verts;
@@ -980,35 +1016,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             if sense < 0.0 {
                 order.reverse();
             }
-            // Each point's vertex in the nearer piece and in the farther: itself when it is
-            // there, else a neighbour within three steps, else the old ring's nearest.
-            let (from, to) = (rings[r].from, rings[r].to);
-            let pick = |v: u32, piece: u32, old: &[u32]| -> u32 {
-                if comp[v as usize] == piece {
-                    return v;
-                }
-                let mut seen = vec![v];
-                let mut frontier = vec![v];
-                for _ in 0..3 {
-                    let mut next = Vec::new();
-                    for &x in &frontier {
-                        for &u in w.neighbours(x) {
-                            if comp[u as usize] == piece {
-                                return u;
-                            }
-                            if !seen.contains(&u) {
-                                seen.push(u);
-                                next.push(u);
-                            }
-                        }
-                    }
-                    frontier = next;
-                }
-                let q = w.p[v as usize];
-                (0..old.len()).min_by(|&a, &b| rp[a].distance(q).total_cmp(&rp[b].distance(q))).map_or(v, |i| old[i])
-            };
-            let near: Vec<u32> = order.iter().map(|&v| pick(v, from, &rings[r].near)).collect();
-            let far: Vec<u32> = order.iter().map(|&v| pick(v, to, &rings[r].far)).collect();
+            let (near, far) = pick_sides(&order, &rings[r]);
             let pts: Vec<Vec3> = order.iter().map(|&v| w.p[v as usize]).collect();
             creases.push((r, m, pts, near, far, "hard loop"));
         }
@@ -1082,14 +1090,18 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let bends: Vec<f32> = samples.iter().map(|s| s.1.as_ref().map_or(0.0, |l| bend(&l.1, &l.2))).collect();
                 let Some(best) = (0..bends.len()).filter(|&i| samples[i].1.is_some()).max_by(|&a, &b| bends[a].total_cmp(&bends[b]).then(b.cmp(&a))) else { continue };
                 // A crease: the fold peaks over the bar and is well above the link's quietest
-                // level set (a tube bent all along is not a crease).
-                let quiet = bends.iter().copied().fold(f32::INFINITY, f32::min);
+                // level set (a tube bent all along is not a crease). Levels with no single
+                // loop have no fold measured and do not count.
+                let quiet = (0..bends.len()).filter(|&i| samples[i].1.is_some()).map(|i| bends[i]).fold(f32::INFINITY, f32::min);
                 if bends[best] < fold_min || bends[best] < quiet + 15.0 {
                     continue;
                 }
                 let (t, lp) = (samples[best].0, samples[best].1.clone().unwrap());
                 found.push((r, t, bends[best]));
-                creases.push((r, t, lp.0, lp.1, lp.2, "fold"));
+                // Its lower vertices into the ring's nearer piece, its higher into the farther.
+                let near: Vec<u32> = lp.1.iter().map(|&v| pick(v, rings[r].from, &rings[r], &rings[r].near)).collect();
+                let far: Vec<u32> = lp.2.iter().map(|&v| pick(v, rings[r].to, &rings[r], &rings[r].far)).collect();
+                creases.push((r, t, lp.0, near, far, "fold"));
             }
             if debug {
                 let mut at: Vec<(f32, f32, Vec3)> = found.iter().map(|f| ((f.1 * 10.0).round() / 10.0, f.2.round(), rings[f.0].pts.iter().copied().sum::<Vec3>() / rings[f.0].pts.len() as f32)).collect();
@@ -1540,7 +1552,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // The points that may move: not the two on the plane of a pinned row; its first half
         // moves and the other half mirrors it.
         let free: Vec<usize> = if is_pinned { (1..n / 2).collect() } else { (0..n).collect() };
-        if rings[r].hard && !feats.corners.is_empty() {
+        if hard_rows && rings[r].hard && !feats.corners.is_empty() {
             for &c in &feats.corners {
                 if let Some(i) = free.iter().copied().filter(|&i| row[i].distance(c) < quad * 0.5).min_by(|&a, &b| row[a].distance(c).total_cmp(&row[b].distance(c))) {
                     row[i] = c;
@@ -3113,5 +3125,213 @@ mod reduce_tests {
         let mut p2 = Vec::new();
         let (a, b) = (circle(28, 0.0, &mut p2), circle(26, 1.0, &mut p2));
         assert!(!reduce_sym(&a, &b, &[], plane, &mut p2, &mut Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod hard_tests {
+    use super::*;
+    use crate::mesh::SculptMesh;
+
+    /// A small figure: a trunk of radius 0.6 from y = 2 (round top) down to the crotch at
+    /// y = 0, two legs of radius 0.28 round x = ±0.32 down to y = −2 with round ends. Rows
+    /// 0.1 apart, 36 points round the trunk, 21 round each leg (the trunk's half plus two
+    /// crotch points shared by both legs). Its own mirror image in X.
+    fn figure() -> SculptMesh {
+        let (m, rt, rl, cx) = (36usize, 0.6f32, 0.28f32, 0.32f32);
+        let n = m / 2 + 3;
+        let mut p: Vec<Vec3> = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+        let snap = |x: f32| if x.abs() < 1e-6 { 0.0 } else { x };
+        let add = |p: &mut Vec<Vec3>, q: Vec3| -> u32 {
+            p.push(Vec3::new(snap(q.x), q.y, snap(q.z)));
+            (p.len() - 1) as u32
+        };
+        // A band of quads between rows `a` (above) and `b` (below), the same count, the
+        // diagonals alternating (one way throughout, the smoothing of the part function
+        // would skew round the trunk).
+        let band = |idx: &mut Vec<u32>, a: &[u32], b: &[u32], row: usize| {
+            let k = a.len();
+            for s in 0..k {
+                let (a0, a1, b0, b1) = (a[s], a[(s + 1) % k], b[s], b[(s + 1) % k]);
+                if (s + row) % 2 == 0 {
+                    idx.extend([a0, b0, b1, a0, b1, a1]);
+                } else {
+                    idx.extend([a0, b0, a1, a1, b0, b1]);
+                }
+            }
+        };
+        let trunk_ring = |p: &mut Vec<Vec3>, r: f32, y: f32| -> Vec<u32> {
+            (0..m).map(|s| {
+                let a = std::f32::consts::TAU * s as f32 / m as f32;
+                add(p, Vec3::new(r * a.sin(), y, r * a.cos()))
+            }).collect()
+        };
+        // The round top: a pole, then rings down to the trunk's first.
+        let top = add(&mut p, Vec3::new(0.0, 2.0 + rt, 0.0));
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for k in (0..5).rev() {
+            let th = k as f32 / 5.0 * std::f32::consts::FRAC_PI_2;
+            rows.push(trunk_ring(&mut p, rt * th.cos(), 2.0 + rt * th.sin()));
+        }
+        for s in 0..m {
+            idx.extend([top, rows[0][s], rows[0][(s + 1) % m]]);
+        }
+        for i in 1..=20 {
+            rows.push(trunk_ring(&mut p, rt, 2.0 - 0.1 * i as f32));
+        }
+        for (i, w) in rows.windows(2).enumerate() {
+            band(&mut idx, &w[0], &w[1], i);
+        }
+        let split = rows.last().unwrap().clone();
+        let c_front = add(&mut p, Vec3::new(0.0, -0.03, 0.1));
+        let c_back = add(&mut p, Vec3::new(0.0, -0.03, -0.1));
+        // Each leg: its first ring is the trunk's half with the crotch points; the rings
+        // below keep its points' angles round the leg, eased to even spacing over six rows.
+        for right in [true, false] {
+            let sign = if right { 1.0 } else { -1.0 };
+            let first: Vec<u32> = if right {
+                (0..=m / 2).map(|s| split[s]).chain([c_back, c_front]).collect()
+            } else {
+                (m / 2..=m).map(|s| split[s % m]).chain([c_front, c_back]).collect()
+            };
+            let centre = Vec3::new(sign * cx, 0.0, 0.0);
+            // Angles round the leg's centre, unwrapped to increase from the first point.
+            let mut ang: Vec<f32> = first.iter().map(|&v| { let d = p[v as usize] - centre; (sign * d.x).atan2(sign * d.z) }).collect();
+            for j in 1..n {
+                while ang[j] < ang[j - 1] {
+                    ang[j] += std::f32::consts::TAU;
+                }
+            }
+            let at = |j: usize, i: usize, y: f32| -> Vec3 {
+                let even = ang[0] + std::f32::consts::TAU * j as f32 / n as f32;
+                let b = ang[j] + (even - ang[j]) * (i as f32 / 6.0).min(1.0);
+                centre + Vec3::new(sign * rl * b.sin(), y, sign * rl * b.cos())
+            };
+            let mut lrows: Vec<Vec<u32>> = vec![first];
+            for i in 1..=20 {
+                lrows.push((0..n).map(|j| add(&mut p, at(j, i, -0.1 * i as f32))).collect());
+            }
+            for k in 1..5 {
+                let th = k as f32 / 5.0 * std::f32::consts::FRAC_PI_2;
+                lrows.push((0..n).map(|j| {
+                    let q = at(j, 20, -2.0 - rl * th.sin());
+                    add(&mut p, centre + (q - centre - Vec3::new(0.0, q.y, 0.0)) * th.cos() + Vec3::new(0.0, q.y, 0.0))
+                }).collect());
+            }
+            for (i, w) in lrows.windows(2).enumerate() {
+                band(&mut idx, &w[0], &w[1], i);
+            }
+            let pole = add(&mut p, centre + Vec3::new(0.0, -2.0 - rl, 0.0));
+            let last = lrows.last().unwrap();
+            for j in 0..n {
+                idx.extend([last[j], pole, last[(j + 1) % n]]);
+            }
+        }
+        SculptMesh::from_raw(p, idx)
+    }
+
+    /// Whether an edge of the figure is hard: on one of the creased rings (the trunk at
+    /// y = 1 and at the crotch y = 0; the right leg at y = −1, both legs when `both`), or on
+    /// the outline of a plate on the back of the trunk (three rows by four columns of its
+    /// grid, between y = 1.3 and 1.6 and 160° and 200° round).
+    fn is_hard(a: Vec3, b: Vec3, both: bool) -> bool {
+        let on = |q: Vec3, y: f32| (q.y - y).abs() < 1e-4;
+        let ring = |y: f32| on(a, y) && on(b, y);
+        let leg = ring(-1.0) && (both || (a.x > 0.02 && b.x > 0.02));
+        let angle = |q: Vec3| q.x.atan2(q.z).to_degrees().rem_euclid(360.0);
+        let in_plate = |q: Vec3| (1.3 - 1e-4..=1.6 + 1e-4).contains(&q.y) && (159.0..=201.0).contains(&angle(q));
+        let column = |d: f32| (angle(a) - d).abs() < 0.5 && (angle(b) - d).abs() < 0.5;
+        let plate = in_plate(a) && in_plate(b) && (ring(1.3) || ring(1.6) || column(160.0) || column(200.0));
+        ring(1.0) || ring(0.0) || leg || plate
+    }
+
+    /// The output points on the ring at `y` (and on the side `side` of x, if any) form one
+    /// closed loop of the output's edges: at least eight points, each with two edges to the
+    /// others.
+    fn ring_row(p: &[Vec3], quads: &[[u32; 4]], y: f32, side: Option<f32>) -> usize {
+        let on: Vec<bool> = p.iter().map(|q| (q.y - y).abs() < 1e-4 && side.is_none_or(|s| q.x * s > 0.02)).collect();
+        let count = on.iter().filter(|&&b| b).count();
+        let mut deg = vec![0usize; p.len()];
+        let mut edges: HashSet<(u32, u32)> = HashSet::default();
+        for q in quads {
+            for k in 0..4 {
+                let (a, b) = (q[k], q[(k + 1) % 4]);
+                if a != b && on[a as usize] && on[b as usize] && edges.insert((a.min(b), a.max(b))) {
+                    deg[a as usize] += 1;
+                    deg[b as usize] += 1;
+                }
+            }
+        }
+        assert!(count >= 8, "{count} points on the ring at y = {y}");
+        assert_eq!(edges.len(), count, "the points on the ring at y = {y} are not one loop");
+        assert!((0..p.len()).all(|v| !on[v] || deg[v] == 2), "a point on the ring at y = {y} has not two ring edges");
+        count
+    }
+
+    #[test]
+    fn creased_rings_of_a_figure_become_its_rows() {
+        let m = figure();
+        let quad = 0.2;
+        let hard = |a: Vec3, b: Vec3, _: u16, _: u16| is_hard(a, b, false);
+        let w = Work::new(&m, &hard, None).unwrap();
+        let src = (0..w.p.len() as u32).max_by(|&a, &b| w.p[a as usize].y.total_cmp(&w.p[b as usize].y)).unwrap();
+        let phi = part_distance(&w, src);
+        let bf = BodyFeatures::new(&w, &phi, body_step(quad), Vec::new(), false);
+        let kinds: Vec<LoopKind> = bf.loops.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Transverse).count(), 3, "{kinds:?}");
+        let plates: Vec<&HardLoop> = bf.loops.iter().filter(|l| l.kind == LoopKind::Plate).collect();
+        assert_eq!(plates.len(), 1, "{kinds:?}");
+        assert_eq!(plates[0].inside.len(), 24, "the plate's inside is three rows of four quads");
+        assert!(bf.lines.is_empty());
+        // Without the features the figure builds, and no row happens to lie on a crease.
+        let (p0, q0) = sweep_body(&w, &phi, quad, src, None, &BodyFeatures::default()).unwrap();
+        assert!(q0.len() > 300);
+        let stray = p0.iter().filter(|q| (q.y - 1.0).abs() < 1e-4).count();
+        assert!(stray < 4, "{stray} points on y = 1 by chance");
+        // With them every creased ring is a row of the output, the crotch one included (its
+        // ring borders the piece where the trunk splits).
+        let (p, q) = sweep_body(&w, &phi, quad, src, None, &bf).unwrap();
+        assert!(q.len() > 300);
+        let trunk = ring_row(&p, &q, 1.0, None);
+        let crotch = ring_row(&p, &q, 0.0, None);
+        let leg = ring_row(&p, &q, -1.0, Some(1.0));
+        eprintln!("rows of {trunk}, {crotch} and {leg} points on the creases; {} quads", q.len());
+        assert!(trunk >= 12 && crotch >= 12 && leg >= 8);
+        // The left leg has no crease: no row on it at y = −1.
+        assert!(p.iter().filter(|q| (q.y + 1.0).abs() < 1e-4 && q.x < -0.02).count() < 4);
+    }
+
+    #[test]
+    fn creased_rings_of_a_mirrored_figure_become_mirrored_rows() {
+        let m = figure();
+        let quad = 0.2;
+        let pl = MirrorPlane { axis: Axis::X, at: 0.0 };
+        let ms = mirrored_mesh(&m, pl);
+        let hard = |a: Vec3, b: Vec3, _: u16, _: u16| is_hard(a, b, true);
+        let w = Work::new(&ms, &hard, None).unwrap();
+        let top = m.positions.iter().copied().max_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
+        let src = (0..w.p.len() as u32).filter(|&v| pl.distance(w.p[v as usize]) == 0.0 && !w.neighbours(v).is_empty()).min_by(|&a, &b| w.p[a as usize].distance(top).total_cmp(&w.p[b as usize].distance(top))).unwrap();
+        let phi = part_distance(&w, src);
+        let bf = BodyFeatures::new(&w, &phi, body_step(quad), Vec::new(), false);
+        let kinds: Vec<LoopKind> = bf.loops.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Transverse).count(), 4, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|&&k| k == LoopKind::Plate).count(), 1, "{kinds:?}");
+        let (p, q) = sweep_body(&w, &phi, quad, src, Some(pl), &bf).unwrap();
+        assert!(q.len() > 300);
+        ring_row(&p, &q, 1.0, None);
+        ring_row(&p, &q, 0.0, None);
+        let right = ring_row(&p, &q, -1.0, Some(1.0));
+        let left = ring_row(&p, &q, -1.0, Some(-1.0));
+        assert_eq!(right, left);
+        // Its own mirror image: every point has its reflection among the points.
+        let mut lonely = 0;
+        for &a in &p {
+            let want = pl.reflect(a);
+            if !p.iter().any(|&b| b.distance(want) < 1e-5) {
+                lonely += 1;
+            }
+        }
+        assert_eq!(lonely, 0, "{lonely} of {} points without a mirror image", p.len());
     }
 }
