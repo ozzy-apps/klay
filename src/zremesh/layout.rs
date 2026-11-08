@@ -6008,7 +6008,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                                     lap("mirrored mesh");
                                     let g = part_distance(&ws, ssrc);
                                     lap("its part distance");
-                                    let r = body::sweep_body(&ws, &g, quad, ssrc, Some(pl));
+                                    // The hard edges (edge lines, polygroup borders) sorted for
+                                    // the builder: loops round parts, plates, lines, corners.
+                                    let bf = body::BodyFeatures::new(&ws, &g, body::body_step(quad), features.corners.iter().copied().chain(features.loop_corner_points()).collect(), s.detect_edges);
+                                    let r = body::sweep_body(&ws, &g, quad, ssrc, Some(pl), &bf);
                                     lap("body built");
                                     r
                                 }
@@ -6016,9 +6019,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                             }
                         }
                         None => {
-                        part_phi = part_distance(&w, src);
-                        body::sweep_body(&w, &part_phi, quad, src, None)
-                    }
+                            part_phi = part_distance(&w, src);
+                            let bf = body::BodyFeatures::new(&w, &part_phi, body::body_step(quad), features.corners.iter().copied().chain(features.loop_corner_points()).collect(), s.detect_edges);
+                            body::sweep_body(&w, &part_phi, quad, src, None, &bf)
+                        }
                     };
                     match built {
                         Ok(r) => return Ok(r),
