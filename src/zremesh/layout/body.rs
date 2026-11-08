@@ -254,6 +254,8 @@ struct YokePlan {
     n_trunk: usize,
     n_arm: usize,
     dims: yoke::Yoke,
+    /// The trunk's own count, which it steps back to below the yoke.
+    base: usize,
 }
 
 fn even(g: f32) -> usize {
@@ -1375,6 +1377,11 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
     // The rings the trunk steps down from under a yoke: their bands' diamonds go at the sides.
     let yoke_steps: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
+    // Their rows keep the trunk's own spacing (`yoke_base` points round) at the front and the
+    // back and take the extra points at the sides, where those bands' diamonds remove them, so
+    // the chest's columns run down unbroken at their own width (`ZR_YOKEEVEN`: spaced evenly).
+    let yoke_base: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+    let side_weighted = std::env::var_os("ZR_YOKEEVEN").is_none();
     let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
     let ankle_diff: usize = std::env::var("ZR_ANKLEDIFF").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let plan = |rs: &[usize]| -> Vec<usize> {
@@ -1620,6 +1627,39 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let l1 = (b - f).rem_euclid(total);
                 let l2 = total - l1;
                 row = (0..half).map(|t| point_at(r, f + l1 * t as f32 / half as f32)).chain((0..half).map(|t| point_at(r, b + l2 * t as f32 / half as f32))).collect();
+                // A yoke trunk ring: the half from the front point to the back placed by a
+                // length weighted 1 over the front and back and more at the sides, so the
+                // front and back spacing is the trunk's own (`yoke_base` round).
+                if let Some(nb) = yoke_base.get().filter(|&nb| side_weighted && nb < n && yoke_steps.borrow().contains(&r)) {
+                    let k = 400usize;
+                    let arc: Vec<Vec3> = (0..=k).map(|t| point_at(r, f + l1 * t as f32 / k as f32)).collect();
+                    let dist: Vec<f32> = arc.iter().map(|&q| pl.distance(q).abs()).collect();
+                    let dmax = dist.iter().copied().fold(0.0f32, f32::max).max(1e-9);
+                    let side: Vec<f32> = dist.iter().map(|&d| {
+                        let t = ((d / dmax - 0.55) / 0.4).clamp(0.0, 1.0);
+                        t * t * (3.0 - 2.0 * t)
+                    }).collect();
+                    let seg = l1 / k as f32;
+                    let s_int: f32 = (0..k).map(|i| (side[i] + side[i + 1]) * 0.5 * seg).sum();
+                    let want = l1 * half as f32 / (nb / 2) as f32;
+                    if s_int > 1e-9 && want > l1 {
+                        let lambda = (want - l1) / s_int;
+                        let mut cum = vec![0.0f32; k + 1];
+                        for i in 0..k {
+                            cum[i + 1] = cum[i] + seg * (1.0 + lambda * (side[i] + side[i + 1]) * 0.5);
+                        }
+                        let total_w = cum[k];
+                        let mut j = 0usize;
+                        for t in 1..half {
+                            let target = total_w * t as f32 / half as f32;
+                            while j + 1 < k && cum[j + 1] < target {
+                                j += 1;
+                            }
+                            let u = ((target - cum[j]) / (cum[j + 1] - cum[j]).max(1e-12)).clamp(0.0, 1.0);
+                            row[t] = point_at(r, f + seg * (j as f32 + u));
+                        }
+                    }
+                }
                 row[0] = pl.project(row[0]);
                 row[half] = pl.project(row[half]);
                 for i in 1..half {
@@ -2034,7 +2074,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 if pinned(r, n) && pinned(trunk, n_y) {
                     if let Some(dims) = yoke::yoke_dims(n_y, n, n_arm, wd, dp) {
                         let cells = dims.a * dims.b - dims.neck.0 * dims.neck.1 - 2 * dims.arm.0 * dims.arm.1;
-                        let y = YokePlan { m, trunk, plus, minus, n_trunk: n_y, n_arm, dims };
+                        let y = YokePlan { m, trunk, plus, minus, n_trunk: n_y, n_arm, dims, base: n_trunk };
                         if cells as f64 >= target || plain {
                             if debug {
                                 eprintln!("  body: yoke ring {n_y} (trunk {n_trunk}): {cells} cells for {:.0} quads of surface", area / (quad as f64 * quad as f64));
@@ -2364,6 +2404,8 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 if row.len() != 2 * (a_n + b_n) {
                     return Err(format!("the neck row has {} points, the hole {}", row.len(), 2 * (a_n + b_n)));
                 }
+                yoke_base.set(Some(y.base));
+                yoke_steps.borrow_mut().insert(y.trunk);
                 let row_t = make_row(y.trunk, y.n_trunk, None, None, &mut out_p);
                 let centroid = |ids: &[u32], out_p: &[Vec3]| ids.iter().map(|&v| out_p[v as usize]).sum::<Vec3>() / ids.len().max(1) as f32;
                 let (c_neck, c_trunk) = (centroid(&row, &out_p), centroid(&row_t, &out_p));
@@ -2450,6 +2492,8 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 Err(e) => {
                     out_p.truncate(np0);
                     quads.truncate(nq0);
+                    yoke_steps.borrow_mut().clear();
+                    yoke_base.set(None);
                     if debug {
                         eprintln!("  body: yoke not built ({e}); the rings below instead");
                     }
