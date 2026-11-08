@@ -768,20 +768,34 @@ fn merge_doublets(quads: &mut Vec<[u32; 4]>) -> usize {
 }
 
 /// A model's triangles by grid cell, for the nearest point of its surface.
-struct TriGrid {
+pub(crate) struct TriGrid {
     cell: f32,
     cells: HashMap<(i32, i32, i32), Vec<u32>>,
 }
 
 impl TriGrid {
     fn new(mesh: &SculptMesh, cell: f32) -> Self {
+        let tri = |t: usize| {
+            if !mesh.hidden.is_empty() && mesh.hidden[t] != 0 {
+                return None;
+            }
+            let i = t * 3;
+            Some([mesh.positions[mesh.indices[i] as usize], mesh.positions[mesh.indices[i + 1] as usize], mesh.positions[mesh.indices[i + 2] as usize]])
+        };
+        Self::build(cell, mesh.indices.len() / 3, &tri)
+    }
+
+    /// Over plain triangles.
+    pub(crate) fn from_tris(p: &[Vec3], t: &[[u32; 3]], cell: f32) -> Self {
+        Self::build(cell, t.len(), &|i| Some([p[t[i][0] as usize], p[t[i][1] as usize], p[t[i][2] as usize]]))
+    }
+
+    fn build(cell: f32, n: usize, tri: &dyn Fn(usize) -> Option<[Vec3; 3]>) -> Self {
         let cell = cell.max(1e-6);
         let mut cells: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
-        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
-            if !mesh.hidden.is_empty() && mesh.hidden[t] != 0 {
-                continue;
-            }
-            let (lo, hi) = tri.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &v| (a.min(mesh.positions[v as usize]), b.max(mesh.positions[v as usize])));
+        for t in 0..n {
+            let Some(abc) = tri(t) else { continue };
+            let (lo, hi) = abc.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &v| (a.min(v), b.max(v)));
             let (c0, c1) = ((lo / cell).floor(), (hi / cell).floor());
             for x in c0.x as i32..=c1.x as i32 {
                 for y in c0.y as i32..=c1.y as i32 {
@@ -796,6 +810,18 @@ impl TriGrid {
 
     /// The nearest point of the surface within a few cells, and its triangle.
     fn closest(&self, mesh: &SculptMesh, p: Vec3) -> Option<(Vec3, u32)> {
+        self.search(p, &|t| {
+            let i = t as usize * 3;
+            [mesh.positions[mesh.indices[i] as usize], mesh.positions[mesh.indices[i + 1] as usize], mesh.positions[mesh.indices[i + 2] as usize]]
+        })
+    }
+
+    /// The same over the plain triangles the grid was built from.
+    pub(crate) fn closest_tris(&self, p: &[Vec3], t: &[[u32; 3]], q: Vec3) -> Option<(Vec3, u32)> {
+        self.search(q, &|i| [p[t[i as usize][0] as usize], p[t[i as usize][1] as usize], p[t[i as usize][2] as usize]])
+    }
+
+    fn search(&self, p: Vec3, tri: &dyn Fn(u32) -> [Vec3; 3]) -> Option<(Vec3, u32)> {
         let c = (p / self.cell).floor();
         let c = (c.x as i32, c.y as i32, c.z as i32);
         let mut best: Option<(f32, Vec3, u32)> = None;
@@ -807,8 +833,8 @@ impl TriGrid {
                             continue;
                         }
                         for &t in self.cells.get(&(c.0 + x, c.1 + y, c.2 + z)).into_iter().flatten() {
-                            let i = t as usize * 3;
-                            let q = crate::wedge::closest_on_triangle(p, mesh.positions[mesh.indices[i] as usize], mesh.positions[mesh.indices[i + 1] as usize], mesh.positions[mesh.indices[i + 2] as usize]);
+                            let [a, b, cc] = tri(t);
+                            let q = crate::wedge::closest_on_triangle(p, a, b, cc);
                             let d = q.distance_squared(p);
                             if best.is_none_or(|b| d < b.0) {
                                 best = Some((d, q, t));
