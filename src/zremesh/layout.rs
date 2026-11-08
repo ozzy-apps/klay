@@ -25,6 +25,7 @@ use glam::{Quat, Vec2};
 use std::collections::VecDeque;
 
 mod body;
+mod rect;
 type HashSet<T> = crate::fx::FxHashSet<T>;
 
 const NONE: u32 = u32::MAX;

@@ -619,34 +619,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         if sym && a % 2 == 1 && n >= 8 {
             a += 1;
         }
-        let b = n / 2 - a;
-        let shift = if sym && a % 2 == 0 { n - a / 2 } else { 0 };
-        let at = |k: usize| row[(k + shift) % n];
-        let mut ids = vec![vec![0u32; a + 1]; b + 1];
-        for i in 0..=a {
-            ids[0][i] = at(i);
-            ids[b][i] = at(2 * a + b - i);
-        }
-        for j in 0..=b {
-            ids[j][a] = at(a + j);
-            ids[j][0] = at((2 * a + 2 * b - j) % n);
-        }
-        let (c0, c1, c2, c3) = (out_p[ids[0][0] as usize], out_p[ids[0][a] as usize], out_p[ids[b][a] as usize], out_p[ids[b][0] as usize]);
-        for j in 1..b {
-            for i in 1..a {
-                let (u, v) = (i as f32 / a as f32, j as f32 / b as f32);
-                let (bot, top) = (out_p[ids[0][i] as usize], out_p[ids[b][i] as usize]);
-                let (lft, rgt) = (out_p[ids[j][0] as usize], out_p[ids[j][a] as usize]);
-                let q = bot * (1.0 - v) + top * v + lft * (1.0 - u) + rgt * u - (c0 * (1.0 - u) * (1.0 - v) + c1 * u * (1.0 - v) + c2 * u * v + c3 * (1.0 - u) * v);
-                out_p.push(q);
-                ids[j][i] = (out_p.len() - 1) as u32;
-            }
-        }
-        for j in 0..b {
-            for i in 0..a {
-                quads.push([ids[j][i], ids[j][i + 1], ids[j + 1][i + 1], ids[j + 1][i]]);
-            }
-        }
+        rect::cap_dims(row, a, sym, out_p, quads);
     };
     // A cap's inner points lifted toward the end beyond its row (a dome: all the way at its
     // middle, none at the row), so it reaches the tip of a finger, a toe or the head instead
@@ -1170,7 +1143,10 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // mirror image.
     orient(&mut quads, &out_p);
     if let (Some(pl), None) = (plane, std::env::var_os("ZR_NOBUMPS")) {
-        let made = bumps(&torso, &mut out_p, &mut quads, pl, quad, debug, &cap, 1.0, ("ZR_BUMP", 1.5, 0.4, 8.0, 0.6, 1.0));
+        // The working surface, for the inset's rings and grids to lie on.
+        let tg = crate::zremesh::TriGrid::from_tris(&w.p, &w.t, quad);
+        let surface = |q: Vec3| tg.closest_tris(&w.p, &w.t, q).map_or(q, |c| c.0);
+        let made = bumps(&torso, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface, 1.0, ("ZR_BUMP", 1.5, 0.4, 8.0, 0.6, 1.0));
         if debug {
             eprintln!("  body: {made} bumps capped");
         }
@@ -1180,7 +1156,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // Eyes (`ZR_NOEYES` off): the sockets, the deepest dips on the front of the head,
         // ringed the same way.
         if std::env::var_os("ZR_NOEYES").is_none() {
-            let eyes = bumps(&head, &mut out_p, &mut quads, pl, quad, debug, &cap, -1.0, ("ZR_EYE", 0.4, 0.5, 4.0, 0.5, 1.0));
+            let eyes = bumps(&head, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface, -1.0, ("ZR_EYE", 0.4, 0.5, 4.0, 0.5, 1.0));
             if debug {
                 eprintln!("  body: {eyes} eye sockets ringed");
             }
@@ -1189,7 +1165,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             }
         }
         // The mouth (`ZR_NOMOUTH` off): one ring across the centre line.
-        if std::env::var_os("ZR_NOMOUTH").is_none() && mouth(&lower_face, &mut out_p, &mut quads, pl, quad, debug, &cap) {
+        if std::env::var_os("ZR_NOMOUTH").is_none() && mouth(&lower_face, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface) {
             orient(&mut quads, &out_p);
         }
     }
@@ -1258,17 +1234,21 @@ fn orient(quads: &mut [[u32; 4]], p: &[Vec3]) {
     }
 }
 
-/// Bumps on the front of the torso (breasts), capped like spheres bridged into it. Each
-/// point's height over the result smoothed many times; the highest torso point on the front
-/// of the + side standing over `ZR_BUMP` (1.5) quads out is a bump's tip, the torso points
-/// round it over `ZR_BUMPFRAC` (0.4) of that its region. The quads within its reach (a disc)
-/// are cut out and the hole filled with rings in toward the tip and a grid; the other side
-/// the mirror image. Returns how many were capped.
+/// Bumps on the front of the torso (breasts), inset like a box modeller does it. Each point's
+/// height over the result smoothed many times; the highest torso point on the front of the +
+/// side standing over `ZR_BUMP` (1.5) quads out is a bump's tip, the torso points round it over
+/// `ZR_BUMPFRAC` (0.4) of that its region. A rectangle of the grid round the tip as wide as
+/// the region is cut out and filled with rings in toward the tip and a grid at the middle
+/// (four 5-poles at the rectangle's corners, four 3-poles at the grid's, the grid outside
+/// untouched); the other side the mirror image. Returns how many were made.
 /// `sign` −1 finds dips instead (eye sockets); `set` is the env prefix and defaults: (prefix,
 /// least height in quads, region fraction, most reach in quads, least forward normal, pairs).
+/// `ZR_DISC` cuts the disc of quads within reach instead and fills it with rings at the
+/// border's count then a third of it (the old way, for comparison).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, plane: MirrorPlane, quad: f32, debug: bool, cap: &dyn Fn(&[u32], bool, &mut Vec<Vec3>, &mut Vec<[u32; 4]>), sign: f32, set: (&str, f32, f32, f32, f32, f32)) -> usize {
+fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, plane: MirrorPlane, quad: f32, debug: bool, cap: &dyn Fn(&[u32], bool, &mut Vec<Vec3>, &mut Vec<[u32; 4]>), surface: &dyn Fn(Vec3) -> Vec3, sign: f32, set: (&str, f32, f32, f32, f32, f32)) -> usize {
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    let disc = std::env::var_os("ZR_DISC").is_some();
     let pre = set.0;
     let (min_h, frac, max_r) = (env(pre, set.1), env(&format!("{pre}FRAC"), set.2), env(&format!("{pre}MAXR"), set.3));
     let np = out_p.len();
@@ -1339,6 +1319,167 @@ fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>,
         used.extend(region.iter().copied());
         let c = pos0[tip];
         let mut r = (region.iter().map(|&v| pos0[v as usize].distance(c)).fold(0.0f32, f32::max) + quad * 0.5).min(quad * max_r);
+        if !disc {
+            // A rectangle of the grid over the region: its strips run across the body (along
+            // the plane's normal) through the tip's quad; it is one cell wider than the
+            // region each way (the cells measured at the tip: the face's are wider than a
+            // quad), shrunk a side at a time while none fits; of the places it can take
+            // round the tip, the one centred nearest the region's middle. It stays off the
+            // plane and its border on regular grid points; poles inside it are cut away.
+            let adj = rect::Adj::new(quads, out_p.len());
+            let mut along = Vec3::ZERO;
+            along[plane.axis as usize] = 1.0;
+            let Some((seed, u_edge)) = rect::seed_at(&adj, quads, out_p, tip as u32, along, &|q| plane.distance(q)) else {
+                if debug {
+                    eprintln!("    bump at {c:.3} ({hp:.1} quads out): its tip is not on a regular grid");
+                }
+                continue;
+            };
+            let (cu, cv) = rect::cell_sizes(quads, out_p, seed, u_edge);
+            let vdir = (pos0[u_edge.1 as usize] - pos0[u_edge.0 as usize]).normalize_or_zero();
+            let mut vs: Vec<u32> = region.iter().copied().collect();
+            vs.sort_unstable();
+            let mid = (vs.iter().fold(glam::DVec3::ZERO, |s, &v| s + pos0[v as usize].as_dvec3()) / vs.len().max(1) as f64).as_vec3();
+            let extent = |d: Vec3| vs.iter().map(|&v| pos0[v as usize].dot(d)).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+            let (ulo, uhi) = extent(along);
+            let (vlo, vhi) = extent(vdir);
+            let most = (2.0 * max_r) as usize;
+            let (mut a, mut b) = ((((uhi - ulo) / cu.max(1e-9)).ceil() as usize + 2).clamp(2, most), (((vhi - vlo) / cv.max(1e-9)).ceil() as usize + 2).clamp(2, most));
+            if debug {
+                eprintln!("    bump at {c:.3}: region of {} points, {:.1} x {:.1} cells of {:.2} x {:.2} quads, middle {mid:.3}: block {a} x {b}", vs.len(), (uhi - ulo) / cu, (vhi - vlo) / cv, cu / quad, cv / quad);
+            }
+            // (Its corners on regular points, so they become plain 5-poles; a merge on a side
+            // keeps the valence it had.)
+            let fits = |block: &[usize]| -> bool {
+                block.iter().all(|&f| quads[f].iter().all(|&v| (v as usize) < np && plane.distance(pos0[v as usize]) > quad * 0.3)) && rect::rect_border(quads, block).is_some_and(|(border, corners)| corners.iter().all(|&m| adj.regular(border[m])))
+            };
+            let mut found: Option<(Vec<usize>, usize, usize, usize, usize)> = None;
+            while a >= 2 && b >= 2 && found.is_none() {
+                let mut best: Option<(f32, Vec<usize>, usize, usize)> = None;
+                for (ia, ib) in rect::shifts(a, b, false) {
+                    if let Some(block) = rect::grid_rect(&adj, quads, seed, u_edge, a, b, ia, ib) {
+                        if fits(&block) {
+                            let centre = (block.iter().flat_map(|&f| quads[f]).fold(glam::DVec3::ZERO, |s, v| s + pos0[v as usize].as_dvec3()) / (4 * block.len()) as f64).as_vec3();
+                            let d = centre.distance(mid);
+                            if best.as_ref().is_none_or(|bst| d < bst.0) {
+                                best = Some((d, block, ia, ib));
+                            }
+                        }
+                    }
+                }
+                if let Some((_, block, ia, ib)) = best {
+                    found = Some((block, a, b, ia, ib));
+                } else if a >= b {
+                    a -= 1;
+                } else {
+                    b -= 1;
+                }
+            }
+            let Some((block, a, b, ia, ib)) = found else {
+                if debug {
+                    let round: Vec<(u32, bool)> = adj.quads_at(tip as u32).iter().flat_map(|&f| quads[f as usize].iter().map(|&v| (v, adj.regular(v)))).collect();
+                    eprintln!("    bump at {c:.3} ({hp:.1} quads out): no rectangle of the grid round it (seed {seed}, edge {u_edge:?}, points round the tip {round:?})");
+                }
+                continue;
+            };
+            // Its mirror image: each quad's centre reflected and looked up among the centres.
+            let cell = quad.max(1e-6);
+            let centre = |f: usize| quads[f].iter().map(|&v| out_p[v as usize]).sum::<Vec3>() * 0.25;
+            let key = |q: Vec3| { let k = (q / cell).floor(); (k.x as i32, k.y as i32, k.z as i32) };
+            let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::default();
+            for f in 0..quads.len() {
+                grid.entry(key(centre(f))).or_default().push(f);
+            }
+            let mut block2: Vec<usize> = Vec::with_capacity(block.len());
+            for &f in &block {
+                let m = plane.reflect(centre(f));
+                let k = key(m);
+                let mut best: Option<(f32, usize)> = None;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            for &g in grid.get(&(k.0 + dx, k.1 + dy, k.2 + dz)).into_iter().flatten() {
+                                let d = centre(g).distance(m);
+                                if best.is_none_or(|b| d < b.0 || (d == b.0 && g < b.1)) {
+                                    best = Some((d, g));
+                                }
+                            }
+                        }
+                    }
+                }
+                match best {
+                    Some((d, g)) if d <= quad * 0.3 => block2.push(g),
+                    _ => break,
+                }
+            }
+            let mut uniq = block2.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let on_grid = block2.len() == block.len() && uniq.len() == block.len() && block2.iter().all(|&f| quads[f].iter().all(|&v| (v as usize) < np));
+            let borders = if on_grid { rect::rect_border(quads, &block).zip(rect::rect_border(quads, &block2)) } else { None };
+            let Some(((border, corners), (border2, _))) = borders else {
+                if debug {
+                    eprintln!("    bump at {c:.3}: mirror block not on the grid");
+                }
+                continue;
+            };
+            // The mirror border turned and run to match point for point.
+            let nbd = border.len();
+            let img = |v: u32| plane.reflect(pos0[v as usize]);
+            let start = (0..nbd).min_by(|&x, &y| pos0[border2[x] as usize].distance(img(border[0])).total_cmp(&pos0[border2[y] as usize].distance(img(border[0])))).unwrap();
+            let fwd_ok = pos0[border2[(start + 1) % nbd] as usize].distance(img(border[1])) < pos0[border2[(start + nbd - 1) % nbd] as usize].distance(img(border[1]));
+            let b2: Vec<u32> = (0..nbd).map(|m| if fwd_ok { border2[(start + m) % nbd] } else { border2[(start + nbd - m) % nbd] }).collect();
+            if border2.len() != nbd || (0..nbd).any(|m| pos0[b2[m] as usize].distance(img(border[m])) > quad * 0.3) {
+                if debug {
+                    eprintln!("    bump at {c:.3}: mirror block not on the grid (its border does not line up)");
+                }
+                continue;
+            }
+            let block_verts: Vec<u32> = block.iter().flat_map(|&f| quads[f]).collect();
+            let mut gone: Vec<usize> = block.iter().chain(block2.iter()).copied().collect();
+            gone.sort_unstable();
+            for &f in gone.iter().rev() {
+                quads.swap_remove(f);
+            }
+            // Rings in toward the tip, a grid at the middle, lifted to the tip and put on the
+            // surface: the right side built, the left its mirror image quad for quad.
+            // (Toward the block's highest inner point: the tip itself unless the block had
+            // to slide off it.)
+            let peak = {
+                let mut best: Option<u32> = None;
+                for &v in &block_verts {
+                    if !border.contains(&v) && best.is_none_or(|b| h[v as usize] > h[b as usize] || (h[v as usize] == h[b as usize] && v < b)) {
+                        best = Some(v);
+                    }
+                }
+                pos0[best.map_or(tip, |v| v as usize)]
+            };
+            let k = ((a.min(b) as f32 / 2.0).round() as usize).clamp(1, 4);
+            let (p_start, q_start) = (out_p.len(), quads.len());
+            let rings = rect::inset_fill(&border, corners, k, 1.0, Some(peak), surface, out_p, quads);
+            let last = rings.last().cloned().unwrap_or_else(|| border.clone());
+            let from = out_p.len();
+            rect::cap_dims(&last, corners[1], false, out_p, quads);
+            rect::dome_cap(&last, from, Some(peak), surface, out_p);
+            if debug {
+                eprintln!("    bump at {c:.3}, {hp:.1} quads out: {a} x {b} block cut (the tip at column {ia}, row {ib}), {k} rings and a grid");
+            }
+            let mut mir: HashMap<u32, u32> = HashMap::default();
+            for m in 0..nbd {
+                mir.insert(border[m], b2[m]);
+            }
+            for v in p_start..out_p.len() {
+                let q = plane.reflect(out_p[v]);
+                out_p.push(q);
+                mir.insert(v as u32, (out_p.len() - 1) as u32);
+            }
+            for f in q_start..quads.len() {
+                let m = quads[f].map(|v| mir[&v]);
+                quads.push([m[1], m[0], m[3], m[2]]);
+            }
+            made += 2;
+            continue;
+        }
         // The quads within reach, shrunk until they are one disc (a single border loop).
         let mut found: Option<(Vec<usize>, Vec<u32>)> = None;
         while r >= quad * 2.0 {
@@ -1420,7 +1561,7 @@ fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>,
 
 /// The border of the quads `qs` as one loop of points, if they make a disc (every border
 /// point on two border edges, one loop through all of them, V − E + F = 1).
-fn disc_border(quads: &[[u32; 4]], qs: &[usize]) -> Option<Vec<u32>> {
+pub(super) fn disc_border(quads: &[[u32; 4]], qs: &[usize]) -> Option<Vec<u32>> {
     if qs.is_empty() {
         return None;
     }
@@ -1470,12 +1611,13 @@ fn disc_border(quads: &[[u32; 4]], qs: &[usize]) -> Option<Vec<u32>> {
 }
 
 /// The mouth: on the centre line of the lower face, facing front, the first point below the
-/// nose tip that stands out less than its neighbours above and below. The quads within
-/// `ZR_MOUTHR` (2.5) quads of it (a disc across the plane, its own mirror image) are cut out
-/// and the hole filled with rings toward it pinned to the plane, then a grid with a line
-/// along the plane. Whether one was made.
-#[allow(clippy::type_complexity)]
-fn mouth(face: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, plane: MirrorPlane, quad: f32, debug: bool, cap: &dyn Fn(&[u32], bool, &mut Vec<Vec3>, &mut Vec<[u32; 4]>)) -> bool {
+/// nose tip that stands out less than its neighbours above and below. A rectangle of the grid
+/// across the plane there, `ZR_MOUTHR` (2.5) quads to each side and half as tall, is cut out
+/// and filled with rings in from its border and a grid with a line along the plane, its own
+/// mirror image. Whether one was made. `ZR_DISC` cuts the disc within reach instead (the old
+/// way).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn mouth(face: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, plane: MirrorPlane, quad: f32, debug: bool, cap: &dyn Fn(&[u32], bool, &mut Vec<Vec3>, &mut Vec<[u32; 4]>), surface: &dyn Fn(Vec3) -> Vec3) -> bool {
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
     let np = out_p.len();
     let pos0 = out_p.clone();
@@ -1539,6 +1681,110 @@ fn mouth(face: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, 
         let tip = line[pause];
         let hp = h[tip];
         let c = pos0[tip];
+        if std::env::var_os("ZR_DISC").is_none() {
+            // The block: strips across the plane through the quad below and right of the
+            // mouth point (the edge down the centre line is the strip's edge, so the block
+            // reaches a row farther down than up), an even count across so the walk crosses
+            // the plane at its middle, half as many rows; narrowed while a strip meets a pole.
+            let adj = rect::Adj::new(quads, np);
+            let on_plane_v = |v: u32| (v as usize) < np && on_plane(v as usize);
+            let mut nbs: Vec<u32> = Vec::new();
+            for &f in adj.quads_at(tip as u32) {
+                let q = quads[f as usize];
+                for k in 0..4 {
+                    if q[k] == tip as u32 {
+                        for u in [q[(k + 1) % 4], q[(k + 3) % 4]] {
+                            if on_plane_v(u) && !nbs.contains(&u) {
+                                nbs.push(u);
+                            }
+                        }
+                    }
+                }
+            }
+            let below = nbs.into_iter().min_by(|&x, &y| pos0[x as usize].y.total_cmp(&pos0[y as usize].y).then(x.cmp(&y)));
+            let seed = below.and_then(|u| {
+                let centre = |f: u32| quads[f as usize].iter().map(|&w| pos0[w as usize]).sum::<Vec3>() * 0.25;
+                adj.quads_on(tip as u32, u).iter().copied().max_by(|&x, &y| plane.distance(centre(x)).total_cmp(&plane.distance(centre(y))).then(y.cmp(&x))).map(|f| (f as usize, (tip as u32, u)))
+            });
+            let Some((seed, u_edge)) = seed else {
+                if debug {
+                    eprintln!("    mouth at {c:.3} ({hp:.2}): not on a regular grid");
+                }
+                return false;
+            };
+            // `ZR_MOUTHR` quads to each side in the cells at the mouth (the face's are wider
+            // than a quad), an even count.
+            let (cu, _) = rect::cell_sizes(quads, out_p, seed, u_edge);
+            let mut a = ((quad * env("ZR_MOUTHR", 2.5) / cu.max(1e-9)).ceil() as usize).max(1) * 2;
+            let mut found: Option<(Vec<usize>, usize, usize, usize, usize)> = None;
+            'size: while a >= 2 {
+                let b = (a / 2).max(2);
+                for (ia, ib) in rect::shifts(a, b, true) {
+                    if let Some(block) = rect::grid_rect(&adj, quads, seed, u_edge, a, b, ia, ib) {
+                        if block.iter().all(|&f| quads[f].iter().all(|&v| (v as usize) < np)) && rect::rect_border(quads, &block).is_some_and(|(border, _)| border.iter().all(|&v| adj.regular(v))) {
+                            found = Some((block, a, b, ia, ib));
+                            break 'size;
+                        }
+                    }
+                }
+                a -= 2;
+            }
+            let Some((block, a, b, ia, ib)) = found else {
+                if debug {
+                    eprintln!("    mouth at {c:.3} ({hp:.2}): no rectangle of the grid round it");
+                }
+                return false;
+            };
+            let Some((mut border, mut corners)) = rect::rect_border(quads, &block) else { return false };
+            let n = border.len();
+            // Turned to start at a corner of a side across the plane (its middle on the plane).
+            if !on_plane_v(border[a / 2]) {
+                let s = corners[1];
+                border.rotate_left(s);
+                corners = [0, corners[2] - s, corners[3] - s, n - s];
+            }
+            if corners[1] != a || !on_plane_v(border[a / 2]) || !on_plane_v(border[a + b + a / 2]) || (0..n).filter(|&m| on_plane_v(border[m])).count() != 2 {
+                if debug {
+                    eprintln!("    mouth at {c:.3} ({hp:.2}): the block does not straddle the plane");
+                }
+                return false;
+            }
+            let mut gone = block.clone();
+            gone.sort_unstable();
+            for &f in gone.iter().rev() {
+                quads.swap_remove(f);
+            }
+            // Two rings: the lip line and the loop round the lips.
+            let k = 2;
+            let rings = rect::inset_fill(&border, corners, k, 0.7, None, surface, out_p, quads);
+            let last = rings.last().cloned().unwrap_or_else(|| border.clone());
+            let from = out_p.len();
+            let ids = rect::cap_dims(&last, a, false, out_p, quads);
+            rect::dome_cap(&last, from, None, surface, out_p);
+            // Its own mirror image exactly: ring point m and point a − m, grid column i and
+            // column a − i.
+            let pair = |out_p: &mut [Vec3], u: u32, v: u32| {
+                if u == v {
+                    out_p[u as usize] = plane.project(out_p[u as usize]);
+                } else if plane.distance(out_p[u as usize]) > 0.0 {
+                    out_p[v as usize] = plane.reflect(out_p[u as usize]);
+                }
+            };
+            for ring in &rings {
+                for m in 0..n {
+                    pair(out_p, ring[m], ring[(a + n - m) % n]);
+                }
+            }
+            for row in &ids {
+                for i in 0..=a {
+                    pair(out_p, row[i], row[a - i]);
+                }
+            }
+            if debug {
+                eprintln!("    mouth at {c:.3} ({hp:.2}): {a} x {b} block cut (the mouth at column {ia}, row {ib}), {k} rings and a grid");
+            }
+            return true;
+        }
         let mut r = quad * env("ZR_MOUTHR", 2.5);
         while r >= quad * 1.5 {
             let qs: Vec<usize> = (0..quads.len()).filter(|&f| quads[f].iter().all(|&v| (v as usize) < np && pos0[v as usize].distance(c) <= r)).collect();
