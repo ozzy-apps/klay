@@ -653,8 +653,16 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // A run that narrows and then flares again near its end (the ankle into the foot, the
     // wrist into the hand) is two: the limb with one count to its narrowest ring, then the
     // foot or hand with its own (`ZR_NOANKLE` off). The foot's or hand's rings are noted:
-    // their reductions go on the sole.
+    // their reductions go on the sole. Where the limb's count is the larger, it carries on
+    // through the ankle to the ring before the foot's widest, as a box modeller's shin loops
+    // wrap the ankle and the instep; from the widest ring on the foot's own counts hold. The
+    // ankle band is then an equal join, and the step down to the foot's count lies between
+    // two rings round the whole foot, gathered on the sole, not under the heel where a ring
+    // round the whole foot meets one round the forefoot (`ZR_NOCARRY` or `ZR_OLDMERGE` gives
+    // the foot its own count from its first ring, as before). A neck widening into the
+    // shoulders also parts here, and keeps its own counts.
     let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
+    let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
     let plan = |rs: &[usize]| -> Vec<usize> {
         let n = rs.len();
         if n >= 8 && std::env::var_os("ZR_NOANKLE").is_none() {
@@ -665,7 +673,17 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 if tail_max > gs[e] * 1.3 {
                     after_ankle.borrow_mut().extend(rs[e + 1..].iter().copied());
                     let mut out = plan_one(&rs[..=e]);
-                    out.extend(plan_one(&rs[e + 1..]));
+                    let mut foot = plan_one(&rs[e + 1..]);
+                    if carry && out[e] > foot[0] {
+                        let widest = (e + 1..n).max_by(|&a, &b| gs[a].total_cmp(&gs[b]).then(b.cmp(&a))).unwrap_or(e + 1);
+                        for c in &mut foot[..widest - e - 1] {
+                            *c = out[e];
+                        }
+                        if debug {
+                            eprintln!("    plan: {} carried through the ankle (ring {e} of {n}, girth {:.1}) to the widest ring past it: girths {:?} -> counts {:?}", out[e], gs[e], gs[e + 1..].iter().map(|g| (g * 10.0).round() / 10.0).collect::<Vec<_>>(), foot);
+                        }
+                    }
+                    out.extend(foot);
                     return out;
                 }
             }
