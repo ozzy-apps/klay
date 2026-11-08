@@ -894,6 +894,25 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     edges.dedup();
     let (lines, corners) = crate::crease::lines(mesh, &edges, 0.0);
     let features = Features { lines, corners };
+    // KLAY_ZR_FEATLINES=file.obj: the feature lines as OBJ polylines (`v` records, one `l`
+    // per line) for deep-test/2026-11-05-layout/edgecover.py.
+    if let Some(path) = std::env::var_os("KLAY_ZR_FEATLINES") {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let mut n = 0usize;
+        for line in &features.lines {
+            for p in line {
+                writeln!(s, "v {} {} {}", p.x, p.y, p.z).unwrap();
+            }
+            s.push('l');
+            for k in 0..line.len() {
+                write!(s, " {}", n + k + 1).unwrap();
+            }
+            s.push('\n');
+            n += line.len();
+        }
+        std::fs::write(path, s).ok();
+    }
     crate::jobs::check()?;
     let (mut out, stats) = match s.mirror {
         // Plan Layout with Symmetry: a body is built whole and symmetric; anything else is
@@ -2694,6 +2713,178 @@ mod shape_tests {
         (inner.iter().filter(|&&v| val[v] != 4).count(), inner.len())
     }
 
+    /// The poles of `m` (interior vertices with other than four edges), and how many of them
+    /// lie on the x = 0 plane (|x| under 0.05 of the mean edge length).
+    pub fn poles_on_plane(m: &SculptMesh) -> (usize, usize) {
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+        for f in polygons(m) {
+            for k in 0..f.len() {
+                let (a, b) = (f[k], f[(k + 1) % f.len()]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let mut val = vec![0u32; m.positions.len()];
+        let mut border = vec![false; m.positions.len()];
+        for (&(a, b), &c) in &edges {
+            val[a as usize] += 1;
+            val[b as usize] += 1;
+            if c == 1 {
+                border[a as usize] = true;
+                border[b as usize] = true;
+            }
+        }
+        let quad = stats_quad(m);
+        let poles: Vec<usize> = (0..val.len()).filter(|&v| val[v] > 0 && !border[v] && val[v] != 4).collect();
+        let on_plane = poles.iter().filter(|&&v| m.positions[v].x.abs() < 0.05 * quad).count();
+        (poles.len(), on_plane)
+    }
+
+    /// A hard-surface test shape: a 30 x 4 x 20 plate in cells of 0.1, with a two-step flange
+    /// along one long side (the steps three cells apart, one cell tall) and three square
+    /// through-holes of four cells with a one-cell chamfer round the rim. Built as a grid of
+    /// cells on an integer lattice, welded by position: no booleans.
+    pub fn plate() -> SculptMesh {
+        let (nx, nz) = (30i32, 20i32);
+        // The top height over a cell row: the flange steps up away from z = 0.
+        let top = |j: i32| if j < 3 { 2 } else if j < 6 { 3 } else { 4 };
+        let holes = [(5i32, 11i32), (13, 11), (21, 11)];
+        let in_hole = |i: i32, j: i32| holes.iter().any(|&(hx, hz)| (hx..hx + 4).contains(&i) && (hz..hz + 4).contains(&j));
+        // A lattice point on a hole's rim sits one cell down: the chamfer.
+        let rim = |x: i32, z: i32| holes.iter().any(|&(hx, hz)| (hx..=hx + 4).contains(&x) && (hz..=hz + 4).contains(&z) && (x == hx || x == hx + 4 || z == hz || z == hz + 4));
+        let mut ids: HashMap<[i32; 3], u32> = HashMap::default();
+        let mut pos: Vec<Vec3> = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+        // A quad on lattice corners, wound so its normal points along `out`.
+        let mut quad = |c: [[i32; 3]; 4], out: Vec3| {
+            let at = |l: [i32; 3]| Vec3::new(l[0] as f32, l[1] as f32, l[2] as f32) * 0.1 - Vec3::new(1.5, 0.2, 1.0);
+            let n = (at(c[1]) - at(c[0])).cross(at(c[2]) - at(c[0]));
+            let c = if n.dot(out) < 0.0 { [c[0], c[3], c[2], c[1]] } else { c };
+            let v: Vec<u32> = c.iter().map(|&l| *ids.entry(l).or_insert_with(|| { pos.push(at(l)); (pos.len() - 1) as u32 })).collect();
+            idx.extend_from_slice(&[v[0], v[1], v[2], v[0], v[2], v[3]]);
+        };
+        for i in 0..nx {
+            for j in 0..nz {
+                if in_hole(i, j) {
+                    continue;
+                }
+                let h = top(j);
+                let y = |x: i32, z: i32| if h == 4 && rim(x, z) { 3 } else { h };
+                quad([[i, y(i, j), j], [i, y(i, j + 1), j + 1], [i + 1, y(i + 1, j + 1), j + 1], [i + 1, y(i + 1, j), j]], Vec3::Y);
+                quad([[i, 0, j], [i, 0, j + 1], [i + 1, 0, j + 1], [i + 1, 0, j]], Vec3::NEG_Y);
+            }
+        }
+        // The flange steps, and the four outer walls.
+        for i in 0..nx {
+            for j in [3, 6] {
+                let (a, b) = (top(j - 1), top(j));
+                quad([[i, a, j], [i + 1, a, j], [i + 1, b, j], [i, b, j]], Vec3::NEG_Z);
+            }
+            for y in 0..top(0) {
+                quad([[i, y, 0], [i + 1, y, 0], [i + 1, y + 1, 0], [i, y + 1, 0]], Vec3::NEG_Z);
+            }
+            for y in 0..top(nz - 1) {
+                quad([[i, y, nz], [i + 1, y, nz], [i + 1, y + 1, nz], [i, y + 1, nz]], Vec3::Z);
+            }
+        }
+        for j in 0..nz {
+            for y in 0..top(j) {
+                quad([[0, y, j], [0, y, j + 1], [0, y + 1, j + 1], [0, y + 1, j]], Vec3::NEG_X);
+                quad([[nx, y, j], [nx, y, j + 1], [nx, y + 1, j + 1], [nx, y + 1, j]], Vec3::X);
+            }
+        }
+        // The hole walls, from the chamfer rim down to the bottom, facing into the hole.
+        for &(hx, hz) in &holes {
+            for k in 0..4 {
+                for y in 0..3 {
+                    quad([[hx, y, hz + k], [hx, y, hz + k + 1], [hx, y + 1, hz + k + 1], [hx, y + 1, hz + k]], Vec3::X);
+                    quad([[hx + 4, y, hz + k], [hx + 4, y, hz + k + 1], [hx + 4, y + 1, hz + k + 1], [hx + 4, y + 1, hz + k]], Vec3::NEG_X);
+                    quad([[hx + k, y, hz], [hx + k + 1, y, hz], [hx + k + 1, y + 1, hz], [hx + k, y + 1, hz]], Vec3::Z);
+                    quad([[hx + k, y, hz + 4], [hx + k + 1, y, hz + 4], [hx + k + 1, y + 1, hz + 4], [hx + k, y + 1, hz + 4]], Vec3::NEG_Z);
+                }
+            }
+        }
+        SculptMesh::from_raw(pos, idx)
+    }
+
+    /// A hard-surface test shape: a lathe (48 meridians) of disc, neck, sphere and a ledge on
+    /// top, with one flat cut into the side of the sphere: the triangles past the plane
+    /// x = 0.42 on the sphere are removed, the border is flattened onto the plane and fanned.
+    pub fn finial() -> SculptMesh {
+        let mut prof: Vec<(f32, f32)> = vec![(0.0, 0.0), (0.8, 0.0), (0.8, 0.2), (0.25, 0.2), (0.25, 0.75)];
+        // The sphere: centre (0, 1.3), radius 0.55, from the neck up to where the ledge sits.
+        let (cy, r) = (1.3f32, 0.55f32);
+        let a0 = -(1.0f32 - (0.25f32 / r).powi(2)).sqrt().atan2(0.25 / r);
+        let a1 = (1.0f32 - (0.3f32 / r).powi(2)).sqrt().atan2(0.3 / r);
+        for k in 0..=24 {
+            let a = a0 + (a1 - a0) * k as f32 / 24.0;
+            prof.push((r * a.cos(), cy + r * a.sin()));
+        }
+        let ledge = prof.last().unwrap().1;
+        prof.extend_from_slice(&[(0.4, ledge), (0.4, ledge + 0.1), (0.0, ledge + 0.1)]);
+        let m = revolve(&prof, 2, 48);
+        let plane = 0.42f32;
+        let on_sphere = |p: Vec3| p.y > 0.8 && p.y < ledge - 0.01;
+        let mut pos = m.positions.clone();
+        let mut idx: Vec<u32> = Vec::new();
+        let mut cut: Vec<[u32; 3]> = Vec::new();
+        for t in m.indices.chunks_exact(3) {
+            let p = [pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]];
+            if p.iter().all(|q| q.x > plane && on_sphere(*q)) {
+                cut.push([t[0], t[1], t[2]]);
+            } else {
+                idx.extend_from_slice(t);
+            }
+        }
+        // The border: edges of the kept triangles that the removed ones also used, walked in
+        // the kept triangles' order so the fan faces outward.
+        let mut removed: crate::fx::FxHashSet<(u32, u32)> = Default::default();
+        for t in &cut {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                removed.insert((a.min(b), a.max(b)));
+            }
+        }
+        let mut border: Vec<(u32, u32)> = Vec::new();
+        for t in idx.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if removed.contains(&(a.min(b), a.max(b))) {
+                    border.push((a, b));
+                }
+            }
+        }
+        let mut sum = Vec3::ZERO;
+        for &(a, _) in &border {
+            pos[a as usize].x = plane;
+            sum += pos[a as usize];
+        }
+        let centre = pos.len() as u32;
+        pos.push(sum / border.len().max(1) as f32);
+        for (a, b) in border {
+            idx.extend_from_slice(&[b, a, centre]);
+        }
+        SculptMesh::from_raw(pos, idx)
+    }
+
+    /// Both hard-surface shapes are closed and manifold: every edge in two triangles, the
+    /// plate with its three holes a genus-3 surface, the finial a ball.
+    #[test]
+    fn hard_surface_shapes_are_closed() {
+        for (name, m, chi) in [("plate", plate(), -4i64), ("finial", finial(), 2)] {
+            let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+            for t in m.indices.chunks_exact(3) {
+                for k in 0..3 {
+                    let (a, b) = (t[k], t[(k + 1) % 3]);
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+            let open = edges.values().filter(|&&c| c != 2).count();
+            let used: crate::fx::FxHashSet<u32> = m.indices.iter().copied().collect();
+            let got = used.len() as i64 - edges.len() as i64 + m.triangle_count() as i64;
+            assert_eq!((open, got), (0, chi), "{name}: {open} edges not in two triangles, Euler {got}");
+        }
+    }
+
     /// For a shape turned round Y: the mean angle (degrees) between the quads' edges on its
     /// sides and the nearest of round / along, skipping caps and the axis.
     pub fn misalignment(m: &SculptMesh) -> f32 {
@@ -2811,6 +3002,15 @@ mod shape_tests {
         let shapes: [(&str, SculptMesh, f32, bool); 6] = [("ball", ball, 1.0, false), ("cube", cube, 1.0, false), ("torus", torus(), 1.5, true), ("vase", vase(), 2.0, true), ("rook", rook(), 2.0, true), ("blob", blob(), 2.5, false)];
         let only = std::env::var("ZR_ONLY").ok();
         let mut shapes: Vec<(&str, SculptMesh, f32, bool)> = shapes.into_iter().collect();
+        // The hard-surface shapes run only when ZR_ONLY names them (ZR_ONLY=plate,finial), at
+        // 2 thousand quads, with Detect Edges on by default.
+        let named = |n: &str| only.as_deref().is_some_and(|o| o.split(',').any(|x| x == n));
+        if named("plate") {
+            shapes.push(("plate", plate(), 2.0, false));
+        }
+        if named("finial") {
+            shapes.push(("finial", finial(), 2.0, true));
+        }
         // ZR_OBJ=file.obj: a model from disk as "obj" (ZR_K thousand quads, default 5),
         // corners welded by position.
         if let Ok(path) = std::env::var("ZR_OBJ") {
@@ -2963,6 +3163,8 @@ mod shape_tests {
                 let mis = if turned { misalignment(&out) } else { f32::NAN };
                 let tag = if planned { "new" } else { "old" };
                 eprintln!("{name:6} {tag}: {} quads, {irr} poles of {inner} ({:.1}%), misaligned {mis:.1}°, {:.0} ms, planned {} {:?}", st.quads, irr as f32 * 100.0 / inner.max(1) as f32, st.ms, st.planned, st.fallback);
+                let (total, on_plane) = poles_on_plane(&out);
+                eprintln!("poles: {total}, on plane {on_plane}");
                 let follow = if planned { 1 } else { 0 };
                 write_obj(&out, &dir.join(format!("{name}-{}.obj", ["old", "new"][follow])));
             }
