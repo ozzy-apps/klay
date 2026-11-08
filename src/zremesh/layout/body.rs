@@ -1423,13 +1423,20 @@ fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>,
                 }
                 continue;
             };
-            // The mirror border turned and run to match point for point.
+            // The mirror border turned and run to match point for point. Its length is
+            // checked first: the same quad count can make a different rectangle.
             let nbd = border.len();
+            if border2.len() != nbd {
+                if debug {
+                    eprintln!("    bump at {c:.3}: mirror block not on the grid (its border has {} points to {nbd})", border2.len());
+                }
+                continue;
+            }
             let img = |v: u32| plane.reflect(pos0[v as usize]);
             let start = (0..nbd).min_by(|&x, &y| pos0[border2[x] as usize].distance(img(border[0])).total_cmp(&pos0[border2[y] as usize].distance(img(border[0])))).unwrap();
             let fwd_ok = pos0[border2[(start + 1) % nbd] as usize].distance(img(border[1])) < pos0[border2[(start + nbd - 1) % nbd] as usize].distance(img(border[1]));
             let b2: Vec<u32> = (0..nbd).map(|m| if fwd_ok { border2[(start + m) % nbd] } else { border2[(start + nbd - m) % nbd] }).collect();
-            if border2.len() != nbd || (0..nbd).any(|m| pos0[b2[m] as usize].distance(img(border[m])) > quad * 0.3) {
+            if (0..nbd).any(|m| pos0[b2[m] as usize].distance(img(border[m])) > quad * 0.3) {
                 if debug {
                     eprintln!("    bump at {c:.3}: mirror block not on the grid (its border does not line up)");
                 }
