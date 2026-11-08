@@ -360,16 +360,21 @@ pub(super) fn marks(c: &Ctx, out_p: &[Vec3], quads: &[[u32; 4]], upper: &HashSet
     let h = dips(1.0);
     let h_eye = if reach > 1.05 { dips(reach) } else { h.clone() };
     let nose = (0..line.len() - 1).min_by(|&a, &b| h[line[a] as usize].total_cmp(&h[line[b] as usize])).ok_or("no nose")?;
-    // The chin: the last point below the nose before the surface turns under the jaw.
-    // (Past the nose's underside first, which faces down too.)
-    let lip = (nose + 1..line.len()).find(|&i| nrm[line[i] as usize].y > -0.3).ok_or("no lip below the nose")?;
-    let chin = (lip..line.len()).take_while(|&i| nrm[line[i] as usize].y > -0.85).last().ok_or("no chin below the nose")?;
-    // The mouth: the deepest dip between the nose and the chin, two rows clear of each (the
-    // first pause below the nose is the dip under it, on a finer head).
-    let mouth = if std::env::var_os("ZR_MOUTHPAUSE").is_some() {
-        (nose + 1..line.len() - 1).find(|&i| h[line[i] as usize] > h[line[i - 1] as usize] && h[line[i] as usize] >= h[line[i + 1] as usize]).ok_or("no mouth below the nose")?
-    } else {
+    // Down the profile (how far forward each centre-line point stands): the nose's base, the
+    // first point below the tip that stands less far than the one after it; the chin, the
+    // point standing furthest out below that (past the lips), and down from it while within
+    // two cells of it; the mouth a third of the way from the nose's base to the chin (the
+    // proportion of a face; `ZR_MOUTHDIP` the deepest dip between them instead).
+    let z = |i: usize| out_p[line[i] as usize][fwd];
+    let base = (nose + 1..line.len() - 1).find(|&i| z(i) <= z(i + 1)).ok_or("no base under the nose")?;
+    let lips_end = (base + 1..line.len()).find(|&i| out_p[line[i] as usize].y < out_p[line[base] as usize].y - (out_p[line[base] as usize].y - out_p[line[line.len() - 1] as usize].y) * 0.4).unwrap_or(base + 1);
+    let chin_tip = (lips_end..line.len()).max_by(|&a, &b| z(a).total_cmp(&z(b)).then(b.cmp(&a))).ok_or("no chin")?;
+    let chin = (chin_tip..line.len()).take_while(|&i| z(i) > z(chin_tip) - cell * 2.0).last().unwrap_or(chin_tip);
+    let mouth = if std::env::var_os("ZR_MOUTHDIP").is_some() {
         (nose + 2..chin.saturating_sub(1)).max_by(|&a, &b| h[line[a] as usize].total_cmp(&h[line[b] as usize]).then(b.cmp(&a))).ok_or("no room for a mouth between nose and chin")?
+    } else {
+        let my = out_p[line[base] as usize].y - (out_p[line[base] as usize].y - out_p[line[chin] as usize].y) / 3.0;
+        (base + 1..chin).min_by(|&a, &b| (out_p[line[a] as usize].y - my).abs().total_cmp(&(out_p[line[b] as usize].y - my).abs())).ok_or("no room for a mouth between nose and chin")?
     };
     let ny = out_p[line[nose] as usize].y;
     // The eye: the deepest dip above the nose, within four cells of the centre line (the two
@@ -391,11 +396,24 @@ pub(super) fn marks(c: &Ctx, out_p: &[Vec3], quads: &[[u32; 4]], upper: &HashSet
             sp += out_p[v].as_dvec3() * wgt;
         }
     }
-    let eye_at = if sw > 0.0 { (sp / sw).as_vec3() } else { out_p[eye] };
+    let eye_dip = if sw > 0.0 { (sp / sw).as_vec3() } else { out_p[eye] };
+    // The face's half width at that height: out along the head to where the surface turns
+    // to the side. The eye's middle across is `ZR_EYEX` (0.45) of it, its half width
+    // `ZR_EYEW` (0.2): the hollow's deepest part is the inner corner, too near the nose.
+    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    let half_w = (0..np).filter(|&v| upper.contains(&(v as u32)) && (out_p[v].y - eye_dip.y).abs() < cell * 0.75 && pl.distance(out_p[v]) > 0.0 && nrm[v][fwd] > 0.25).map(|v| pl.distance(out_p[v])).fold(0.0f32, f32::max);
+    let eye_at = if half_w > cell * 3.0 && std::env::var_os("ZR_EYEDIP").is_none() {
+        let target = pl.distance(eye_dip).max(half_w * envf("ZR_EYEX", 0.45));
+        // The grid point on that row nearest that far out (its position on the surface).
+        (0..np).filter(|&v| upper.contains(&(v as u32)) && (out_p[v].y - eye_dip.y).abs() < cell * 0.75 && pl.distance(out_p[v]) > 0.0).min_by(|&a, &b| (pl.distance(out_p[a]) - target).abs().total_cmp(&(pl.distance(out_p[b]) - target).abs())).map_or(eye_dip, |v| out_p[v])
+    } else {
+        eye_dip
+    };
+    let eye_w = if half_w > cell * 3.0 { half_w * envf("ZR_EYEW", 0.2) } else { 0.0 };
     let socket: Vec<usize> = (0..np).filter(|&v| upper.contains(&(v as u32)) && pl.distance(out_p[v]) > 0.0 && out_p[v].distance(eye_at) < cell * 5.0 && h_eye[v] > deep * 0.4).collect();
     let eye_r = (
-        socket.iter().map(|&v| (pl.distance(out_p[v]) - pl.distance(eye_at)).abs()).fold(cell, f32::max),
-        socket.iter().map(|&v| (out_p[v].y - eye_at.y).abs()).fold(cell, f32::max),
+        socket.iter().map(|&v| (pl.distance(out_p[v]) - pl.distance(eye_at)).abs()).fold(cell, f32::max).max(eye_w),
+        socket.iter().map(|&v| (out_p[v].y - eye_at.y).abs()).fold(cell, f32::max).min(eye_w.max(cell) * 0.8),
     );
     let ey = eye_at.y;
     let eye_row = (0..line.len()).min_by(|&a, &b| (out_p[line[a] as usize].y - ey).abs().total_cmp(&(out_p[line[b] as usize].y - ey).abs())).unwrap_or(0);
@@ -406,12 +424,17 @@ pub(super) fn marks(c: &Ctx, out_p: &[Vec3], quads: &[[u32; 4]], upper: &HashSet
     Ok(Marks { line, eye: eye_at, eye_r, eye_row, nose, mouth, chin })
 }
 
-/// The nest, on the plain head grid (rows round the head, the centre line a grid line):
-/// the mask from two rows above the eyes to three below, as wide as the eyes and two
-/// columns more; the eyes as a pair inside its grid; the loop round nose and mouth from the
-/// row under the mask to the row above the chin; the nose and the mouth inside its grid.
-/// False (and nothing changed) when the landmarks are not found or the mask does not fit;
-/// later steps that do not fit are left out with a log line.
+/// The nest, laid out as the reference base meshes are (quadremesh-ref 3.jpg, 4.jpg, a.webp),
+/// top to bottom on the plain head grid:
+/// - the mask (the goggle loop) from above the brows to the row above the nose tip, as wide
+///   as the eyes and their sockets and two columns more;
+/// - the eyes filling its two halves, a column of bridge between them and a row clear of its
+///   top and bottom, ringed up to three times toward the socket;
+/// - the nose, a narrow loop from the mask down past the nostrils;
+/// - the mouth, the largest nest: rings from the row under the nose to the chin, as wide as
+///   the mask less a column, up to three, round a wide grid for the lips.
+/// False (and nothing changed) when the landmarks are not found or the mask or the eyes do
+/// not fit; the nose or the mouth that do not fit are left out with a log line.
 pub(super) fn nest(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, upper: &HashSet<u32>, lower: &HashSet<u32>, orient: &dyn Fn(&mut [[u32; 4]], &[Vec3])) -> bool {
     let pl = c.plane;
     let m = match marks(c, out_p, quads, upper, lower) {
@@ -425,105 +448,82 @@ pub(super) fn nest(c: &Ctx, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, up
     };
     let line = m.line.clone();
     let er = m.eye_row;
-    if er < 2 || er + 5 >= m.chin {
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d);
+    let cell = out_p[line[er] as usize].distance(out_p[line[(er + 1).min(line.len() - 1)] as usize]).max(1e-6);
+    let col_eye = ((pl.distance(m.eye) / cell).round() as usize).max(1);
+    let (rx, ry) = (((m.eye_r.0 / cell).round() as usize).clamp(1, 5), ((m.eye_r.1 / cell).round() as usize).clamp(1, 4));
+    if c.debug {
+        eprintln!("  face: eye at {:.3} (column {col_eye}, row {er}, reaching {rx} across, {ry} up and down), nose row {}, mouth row {}, chin row {}, cell {:.4}", m.eye, m.nose, m.mouth, m.chin, cell);
+        eprintln!("  face: centre line heights {:?}", line.iter().map(|&v| (out_p[v as usize].y * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+    }
+    // The mask: from above the brows to the row above the nose tip.
+    let mask_top = er.saturating_sub(env("ZR_MASKUP", ry + 2));
+    let mask_bot = m.nose.saturating_sub(env("ZR_MASKNOSE", 1)).max(er + ry + 1);
+    let mask_half = col_eye + rx + env("ZR_MASKW", 2);
+    if mask_bot <= mask_top + 3 || mask_bot >= m.mouth {
         if c.debug {
-            eprintln!("  face: the eyes (row {er}) too near the top or the chin (row {}); as before", m.chin);
+            eprintln!("  face: no room for the mask (rows {mask_top} to {mask_bot}, the mouth at {}); as before", m.mouth);
         }
         return false;
     }
-    let cell = out_p[line[er] as usize].distance(out_p[line[er + 1] as usize]).max(1e-6);
-    let col_eye = ((pl.distance(m.eye) / cell).round() as usize).max(1);
-    // The socket's reach in cells, and the eye block over it (`ZR_EYEBLOCK` cells across: the
-    // socket's width by default).
-    let (rx, ry) = (((m.eye_r.0 / cell).round() as usize).clamp(1, 4), ((m.eye_r.1 / cell).round() as usize).clamp(1, 3));
-    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d);
-    if c.debug {
-        eprintln!("  face: eye at {:.3} (column {col_eye}, row {er}), nose row {}, mouth row {}, chin row {}, cell {:.4}", m.eye, m.nose, m.mouth, m.chin, cell);
-        eprintln!("  face: centre line heights {:?}", line.iter().map(|&v| (out_p[v as usize].y * 1000.0).round() / 1000.0).collect::<Vec<_>>());
-    }
-    // Undone (the eyes and mouth then as before) when the eyes do not fit in the mask.
     let (keep_p, keep_q) = (out_p.clone(), quads.clone());
-    // The mask (the goggle loop).
-    let mask_half = col_eye + rx + env("ZR_MASKW", 1);
-    // Down to two rows above the nose tip at most, so the nose is inside the loop below.
-    let above = env("ZR_MASKUP", ry + 1).min(er);
-    let below = env("ZR_MASKDOWN", ry + 2).min(m.nose.saturating_sub(er + 2)).max(1);
-    let Some(mask) = straddle(c, out_p, quads, line[er - above], mask_half, above + below, 1, 0.6, None, "mask") else {
+    let undo = |out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>, why: &str| {
+        *out_p = keep_p.clone();
+        *quads = keep_q.clone();
+        if c.debug {
+            eprintln!("  face: {why}; the eyes and the mouth as before");
+        }
+    };
+    let Some(mask) = straddle(c, out_p, quads, line[mask_top], mask_half, mask_bot - mask_top, 1, 0.5, None, "mask") else {
+        undo(out_p, quads, "no mask");
         return false;
     };
     orient(quads, out_p);
-    // The eyes inside it: as many rows as the mask's grid leaves one above and below, three
-    // columns (two if they do not fit).
-    let among: Vec<u32> = mask.iter().flatten().copied().collect();
+    // The eyes filling its halves: past `ZR_BRIDGE` (1) columns each side of the plane to a
+    // column short of the side, a row clear of the top and the bottom.
     let rows = mask.len().saturating_sub(1);
-    let a0 = env("ZR_EYEBLOCK", 2 * rx + 1).clamp(2, 2 * mask_half);
-    let b_e = (2 * ry + 1).min(rows.saturating_sub(2)).max(1);
-    if c.debug {
-        eprintln!("  face: socket reaches {rx} cells across, {ry} up and down; mask half {mask_half}, {above} rows up, {below} down");
-    }
+    let bridge = env("ZR_BRIDGE", 1);
+    let among: Vec<u32> = mask.iter().flatten().copied().collect();
     let mut eyes = false;
-    for a_e in (2..=a0).rev() {
-        let k = if a_e >= 5 { 3 } else if a_e >= 3 { 2 } else { 1 };
-        if paired(c, out_p, quads, &among, m.eye, a_e, b_e, k, 1.0, Some(m.eye), "eyes") {
+    'fit: for shrink in 0..3usize {
+        // As wide as the socket, at most the half less the bridge and a column; two thirds as
+        // tall, a row clear of the mask's top and bottom.
+        let a_e = (2 * rx + 1).min(mask_half.saturating_sub(bridge + 1)).saturating_sub(shrink).max(2);
+        let b_e = ((2 * a_e).div_ceil(3)).min(rows.saturating_sub(2)).saturating_sub(shrink / 2).max(1);
+        // Its middle: the mask's grid point that far out on the + side, half way down.
+        let k = (a_e.min(b_e) / 2).clamp(1, 3);
+        // (On the surface, not lifted toward the socket: the lift dug channels by the nose.)
+        if paired(c, out_p, quads, &among, m.eye, a_e, b_e, k, 1.0, None, "eyes") {
             eyes = true;
-            break;
+            break 'fit;
         }
     }
     if !eyes {
-        *out_p = keep_p;
-        *quads = keep_q;
-        if c.debug {
-            eprintln!("  face: the eyes do not fit in the mask; the eyes and the mouth as before");
-        }
+        undo(out_p, quads, "the eyes do not fit in the mask");
         return false;
     }
     orient(quads, out_p);
-    // The loop round the nose and the mouth: from the row under the mask to the row above
-    // the chin.
-    let top = er + below + 1;
-    let bottom = m.chin.saturating_sub(1);
-    if bottom <= top + 2 {
-        if c.debug {
-            eprintln!("  face: no room for the nose and mouth loop (rows {top} to {bottom})");
+    // The nose: from the mask's bottom down to two rows above the mouth (past the nostrils).
+    // (Two columns each side: the nostrils' width.)
+    let nose_half = env("ZR_NOSEW", 2);
+    let nose_bot = m.mouth.saturating_sub(2).max(m.nose + 1);
+    if nose_bot > mask_bot {
+        if straddle(c, out_p, quads, line[mask_bot], nose_half, nose_bot - mask_bot, 1, 0.8, None, "nose").is_some() {
+            orient(quads, out_p);
         }
-        return true;
     }
-    let muzzle_half = (col_eye + env("ZR_MUZZLEW", 1)).min(mask_half);
-    let Some(muzzle) = straddle(c, out_p, quads, line[top], muzzle_half, bottom - top, env("ZR_MUZZLEK", 1), 0.6, None, "nose and mouth loop") else {
-        return true;
-    };
-    orient(quads, out_p);
-    // Inside it: its centre column top to bottom.
-    let mut col: Vec<u32> = muzzle.iter().map(|r| r[muzzle_half]).collect();
-    if out_p[col[0] as usize].y < out_p[col[col.len() - 1] as usize].y {
-        col.reverse();
-    }
-    let my = out_p[line[m.mouth] as usize].y;
-    let jm = (1..col.len().saturating_sub(1)).min_by(|&a, &b| (out_p[col[a] as usize].y - my).abs().total_cmp(&(out_p[col[b] as usize].y - my).abs())).unwrap_or(1);
-    // The mouth: a row above it to a row below, two columns in from the loop's sides.
-    // (Two rows when the loop has them below: from a row above the mouth to a row below.)
-    let mouth_top = jm.saturating_sub(1).max(1).min(col.len().saturating_sub(4).max(1));
-    let mouth_half = muzzle_half.saturating_sub(1).max(1);
-    let mouth_rows = 2usize.min(col.len().saturating_sub(1 + mouth_top + 1)).max(1);
-    // The nose first, centred on its tip: two rows above it (not above the loop's second
-    // row) to a row clear of the mouth.
-    let nose_tip = out_p[line[m.nose] as usize];
-    let jn = (1..col.len().saturating_sub(1)).min_by(|&a, &b| (out_p[col[a] as usize].y - nose_tip.y).abs().total_cmp(&(out_p[col[b] as usize].y - nose_tip.y).abs())).unwrap_or(1);
-    let nose_top = jn.saturating_sub(1);
-    let nose_rows = (jn + 2).min(mouth_top.saturating_sub(1)).saturating_sub(nose_top);
-    if nose_rows >= 2 {
-        // (On the surface, not lifted toward the tip: the block is round and below it, and a
-        // lift there raises a second tip.)
-        if straddle(c, out_p, quads, col[nose_top], 1, nose_rows, 1, 0.8, None, "nose").is_some() {
+    // The mouth: from the row under the nose to the chin, out to a column past the eyes' middles.
+    let top = nose_bot + 1;
+    let rows_m = m.chin.saturating_sub(top);
+    let mouth_half = env("ZR_MOUTHW", col_eye + 1).max(2);
+    let k_m = (rows_m.saturating_sub(1) / 2).clamp(1, env("ZR_MOUTHK", 3));
+    if rows_m >= 2 {
+        // (Rounded all the way: the mouth's loops are ovals.)
+        if straddle(c, out_p, quads, line[top], mouth_half, rows_m, k_m, 1.0, None, "mouth").is_some() {
             orient(quads, out_p);
         }
     } else if c.debug {
-        eprintln!("    face: nose: no room between the loop's top and the mouth");
-    }
-    // (Two rings only in a block two rows tall: one row squeezes them into slivers.)
-    let mouth_k = if mouth_half >= 2 && mouth_rows >= 2 { 2 } else { 1 };
-    if straddle(c, out_p, quads, col[mouth_top], mouth_half, mouth_rows, mouth_k, 0.9, None, "mouth").is_some() {
-        orient(quads, out_p);
+        eprintln!("  face: mouth: no room between the nose (row {nose_bot}) and the chin (row {})", m.chin);
     }
     true
 }
