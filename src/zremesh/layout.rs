@@ -5996,7 +5996,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 // Symmetry setting's plane, or in X through the head's top when the model
                 // is its own mirror image there (`ZR_NOSYM`: never).
                 if std::env::var_os("ZR_NOBODY").is_none() {
-                    let body_feats = std::env::var_os("ZR_NOBODYFEATS").is_none();
+                    // Hard rings on the body (creases found by fold, clean edge lines) are opt-in
+                    // (`ZR_BODYFEATS=1`) until they are held through finish(): projected after it
+                    // they sit half a quad off their crease and cost a few folded quads.
+                    let body_feats = std::env::var_os("ZR_BODYFEATS").is_some();
                     let plane = s.mirror.or_else(|| {
                         let pl = MirrorPlane { axis: crate::symmetry::Axis::X, at: w.p[src as usize].x };
                         (std::env::var_os("ZR_NOSYM").is_none() && is_symmetric(&w, pl, quad)).then_some(pl)
