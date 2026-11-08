@@ -118,6 +118,280 @@ fn join_sym(lo: &[u32], hi: &[u32], out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32;
     true
 }
 
+/// Where a band's reductions are gathered, as a box modeller hides them: on the back, on the
+/// inside of a limb, or on the sole.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pref {
+    Back,
+    Inside,
+    Sole,
+}
+
+/// A strip of quads between `b` (the longer row) and `t` with a diamond at each index in
+/// `kites`: the kite quad [b(i+1), b(i), b(i-1), t(j)] takes two edges of `b` into none of
+/// `t`, so b(i) is left with valence 3 and t(j) with valence 5, the way a box modeller drops
+/// two edge loops at once. Every other step is a plain quad. Closed rows are joined round,
+/// `t` turned so its points sit nearest the matching points of `b`; open rows are joined end
+/// to end. b(i) is moved away from t(j) by `ZR_KITELIFT` (0.4) of the band's height so the
+/// kite has a convex corner there (toward it, the kite folds in; the rows' relax evens the
+/// band below out). Returns the kite points moved.
+fn kite_strip(b: &[u32], t: &[u32], kites: &[usize], closed: bool, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>) -> Vec<u32> {
+    let (n0, n1) = (b.len(), t.len());
+    let lift: f32 = std::env::var("ZR_KITELIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.4);
+    let (start, steps) = kite_steps(n0, kites, closed);
+    let bb = |i: usize| b[i % n0];
+    let sh = if closed {
+        let b_pos: Vec<Vec3> = b.iter().map(|&v| out_p[v as usize]).collect();
+        let t_pos: Vec<Vec3> = t.iter().map(|&v| out_p[v as usize]).collect();
+        (0..n1).min_by(|&x, &y| band_cost(&b_pos, &t_pos, start, &steps, x).total_cmp(&band_cost(&b_pos, &t_pos, start, &steps, y))).unwrap_or(0)
+    } else {
+        0
+    };
+    let tt = |o: usize| t[(o + sh) % n1];
+    let (mut i, mut o) = (start, 0usize);
+    let mut moved = Vec::new();
+    for &st in &steps {
+        if st == 1 {
+            quads.push([bb(i + 1), bb(i), tt(o), tt(o + 1)]);
+            i += 1;
+            o += 1;
+        } else {
+            quads.push([bb(i + 2), bb(i + 1), bb(i), tt(o)]);
+            let (v, u) = (bb(i + 1), tt(o));
+            out_p[v as usize] = out_p[v as usize].lerp(out_p[u as usize], -lift);
+            moved.push(v);
+            i += 2;
+        }
+    }
+    moved
+}
+
+/// The steps along a row of `n0` points with kites at `kites`: where to start (just before
+/// the first kite round a closed row, the end of an open one) and each step's edges, 2 at a
+/// kite (two edges of this row, none of the other), else 1.
+fn kite_steps(n0: usize, kites: &[usize], closed: bool) -> (usize, Vec<u8>) {
+    let is_kite = |i: usize| kites.contains(&(i % n0));
+    let (edges, start) = if closed { (n0, kites.first().map_or(0, |&k| (k + n0 - 1) % n0)) } else { (n0 - 1, 0) };
+    let mut steps: Vec<u8> = Vec::new();
+    let mut i = start;
+    while i < start + edges {
+        if is_kite(i + 1) && i + 2 <= start + edges {
+            steps.push(2);
+            i += 2;
+        } else {
+            steps.push(1);
+            i += 1;
+        }
+    }
+    (start, steps)
+}
+
+/// How far a band's steps reach across: the squared distances from each step's point on the
+/// longer row to its point on the shorter, the shorter turned by `sh`.
+fn band_cost(b_pos: &[Vec3], t_pos: &[Vec3], start: usize, steps: &[u8], sh: usize) -> f32 {
+    let (n0, n1) = (b_pos.len(), t_pos.len());
+    let (mut i, mut o, mut cost) = (start, 0usize, 0.0f32);
+    for &st in steps {
+        cost += b_pos[i % n0].distance_squared(t_pos[(o + sh) % n1]);
+        i += st as usize;
+        if st == 1 {
+            o += 1;
+        }
+    }
+    cost
+}
+
+/// The least cost of a band with kites at `cols` of the longer row: over every turn of the
+/// shorter row when closed; the first halves end to end when pinned.
+fn kite_cost(long_pos: &[Vec3], short_pos: &[Vec3], cols: &[usize], pinned: bool) -> f32 {
+    if pinned {
+        let (b, t) = (&long_pos[..=long_pos.len() / 2], &short_pos[..=short_pos.len() / 2]);
+        let (start, steps) = kite_steps(b.len(), cols, false);
+        band_cost(b, t, start, &steps, 0)
+    } else {
+        let (start, steps) = kite_steps(long_pos.len(), cols, true);
+        (0..short_pos.len()).map(|sh| band_cost(long_pos, short_pos, start, &steps, sh)).fold(f32::INFINITY, f32::min)
+    }
+}
+
+/// A band between two closed rows of different counts joined with diamonds instead of
+/// merges: `cols` are the indices on the longer row of the kites' valence-3 points, each at
+/// least 3 apart and as many as half the difference. False (nothing built) if they do not fit.
+fn reduce_band(lo: &[u32], hi: &[u32], cols: &[usize], out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>) -> bool {
+    let flip = hi.len() > lo.len();
+    let (b, t): (Vec<u32>, Vec<u32>) = if flip { (hi.iter().rev().copied().collect(), lo.iter().rev().copied().collect()) } else { (lo.to_vec(), hi.to_vec()) };
+    let (n0, n1) = (b.len(), t.len());
+    if n0 < n1 + 2 || n0 - n1 != 2 * cols.len() || n1 < 3 {
+        return false;
+    }
+    let mut kites: Vec<usize> = cols.iter().map(|&c| if flip { n0 - 1 - c } else { c }).collect();
+    kites.sort_unstable();
+    for k in 0..kites.len() {
+        let gap = (kites[(k + 1) % kites.len()] + n0 - kites[k]) % n0;
+        if kites.len() > 1 && gap < 3 {
+            return false;
+        }
+    }
+    kite_strip(&b, &t, &kites, true, out_p, quads);
+    true
+}
+
+/// A band between two pinned rows (points 0 and n/2 on the plane, i and n − i mirrored) of
+/// different counts: the half on one side joined with diamonds at `cols_plus` (indices on
+/// the longer row's half, 2 from its ends and 3 apart), the other half its mirror image.
+/// False if the counts do not allow it or the kites do not fit.
+fn reduce_sym(lo: &[u32], hi: &[u32], cols_plus: &[usize], plane: MirrorPlane, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>) -> bool {
+    let (n0, n1) = (lo.len(), hi.len());
+    if n0 % 2 != 0 || n1 % 2 != 0 || n0 == n1 || (n0 / 2).abs_diff(n1 / 2) % 2 != 0 {
+        return false;
+    }
+    let flip = n1 > n0;
+    let (long, short) = if flip { (hi, lo) } else { (lo, hi) };
+    let (nb, nt) = (long.len() / 2, short.len() / 2);
+    if (nb - nt) / 2 != cols_plus.len() {
+        return false;
+    }
+    let mut kites: Vec<usize> = cols_plus.iter().map(|&c| if flip { nb - c } else { c }).collect();
+    kites.sort_unstable();
+    if kites.iter().any(|&k| k < 2 || k + 2 > nb) || kites.windows(2).any(|w| w[1] - w[0] < 3) {
+        return false;
+    }
+    let (b, t): (Vec<u32>, Vec<u32>) = if flip {
+        (long[..=nb].iter().rev().copied().collect(), short[..=nt].iter().rev().copied().collect())
+    } else {
+        (long[..=nb].to_vec(), short[..=nt].to_vec())
+    };
+    let mut mir: HashMap<u32, u32> = HashMap::default();
+    for i in 0..n0 {
+        mir.insert(lo[i], lo[(n0 - i) % n0]);
+    }
+    for j in 0..n1 {
+        mir.insert(hi[j], hi[(n1 - j) % n1]);
+    }
+    let mut half: Vec<[u32; 4]> = Vec::new();
+    for v in kite_strip(&b, &t, &kites, false, out_p, &mut half) {
+        let m = mir[&v];
+        out_p[m as usize] = plane.reflect(out_p[v as usize]);
+    }
+    for q in half {
+        quads.push(q);
+        let m = q.map(|v| mir[&v]);
+        quads.push([m[1], m[0], m[3], m[2]]);
+    }
+    true
+}
+
+/// The columns of `d` diamonds on a row of points `row_pos`, gathered 3 apart round the
+/// preferred point: the one furthest back (smallest component `fwd`), nearest the plane, or
+/// lowest. On a pinned row the indices are on its first half (point 0 in front, n/2 at the
+/// back), 2 from its ends, and their mirror images make the pairs. None if they do not fit.
+fn reduce_cols(row_pos: &[Vec3], d: usize, prefer: Pref, plane: Option<MirrorPlane>, fwd: usize, pinned: bool) -> Option<Vec<usize>> {
+    let n = row_pos.len();
+    let score = |i: usize| -> f32 {
+        match (prefer, plane) {
+            (Pref::Back, _) => row_pos[i][fwd],
+            (Pref::Inside, Some(pl)) => pl.distance(row_pos[i]).abs(),
+            (Pref::Inside, None) => row_pos[i][fwd],
+            (Pref::Sole, _) => row_pos[i].y,
+        }
+    };
+    if d == 0 {
+        return Some(Vec::new());
+    }
+    if pinned {
+        let nb = n / 2;
+        if nb < 4 || 3 * (d - 1) + 4 > nb {
+            return None;
+        }
+        let c = match prefer {
+            Pref::Back => nb,
+            _ => (2..=nb - 2).min_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(nb),
+        }.clamp(2, nb - 2);
+        // Out from the preferred point, alternating sides, as far as the half allows.
+        let mut cols = Vec::new();
+        let mut k = 0usize;
+        while cols.len() < d && k <= nb {
+            for s in [c as isize - 3 * k as isize, c as isize + 3 * k as isize] {
+                if cols.len() < d && s >= 2 && s as usize + 2 <= nb && !cols.contains(&(s as usize)) {
+                    cols.push(s as usize);
+                }
+            }
+            k += 1;
+        }
+        if cols.len() < d {
+            return None;
+        }
+        cols.sort_unstable();
+        Some(cols)
+    } else {
+        if 3 * d + (d % 2 == 0) as usize > n {
+            return None;
+        }
+        let c = (0..n).min_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(0) as isize;
+        // Spread symmetric about the preferred point, so a limb and its mirror image agree:
+        // c, c ± 3, c ± 6 … for an odd count; c ± 2, c ± 5 … for an even one.
+        let mut cols: Vec<usize> = (0..d).map(|k| {
+            let off = if d % 2 == 1 {
+                let m = (k as isize + 1) / 2;
+                if k % 2 == 1 { -3 * m } else { 3 * m }
+            } else {
+                let m = k as isize / 2;
+                if k % 2 == 0 { -(2 + 3 * m) } else { 2 + 3 * m }
+            };
+            (c + off).rem_euclid(n as isize) as usize
+        }).collect();
+        cols.sort_unstable();
+        Some(cols)
+    }
+}
+
+/// The columns of `d` diamonds on the longer row spread where the two rows diverge, for a
+/// step too big to gather in one place (the neck into the shoulders: gathered, the quads
+/// between would shear). Each point of the longer row goes to its nearest point of the
+/// shorter; where c of them share one, (c − 1) / 2 of their edges want a kite. The kites are
+/// dealt along the row by that weight, 3 apart, the rest at the best places left. On a
+/// pinned row: on its first half, 2 from its ends. None if they do not fit.
+fn fan_cols(long_pos: &[Vec3], short_pos: &[Vec3], d: usize, pinned: bool) -> Option<Vec<usize>> {
+    let (n, m) = (long_pos.len(), short_pos.len());
+    if d == 0 {
+        return Some(Vec::new());
+    }
+    if n < 4 || m == 0 {
+        return None;
+    }
+    let nearest: Vec<usize> = long_pos.iter().map(|&q| (0..m).min_by(|&a, &b| short_pos[a].distance_squared(q).total_cmp(&short_pos[b].distance_squared(q))).unwrap_or(0)).collect();
+    let mut share = vec![0usize; m];
+    for &j in &nearest {
+        share[j] += 1;
+    }
+    let (lo, hi) = if pinned { (2usize, n / 2 - 2) } else { (0, n - 1) };
+    if hi < lo {
+        return None;
+    }
+    let mut weight: Vec<f32> = (lo..=hi).map(|i| { let c = share[nearest[i]] as f32; (c - 1.0).max(0.0) / (2.0 * c) }).collect();
+    let total: f32 = weight.iter().sum();
+    if total <= 0.0 {
+        weight = vec![1.0; hi + 1 - lo];
+    }
+    let scale = d as f32 / weight.iter().sum::<f32>();
+    let far = |cols: &[usize], i: usize| cols.iter().all(|&c| { let g = c.abs_diff(i); g >= 3 && (pinned || n - g >= 3) });
+    let mut cols: Vec<usize> = Vec::new();
+    let mut acc = 0.5f32;
+    for i in lo..=hi {
+        acc += weight[i - lo] * scale;
+        if acc >= 1.0 && cols.len() < d && far(&cols, i) {
+            cols.push(i);
+            acc -= 1.0;
+        }
+    }
+    while cols.len() < d {
+        let best = (lo..=hi).filter(|&i| far(&cols, i)).max_by(|&a, &b| weight[a - lo].total_cmp(&weight[b - lo]).then(b.cmp(&a)))?;
+        cols.push(best);
+    }
+    cols.sort_unstable();
+    Some(cols)
+}
+
 /// Points paired with their mirror images moved to agree exactly (a point that is its own
 /// image onto the plane).
 fn symmetrize(p: &mut [Vec3], plane: MirrorPlane, quad: f32) -> usize {
@@ -378,7 +652,17 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     };
     // A run that narrows and then flares again near its end (the ankle into the foot, the
     // wrist into the hand) is two: the limb with one count to its narrowest ring, then the
-    // foot or hand with its own (`ZR_NOANKLE` off).
+    // foot or hand with its own (`ZR_NOANKLE` off). The foot's or hand's rings are noted:
+    // their reductions go on the sole. Where the limb's count is the larger, it carries on
+    // through the ankle to the ring before the foot's widest, as a box modeller's shin loops
+    // wrap the ankle and the instep; from the widest ring on the foot's own counts hold. The
+    // ankle band is then an equal join, and the step down to the foot's count lies between
+    // two rings round the whole foot, gathered on the sole, not under the heel where a ring
+    // round the whole foot meets one round the forefoot (`ZR_NOCARRY` or `ZR_OLDMERGE` gives
+    // the foot its own count from its first ring, as before). A neck widening into the
+    // shoulders also parts here, and keeps its own counts.
+    let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
+    let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
     let plan = |rs: &[usize]| -> Vec<usize> {
         let n = rs.len();
         if n >= 8 && std::env::var_os("ZR_NOANKLE").is_none() {
@@ -387,8 +671,19 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
             if let Some(e) = (from..n.saturating_sub(2)).min_by(|&a, &b| gs[a].total_cmp(&gs[b])) {
                 let tail_max = gs[e + 1..].iter().copied().fold(0.0f32, f32::max);
                 if tail_max > gs[e] * 1.3 {
+                    after_ankle.borrow_mut().extend(rs[e + 1..].iter().copied());
                     let mut out = plan_one(&rs[..=e]);
-                    out.extend(plan_one(&rs[e + 1..]));
+                    let mut foot = plan_one(&rs[e + 1..]);
+                    if carry && out[e] > foot[0] {
+                        let widest = (e + 1..n).max_by(|&a, &b| gs[a].total_cmp(&gs[b]).then(b.cmp(&a))).unwrap_or(e + 1);
+                        for c in &mut foot[..widest - e - 1] {
+                            *c = out[e];
+                        }
+                        if debug {
+                            eprintln!("    plan: {} carried through the ankle (ring {e} of {n}, girth {:.1}) to the widest ring past it: girths {:?} -> counts {:?}", out[e], gs[e], gs[e + 1..].iter().map(|g| (g * 10.0).round() / 10.0).collect::<Vec<_>>(), foot);
+                        }
+                    }
+                    out.extend(foot);
                     return out;
                 }
             }
@@ -610,6 +905,87 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     };
     // Whether rows of ring `r` are pinned to the plane (and n their count).
     let pinned = |r: usize, n: usize| plane.is_some() && ring_cross[r].is_some() && n % 2 == 0;
+    // A band between two rows: plain quads at equal counts; at different counts, diamonds
+    // (`ZR_OLDMERGE` off): a step up to a quarter of the smaller count gathers them where
+    // `prefer` says, a bigger one spreads them where the rows diverge; else (an odd
+    // difference, or more than fit) the merges of join_sym and join_band.
+    let old_merge = std::env::var_os("ZR_OLDMERGE").is_some();
+    let join_rows = |row: &[u32], row_sym: bool, next: &[u32], next_sym: bool, prefer: Pref, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>| {
+        let (n0, n1) = (row.len(), next.len());
+        let sym = plane.is_some() && row_sym && next_sym;
+        if n0 != n1 && !old_merge && n0.abs_diff(n1) % 2 == 0 {
+            let (long, short) = if n0 > n1 { (row, next) } else { (next, row) };
+            let mut long_pos: Vec<Vec3> = long.iter().map(|&v| out_p[v as usize]).collect();
+            let mut short_pos: Vec<Vec3> = short.iter().map(|&v| out_p[v as usize]).collect();
+            let d = n0.abs_diff(n1) / 2;
+            let pinned = plane.is_some() && sym;
+            // A limb on the far side of the plane is decided as its mirror image (its rows
+            // reflected and run the other way), so the two limbs come out alike.
+            let far_side = match plane {
+                Some(pl) if !pinned => pl.distance(long_pos.iter().copied().sum::<Vec3>() / long_pos.len() as f32) < 0.0,
+                _ => false,
+            };
+            if far_side {
+                for pos in [&mut long_pos, &mut short_pos] {
+                    let pl = plane.unwrap();
+                    let n = pos.len();
+                    *pos = (0..n).map(|i| pl.reflect(pos[(n - i) % n])).collect();
+                }
+            }
+            // Gathered when the step is small and the rows taper evenly enough that the
+            // gathered band reaches across little further than one spread where the rows
+            // diverge (`ZR_KITEGATHER`, 2, how much further it may; 0 spreads every band).
+            let gather_most: f32 = std::env::var("ZR_KITEGATHER").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+            let dk = if pinned { d / 2 } else { d };
+            let (cols_g, cols_s) = if pinned && d % 2 != 0 {
+                (None, None)
+            } else {
+                (if d <= n0.min(n1) / 4 { reduce_cols(&long_pos, dk, prefer, plane, fwd, pinned) } else { None }, fan_cols(&long_pos, &short_pos, dk, pinned))
+            };
+            let costs = (cols_g.as_ref().map(|c| kite_cost(&long_pos, &short_pos, c, pinned)), cols_s.as_ref().map(|c| kite_cost(&long_pos, &short_pos, c, pinned)));
+            let gather = match costs {
+                (Some(g), Some(s)) => g <= s * gather_most,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let cols = (if gather { cols_g } else { cols_s }).map(|c| {
+                if far_side {
+                    let n = long.len();
+                    let mut back: Vec<usize> = c.iter().map(|&i| (n - i) % n).collect();
+                    back.sort_unstable();
+                    back
+                } else {
+                    c
+                }
+            });
+            let built = match plane {
+                Some(pl) if sym => {
+                    cols.filter(|c| reduce_sym(row, next, c, pl, out_p, quads)).map(|c| {
+                        let n = long.len();
+                        let mut all: Vec<usize> = c.iter().map(|&i| n - i).chain(c.iter().copied()).collect();
+                        all.sort_unstable();
+                        all
+                    })
+                }
+                _ => cols.filter(|c| reduce_band(row, next, c, out_p, quads)),
+            };
+            if let Some(cols) = built {
+                if debug {
+                    let how = if gather { format!("{prefer:?}") } else { "spread".to_string() };
+                    let (g, sp) = (costs.0.unwrap_or(f32::NAN), costs.1.unwrap_or(f32::NAN));
+                    eprintln!("    reduce: {n0} -> {n1}, {d} diamonds at cols {cols:?} ({how}; reach gathered {g:.3}, spread {sp:.3})");
+                }
+                return;
+            }
+        }
+        let done = match plane {
+            Some(pl) if sym => join_sym(row, next, out_p, quads, pl),
+            _ => false,
+        };
+        if !done {
+            join_band(row, next, out_p, quads);
+        }
+    };
     // A grid over a row (an even count): a × b quads, its border the row. On a pinned row
     // (`sym`): a even and the row's point 0 the middle of a side, so a grid line runs along
     // the plane.
@@ -946,10 +1322,16 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 }
                 let next = make_row(r, n, Some(&row_pos), &mut out_p);
                 let next_sym = pinned(r, n);
-                let done = match plane {
-                    Some(pl) if row_sym && next_sym => join_sym(&row, &next, &mut out_p, &mut quads, pl),
-                    _ => false,
+                // Where this band's reductions go: the back of the head, neck and trunk, the
+                // inside of a limb, the sole of a foot or hand.
+                let prefer = if plane.is_none() || ring_cross[r].is_some() || head_run.contains(&r) {
+                    Pref::Back
+                } else if after_ankle.borrow().contains(&r) {
+                    Pref::Sole
+                } else {
+                    Pref::Inside
                 };
+                join_rows(&row, row_sym, &next, next_sym, prefer, &mut out_p, &mut quads);
                 if next_sym && !head_rings.contains(&r) {
                     torso.extend(next.iter().copied());
                 }
@@ -958,9 +1340,6 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 }
                 if lower_face_rings.contains(&r) {
                     lower_face.extend(next.iter().copied());
-                }
-                if !done {
-                    join_band(&row, &next, &mut out_p, &mut quads);
                 }
                 stack.push((rings[r].to, next, next_sym, r));
             }
@@ -1869,5 +2248,122 @@ fn tour(i: usize, start: usize, parent: Option<usize>, rows: &[Vec<u32>], att_ro
     }
     if !root {
         seq.push(rows[i][start]);
+    }
+}
+
+#[cfg(test)]
+mod reduce_tests {
+    use super::*;
+
+    /// Each vertex's valence in the band with the edge it has into the row before or after
+    /// (one per row point) counted in, and a check that the band is a manifold strip of
+    /// quads: row edges used once, inner edges twice, four distinct corners, no corner
+    /// angle near 0 or 180 degrees.
+    fn valences(p: &[Vec3], quads: &[[u32; 4]], rows: &[&[u32]]) -> HashMap<u32, usize> {
+        let mut used: HashMap<(u32, u32), usize> = HashMap::default();
+        for q in quads {
+            let mut c = q.to_vec();
+            c.sort_unstable();
+            c.dedup();
+            assert_eq!(c.len(), 4, "quad {q:?} repeats a corner");
+            for k in 0..4 {
+                let (a, b, o) = (p[q[k] as usize], p[q[(k + 1) % 4] as usize], p[q[(k + 3) % 4] as usize]);
+                let ang = (b - a).angle_between(o - a).to_degrees();
+                assert!(ang > 10.0 && ang < 170.0, "quad {q:?} has a corner of {ang:.1} degrees");
+                *used.entry((q[k].min(q[(k + 1) % 4]), q[k].max(q[(k + 1) % 4]))).or_default() += 1;
+            }
+        }
+        let mut row_edges: HashSet<(u32, u32)> = HashSet::default();
+        for r in rows {
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                row_edges.insert((a.min(b), a.max(b)));
+            }
+        }
+        let mut val: HashMap<u32, usize> = HashMap::default();
+        for (&(a, b), &n) in &used {
+            assert_eq!(n, if row_edges.contains(&(a, b)) { 1 } else { 2 }, "edge {a}-{b} used {n} times");
+            *val.entry(a).or_default() += 1;
+            *val.entry(b).or_default() += 1;
+        }
+        for r in rows {
+            for &v in r.iter() {
+                assert!(used.keys().any(|&(a, b)| a == v || b == v), "row point {v} is not in the band");
+                *val.entry(v).or_default() += 1;
+            }
+        }
+        val
+    }
+
+    fn circle(n: usize, y: f32, p: &mut Vec<Vec3>) -> Vec<u32> {
+        let r = n as f32 / std::f32::consts::TAU;
+        (0..n).map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            p.push(Vec3::new(-r * a.sin(), y, r * a.cos()));
+            (p.len() - 1) as u32
+        }).collect()
+    }
+
+    #[test]
+    fn diamonds_take_a_closed_band_from_24_to_20() {
+        for flip in [false, true] {
+            let mut p = Vec::new();
+            let (lo, hi) = if flip { (circle(20, 0.0, &mut p), circle(24, 1.0, &mut p)) } else { (circle(24, 0.0, &mut p), circle(20, 1.0, &mut p)) };
+            let long = if flip { &hi } else { &lo };
+            let long_pos: Vec<Vec3> = long.iter().map(|&v| p[v as usize]).collect();
+            let cols = reduce_cols(&long_pos, 2, Pref::Back, None, 2, false).unwrap();
+            // The back of the circle is index 12; an even count straddles it.
+            assert_eq!(cols, vec![10, 14]);
+            let mut quads = Vec::new();
+            assert!(reduce_band(&lo, &hi, &cols, &mut p, &mut quads));
+            assert_eq!(quads.len(), 22);
+            let val = valences(&p, &quads, &[&lo, &hi]);
+            let threes: Vec<u32> = val.iter().filter(|x| *x.1 == 3).map(|x| *x.0).collect();
+            let fives: Vec<u32> = val.iter().filter(|x| *x.1 == 5).map(|x| *x.0).collect();
+            assert_eq!(threes.len(), 2, "flip {flip}: valence 3 at {threes:?}");
+            assert_eq!(fives.len(), 2, "flip {flip}: valence 5 at {fives:?}");
+            assert!(val.values().all(|&v| (3..=5).contains(&v)));
+            for &c in &cols {
+                assert!(threes.contains(&long[c]), "flip {flip}: column {c} is not a valence-3 point");
+            }
+            let short = if flip { &lo } else { &hi };
+            assert!(fives.iter().all(|v| short.contains(v)), "the valence-5 points are on the shorter row");
+            // The kite points moved away from the other row, so the kites are convex.
+            for &c in &cols {
+                assert!((p[long[c] as usize].y - if flip { 1.0 } else { 0.0 }).abs() > 0.3);
+            }
+        }
+    }
+
+    #[test]
+    fn mirrored_diamonds_take_a_pinned_band_from_28_to_24() {
+        let plane = MirrorPlane { axis: Axis::X, at: 0.0 };
+        let mut p = Vec::new();
+        let lo = circle(28, 0.0, &mut p);
+        let hi = circle(24, 1.0, &mut p);
+        let lo_pos: Vec<Vec3> = lo.iter().map(|&v| p[v as usize]).collect();
+        assert!(plane.distance(lo_pos[0]).abs() < 1e-5 && plane.distance(lo_pos[14]).abs() < 1e-5);
+        assert_eq!(reduce_cols(&lo_pos, 1, Pref::Back, Some(plane), 2, true), Some(vec![12]));
+        assert_eq!(reduce_cols(&lo_pos, 3, Pref::Back, Some(plane), 2, true), Some(vec![6, 9, 12]));
+        assert_eq!(reduce_cols(&lo_pos, 1, Pref::Sole, Some(plane), 2, true), Some(vec![2]));
+        let cols = reduce_cols(&lo_pos, 1, Pref::Back, Some(plane), 2, true).unwrap();
+        let mut quads = Vec::new();
+        assert!(reduce_sym(&lo, &hi, &cols, plane, &mut p, &mut quads));
+        assert_eq!(quads.len(), 26);
+        let val = valences(&p, &quads, &[&lo, &hi]);
+        let mut threes: Vec<u32> = val.iter().filter(|x| *x.1 == 3).map(|x| *x.0).collect();
+        threes.sort_unstable();
+        assert_eq!(threes, vec![lo[12], lo[16]]);
+        assert_eq!(val.values().filter(|&&v| v == 5).count(), 2);
+        // Its own mirror image: every quad's reflection is a quad, and no point is lonely.
+        for q in &quads {
+            let want: Vec<Vec3> = q.iter().map(|&v| plane.reflect(p[v as usize])).collect();
+            assert!(quads.iter().any(|r| (0..4).all(|k| r.iter().any(|&v| p[v as usize].distance(want[k]) < 1e-5))), "quad {q:?} has no mirror image");
+        }
+        assert_eq!(symmetrize(&mut p, plane, 1.0), 0);
+        // A difference not in fours is not for diamonds.
+        let mut p2 = Vec::new();
+        let (a, b) = (circle(28, 0.0, &mut p2), circle(26, 1.0, &mut p2));
+        assert!(!reduce_sym(&a, &b, &[], plane, &mut p2, &mut Vec::new()));
     }
 }
