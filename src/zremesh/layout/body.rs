@@ -604,6 +604,54 @@ fn fan_cols(long_pos: &[Vec3], short_pos: &[Vec3], d: usize, pinned: bool) -> Op
     Some(cols)
 }
 
+/// A row's spread in its own plane (the plane of the row as a polygon): its centroid, the
+/// long and short axes (unit vectors), and the semi-axes of the ellipse with the same second
+/// moments. Sums in f64, so a row and its mirror image agree.
+fn row_axes(pts: &[Vec3]) -> (Vec3, Vec3, Vec3, f32, f32) {
+    use glam::DVec3;
+    let n = pts.len().max(1) as f64;
+    let d: Vec<DVec3> = pts.iter().map(|p| p.as_dvec3()).collect();
+    let c = d.iter().fold(DVec3::ZERO, |s, &q| s + q) / n;
+    let mut nrm = DVec3::ZERO;
+    for i in 0..d.len() {
+        nrm += (d[i] - c).cross(d[(i + 1) % d.len()] - c);
+    }
+    let nrm = nrm.normalize_or(DVec3::Z);
+    let seed = d.first().map_or(DVec3::X, |&q| q - c);
+    let e1 = (seed - nrm * seed.dot(nrm)).normalize_or(nrm.any_orthonormal_vector());
+    let e2 = nrm.cross(e1);
+    let (mut a, mut b, mut cc) = (0.0f64, 0.0f64, 0.0f64);
+    for &q in &d {
+        let (x, y) = ((q - c).dot(e1), (q - c).dot(e2));
+        a += x * x;
+        b += x * y;
+        cc += y * y;
+    }
+    let mid = (a + cc) * 0.5;
+    let half = (((a - cc) * 0.5).powi(2) + b * b).sqrt();
+    let (l1, l2) = (mid + half, (mid - half).max(0.0));
+    let (vx, vy) = if b.abs() > 1e-18 { (l1 - cc, b) } else if a >= cc { (1.0, 0.0) } else { (0.0, 1.0) };
+    let u = (e1 * vx + e2 * vy).normalize_or(e1);
+    let v = nrm.cross(u);
+    (c.as_vec3(), u.as_vec3(), v.as_vec3(), (2.0 * l1 / n).sqrt() as f32, (2.0 * l2 / n).sqrt() as f32)
+}
+
+/// Where a row with axes `u`, `v` (semi-axes `big`, `small`) should start so that a grid's
+/// first side runs along its long axis: the point nearest the corner at 135° behind the
+/// long axis, going the row's way round. The points' angles are taken on the ellipse
+/// squashed to a circle, so the four corners are the quarter points of the row.
+fn corner_start(pts: &[Vec3], c: Vec3, u: Vec3, v: Vec3, big: f32, small: f32) -> usize {
+    let n = pts.len();
+    let xy: Vec<(f32, f32)> = pts.iter().map(|&p| ((p - c).dot(u) / big.max(1e-9), (p - c).dot(v) / small.max(1e-9))).collect();
+    let area: f32 = (0..n).map(|i| { let (p, q) = (xy[i], xy[(i + 1) % n]); p.0 * q.1 - q.0 * p.1 }).sum();
+    let goal = if area >= 0.0 { -0.75 * std::f32::consts::PI } else { -0.25 * std::f32::consts::PI };
+    let off = |i: usize| {
+        let t = xy[i].1.atan2(xy[i].0) - goal;
+        (t - (t / std::f32::consts::TAU).round() * std::f32::consts::TAU).abs()
+    };
+    (0..n).min_by(|&i, &j| off(i).total_cmp(&off(j))).unwrap_or(0)
+}
+
 /// Each point's mirror image among `p`: the point nearest its reflection within 0.35 quad (a
 /// point on the plane is its own), or None. The pairs are mutual, and a point is the image
 /// of one point only, so two points at one place get two images (the nearest free point, if
@@ -1266,15 +1314,21 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // along a limb or the trunk; else stepping where the girth drifts past 1.5 times.
     let ratio: f32 = std::env::var("ZR_BODYRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
     let drift: f32 = std::env::var("ZR_BODYDRIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5);
+    // A thin tube (a finger: two rings or more, all under 8 quads round) gets at least
+    // `ZR_MINTUBE` (8) points round it, so its tip cap is a 2 × 2 grid (0 for the girth's own
+    // count).
+    let min_tube: usize = std::env::var("ZR_MINTUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let tubular = |rs: &[usize]| rs.len() >= 2 && rs.iter().all(|&r| rings[r].girth < 8.0);
     // A ring the plane cuts takes its count in fours (its row is pinned front and back);
     // a run with one count takes fours when any of its rings is cut (harmless on the rest).
     let plan_one = |rs: &[usize]| -> Vec<usize> {
         let gs: Vec<f32> = rs.iter().map(|&r| rings[r].girth.max(1e-3)).collect();
-        let q = |g: f32, r: usize| if ring_cross[r].is_some() { even4(g) } else { even(g) };
+        let floor = if tubular(rs) { min_tube } else { 0 };
+        let q = |g: f32, r: usize| (if ring_cross[r].is_some() { even4(g) } else { even(g) }).max(floor);
         let (mn, mx) = gs.iter().fold((f32::INFINITY, 0.0f32), |m, &g| (m.0.min(g), m.1.max(g)));
         if mx <= mn * ratio {
             let gm = (gs.iter().map(|g| g.ln()).sum::<f32>() / gs.len() as f32).exp();
-            let n = if rs.iter().any(|&r| ring_cross[r].is_some()) { even4(gm) } else { even(gm) };
+            let n = (if rs.iter().any(|&r| ring_cross[r].is_some()) { even4(gm) } else { even(gm) }).max(floor);
             return vec![n; gs.len()];
         }
         let mut n = q(gs[0], rs[0]);
@@ -1297,10 +1351,14 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // ankle band is then an equal join, and the step down to the foot's count lies between
     // two rings round the whole foot, gathered on the sole, not under the heel where a ring
     // round the whole foot meets one round the forefoot (`ZR_NOCARRY` or `ZR_OLDMERGE` gives
-    // the foot its own count from its first ring, as before). A neck widening into the
-    // shoulders also parts here, and keeps its own counts.
+    // the foot its own count from its first ring, as before). When the limb's count at the
+    // ankle and the foot's first differ by less than `ZR_ANKLEDIFF` (8) the run is not parted
+    // at all: planned as one, the heel keeps the leg's columns and no merge ring forms (0
+    // parts it as before). A neck widening into the shoulders also parts here, and keeps its
+    // own counts.
     let after_ankle: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::default());
     let carry = std::env::var_os("ZR_NOCARRY").is_none() && std::env::var_os("ZR_OLDMERGE").is_none();
+    let ankle_diff: usize = std::env::var("ZR_ANKLEDIFF").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let plan = |rs: &[usize]| -> Vec<usize> {
         let n = rs.len();
         if n >= 8 && std::env::var_os("ZR_NOANKLE").is_none() {
@@ -1312,6 +1370,12 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                     after_ankle.borrow_mut().extend(rs[e + 1..].iter().copied());
                     let mut out = plan_one(&rs[..=e]);
                     let mut foot = plan_one(&rs[e + 1..]);
+                    if out[e].abs_diff(foot[0]) < ankle_diff {
+                        if debug {
+                            eprintln!("    plan: ankle at ring {e} of {n} (girth {:.1}) kept in its run: {} above, {} below", gs[e], out[e], foot[0]);
+                        }
+                        return plan_one(rs);
+                    }
                     if carry && out[e] > foot[0] {
                         let widest = (e + 1..n).max_by(|&a, &b| gs[a].total_cmp(&gs[b]).then(b.cmp(&a))).unwrap_or(e + 1);
                         for c in &mut foot[..widest - e - 1] {
@@ -1714,13 +1778,16 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         rect::cap_dims(row, a, sym, out_p, quads);
     };
     // A cap's inner points lifted toward the end beyond its row (a dome: all the way at its
-    // middle, none at the row), so it reaches the tip of a finger, a toe or the head instead
-    // of lying flat across the last ring.
-    let dome = |row: &[u32], from: usize, tip: Vec3, out_p: &mut Vec<Vec3>| {
+    // middle, none at the row, but no further than `most`), so it reaches the tip of a
+    // finger, a toe or the head instead of lying flat across the last ring.
+    let dome = |row: &[u32], from: usize, tip: Vec3, most: f32, out_p: &mut Vec<Vec3>| {
         let pts: Vec<Vec3> = row.iter().map(|&v| out_p[v as usize]).collect();
         let c = pts.iter().copied().sum::<Vec3>() / pts.len().max(1) as f32;
         let rr = pts.iter().map(|q| q.distance(c)).sum::<f32>() / pts.len().max(1) as f32;
-        let lift = tip - c;
+        let mut lift = tip - c;
+        if lift.length() > most {
+            lift *= most / lift.length();
+        }
         for v in from..out_p.len() {
             let d = out_p[v].distance(c) / rr.max(1e-9);
             out_p[v] += lift * (1.0 - d * d).max(0.0);
@@ -1827,7 +1894,121 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     let row0 = make_row(first, counts[&first], None, None, &mut out_p);
     let cap_from = out_p.len();
     cap(&row0, pinned(first, row0.len()), &mut out_p, &mut quads);
-    dome(&row0, cap_from, w.p[src as usize], &mut out_p);
+    dome(&row0, cap_from, w.p[src as usize], f32::INFINITY, &mut out_p);
+    // The working surface, for cap points to be put on.
+    let tg = crate::zremesh::TriGrid::from_tris(&w.p, &w.t, quad);
+    let surface = |q: Vec3| tg.closest_tris(&w.p, &w.t, q).map_or(q, |c| c.0);
+    // How a limb's end is capped (`ZR_OLDTIPS`: rows a quad apart shrinking like a sphere,
+    // then a grid domed all the way to the tip, as before): a row whose long radius is
+    // `ZR_FLATASPECT` (1.3) times its short one is a flat end (a foot's last rows, slanting
+    // over the toes, are 1.35 to 1.45; a thumb's 1.27).
+    let old_tips = std::env::var_os("ZR_OLDTIPS").is_some();
+    let flat_aspect: f32 = std::env::var("ZR_FLATASPECT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.3);
+    // How far past its ring's girth a split's bridged count may be for the band above to
+    // step up to it: 1.8 times, as before, or `ZR_SPLITRATIO` (2.2) when one of the split's
+    // runs is a thin tube lifted to the `ZR_MINTUBE` floor (fingers of 8 bridge to about
+    // twice the palm's girth).
+    let split_ratio: f32 = std::env::var("ZR_SPLITRATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(2.2);
+    let floored = |rs: &[usize]| tubular(rs) && rs.iter().any(|&r| even(rings[r].girth) < min_tube);
+    // Whether rings join at piece `p` (more than one kept ring comes in).
+    let joins_at = |p: u32| ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count()) > 1;
+    // Whether a row lies on the far side of the plane, where it runs the other way round
+    // from its twin (`ZR_NOCAPMIRROR`: no row does, the caps then differ).
+    let far_side = |row_sym: bool, row_pos: &[Vec3]| {
+        !row_sym
+            && std::env::var_os("ZR_NOCAPMIRROR").is_none()
+            && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0)
+    };
+    // The cap at the end of a limb, on `row`, the tip past it at `tip`. A flat end (the toe
+    // end of a foot, a mitten) goes on in rows a quad apart keeping the row's shape (shrunk
+    // only near the end), the last half a quad or more short of the tip, then a grid laid
+    // straight across, more quads along its long side, its inside lifted toward the tip by
+    // at most half a quad and put on the surface. A round end (a finger) goes on in rows
+    // shrinking toward the tip like a sphere, half a quad apart while they are wider than
+    // 0.6 quad, then a grid domed toward the tip by at most half a quad.
+    let end_cap = |row: &[u32], row_sym: bool, tip: Vec3, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>| {
+        let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
+        let n = row.len();
+        let (c, _, _, big, small) = row_axes(&row_pos);
+        let dist = tip.distance(c);
+        if !old_tips && n >= 6 && big >= small * flat_aspect {
+            let extra = (dist / quad).floor() as usize;
+            let mut last = row.to_vec();
+            let mut rows = 0;
+            for k in 1..=extra.min(8) {
+                let t = k as f32 / (extra as f32 + 1.0);
+                let s = (1.0 - t.powi(4)).max(0.0).powf(0.25);
+                let cc = c.lerp(tip, t);
+                let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
+                join_band(&last, &next, out_p, quads);
+                last = next;
+                rows += 1;
+            }
+            let last_pos: Vec<Vec3> = last.iter().map(|&i| out_p[i as usize]).collect();
+            let (c, ax_u, ax_v, big, small) = row_axes(&last_pos);
+            let half = n / 2;
+            let mut a = ((half as f32 * big / (big + small)).round() as usize).clamp(1, half - 1);
+            if row_sym && a % 2 == 1 {
+                a = if a + 1 < half { a + 1 } else { a - 1 };
+            }
+            let a = a.max(1);
+            // A row on the far side of the plane runs the other way round from its twin's:
+            // reversed, then started at the corner where its long side begins, so the cap is
+            // the twin's mirror image (a pinned row keeps its start: the grid line along the
+            // plane). cap_dims winds its quads the row's way, so the reversed row's cap comes
+            // out inside out until orient() at the end of the build turns it.
+            if far_side(row_sym, &row_pos) {
+                last = (0..n).map(|i| last[(n - i) % n]).collect();
+            }
+            if !row_sym {
+                let last_pos: Vec<Vec3> = last.iter().map(|&i| out_p[i as usize]).collect();
+                let k = corner_start(&last_pos, c, ax_u, ax_v, big, small);
+                last = (0..n).map(|i| last[(i + k) % n]).collect();
+            }
+            let from = out_p.len();
+            rect::cap_dims(&last, a, row_sym, out_p, quads);
+            let dir = (tip - c).normalize_or_zero();
+            let lift = tip.distance(c).min(quad * 0.5);
+            let (eu, ev) = last_pos.iter().fold((0.0f32, 0.0f32), |m, &q| (m.0.max((q - c).dot(ax_u).abs()), m.1.max((q - c).dot(ax_v).abs())));
+            for v in from..out_p.len() {
+                let q = out_p[v] - c;
+                let (x, y) = (q.dot(ax_u) / eu.max(1e-9), q.dot(ax_v) / ev.max(1e-9));
+                out_p[v] += dir * (lift * (1.0 - x * x - y * y).max(0.0));
+                out_p[v] = surface(out_p[v]);
+            }
+            if debug {
+                eprintln!("    cap flat {a} x {} after {rows} rows near {:.3}: row of {n}, radii {:.2} x {:.2} quads, tip {:.2} quads past", half - a, c, big / quad, small / quad, dist / quad);
+            }
+        } else {
+            let rr = row_pos.iter().map(|q| q.distance(c)).sum::<f32>() / n as f32;
+            let extra = if old_tips { (dist / quad).round() as usize } else { (dist / (quad * 0.5)).floor() as usize };
+            let mut last = row.to_vec();
+            let mut rows = 0;
+            for k in 1..=extra.min(if old_tips { 8 } else { 16 }) {
+                let t = k as f32 / (extra as f32 + 1.0);
+                let s = (1.0 - t * t).max(0.0).sqrt();
+                if !old_tips && rr * s < quad * 0.6 {
+                    break;
+                }
+                let cc = c.lerp(tip, t);
+                let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
+                join_band(&last, &next, out_p, quads);
+                last = next;
+                rows += 1;
+            }
+            // Reversed on the far side of the plane, so the cap is the twin's mirror image
+            // (the dome only reads the row's centre and radius).
+            let nl = last.len();
+            let capped: Vec<u32> = if far_side(row_sym, &row_pos) { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
+            let from = out_p.len();
+            cap(&capped, row_sym, out_p, quads);
+            dome(&last, from, tip, if old_tips { f32::INFINITY } else { quad * 0.5 }, out_p);
+            if debug {
+                let a = (n / 4).max(1) + usize::from(row_sym && (n / 4).max(1) % 2 == 1 && n >= 8);
+                eprintln!("    cap round {rows} rows, {a} x {} near {:.3}: row of {n}, radii {:.2} x {:.2} quads, tip {:.2} quads past", n / 2 - a, c, big / quad, small / quad, dist / quad);
+            }
+        }
+    };
     // Points of the head (its cap and rows down to the neck): where the eyes are looked for.
     let mut head: HashSet<u32> = row0.iter().copied().chain(cap_from as u32..out_p.len() as u32).collect();
     let mut stack: Vec<(u32, Vec<u32>, bool, usize)> = vec![(rings[first].to, row0.clone(), pinned(first, row0.len()), first)];
@@ -1853,7 +2034,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         // piece also splits or ends, goes on as the ring into it. If the strips cannot be
         // found, the body is not built (planned instead).
         let in_k = ins.get(&p).map_or(0, |v| v.iter().filter(|&&r| rings[r].girth >= min_girth).count());
-        let (row, row_sym) = if in_k > 1 {
+        let (row, row_sym) = if joins_at(p) {
             let waiting = pending.entry(p).or_default();
             waiting.push((row, in_ring));
             if waiting.len() < in_k {
@@ -2000,54 +2181,58 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
         let row_pos: Vec<Vec3> = row.iter().map(|&i| out_p[i as usize]).collect();
         match k.len() {
             0 => {
-                // Rows on to the tip (a finger's end is thinner than the rings kept), shrinking
-                // toward it like the end of a sphere, then the cap.
-                let tip = tip_past(p);
-                let c = row_pos.iter().copied().sum::<Vec3>() / row_pos.len() as f32;
-                let extra = (tip.distance(c) / quad).round() as usize;
-                let mut last = row.clone();
-                for k in 1..=extra.min(8) {
-                    let t = k as f32 / (extra as f32 + 1.0);
-                    let s = (1.0 - t * t).max(0.0).sqrt();
-                    let cc = c.lerp(tip, t);
-                    let next: Vec<u32> = row_pos.iter().map(|&q| { out_p.push(cc + (q - c) * s); (out_p.len() - 1) as u32 }).collect();
-                    join_band(&last, &next, &mut out_p, &mut quads);
-                    last = next;
-                }
-                // A row on the far side of the plane runs the other way round from its
-                // twin's: capped reversed, so the cap is the twin's mirror image
-                // (`ZR_NOCAPMIRROR`: capped as laid out, the caps then differ).
-                let far_side = !row_sym
-                    && std::env::var_os("ZR_NOCAPMIRROR").is_none()
-                    && plane.is_some_and(|pl| pl.distance(row_pos.iter().copied().sum::<Vec3>() / row_pos.len().max(1) as f32) < 0.0);
-                let nl = last.len();
-                let capped: Vec<u32> = if far_side { (0..nl).map(|i| last[(nl - i) % nl]).collect() } else { last.clone() };
-                let from = out_p.len();
-                cap(&capped, row_sym, &mut out_p, &mut quads);
-                dome(&last, from, tip, &mut out_p);
+                // The end of a limb: the tip past the rings kept (a finger's end is thinner
+                // than they are).
+                end_cap(&row, row_sym, tip_past(p), &mut out_p, &mut quads);
                 caps += 1;
             }
             1 => {
                 let r = k[0];
+                // At the end of a limb whose last rings close round the tip (the toes of a
+                // foot): when this row is flat and the rings left (three at most) are all
+                // under 0.85 of its girth, the cap goes on this row and they are dropped. Not
+                // when another part joins at one of them (a hand resting on a thigh): the
+                // other row would wait for this one for ever.
+                if !old_tips && row.len() >= 6 {
+                    let rest = chain_from(r);
+                    if rest.len() <= 3 && kept(rings[rest[rest.len() - 1]].to).is_empty() && !rest.iter().any(|&q| joins_at(rings[q].to)) {
+                        let aspect = |pts: &[Vec3]| { let (_, _, _, b, s) = row_axes(pts); b / s.max(1e-9) };
+                        let here = aspect(&row_pos);
+                        let ahead: Vec<f32> = rest.iter().map(|&q| aspect(&rings[q].pts)).collect();
+                        let closing = rest.iter().all(|&q| rings[q].girth < rings[in_ring].girth * 0.85);
+                        let early = here >= flat_aspect && closing;
+                        if debug {
+                            eprintln!("    limb end near {:.3}: row of {} (girth {:.1}, aspect {here:.2}), {} rings left (girths {:?}, aspects {:?}){}", row_pos[0], row.len(), rings[in_ring].girth, rest.len(), rest.iter().map(|&q| (rings[q].girth * 10.0).round() / 10.0).collect::<Vec<_>>(), ahead.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>(), if early { ": capped here" } else { "" });
+                        }
+                        if early {
+                            end_cap(&row, row_sym, tip_past(p), &mut out_p, &mut quads);
+                            caps += 1;
+                            continue;
+                        }
+                    }
+                }
                 let g = rings[r].girth;
                 let cut = ring_cross[r].is_some();
                 let mut n = match counts.get(&r) {
                     Some(&c) => c,
                     None => {
                         let n0 = row.len();
-                        if g > n0 as f32 * drift || g < n0 as f32 / drift {
+                        let c = if g > n0 as f32 * drift || g < n0 as f32 / drift {
                             if cut { even4(g) } else { even(g) }
                         } else {
                             n0
-                        }
+                        };
+                        if tubular(&chain_from(r)) { c.max(min_tube) } else { c }
                     }
                 };
                 // Before a split, the count it bridges into (the merges go in this band, not
-                // in the split's).
+                // in the split's) when within 1.8 times the girth (`ZR_SPLITRATIO`, 2.2, when
+                // a part of the split is a thin tube given the `ZR_MINTUBE` floor).
                 let nk = kept(rings[r].to);
                 if nk.len() >= 2 {
                     if let Ok(sp) = split_plan(rings[r].to, &nk, &totals) {
-                        if (sp.total as f32) < g * 1.8 && (sp.total as f32) > g / 1.8 {
+                        let ratio = if nk.iter().any(|&q| floored(&chain_from(q))) { split_ratio } else { 1.8 };
+                        if (sp.total as f32) < g * ratio && (sp.total as f32) > g / ratio {
                             n = sp.total;
                         }
                     }
@@ -2194,7 +2379,7 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
                 let mut seq: Vec<u32> = Vec::new();
                 tour(0, 0, None, &rows, &att_row, &sp.strips, &strip_pts, &mut seq, true);
                 if debug {
-                    eprintln!("    body split near {:.3}: ring {} round into {:?} (strips {:?}), bridged loop {}", w.p[p as usize], row.len(), sp.counts, strip_pts.iter().map(|s| s.len() + 1).collect::<Vec<_>>(), seq.len());
+                    eprintln!("    body split near {:.3}: ring {} round into {:?} (strips {:?}), bridged loop {}; runs of {:?} rings, girths {:?}", w.p[p as usize], row.len(), sp.counts, strip_pts.iter().map(|s| s.len() + 1).collect::<Vec<_>>(), seq.len(), sp.rings.iter().map(|&r| chain_from(r).len()).collect::<Vec<_>>(), sp.rings.iter().map(|&r| (rings[r].girth * 10.0).round() / 10.0).collect::<Vec<_>>());
                 }
                 // The ring above against the bridged loop, turned to lie best against it.
                 let seq_pos: Vec<Vec3> = seq.iter().map(|&i| out_p[i as usize]).collect();
@@ -2276,9 +2461,6 @@ pub(super) fn sweep_body(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Opti
     // mirror image.
     orient(&mut quads, &out_p);
     if let (Some(pl), None) = (plane, std::env::var_os("ZR_NOBUMPS")) {
-        // The working surface, for the inset's rings and grids to lie on.
-        let tg = crate::zremesh::TriGrid::from_tris(&w.p, &w.t, quad);
-        let surface = |q: Vec3| tg.closest_tris(&w.p, &w.t, q).map_or(q, |c| c.0);
         let made = bumps(&torso, &mut out_p, &mut quads, pl, quad, debug, &cap, &surface, 1.0, ("ZR_BUMP", 1.5, 0.4, 8.0, 0.6, 1.0));
         if debug {
             eprintln!("  body: {made} bumps capped");
@@ -3014,6 +3196,35 @@ fn tour(i: usize, start: usize, parent: Option<usize>, rows: &[Vec<u32>], att_ro
 #[cfg(test)]
 mod reduce_tests {
     use super::*;
+
+    /// An ellipse 3 by 1 in a tilted plane: axes along its long and short sides, the aspect
+    /// 3, and the grid's first side (the point nearest the corner) starting on the long
+    /// side whichever way round the points go.
+    #[test]
+    fn row_axes_and_corner_of_a_flat_ellipse() {
+        let tilt = glam::Quat::from_axis_angle(Vec3::new(1.0, 2.0, 0.5).normalize(), 0.7);
+        for reverse in [false, true] {
+            let mut pts: Vec<Vec3> = (0..32).map(|i| {
+                let a = std::f32::consts::TAU * i as f32 / 32.0;
+                tilt * Vec3::new(3.0 * a.cos(), 0.0, a.sin()) + Vec3::new(5.0, -2.0, 1.0)
+            }).collect();
+            if reverse {
+                pts.reverse();
+            }
+            let (c, u, v, big, small) = row_axes(&pts);
+            assert!(c.distance(Vec3::new(5.0, -2.0, 1.0)) < 1e-3, "centroid {c:?}");
+            assert!((big / small - 3.0).abs() < 0.05, "aspect {}", big / small);
+            assert!(u.dot(tilt * Vec3::X).abs() > 0.999, "long axis {u:?}");
+            assert!(v.dot(tilt * Vec3::Z).abs() > 0.999, "short axis {v:?}");
+            let k = corner_start(&pts, c, u, v, big, small);
+            let n = pts.len();
+            let (x0, x1) = ((pts[k] - c).dot(u).abs(), (pts[(k + n / 4) % n] - c).dot(u).abs());
+            let (y0, y1) = ((pts[k] - c).dot(v).abs(), (pts[(k + n / 4) % n] - c).dot(v).abs());
+            assert!((x0 - x1).abs() < 0.05 && (y0 - y1).abs() < 0.05, "a quarter of the row from the corner is the next corner: {x0} {x1} {y0} {y1}");
+            let mid = pts[(k + n / 8) % n] - c;
+            assert!(mid.dot(u).abs() < 0.2 && mid.dot(v).abs() > 0.9, "the first side runs along the long axis: {mid:?}");
+        }
+    }
 
     /// Each vertex's valence in the band with the edge it has into the row before or after
     /// (one per row point) counted in, and a check that the band is a manifold strip of
