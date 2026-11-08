@@ -1840,7 +1840,9 @@ fn bumps(torso: &HashSet<u32>, out_p: &mut Vec<Vec3>, quads: &mut Vec<[u32; 4]>,
                 }
                 pos0[best.map_or(tip, |v| v as usize)]
             };
-            let k = ((a.min(b) as f32 / 2.0).round() as usize).clamp(1, 4);
+            // Rings from the block's longer side (`ZR_INSETSHORT`: the shorter, fewer rings).
+            let side = if std::env::var_os("ZR_INSETSHORT").is_some() { a.min(b) } else { a.max(b) };
+            let k = ((side as f32 / 2.0).round() as usize).clamp(1, 4);
             let (p_start, q_start) = (out_p.len(), quads.len());
             let rings = rect::inset_fill(&border, corners, k, 1.0, Some(peak), surface, out_p, quads);
             let last = rings.last().cloned().unwrap_or_else(|| border.clone());
