@@ -5996,6 +5996,7 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 // Symmetry setting's plane, or in X through the head's top when the model
                 // is its own mirror image there (`ZR_NOSYM`: never).
                 if std::env::var_os("ZR_NOBODY").is_none() {
+                    let body_feats = std::env::var_os("ZR_NOBODYFEATS").is_none();
                     let plane = s.mirror.or_else(|| {
                         let pl = MirrorPlane { axis: crate::symmetry::Axis::X, at: w.p[src as usize].x };
                         (std::env::var_os("ZR_NOSYM").is_none() && is_symmetric(&w, pl, quad)).then_some(pl)
@@ -6012,7 +6013,12 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                                     lap("mirrored mesh");
                                     let g = part_distance(&ws, ssrc);
                                     lap("its part distance");
-                                    let r = body::sweep_body(&ws, &g, quad, ssrc, Some(pl));
+                                    // The hard edges (edge lines, polygroup borders) sorted for
+                                    // the builder: loops round parts, plates, lines, corners
+                                    // (`ZR_NOBODYFEATS`: none, the body built from the part
+                                    // function alone).
+                                    let bf = if body_feats { body::BodyFeatures::new(&ws, &g, body::body_step(quad), features.corners.iter().copied().chain(features.loop_corner_points()).collect(), s.detect_edges) } else { body::BodyFeatures::default() };
+                                    let r = body::sweep_body(&ws, &g, quad, ssrc, Some(pl), &bf);
                                     lap("body built");
                                     r
                                 }
@@ -6020,9 +6026,10 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                             }
                         }
                         None => {
-                        part_phi = part_distance(&w, src);
-                        body::sweep_body(&w, &part_phi, quad, src, None)
-                    }
+                            part_phi = part_distance(&w, src);
+                            let bf = if body_feats { body::BodyFeatures::new(&w, &part_phi, body::body_step(quad), features.corners.iter().copied().chain(features.loop_corner_points()).collect(), s.detect_edges) } else { body::BodyFeatures::default() };
+                            body::sweep_body(&w, &part_phi, quad, src, None, &bf)
+                        }
                     };
                     match built {
                         Ok((p, q)) => return Ok((p, q, plane)),

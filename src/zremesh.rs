@@ -91,13 +91,72 @@ pub const EDGE_ANGLE: f32 = 40.0;
 struct Features {
     lines: Vec<Vec<Vec3>>,
     corners: Vec<Vec3>,
+    /// The closed lines (also in `lines`), each round once, and on each the indices where
+    /// it turns a corner (over 35° measured a quad either way).
+    loops: Vec<Vec<Vec3>>,
+    loop_corners: Vec<Vec<usize>>,
 }
 
 impl Features {
     fn folded(&self, plane: MirrorPlane) -> Self {
         let f = |p: &Vec3| plane.fold(*p);
-        Self { lines: self.lines.iter().map(|l| l.iter().map(f).collect()).collect(), corners: self.corners.iter().map(f).collect() }
+        Self {
+            lines: self.lines.iter().map(|l| l.iter().map(f).collect()).collect(),
+            corners: self.corners.iter().map(f).collect(),
+            loops: self.loops.iter().map(|l| l.iter().map(f).collect()).collect(),
+            loop_corners: self.loop_corners.clone(),
+        }
     }
+
+    /// The corner points of the loops.
+    fn loop_corner_points(&self) -> Vec<Vec3> {
+        self.loops.iter().zip(&self.loop_corners).flat_map(|(l, c)| c.iter().map(move |&i| l[i])).collect()
+    }
+}
+
+/// Where a closed line turns a corner: the indices where the direction a quad back to the
+/// point and from it a quad on differ by over 35° (the rule the layout's cut uses for hard
+/// edges), one per run of such points (the sharpest).
+fn loop_corners(lp: &[Vec3], quad: f32) -> Vec<usize> {
+    let m = lp.len();
+    if m < 3 {
+        return Vec::new();
+    }
+    // The point about a quad along from i, forward or back.
+    let reach = |i: usize, step: isize| -> Vec3 {
+        let mut j = i;
+        let mut len = 0.0;
+        for _ in 0..m {
+            let k = (j as isize + step).rem_euclid(m as isize) as usize;
+            len += lp[j].distance(lp[k]);
+            j = k;
+            if len >= quad {
+                break;
+            }
+        }
+        lp[j]
+    };
+    let turn: Vec<f32> = (0..m).map(|i| (lp[i] - reach(i, -1)).angle_between(reach(i, 1) - lp[i]).to_degrees()).collect();
+    let sharp = |i: usize| turn[i] > 35.0;
+    if (0..m).all(sharp) {
+        return Vec::new();
+    }
+    // Runs of sharp points, started after a point that is not: the sharpest of each.
+    let start = (0..m).find(|&i| !sharp(i)).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut run: Option<usize> = None;
+    for k in 1..=m {
+        let i = (start + k) % m;
+        if sharp(i) {
+            if run.is_none_or(|b| turn[i] > turn[b]) {
+                run = Some(i);
+            }
+        } else if let Some(b) = run.take() {
+            out.push(b);
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 impl Default for Settings {
@@ -911,15 +970,31 @@ fn project(mesh: &SculptMesh, p: Vec3, n: Vec3, reach: f32) -> Option<(Vec3, u32
 /// ZRemesh `mesh` into about `s.target_k` thousand quads, with edge loops steered along
 /// `guides` (curves on the surface, ZBrush: ZRemesherGuide) by `s.curves_strength`.
 pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<(SculptMesh, Stats), String> {
-    // The edge lines: creases, and sharp edges in lines of two quads or more.
+    // The edge lines: creases, and sharp edges in clean lines.
     let quad = (surface_area(mesh) / (s.target_k * 1000.0).max(50.0)).sqrt();
     let creased = if s.keep_creases { mesh.crease_edges() } else { Vec::new() };
-    let mut edges = if s.detect_edges { crate::crease::long_lines_only(mesh, &crate::crease::sharp_edges(mesh, EDGE_ANGLE), quad * 2.0) } else { Vec::new() };
+    // Detect Edges: the sharp edges in clean lines (`ZR_RAWLINES`: every line of two quads or
+    // more, as before).
+    let debug = std::env::var_os("KLAY_ZR_DEBUG").is_some();
+    let (mut edges, closed) = if s.detect_edges {
+        let sharp = crate::crease::sharp_edges(mesh, EDGE_ANGLE);
+        let (kept, closed) = if std::env::var_os("ZR_RAWLINES").is_some() { (crate::crease::long_lines_only(mesh, &sharp, quad * 2.0), Vec::new()) } else { crate::crease::clean_lines(mesh, &sharp, quad) };
+        if debug {
+            let p = &mesh.positions;
+            let lens: Vec<f32> = closed.iter().map(|c| (0..c.len()).map(|i| p[c[i] as usize].distance(p[c[(i + 1) % c.len()] as usize])).sum::<f32>() / quad).collect();
+            eprintln!("edges: {} sharp, {} lines kept, {} closed loops (lengths {:?})", sharp.len(), crate::crease::chains(&kept).0.len(), closed.len(), lens.iter().map(|l| (l * 10.0).round() / 10.0).collect::<Vec<_>>());
+        }
+        (kept, closed)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     edges.extend_from_slice(&creased);
     edges.sort_unstable();
     edges.dedup();
     let (lines, corners) = crate::crease::lines(mesh, &edges, 0.0);
-    let features = Features { lines, corners };
+    let loops: Vec<Vec<Vec3>> = closed.iter().map(|c| c.iter().map(|&v| mesh.positions[v as usize]).collect()).collect();
+    let loop_corners: Vec<Vec<usize>> = loops.iter().map(|l| loop_corners(l, quad)).collect();
+    let features = Features { lines, corners, loops, loop_corners };
     // KLAY_ZR_FEATLINES=file.obj: the feature lines as OBJ polylines (`v` records, one `l`
     // per line) for deep-test/2026-11-05-layout/edgecover.py.
     if let Some(path) = std::env::var_os("KLAY_ZR_FEATLINES") {
@@ -3261,7 +3336,9 @@ mod shape_tests {
             for planned in [false, true] {
                 let follow: f32 = std::env::var("ZR_FOLLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
                 let detect = std::env::var("ZR_EDGES").map(|v| v != "0").unwrap_or(true);
-                let s = Settings { target_k: k, keep_groups: false, layout: planned, mirror: mirrored.then_some(TEST_X_PLANE), follow_shape: follow, detect_edges: detect, ..Settings::default() };
+                // ZR_GROUPS=1: polygroup borders are hard edges (a model with groups, no voxel).
+                let groups = std::env::var_os("ZR_GROUPS").is_some();
+                let s = Settings { target_k: k, keep_groups: groups, layout: planned, mirror: mirrored.then_some(TEST_X_PLANE), follow_shape: follow, detect_edges: detect, ..Settings::default() };
                 let (out, st) = match zremesh(&m, &s, &guides) {
                     Ok(r) => r,
                     Err(e) => {
