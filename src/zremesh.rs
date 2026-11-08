@@ -717,6 +717,116 @@ fn shape_pulls(g: &Graph, tensors: &[glam::Mat3], quad: f32, strength: f32) -> V
         .collect()
 }
 
+/// Merge each pair of quads that share two edges at a point inside only them (a doublet)
+/// into one quad, until none is left. Returns how many points went.
+fn merge_doublets(quads: &mut Vec<[u32; 4]>) -> usize {
+    let mut removed = 0;
+    for _ in 0..16 {
+        let mut vq: HashMap<u32, Vec<usize>> = HashMap::default();
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::default();
+        for (qi, q4) in quads.iter().enumerate() {
+            if q4[2] == q4[3] {
+                continue;
+            }
+            for k in 0..4 {
+                vq.entry(q4[k]).or_default().push(qi);
+                let (a, b) = (q4[k], q4[(k + 1) % 4]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let mut gone = vec![false; quads.len()];
+        let mut add: Vec<[u32; 4]> = Vec::new();
+        let mut cands: Vec<u32> = vq.iter().filter(|x| x.1.len() == 2).map(|x| *x.0).collect();
+        cands.sort_unstable();
+        for v in cands {
+            let qs = &vq[&v];
+            let (q1, q2) = (qs[0], qs[1]);
+            if gone[q1] || gone[q2] {
+                continue;
+            }
+            // Inside: both its edges in two quads.
+            let at = |q: usize| quads[q].iter().position(|&x| x == v).unwrap();
+            let (k1, k2) = (at(q1), at(q2));
+            let (a, x, b) = (quads[q1][(k1 + 1) % 4], quads[q1][(k1 + 2) % 4], quads[q1][(k1 + 3) % 4]);
+            let (b2, y, a2) = (quads[q2][(k2 + 1) % 4], quads[q2][(k2 + 2) % 4], quads[q2][(k2 + 3) % 4]);
+            if a != a2 || b != b2 || x == y || edges.get(&(v.min(a), v.max(a))) != Some(&2) || edges.get(&(v.min(b), v.max(b))) != Some(&2) {
+                continue;
+            }
+            gone[q1] = true;
+            gone[q2] = true;
+            add.push([a, x, b, y]);
+            removed += 1;
+        }
+        if add.is_empty() {
+            break;
+        }
+        let mut next: Vec<[u32; 4]> = quads.iter().enumerate().filter(|(i, _)| !gone[*i]).map(|(_, q)| *q).collect();
+        next.extend(add);
+        *quads = next;
+    }
+    removed
+}
+
+/// A model's triangles by grid cell, for the nearest point of its surface.
+struct TriGrid {
+    cell: f32,
+    cells: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl TriGrid {
+    fn new(mesh: &SculptMesh, cell: f32) -> Self {
+        let cell = cell.max(1e-6);
+        let mut cells: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
+        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+            if !mesh.hidden.is_empty() && mesh.hidden[t] != 0 {
+                continue;
+            }
+            let (lo, hi) = tri.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), &v| (a.min(mesh.positions[v as usize]), b.max(mesh.positions[v as usize])));
+            let (c0, c1) = ((lo / cell).floor(), (hi / cell).floor());
+            for x in c0.x as i32..=c1.x as i32 {
+                for y in c0.y as i32..=c1.y as i32 {
+                    for z in c0.z as i32..=c1.z as i32 {
+                        cells.entry((x, y, z)).or_default().push(t as u32);
+                    }
+                }
+            }
+        }
+        TriGrid { cell, cells }
+    }
+
+    /// The nearest point of the surface within a few cells, and its triangle.
+    fn closest(&self, mesh: &SculptMesh, p: Vec3) -> Option<(Vec3, u32)> {
+        let c = (p / self.cell).floor();
+        let c = (c.x as i32, c.y as i32, c.z as i32);
+        let mut best: Option<(f32, Vec3, u32)> = None;
+        for r in 0..4i32 {
+            for x in -r..=r {
+                for y in -r..=r {
+                    for z in -r..=r {
+                        if x.abs().max(y.abs()).max(z.abs()) != r {
+                            continue;
+                        }
+                        for &t in self.cells.get(&(c.0 + x, c.1 + y, c.2 + z)).into_iter().flatten() {
+                            let i = t as usize * 3;
+                            let q = crate::wedge::closest_on_triangle(p, mesh.positions[mesh.indices[i] as usize], mesh.positions[mesh.indices[i + 1] as usize], mesh.positions[mesh.indices[i + 2] as usize]);
+                            let d = q.distance_squared(p);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, q, t));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((d, _, _)) = best {
+                if d.sqrt() <= r as f32 * self.cell {
+                    break;
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
+    }
+}
+
 /// A point with as many quads round it as neighbours (not on an open border).
 fn w_is_interior(adj: &[Vec<u32>], vq: &[Vec<u32>], v: usize) -> bool {
     adj[v].len() == vq[v].len()
@@ -786,7 +896,12 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     let features = Features { lines, corners };
     crate::jobs::check()?;
     let (mut out, stats) = match s.mirror {
-        Some(plane) => symmetric(mesh, s, guides, &features, plane)?,
+        // Plan Layout with Symmetry: a body is built whole and symmetric; anything else is
+        // planned on its half and mirrored.
+        Some(plane) => match (s.layout, s.layout.then(|| remesh(mesh, s, guides, &[], &features, None))) {
+            (true, Some(Ok(r))) if r.1.planned => r,
+            _ => symmetric(mesh, s, guides, &features, plane)?,
+        },
         None => remesh(mesh, s, guides, &[], &features, None)?,
     };
     if !creased.is_empty() {
@@ -812,11 +927,14 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     Ok((out, stats))
 }
 
+/// The mesh's area, summed in order (a parallel sum rounds differently from run to run, and
+/// the quad size, and with it the planned layout, came out different each time).
 fn surface_area(mesh: &SculptMesh) -> f32 {
-    mesh.indices
+    let parts: Vec<f32> = mesh.indices
         .par_chunks_exact(3)
         .map(|t| (mesh.positions[t[1] as usize] - mesh.positions[t[0] as usize]).cross(mesh.positions[t[2] as usize] - mesh.positions[t[0] as usize]).length() * 0.5)
-        .sum()
+        .collect();
+    parts.iter().map(|&a| a as f64).sum::<f64>() as f32
 }
 
 /// Crease the edges of `out` that lie on `lines` (KeepCreases).
@@ -922,11 +1040,7 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
     let start = Instant::now();
     let mut stats = Stats::default();
     let target = (s.target_k * 1000.0).max(50.0);
-    let area: f32 = mesh
-        .indices
-        .par_chunks_exact(3)
-        .map(|t| (mesh.positions[t[1] as usize] - mesh.positions[t[0] as usize]).cross(mesh.positions[t[2] as usize] - mesh.positions[t[0] as usize]).length() * 0.5)
-        .sum();
+    let area = surface_area(mesh);
     if area <= 0.0 {
         return Err("the surface has no area".into());
     }
@@ -939,11 +1053,17 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         // A gentle pull in between: on limbs the smoothest field can sit at a slant to the
         // limb, so its lines wind round it; a little pull rings them.
         let gentle: f32 = std::env::var("ZR_RETRYPULL").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
-        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0)
-            .or_else(|why| if gentle > 0.0 { layout::quads(mesh, s, guides, seams, features, cut, quad, gentle) } else { Err(why) })
+        // Lines from concave corners of patches over 40 quads² first (a body's big awkward
+        // patches split cleanly); a noisy model (hair) can keep making new ones and not
+        // settle, so then only over 150 quads².
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+        let (reflex, reflex2) = (env("ZR_REFLEXAREA", 40.0), env("ZR_REFLEXAREA2", 150.0));
+        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0, reflex)
+            .or_else(|why| if reflex2 != reflex { layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0, reflex2) } else { Err(why) })
+            .or_else(|why| if gentle > 0.0 { layout::quads(mesh, s, guides, seams, features, cut, quad, gentle, reflex2) } else { Err(why) })
             .or_else(|why| {
                 if s.follow_shape > gentle {
-                    layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape)
+                    layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape, reflex2)
                 } else {
                     Err(why)
                 }
@@ -954,8 +1074,13 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
                 let strength = (s.curves_strength / 100.0).clamp(0.0, 1.0);
                 let g = Guides::new(guides, quad);
                 let closed = crate::wedge::closed(mesh);
+                if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                    eprintln!("  time: layout done at {:.1} s", start.elapsed().as_secs_f32());
+                }
                 return finish(mesh, s, out_p, quads, &Finish { passes: std::env::var("ZR_RELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30), closed, cut, biggest: quad * 2.0, guides: &g, strength, quad, features, start }, stats);
             }
+            // With Symmetry the caller plans the half instead of the plain remesher here.
+            Err(why) if s.mirror.is_some() => return Err(why),
             Err(why) => stats.fallback = Some(why),
         }
     }
@@ -1472,6 +1597,14 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
     let Finish { passes, closed, cut, biggest, guides, strength, quad, features, start } = *f;
     // FreezeBorder: the old open borders come back exactly, each joined to the new border
     // nearest it by a strip. A triangle is kept as a quad with its last corner repeated.
+    // Doublets (planned layout): a point inside only two quads collapses them when relaxed;
+    // the two become one quad and the point goes (unused points are dropped later).
+    if stats.planned && std::env::var_os("ZR_KEEPDOUBLETS").is_none() {
+        let removed = merge_doublets(&mut quads);
+        if removed > 0 && std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+            eprintln!("  doublets merged: {removed}");
+        }
+    }
     let mut pinned = vec![false; out_p.len()];
     if s.freeze_border && !closed {
         let strip = frozen_strips(mesh, &quads, &mut out_p, cut);
@@ -1520,6 +1653,7 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             }
         }
     }
+    let near = (stats.planned && std::env::var_os("ZR_RAYPROJECT").is_none()).then(|| TriGrid::new(mesh, quad));
     for pass in 0..passes {
         normals(&out_p, &mut vnorm);
         if pass > 0 {
@@ -1546,11 +1680,89 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
                 .collect();
             out_p = relaxed;
         }
-        let projected: Vec<Option<(Vec3, u32)>> = out_p.par_iter().zip(vnorm.par_iter()).map(|(&p, &n)| project(mesh, p, n, reach)).collect();
+        let projected: Vec<Option<(Vec3, u32)>> = match &near {
+            // The planned layout: the nearest point of the surface (a ray along a folded
+            // quad's normal can land on another part of the model: spikes).
+            Some(g) => out_p.par_iter().map(|&p| g.closest(mesh, p)).collect(),
+            None => out_p.par_iter().zip(vnorm.par_iter()).map(|(&p, &n)| project(mesh, p, n, reach)).collect(),
+        };
         for (v, hit) in projected.into_iter().enumerate() {
             if let Some((p, _)) = hit {
                 if !pinned[v] {
                     out_p[v] = p;
+                }
+            }
+        }
+    }
+    // Untangle (planned layout): quads still folded or collapsed get their points and the
+    // points round them smoothed a few more rounds, onto the nearest surface each time.
+    if let Some(g) = &near {
+        let rounds: usize = std::env::var("ZR_UNTANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+        let area = |q4: &[u32; 4], p: &[Vec3]| -> (f32, bool) {
+            let pp: Vec<Vec3> = q4.iter().map(|&v| p[v as usize]).collect();
+            let (n1, n2) = ((pp[1] - pp[0]).cross(pp[2] - pp[0]), (pp[2] - pp[0]).cross(pp[3] - pp[0]));
+            ((n1.length() + n2.length()) * 0.5, n1.dot(n2) < 0.0)
+        };
+        let mut areas: Vec<f32> = quads.iter().filter(|q| !is_tri(q)).map(|q4| area(q4, &out_p).0).collect();
+        areas.sort_by(|a, b| a.total_cmp(b));
+        let small = areas.get(areas.len() / 2).copied().unwrap_or(0.0) * 0.05;
+        let mut vq: Vec<Vec<u32>> = vec![Vec::new(); out_p.len()];
+        for (qi, q4) in quads.iter().enumerate() {
+            for (k, &v) in q4.iter().enumerate() {
+                if !q4[..k].contains(&v) {
+                    vq[v as usize].push(qi as u32);
+                }
+            }
+        }
+        for round in 0..rounds {
+            let bad: Vec<usize> = (0..quads.len()).filter(|&q| !is_tri(&quads[q]) && { let (a, f) = area(&quads[q], &out_p); f || a < small }).collect();
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() && (round == 0 || bad.is_empty()) {
+                eprintln!("  untangle round {round}: {} folded or collapsed quads", bad.len());
+            }
+            if bad.is_empty() {
+                break;
+            }
+            let wide = std::env::var_os("ZR_UNTANGLEWIDE").is_some();
+            let mut moving: crate::fx::FxHashSet<u32> = Default::default();
+            for &q in &bad {
+                for &v in &quads[q] {
+                    moving.insert(v);
+                    if wide {
+                        for &u in &adj[v as usize] {
+                            moving.insert(u);
+                        }
+                    }
+                }
+            }
+            let mut order: Vec<u32> = moving.into_iter().filter(|&v| !pinned[v as usize] && !vq[v as usize].is_empty()).collect();
+            order.sort_unstable();
+            for v in order {
+                let a = &adj[v as usize];
+                let c = a.iter().map(|&u| out_p[u as usize]).sum::<Vec3>() / a.len().max(1) as f32;
+                if let Some((q, _)) = g.closest(mesh, c) {
+                    // Only if it helps the quads round it: fewer folded, or as many and the
+                    // smallest larger.
+                    let local = |p: &[Vec3]| -> (usize, f32) {
+                        let mut folded = 0;
+                        let mut least = f32::INFINITY;
+                        for &qi in &vq[v as usize] {
+                            let q4 = quads[qi as usize];
+                            if is_tri(&q4) {
+                                continue;
+                            }
+                            let (a, f) = area(&q4, p);
+                            folded += f as usize;
+                            least = least.min(a);
+                        }
+                        (folded, least)
+                    };
+                    let before = local(&out_p);
+                    let old = out_p[v as usize];
+                    out_p[v as usize] = q;
+                    let after = local(&out_p);
+                    if after.0 > before.0 || (after.0 == before.0 && after.1 < before.1) {
+                        out_p[v as usize] = old;
+                    }
                 }
             }
         }
@@ -1698,6 +1910,31 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
         }
     }
 
+    // Points no quad uses (merged doublets) go.
+    {
+        let mut used = vec![false; out_p.len()];
+        for q4 in &quads {
+            for &v in q4 {
+                used[v as usize] = true;
+            }
+        }
+        if used.iter().any(|&u| !u) {
+            let mut map = vec![u32::MAX; out_p.len()];
+            let mut kept = Vec::with_capacity(out_p.len());
+            for (v, &u) in used.iter().enumerate() {
+                if u {
+                    map[v] = kept.len() as u32;
+                    kept.push(out_p[v]);
+                }
+            }
+            out_p = kept;
+            for q4 in &mut quads {
+                for v in q4.iter_mut() {
+                    *v = map[*v as usize];
+                }
+            }
+        }
+    }
     // Triangles (each quad along its shorter diagonal, unless that is an edge or the
     // diagonal of another quad: two quads on a vertex with two neighbours share three
     // corners, and one diagonal between them would be an edge in four triangles).
@@ -2495,6 +2732,55 @@ mod shape_tests {
         let m = SculptMesh::from_raw(p, i);
         let (irr, inner) = irregular(&zremesh(&m, &Settings { target_k: 1.0, keep_groups: false, ..Settings::default() }, &[]).unwrap().0);
         assert!((irr as f32) < inner as f32 * 0.08, "{irr} of {inner}");
+    }
+
+    /// A capsule round Y: a cylinder of radius 0.15 from y = −3 to 3, with round ends.
+    pub fn capsule() -> SculptMesh {
+        let r = 0.15;
+        let mut prof: Vec<(f32, f32)> = Vec::new();
+        for k in 0..8 {
+            let a = k as f32 / 8.0 * std::f32::consts::FRAC_PI_2;
+            prof.push((r * a.sin(), -3.0 - r * a.cos()));
+        }
+        for k in 0..=60 {
+            prof.push((r, -3.0 + k as f32 * 0.1));
+        }
+        for k in 1..=8 {
+            let a = k as f32 / 8.0 * std::f32::consts::FRAC_PI_2;
+            prof.push((r * a.cos(), 3.0 + r * a.sin()));
+        }
+        revolve(&prof, 2, 64)
+    }
+
+    /// Its two halves are limbs: each is swept as a plain grid (every point on the straight
+    /// part, away from the middle and the ends, has four edges).
+    #[test]
+    fn planned_layout_sweeps_limbs_as_plain_grids() {
+        let m = capsule();
+        let s = Settings { target_k: 2.0, keep_groups: false, layout: true, follow_shape: 0.0, detect_edges: false, ..Settings::default() };
+        let (out, st) = zremesh(&m, &s, &[]).unwrap();
+        assert!(st.planned, "not planned: {:?}", st.fallback);
+        let mut val = vec![0u32; out.positions.len()];
+        let mut edges: crate::fx::FxHashSet<(u32, u32)> = Default::default();
+        let mut tris = 0;
+        for f in polygons(&out) {
+            let c = f.iter().map(|&v| out.positions[v as usize]).sum::<Vec3>() / f.len() as f32;
+            if f.len() != 4 && (1.2..2.4).contains(&c.y.abs()) {
+                tris += 1;
+            }
+            for k in 0..f.len() {
+                let (a, b) = (f[k], f[(k + 1) % f.len()]);
+                if edges.insert((a.min(b), a.max(b))) {
+                    val[a as usize] += 1;
+                    val[b as usize] += 1;
+                }
+            }
+        }
+        let on_tube = |v: usize| (1.2..2.4).contains(&out.positions[v].y.abs());
+        let poles = (0..val.len()).filter(|&v| on_tube(v) && val[v] != 4).count();
+        let points = (0..val.len()).filter(|&v| on_tube(v)).count();
+        assert!(points > 100, "{points} points on the straight part");
+        assert_eq!((poles, tris), (0, 0), "poles and other faces on the straight part ({points} points)");
     }
 
     fn write_obj(m: &SculptMesh, path: &std::path::Path) {

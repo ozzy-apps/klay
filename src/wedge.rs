@@ -121,13 +121,15 @@ pub fn closed(mesh: &SculptMesh) -> bool {
 
 /// Surface area of a mesh (for the vertex estimate).
 pub fn area(mesh: &SculptMesh) -> f32 {
-    mesh.indices
+    // Summed in order: a parallel sum rounds differently from run to run.
+    let parts: Vec<f32> = mesh.indices
         .par_chunks_exact(3)
         .map(|t| {
             let p = |k: usize| mesh.positions[t[k] as usize];
             (p(1) - p(0)).cross(p(2) - p(0)).length() * 0.5
         })
-        .sum()
+        .collect();
+    parts.iter().map(|&a| a as f64).sum::<f64>() as f32
 }
 
 /// The regular grid: point `(i, j, k)` sits at `origin + h (i, j, k)`.
