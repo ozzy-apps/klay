@@ -5,7 +5,7 @@ Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace
 
 ## Latest implementation — 0.50.0
 
-See Step 107 for Transpose axis snapping, the floor grid and SubTool symmetry. See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+0.50.0 is published (Step 109). See Step 108 for the ZRemesher work in it (Plan Layout, the box-modeller body builder) and Step 107 for Transpose axis snapping, the floor grid and SubTool symmetry. See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -1042,6 +1042,11 @@ The user shared four reference images of hand-made / Quad Remesher-quality chara
 - Reference behavior from Maxon’s [Transpose Move documentation](https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/posing-your-model/transpose/moving/moving.html) and [Local Symmetry documentation](https://help.maxon.net/zbr/en-us/Content/html/reference-guide/transform/transform.html).
 - Verified with `cargo build --release --offline` and `cargo test --release --offline` (454 passed, 15 ignored). On Wayland/Vulkan, `--selftest-transpose` passed at 2,457,602 vertices with Move, Scale, Rotate, GPU readback and undo. `--selftest-symmetry` passed off-center Y mirror and radial Z for Draw, Grab, Snake Hook and Inflate, with GPU readback and undo/redo. The viewport screenshot in `docs/images/subtool-floor.png` shows the floor beneath three SubTools in Graphite Blue.
 - Next independent work is the planned ZRemesher layout from Step 106.
+
+## Step 109 — Release 0.50.0 (2026-11-08)
+
+- Published as tag `v0.50.0` with a GitHub release (AppImage, Flatpak, .deb). 0.50.0 had been set in Step 107 but never tagged or pushed, so it carries Step 107 (Transpose axis snapping, model floor, SubTool symmetry) and Step 108 (ZRemesher Plan Layout with the box-modeller body builder, experimental and off; Follow Shape and Detect Edges on by default). `zremesh-topology` was fast-forwarded into `main`; the unfinished shoulder-yoke branch `worktree-wf_9af7fe95-f0a-3` is not in it.
+- Verified: `cargo test --release` 464 passed, 15 ignored. Plan Layout on: the six shapes and the bust unchanged; T-pose 11,012 quads, 270 poles, 0.5% bad, 0 folded, exact mirror. `clean_lines` also reaches the default remesher (Plan Layout off, Detect Edges on); A/B against `ZR_RAWLINES=1` at 10k: bust 20.2% → 18.0% bad, folded 329 → 305; alien failed (non-manifold result) → remeshes at 16.2%; pod 13.9% → 13.3% bad but folded 200 → 241 (worth a look); bored block identical.
 
 ## Step 108 — ZRemesher: inner skins, limb rings (2026-11-06)
 

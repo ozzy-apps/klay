@@ -472,9 +472,14 @@ from the direction field's poles cut the surface into patches, every patch side 
 number of quads that its neighbours agree on, and each patch is filled with a regular grid.
 It gives long loops and very few poles on clean forms (a ball gets its 8, a torus none). A
 ZRemesherGuide stroke drawn as a closed loop (ending where it began) becomes an edge loop,
-with its inside filled as a cap and four loops leaving it, for eyes, mouths and sockets. It
-is slower, still rough on very detailed sculpts, and falls back to the usual remesh when it
-cannot plan; the notice says which happened.
+with its inside filled as a cap and four loops leaving it, for eyes, mouths and sockets. On
+a character with arms and legs it builds the mesh the way a box modeller would: rings a quad
+apart from the top of the head, a quad-sphere head on a cylinder neck, cylinders for the
+trunk, limbs and fingers bridged where they branch, grid caps on hands and feet, and ringed
+insets with four corner poles for the eyes, mouth and breasts. A symmetric character comes
+out as an exact mirror image with a centre line. Planning is slower on other models, still
+rough on very detailed sculpts, and falls back to the usual remesh when it cannot plan; the
+notice says which happened.
 
 **KeepCreases** (on by default) runs an edge loop exactly along every creased edge (see
 Crease below) and creases the new edges there again, so the next Divide keeps them sharp.
