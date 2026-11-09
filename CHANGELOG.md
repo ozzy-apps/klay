@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Remesh (Wedge) on open models**: a model with holes (open shells, parts not closed) no longer crashes the voxel remesh. A grid line through a hole never got back outside, so the inside ran on to the edge of the grid; such a line now ends at its last way out. Anything still inconsistent is refused with a message instead of a crash.
+- **ZRemesher no longer refuses thin hard-surface parts** with "edges shared by more than two polygons": two quads touching at two opposite corners, with both diagonals already used, are now split as a fan round a middle point. A tactical rifle and a dropship that failed now remesh.
+- **ZRemesher wraps small detail**: when a result has folded quads or many badly shaped ones, a copy of the (closed) model is voxel remeshed at about a quad, which closes gaps and undercuts narrower than that (pouches on a vest, straps), and the remesh of that copy is kept when it comes out better. A Meshy tactical soldier with Plan Layout: 20% badly shaped quads and 122 folded → 3.4% and 8. Models that already remesh cleanly are not touched.
+- **Plan Layout: gear is not a limb**: on the trunk, a branch much thinner than the trunk and shorter than it is wide (a pouch, a buckle) is run over by the trunk's rows instead of getting its own little limb.
+- **Plan Layout gives up in time**: planning gets 120 seconds in all, then the plain remesh is used (the notice says so), and a line caught on a fold of the surface (two faces back to back) stops instead of bouncing for minutes. A dropship went from over 15 minutes to about 4.
 - **Plan Layout: face loops**: on a symmetric character the head is built finer than the body (0.6 of the quad) and the face is laid out as nested loops, as in a hand-made base mesh: a mask loop round both eyes from above the brows to the top of the nose, four rings round each eye (placed by the face's proportions), a loop round the nose and nostrils, and three rings round the mouth from under the nose to the chin; each a rectangle of the head's grid ringed in and capped, with poles only at its corners, exactly mirrored. If the eyes do not fit, the face is left as before. On a stylized T-pose base mesh at 10k quads: 0.8% badly shaped quads (0.5% before), no folded quads.
 
 ## 0.50.0 — 2026-11-08

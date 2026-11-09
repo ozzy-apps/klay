@@ -367,7 +367,8 @@ pub(super) fn marks(c: &Ctx, out_p: &[Vec3], quads: &[[u32; 4]], upper: &HashSet
     // two cells of it; the mouth a third of the way from the nose's base to the chin (the
     // proportion of a face; `ZR_MOUTHDIP` the deepest dip between them instead).
     let z = |i: usize| out_p[line[i] as usize][fwd];
-    let base = (nose + 1..line.len() - 1).find(|&i| z(i) <= z(i + 1)).ok_or("no base under the nose")?;
+    // (A face with almost no nose, an alien's, has no such point: the row under the tip.)
+    let base = (nose + 1..line.len() - 1).find(|&i| z(i) <= z(i + 1)).unwrap_or((nose + 1).min(line.len() - 1));
     let lips_end = (base + 1..line.len()).find(|&i| out_p[line[i] as usize].y < out_p[line[base] as usize].y - (out_p[line[base] as usize].y - out_p[line[line.len() - 1] as usize].y) * 0.4).unwrap_or(base + 1);
     let chin_tip = (lips_end..line.len()).max_by(|&a, &b| z(a).total_cmp(&z(b)).then(b.cmp(&a))).ok_or("no chin")?;
     let chin = (chin_tip..line.len()).take_while(|&i| z(i) > z(chin_tip) - cell * 2.0).last().unwrap_or(chin_tip);

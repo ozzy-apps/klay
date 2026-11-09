@@ -1367,10 +1367,41 @@ fn sweep_body_with(w: &Work, phi: &[f32], quad: f32, src: u32, plane: Option<Mir
         outs.entry(r.from).or_default().push(i);
         ins.entry(r.to).or_default().push(i);
     }
-    // The rings past a piece that are kept (thin ones, fingers and ears, are left off).
+    // How many rings a branch runs past ring `r` while it neither splits nor ends (at most 12).
+    let run_rings = |r: usize| -> usize {
+        let mut n = 1;
+        let mut p = rings[r].to;
+        while n < 12 {
+            let next: Vec<usize> = outs.get(&p).map(|v| v.iter().copied().filter(|&q| rings[q].girth >= min_girth).collect()).unwrap_or_default();
+            if next.len() != 1 {
+                break;
+            }
+            n += 1;
+            p = rings[next[0]].to;
+        }
+        n
+    };
+    // A bump, not a limb (`ZR_KEEPBUMPS` keeps them): at a split on the trunk, a branch under a quarter
+    // of the widest one's girth that ends sooner than it is wide (a pouch or a buckle on a
+    // vest, not a finger): the rows past the split run over it.
+    // Only on the trunk (the split's widest ring at least half the body's widest): at a limb's
+    // end a short tip is part of a hand or a foot, and its split shapes the limb's count.
+    let bumps_off = std::env::var_os("ZR_KEEPBUMPS").is_none();
+    let body_widest = rings.iter().map(|r| r.girth).fold(0.0f32, f32::max);
+    let is_bump = |r: usize, widest: f32| -> bool {
+        let g = rings[r].girth;
+        bumps_off && widest >= body_widest * 0.5 && g < widest * 0.25 && (run_rings(r) as f32) * body_step(quad) / quad < g / std::f32::consts::PI
+    };
+    // The rings past a piece that are kept (thin ones, fingers and ears, are left off, and
+    // bumps at a split).
     let kept = |p: u32| -> Vec<usize> {
         let mut v: Vec<usize> = outs.get(&p).map(|v| v.iter().copied().filter(|&r| rings[r].girth >= min_girth).collect()).unwrap_or_default();
         v.sort_by(|&a, &b| rings[b].girth.total_cmp(&rings[a].girth));
+        if v.len() >= 2 {
+            let widest = rings[v[0]].girth;
+            let first = v[0];
+            v.retain(|&r| r == first || !is_bump(r, widest));
+        }
         v
     };
     // The rings of the run that starts with ring `r`: on while one ring is kept.

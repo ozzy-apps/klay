@@ -29,6 +29,40 @@ mod rect;
 mod yoke;
 mod face;
 
+// How long planning may take on this thread (`set_deadline`, from `zremesh::remesh`): a model
+// that does not converge (parts thinner than a quad on a working mesh of a million
+// triangles) would otherwise run its rounds for many minutes; past it, the plain remesher.
+thread_local! {
+    static DEADLINE: std::cell::Cell<Option<(std::time::Instant, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Planning on this thread gives up `secs` seconds from now, unless a deadline is already
+/// running (a plan inside a plan keeps the outer one). True if this call set it, and so
+/// should clear it with `clear_deadline` when done.
+pub(crate) fn set_deadline(secs: u32) -> bool {
+    DEADLINE.with(|d| {
+        if d.get().is_some() {
+            return false;
+        }
+        d.set(Some((std::time::Instant::now() + std::time::Duration::from_secs(secs as u64), secs)));
+        true
+    })
+}
+
+/// No deadline on this thread.
+pub(crate) fn clear_deadline() {
+    DEADLINE.with(|d| d.set(None));
+}
+
+/// The deadline has passed.
+pub(crate) fn past_deadline() -> bool {
+    DEADLINE.with(|d| d.get().is_some_and(|(t, _)| std::time::Instant::now() > t))
+}
+
+fn budget_secs() -> u32 {
+    DEADLINE.with(|d| d.get().map_or(0, |(_, s)| s))
+}
+
 pub(super) use body::mirror_pairs;
 
 type HashSet<T> = crate::fx::FxHashSet<T>;
@@ -3007,6 +3041,10 @@ struct Trace {
     anchor: usize,
     /// Steps in a row that did not move it (stuck at a corner).
     still: u32,
+    /// The face it came from, and how many steps in a row went straight back into the face
+    /// before (ping-pong across a fold of the surface, two faces back to back).
+    prev_face: usize,
+    bounce: u32,
     /// With no entry edge: the vertex it is on (edges round it are not exits).
     pivot: u32,
     /// Debugging: the last thing that changed this line.
@@ -3038,7 +3076,7 @@ impl Trace {
         let k = t.iter().position(|&x| x == v).unwrap_or(0);
         let (a, b) = (w.p[t[(k + 1) % 3] as usize] - w.p[v as usize], w.p[t[(k + 2) % 3] as usize] - w.p[v as usize]);
         let fits = n.dot(a.cross(fd)) >= 0.0 && n.dot(fd.cross(b)) >= 0.0;
-        Trace { face, at: w.p[v as usize], dir: if fits { fd } else { dir }, entry: NONE, path: vec![v], travelled: 0.0, done: false, why: "", same_as: NONE, anchor: 1, still: 0, pivot: v, last_op: "new" }
+        Trace { face, at: w.p[v as usize], dir: if fits { fd } else { dir }, entry: NONE, path: vec![v], travelled: 0.0, done: false, why: "", same_as: NONE, anchor: 1, still: 0, prev_face: usize::MAX, bounce: 0, pivot: v, last_op: "new" }
     }
 
     /// Go on from the path's last vertex (after it was cut back or ended by a walk): the
@@ -3325,6 +3363,14 @@ impl Trace {
         }
         let o = w.twin[h as usize];
         let g = o as usize / 3;
+        // Back into the face it just came from, again and again: caught on a fold.
+        self.bounce = if g == self.prev_face { self.bounce + 1 } else { 0 };
+        self.prev_face = f;
+        if self.bounce > 24 {
+            self.done = true;
+            self.why = "stuck";
+            return false;
+        }
         self.dir = carry(w, z, f, g, self.dir);
         self.face = g;
         self.at = hit;
@@ -3370,6 +3416,15 @@ fn run(traces: &mut [Trace], first_id: u32, w: &Work, z: &[Vec2], marks: &mut [u
     let base = 8u32;
     let mut reported: HashSet<(usize, usize)> = HashSet::default();
     while live && guard < w.t.len() * 4 + 100 {
+        // Past the planning deadline the lines left are ended where they are (the round
+        // that follows gives the plan up).
+        if past_deadline() {
+            for t in traces.iter_mut().filter(|t| !t.done) {
+                t.done = true;
+                t.why = "time";
+            }
+            break;
+        }
         live = false;
         guard += 1;
         for i in 0..traces.len() {
@@ -6829,6 +6884,11 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     // Split points already cut from in an earlier round: a patch that comes back with the
     // same point (its lines got stuck) is cut from a point a few rings away instead.
     let mut split_tries: HashMap<u32, u32> = HashMap::default();
+    // The fewest faults so far and the round they were reached: a pass that has not got
+    // below that in `ZR_STALL` (10) rounds is not converging (a model with parts thinner than
+    // a quad keeps making the same faults) and is given up, rather than run to round 40.
+    let stall: u32 = std::env::var("ZR_STALL").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let mut best = (usize::MAX, 0u32);
     while !c.faults.is_empty() {
         if debug {
             // Dangling ends and vertices two lines pass through.
@@ -6872,6 +6932,18 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
                 dump_lines_marked(&w, &cut_edges, &nodes, &c.faulty, std::path::Path::new(&dir));
             }
             return Err("stopped".into());
+        }
+        if c.faults.len() < best.0 {
+            best = (c.faults.len(), rounds);
+        }
+        if past_deadline() {
+            return Err(format!("planning took over {} s", budget_secs()));
+        }
+        if rounds - best.1 >= stall {
+            if debug {
+                eprintln!("  no fewer than {} faults since round {}: given up", best.0, best.1);
+            }
+            return Err(format!("{} patches stayed faulty", c.faults.len()));
         }
         rounds += 1;
         if rounds > 40 {

@@ -306,6 +306,14 @@ pub struct Stats {
     pub holes: usize,
     /// Vertices put on a guide curve.
     pub on_guides: usize,
+    /// Quads split as a fan round a middle point (both diagonals were taken).
+    pub fans: usize,
+    /// Badly shaped quads (an edge over three times another, or a corner outside 45–135
+    /// degrees) and folded ones (their two halves facing apart).
+    pub bad: usize,
+    pub folded: usize,
+    /// The result is of a wrapped copy (detail finer than a quad closed over).
+    pub wrapped: bool,
     /// The whole layout was planned; else why not (the piecewise fit was used).
     pub planned: bool,
     pub fallback: Option<String>,
@@ -1015,15 +1023,42 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         std::fs::write(path, s).ok();
     }
     crate::jobs::check()?;
-    let (mut out, stats) = match s.mirror {
-        // Plan Layout with Symmetry: a body is built whole and symmetric; anything else is
-        // planned on its half and mirrored.
-        Some(plane) => match (s.layout, s.layout.then(|| remesh(mesh, s, guides, &[], &features, None))) {
-            (true, Some(Ok(r))) if r.1.planned => r,
-            _ => symmetric(mesh, s, guides, &features, plane)?,
-        },
-        None => remesh(mesh, s, guides, &[], &features, None)?,
+    let run = |m: &SculptMesh| -> Result<(SculptMesh, Stats), String> {
+        Ok(match s.mirror {
+            // Plan Layout with Symmetry: a body is built whole and symmetric; anything else is
+            // planned on its half and mirrored.
+            Some(plane) => match (s.layout, s.layout.then(|| remesh(m, s, guides, &[], &features, None))) {
+                (true, Some(Ok(r))) if r.1.planned => r,
+                _ => symmetric(m, s, guides, &features, plane)?,
+            },
+            None => remesh(m, s, guides, &[], &features, None)?,
+        })
     };
+    let (mut out, mut stats) = run(mesh)?;
+    // Detail finer than a quad (pouches on a vest with gaps under them, thin rails and
+    // fins) folds the quads that are laid over it. When the result has folds (over one in
+    // 500 quads) or many badly shaped quads (over 6%), the model is wrapped (`ZR_NOWRAP`
+    // off): voxel remeshed at about 1.1 quads, which closes gaps and undercuts narrower than
+    // that and keeps the general shape, its crumbs dropped; the remesh of that is kept when
+    // it comes out better.
+    let poor = |st: &Stats| st.quads > 0 && (st.folded * 500 > st.quads || st.bad * 100 > st.quads * 6);
+    // (Only a closed model, and not with Freeze Border: wrapping closes openings, so a border
+    // would be lost.)
+    if poor(&stats) && !s.freeze_border && crate::wedge::closed(mesh) && std::env::var_os("ZR_NOWRAP").is_none() {
+        crate::jobs::check()?;
+        if let Some(wrapped) = wrap(mesh, quad) {
+            if let Ok((o2, mut st2)) = run(&wrapped) {
+                let score = |st: &Stats| st.bad + 10 * st.folded;
+                if debug {
+                    eprintln!("wrap: {} bad, {} folded -> {} bad, {} folded on a copy wrapped at {:.4}", stats.bad, stats.folded, st2.bad, st2.folded, quad * 1.1);
+                }
+                if score(&st2) < score(&stats) && o2.subdivision_blocker().is_none() {
+                    st2.wrapped = true;
+                    (out, stats) = (o2, st2);
+                }
+            }
+        }
+    }
     if !creased.is_empty() {
         let (mut lines, _) = crate::crease::lines(mesh, &creased, 0.0);
         if let Some(plane) = s.mirror {
@@ -1035,6 +1070,17 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         crease_along(&mut out, &lines, quad, s.mirror);
     }
     if let Some(why) = out.subdivision_blocker() {
+        // KLAY_ZR_BROKEN=file.obj: the broken result, for a look at where it breaks.
+        if let Some(path) = std::env::var_os("KLAY_ZR_BROKEN") {
+            let mut txt = String::new();
+            for p in &out.positions {
+                txt.push_str(&format!("v {} {} {}\n", p.x, p.y, p.z));
+            }
+            for t in out.indices.chunks_exact(3) {
+                txt.push_str(&format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1));
+            }
+            std::fs::write(path, txt).ok();
+        }
         // A planned layout that came out broken: the plain remesher instead.
         if stats.planned {
             let plain = Settings { layout: false, ..*s };
@@ -1178,16 +1224,36 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         // settle, so then only over 150 quads².
         let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
         let (reflex, reflex2) = (env("ZR_REFLEXAREA", 40.0), env("ZR_REFLEXAREA2", 150.0));
-        let planned = layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0, reflex)
-            .or_else(|why| if reflex2 != reflex { layout::quads(mesh, s, guides, seams, features, cut, quad, 0.0, reflex2) } else { Err(why) })
-            .or_else(|why| if gentle > 0.0 { layout::quads(mesh, s, guides, seams, features, cut, quad, gentle, reflex2) } else { Err(why) })
+        // All the tries together get `ZR_BUDGET` (120) seconds; past it the plain remesher.
+        let owns_deadline = layout::set_deadline(std::env::var("ZR_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(120));
+        let try_layout = |pull: f32, reflex_area: f32| -> Result<_, String> {
+            if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
+                eprintln!("  layout try: pull {pull}, reflex {reflex_area}, past the deadline {} ({:?})", layout::past_deadline(), std::thread::current().id());
+            }
+            if layout::past_deadline() {
+                return Err(format!("planning took over its {} s", std::env::var("ZR_BUDGET").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(120)));
+            }
+            let t = Instant::now();
+            let r = layout::quads(mesh, s, guides, seams, features, cut, quad, pull, reflex_area);
+            // KLAY_ZR_TIME: each try's time and outcome (cheap, unlike the debug log).
+            if std::env::var_os("KLAY_ZR_TIME").is_some() {
+                eprintln!("  try pull {pull} reflex {reflex_area}: {:.1} s, {}", t.elapsed().as_secs_f32(), r.as_ref().map_or_else(|e| e.clone(), |_| "planned".into()));
+            }
+            r
+        };
+        let planned = try_layout(0.0, reflex)
+            .or_else(|why| if reflex2 != reflex { try_layout(0.0, reflex2) } else { Err(why) })
+            .or_else(|why| if gentle > 0.0 { try_layout(gentle, reflex2) } else { Err(why) })
             .or_else(|why| {
                 if s.follow_shape > gentle {
-                    layout::quads(mesh, s, guides, seams, features, cut, quad, s.follow_shape, reflex2)
+                    try_layout(s.follow_shape, reflex2)
                 } else {
                     Err(why)
                 }
             });
+        if owns_deadline {
+            layout::clear_deadline();
+        }
         match planned {
             Ok((out_p, quads, mirrored)) => {
                 stats.planned = true;
@@ -2101,6 +2167,8 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             }
         }
     }
+    // How good the quads came out (for the retry on a wrapped copy in `zremesh`).
+    (stats.bad, stats.folded) = quad_quality(&out_p, &quads);
     // Triangles (each quad along its shorter diagonal, unless that is an edge or the
     // diagonal of another quad: two quads on a vertex with two neighbours share three
     // corners, and one diagonal between them would be an edge in four triangles).
@@ -2120,6 +2188,20 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             continue;
         }
         let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        // Both diagonals taken (one by a quad sharing these two corners, the other an edge of
+        // another): any split makes an edge in four triangles, so a fan round a middle point.
+        if taken.contains(&key(q4[0], q4[2])) && taken.contains(&key(q4[1], q4[3])) {
+            let c = (0..4).map(|k| p(q4[k])).sum::<Vec3>() * 0.25;
+            out_p.push(c);
+            let m = (out_p.len() - 1) as u32;
+            for k in 0..4 {
+                indices.extend_from_slice(&[q4[k], q4[(k + 1) % 4], m]);
+                tri_groups.push(g);
+                halves.push(crate::mesh::LONE);
+            }
+            stats.fans += 1;
+            continue;
+        }
         let mut first = p(q4[0]).distance_squared(p(q4[2])) <= p(q4[1]).distance_squared(p(q4[3]));
         if taken.contains(&if first { key(q4[0], q4[2]) } else { key(q4[1], q4[3]) }) {
             first = !first;
@@ -2138,6 +2220,84 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
     let out = SculptMesh::from_raw_full(out_p, indices, if grouped { tri_groups } else { Vec::new() }, Vec::new(), halves);
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
     Ok((out, stats))
+}
+
+/// `mesh` wrapped for a remesh at `quad`: voxel remeshed at 1.1 quads (gaps and undercuts
+/// narrower than that closed, detail finer than that smoothed over), projected back onto it,
+/// and without the voxel crumbs (pieces under a two-hundredth of the triangles). None if the
+/// voxel remesh fails.
+fn wrap(mesh: &SculptMesh, quad: f32) -> Option<SculptMesh> {
+    let resolution = ((2.0 / (quad * 1.1)).round() as u32).clamp(16, crate::wedge::MAX_RESOLUTION);
+    let o = crate::wedge::remesh(mesh, &crate::wedge::Settings { resolution, blur: 1, project: true }).ok()?;
+    let (p, i) = (o.positions, o.indices);
+    let mut parent: Vec<u32> = (0..p.len() as u32).collect();
+    fn root(par: &mut [u32], mut x: u32) -> u32 {
+        while par[x as usize] != x {
+            par[x as usize] = par[par[x as usize] as usize];
+            x = par[x as usize];
+        }
+        x
+    }
+    for t in i.chunks_exact(3) {
+        let a = root(&mut parent, t[0]);
+        for &v in &t[1..] {
+            let b = root(&mut parent, v);
+            if a != b {
+                parent[b as usize] = a;
+            }
+        }
+    }
+    let mut count: HashMap<u32, usize> = HashMap::default();
+    for t in i.chunks_exact(3) {
+        *count.entry(root(&mut parent, t[0])).or_default() += 1;
+    }
+    let tris = i.len() / 3;
+    let keep: Vec<u32> = i.chunks_exact(3).filter(|t| count[&root(&mut parent, t[0])] * 200 >= tris).flatten().copied().collect();
+    if keep.is_empty() {
+        return None;
+    }
+    // Only the points still used.
+    let mut map = vec![u32::MAX; p.len()];
+    let mut kept_p = Vec::new();
+    let idx: Vec<u32> = keep.iter().map(|&v| {
+        if map[v as usize] == u32::MAX {
+            map[v as usize] = kept_p.len() as u32;
+            kept_p.push(p[v as usize]);
+        }
+        map[v as usize]
+    }).collect();
+    Some(SculptMesh::from_raw(kept_p, idx))
+}
+
+/// Badly shaped quads (an edge over three times another, or a corner outside 45–135
+/// degrees) and folded ones (the halves either side of each diagonal facing apart, or
+/// collapsed); triangles (a repeated corner) are not counted.
+fn quad_quality(p: &[Vec3], quads: &[[u32; 4]]) -> (usize, usize) {
+    let (mut bad, mut folded) = (0, 0);
+    for q in quads {
+        if (0..4).any(|k| q[k] == q[(k + 1) % 4]) {
+            continue;
+        }
+        let c: [Vec3; 4] = q.map(|v| p[v as usize]);
+        let e: Vec<f32> = (0..4).map(|k| c[k].distance(c[(k + 1) % 4])).collect();
+        let (lo, hi) = e.iter().fold((f32::INFINITY, 0.0f32), |(a, b), &x| (a.min(x), b.max(x)));
+        let skew = (0..4).any(|k| {
+            let a = (c[(k + 1) % 4] - c[k]).angle_between(c[(k + 3) % 4] - c[k]).to_degrees();
+            !(45.0..=135.0).contains(&a)
+        });
+        if hi > lo.max(1e-12) * 3.0 || skew {
+            bad += 1;
+        }
+        // (A collapsed quad, an edge or the area next to nothing, counts as folded.)
+        let area = (c[2] - c[0]).cross(c[3] - c[1]).length() * 0.5;
+        // (Folded across both diagonals: a quad only bent across one is not folded.)
+        let fold02 = (c[1] - c[0]).cross(c[2] - c[0]).dot((c[2] - c[0]).cross(c[3] - c[0])) < 0.0;
+        let fold13 = (c[2] - c[1]).cross(c[3] - c[1]).dot((c[3] - c[1]).cross(c[0] - c[1])) < 0.0;
+        if (fold02 && fold13) || lo < hi * 1e-3 || area < hi * hi * 1e-4 {
+            folded += 1;
+        }
+    }
+    (bad, folded)
 }
 
 /// Open border loops of faces given as corner lists (a triangle as a quad with its last
@@ -3333,7 +3493,13 @@ mod shape_tests {
                     guides.push(loop_pts);
                 }
             }
-            for planned in [false, true] {
+            // ZR_PATHS=old or new: only the plain remesher or only Plan Layout.
+            let paths: Vec<bool> = match std::env::var("ZR_PATHS").as_deref() {
+                Ok("old") => vec![false],
+                Ok("new") => vec![true],
+                _ => vec![false, true],
+            };
+            for planned in paths {
                 let follow: f32 = std::env::var("ZR_FOLLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
                 let detect = std::env::var("ZR_EDGES").map(|v| v != "0").unwrap_or(true);
                 // ZR_GROUPS=1: polygroup borders are hard edges (a model with groups, no voxel).

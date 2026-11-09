@@ -301,6 +301,7 @@ fn lines_of(hits: Vec<Hit>, lines: usize, csg: Option<&Csg>) -> Lines {
                         was = now;
                     }
                 }
+                close_line(&mut out);
                 return out;
             }
             let mut w = 0i32;
@@ -311,6 +312,7 @@ fn lines_of(hits: Vec<Hit>, lines: usize, csg: Option<&Csg>) -> Lines {
                     out.push((f32::from_bits(h.key as u32), h.tri));
                 }
             }
+            close_line(&mut out);
             out
         })
         .collect();
@@ -326,6 +328,15 @@ fn lines_of(hits: Vec<Hit>, lines: usize, csg: Option<&Csg>) -> Lines {
         start.push(depth.len() as u32);
     }
     Lines { start, depth, tri }
+}
+
+/// A line that ends inside (an open mesh: it passed through a hole, so its winding never
+/// returned to zero) loses its last way in, so it is outside again past its last way out;
+/// else the inside would run on to the edge of the grid, where there are no cells.
+fn close_line(out: &mut Vec<(f32, u32)>) {
+    if out.len() % 2 == 1 {
+        out.pop();
+    }
 }
 
 /// Edge function of the directed edge `i -> j` at `(x, y)` in the plane `(b, c)`,
@@ -860,11 +871,18 @@ pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result
 
     // Quads: each cell makes the quads of its three edges that end at its far corner
     // (every crossed edge of the grid is the far edge of exactly one cell).
+    // (Every crossed edge's four cells are surface cells when the lines are consistent; one
+    // that is not is noted and its quad left out, and the result refused below, rather than
+    // a crash.)
+    let missing = std::sync::atomic::AtomicBool::new(false);
     let find = |i: usize, j: usize, k: usize| -> usize {
         let key = field.key(i, j, k);
-        keys.binary_search(&key).expect("the cells around a crossed edge are all surface cells")
+        keys.binary_search(&key).unwrap_or_else(|_| {
+            missing.store(true, std::sync::atomic::Ordering::Relaxed);
+            usize::MAX
+        })
     };
-    let vertex = |cell: usize, e: usize| -> u32 { first[cell] + table.patch[cfgs[cell] as usize][e] as u32 };
+    let vertex = |cell: usize, e: usize| -> u32 { if cell == usize::MAX { u32::MAX } else { first[cell] + table.patch[cfgs[cell] as usize][e] as u32 } };
     let has_groups = !mesh.groups.is_empty();
     let quads: Vec<([u32; 4], u16)> = keys
         .par_iter()
@@ -918,6 +936,9 @@ pub fn remesh_with(mesh: &SculptMesh, s: &Settings, csg: Option<&Csg>) -> Result
         })
         .collect();
     drop(field);
+    if missing.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("the voxel surface does not close · try another resolution".into());
+    }
     stats.surface_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     crate::jobs::check()?;
@@ -1440,6 +1461,28 @@ mod tests {
                 let (a, b, c) = (out.positions[t[0] as usize], out.positions[t[1] as usize], out.positions[t[2] as usize]);
                 let n = (b - a).cross(c - a);
                 assert!(n.dot((a + b + c) / 3.0) > 0.0, "a triangle folded at {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn open_input_with_holes_still_gives_a_closed_manifold() {
+        // A sphere and a cylinder with faces taken out (holes, as in a model whose parts are
+        // open shells): lines through a hole never get back to winding zero. Each resolution
+        // must give a closed manifold, not run the inside on to the edge of the grid (which
+        // had no cells there and panicked).
+        for (prim, seg) in [(Primitive::Sphere, 24), (Primitive::Cylinder, 24)] {
+            let (pos, idx) = prim.build(seg, 1.0);
+            let tris = idx.len() / 3;
+            let keep: Vec<u32> = (0..tris).filter(|t| t % 7 != 3 && t % 11 != 5).flat_map(|t| idx[3 * t..3 * t + 3].iter().copied()).collect();
+            let m = SculptMesh::from_raw(pos, keep);
+            assert!(!closed(&m), "the input has holes");
+            for resolution in [24, 57, 101] {
+                let out = remesh(&m, &Settings { resolution, blur: 1, project: true }).expect("an open input remeshes");
+                let v = check_closed(&out.positions, &out.indices);
+                assert!(v > 0.0, "inside out at {resolution}");
+                let mesh = SculptMesh::from_raw(out.positions, out.indices);
+                assert!(!mesh.edges_over_two_triangles(), "non-manifold at {resolution}");
             }
         }
     }
