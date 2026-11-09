@@ -309,6 +309,170 @@ pub fn clean_lines(mesh: &SculptMesh, edges: &[(u32, u32)], quad: f32) -> (Vec<(
     (sorted(out), loops)
 }
 
+/// Hard edges of a dense, noisy surface (a scan, a sculpt, an AI model), where single
+/// edges turn by noise as much as by form: the faces are grown into regions of one facing
+/// (normals smoothed twice; a face joins when within `ZR_REGIONTOL` (20) degrees of the
+/// region's mean and 15 of the face it is reached from, the flattest faces seeded first),
+/// regions under half a `quad`² merged into their likest neighbour, and the boundary between
+/// two regions kept when their means differ by `ZR_REGIONTURN` (35) degrees or more, the
+/// faces across it by 8 on average (a curved part split into regions turns little across
+/// each split), and it is a quad long or more. The boundaries are whole lines, where the
+/// sharp edges of such a surface are broken into many short pieces.
+pub fn region_edges(mesh: &SculptMesh, quad: f32) -> Vec<(u32, u32)> {
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    let (tol, turn) = (env("ZR_REGIONTOL", 20.0), env("ZR_REGIONTURN", 35.0));
+    let min_area = env("ZR_REGIONMIN", 4.0);
+    let p = &mesh.positions;
+    let nt = mesh.indices.len() / 3;
+    let tri = |t: usize| (p[mesh.indices[3 * t] as usize], p[mesh.indices[3 * t + 1] as usize], p[mesh.indices[3 * t + 2] as usize]);
+    let (area, mut n): (Vec<f32>, Vec<Vec3>) = (0..nt)
+        .into_par_iter()
+        .map(|t| {
+            let (a, b, c) = tri(t);
+            let x = (b - a).cross(c - a);
+            (x.length() * 0.5, x.normalize_or_zero())
+        })
+        .unzip();
+    let es = edges(mesh);
+    let inner: Vec<(u32, u32, u32, u32)> = es.iter().copied().filter(|e| e.3 != NONE).collect();
+    let mut nb: Vec<Vec<u32>> = vec![Vec::new(); nt];
+    for &(_, _, t, u) in &inner {
+        nb[t as usize].push(u);
+        nb[u as usize].push(t);
+    }
+    for v in nb.iter_mut() {
+        v.sort_unstable();
+    }
+    // Normals smoothed twice (area weighted, each face and its neighbours, in a fixed order).
+    for _ in 0..2 {
+        n = (0..nt)
+            .into_par_iter()
+            .map(|t| {
+                let mut s = n[t] * area[t];
+                for &u in &nb[t] {
+                    s += n[u as usize] * area[u as usize];
+                }
+                s.normalize_or_zero()
+            })
+            .collect();
+    }
+    // Seeds, the flattest first.
+    let flat: Vec<f32> = (0..nt).into_par_iter().map(|t| if nb[t].is_empty() { 0.0 } else { nb[t].iter().map(|&u| n[t].dot(n[u as usize])).sum::<f32>() / nb[t].len() as f32 }).collect();
+    let mut order: Vec<u32> = (0..nt as u32).collect();
+    order.par_sort_unstable_by(|&a, &b| flat[b as usize].total_cmp(&flat[a as usize]).then(a.cmp(&b)));
+    let (ct, cl) = (tol.to_radians().cos(), 15f32.to_radians().cos());
+    let mut reg = vec![u32::MAX; nt];
+    let mut sum: Vec<Vec3> = Vec::new();
+    let mut size: Vec<f32> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    for &s0 in &order {
+        if reg[s0 as usize] != u32::MAX {
+            continue;
+        }
+        let r = sum.len() as u32;
+        reg[s0 as usize] = r;
+        let mut m = n[s0 as usize] * area[s0 as usize];
+        let mut a = area[s0 as usize];
+        stack.push(s0);
+        while let Some(f) = stack.pop() {
+            let mu = m.normalize_or_zero();
+            for &g in &nb[f as usize] {
+                let gi = g as usize;
+                if reg[gi] == u32::MAX && n[gi].dot(mu) >= ct && n[gi].dot(n[f as usize]) >= cl {
+                    reg[gi] = r;
+                    m += n[gi] * area[gi];
+                    a += area[gi];
+                    stack.push(g);
+                }
+            }
+        }
+        sum.push(m);
+        size.push(a);
+    }
+    // Small regions into the likest neighbour at least as big, a few times over.
+    let q2 = quad * quad;
+    for _ in 0..6 {
+        let mut adj: std::collections::BTreeMap<(u32, u32), u32> = Default::default();
+        for &(_, _, t, u) in &inner {
+            let (x, y) = (reg[t as usize], reg[u as usize]);
+            if x != y {
+                *adj.entry((x, y)).or_default() += 1;
+                *adj.entry((y, x)).or_default() += 1;
+            }
+        }
+        let mut to: Vec<u32> = (0..sum.len() as u32).collect();
+        let mut any = false;
+        let mut cur = u32::MAX;
+        let mut best: Option<(f32, u32, u32)> = None;
+        let flush = |cur: u32, best: Option<(f32, u32, u32)>, to: &mut Vec<u32>, any: &mut bool| {
+            if let Some((_, _, o)) = best {
+                to[cur as usize] = o;
+                *any = true;
+            }
+        };
+        for (&(x, y), &k) in &adj {
+            if x != cur {
+                if cur != u32::MAX {
+                    flush(cur, best, &mut to, &mut any);
+                }
+                cur = x;
+                best = None;
+            }
+            if size[x as usize] >= q2 * 0.5 || size[y as usize] < size[x as usize] {
+                continue;
+            }
+            let sim = sum[x as usize].normalize_or_zero().dot(sum[y as usize].normalize_or_zero());
+            if best.is_none_or(|b| sim > b.0 || (sim == b.0 && (k > b.1 || (k == b.1 && y < b.2)))) {
+                best = Some((sim, k, y));
+            }
+        }
+        if cur != u32::MAX {
+            flush(cur, best, &mut to, &mut any);
+        }
+        if !any {
+            break;
+        }
+        let root = |mut r: u32| {
+            let mut steps = 0;
+            while to[r as usize] != r && steps < 64 {
+                r = to[r as usize];
+                steps += 1;
+            }
+            r
+        };
+        for r in reg.iter_mut() {
+            *r = root(*r);
+        }
+        sum = vec![Vec3::ZERO; sum.len()];
+        size = vec![0.0; size.len()];
+        for t in 0..nt {
+            sum[reg[t] as usize] += n[t] * area[t];
+            size[reg[t] as usize] += area[t];
+        }
+    }
+    // The boundaries between regions, each pair's edges with the angle across each.
+    let mut bnd: std::collections::BTreeMap<(u32, u32), Vec<(u32, u32, f32)>> = Default::default();
+    for &(a, b, t, u) in &inner {
+        let (x, y) = (reg[t as usize], reg[u as usize]);
+        if x != y {
+            let ang = n[t as usize].dot(n[u as usize]).clamp(-1.0, 1.0).acos().to_degrees();
+            bnd.entry((x.min(y), x.max(y))).or_default().push((a, b, ang));
+        }
+    }
+    let turn_cos = turn.to_radians().cos();
+    let mut out = Vec::new();
+    for ((x, y), es) in bnd {
+        let len: f32 = es.iter().map(|e| p[e.0 as usize].distance(p[e.1 as usize])).sum();
+        let local = es.iter().map(|e| e.2).sum::<f32>() / es.len() as f32;
+        let across = sum[x as usize].normalize_or_zero().dot(sum[y as usize].normalize_or_zero());
+        // (Both sides big enough to keep at this quad size: `ZR_REGIONMIN` quads² each.)
+        if across <= turn_cos && local >= 8.0 && len >= quad && size[x as usize].min(size[y as usize]) >= q2 * min_area {
+            out.extend(es.iter().map(|e| (e.0, e.1)));
+        }
+    }
+    sorted(out)
+}
+
 /// The edges of the lines of `edges` (see [`chains`]) at least `min_length` long.
 pub fn long_lines_only(mesh: &SculptMesh, edges: &[(u32, u32)], min_length: f32) -> Vec<(u32, u32)> {
     let p = &mesh.positions;
@@ -338,6 +502,35 @@ mod tests {
         let (lines, corners) = lines(&m, &e, 0.5);
         assert_eq!(lines.len(), 12);
         assert_eq!(corners.len(), 8);
+    }
+
+    #[test]
+    fn region_edges_find_a_noisy_cubes_edges_and_nothing_on_its_faces() {
+        // A dense cube (40 segments a side, about 2 units across) with its points pushed in
+        // and out along the normal by a deterministic noise of a few degrees per edge, at a
+        // quad size of eight segments: its 12 edges are all found, along their length, and
+        // nothing on the faces.
+        let (mut p, i) = crate::primitive::box_surface([40; 3], |p| p);
+        for (k, q) in p.iter_mut().enumerate() {
+            let n = if q.x.abs() >= q.y.abs().max(q.z.abs()) { Vec3::X * q.x.signum() } else if q.y.abs() >= q.z.abs() { Vec3::Y * q.y.signum() } else { Vec3::Z * q.z.signum() };
+            let h = ((k as f32 * 12.9898).sin() * 43758.547).fract() - 0.5;
+            *q += n * h * 0.01;
+        }
+        let m = SculptMesh::from_raw(p, i);
+        let half = m.bounds().max.x;
+        let quad = half * 2.0 / 40.0 * 8.0;
+        let edges = region_edges(&m, quad);
+        let pos = &m.positions;
+        // Every edge found lies on the cube's edges (two coordinates at the extreme).
+        let on_edge = |v: u32| {
+            let q = pos[v as usize];
+            [q.x, q.y, q.z].iter().filter(|c| c.abs() > half * 0.93).count() >= 2
+        };
+        let off = edges.iter().filter(|&&(a, b)| !(on_edge(a) && on_edge(b))).count();
+        assert!(off * 20 <= edges.len(), "{off} of {} edges off the cube's edges", edges.len());
+        // And they cover the 12 edges: total length at least 80% of 12 × 2·half.
+        let len: f32 = edges.iter().map(|&(a, b)| pos[a as usize].distance(pos[b as usize])).sum();
+        assert!(len >= 0.8 * 12.0 * 2.0 * half, "{len} of {}", 12.0 * 2.0 * half);
     }
 
     #[test]

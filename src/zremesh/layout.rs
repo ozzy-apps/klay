@@ -6034,6 +6034,9 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     // head above it is left a free sphere).
     let mut part_phi: Vec<f32> = Vec::new();
     let mut part_neck: Option<f32> = None;
+    if past_deadline() {
+        return Err(format!("planning took over {} s", budget_secs()));
+    }
     if std::env::var_os("ZR_NOTUBES").is_none() {
         lap("half-edges");
         let (_, _, _, mut d, mut tubes, tips) = limb_rings(&w, quad);
@@ -6349,8 +6352,18 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     } else {
         Vec::new()
     };
+    // A working mesh too big to plan a field and patches on in the time (`ZR_MAXWORK`, 3
+    // million triangles: a detailed model at a high count) is given up here, for the plain
+    // remesher (a body has been built by now, whatever its size).
+    let max_work: usize = std::env::var("ZR_MAXWORK").ok().and_then(|v| v.parse().ok()).unwrap_or(3_000_000);
+    if w.t.len() > max_work {
+        return Err(format!("the model is too detailed to plan at this count ({} triangles to plan on)", w.t.len()));
+    }
     let z = cross_field(&w, (field_follow / 100.0).clamp(0.0, 1.0), quad, &grid, &parts);
     crate::jobs::check()?;
+    if past_deadline() {
+        return Err(format!("planning took over {} s", budget_secs()));
+    }
     let mut index = poles(&w, &z);
     // A pole next to one of the opposite sign cancels it: both are dropped.
     {
@@ -6778,6 +6791,9 @@ pub(super) fn quads(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams
     let is_pole: Vec<bool> = index.iter().map(|&i| i != 0).collect();
     prune(&mut traces, &mut marks, &w);
     settle(&mut traces, &mut marks, &mut extra, &w, &z, quad, &pole_list, &is_pole);
+    if past_deadline() {
+        return Err(format!("planning took over {} s", budget_secs()));
+    }
     let (mut cut_edges, mut edge_line, mut same, mut nodes) = rebuild(&traces, &extra);
     let mut c = cut(&w, &z, &is_pole, &cut_edges, &nodes, quad, &edge_line, &same, &pole_lines(&traces, &same, &protected), &protected.iter().map(|&i| root_of(&same, i)).collect(), false, &HashSet::default(), 0.0);
     if select {

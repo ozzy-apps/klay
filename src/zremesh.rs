@@ -985,7 +985,18 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
     // more, as before).
     let debug = std::env::var_os("KLAY_ZR_DEBUG").is_some();
     let (mut edges, closed) = if s.detect_edges {
-        let sharp = crate::crease::sharp_edges(mesh, EDGE_ANGLE);
+        // On a dense surface (its edges under a quarter of a quad: a scan, a sculpt, an AI
+        // model) single edges turn by noise as much as by form, and its sharp edges are many
+        // short pieces: the boundaries of regions of one facing find its hard edges as whole
+        // lines. Opt-in for now (`ZR_REGIONEDGES=1`): the lines are right (a Meshy rifle's
+        // panel outlines, 424 lines where the sharp edges keep 4), but neither remesher makes
+        // better quads from them yet (a soldier 3.4% -> 3.8% badly shaped, a rifle 27.8% ->
+        // 29.2%).
+        let dense = std::env::var_os("ZR_REGIONEDGES").is_some() && median_edge(mesh) < quad * 0.25;
+        let sharp = if dense { crate::crease::region_edges(mesh, quad) } else { crate::crease::sharp_edges(mesh, EDGE_ANGLE) };
+        if debug {
+            eprintln!("edges: {}", if dense { "regions (a dense surface)" } else { "sharper than the edge angle" });
+        }
         let (kept, closed) = if std::env::var_os("ZR_RAWLINES").is_some() { (crate::crease::long_lines_only(mesh, &sharp, quad * 2.0), Vec::new()) } else { crate::crease::clean_lines(mesh, &sharp, quad) };
         if debug {
             let p = &mesh.positions;
@@ -1226,7 +1237,13 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
         let (reflex, reflex2) = (env("ZR_REFLEXAREA", 40.0), env("ZR_REFLEXAREA2", 150.0));
         // All the tries together get `ZR_BUDGET` (120) seconds; past it the plain remesher.
         let owns_deadline = layout::set_deadline(std::env::var("ZR_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(120));
+        // (A model too detailed to plan is so for every try: the rest are not made.)
+        let hopeless = std::cell::Cell::new(None::<String>);
         let try_layout = |pull: f32, reflex_area: f32| -> Result<_, String> {
+            if let Some(why) = hopeless.take() {
+                hopeless.set(Some(why.clone()));
+                return Err(why);
+            }
             if std::env::var_os("KLAY_ZR_DEBUG").is_some() {
                 eprintln!("  layout try: pull {pull}, reflex {reflex_area}, past the deadline {} ({:?})", layout::past_deadline(), std::thread::current().id());
             }
@@ -1235,6 +1252,11 @@ fn remesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>], seams: &[Vec<Ve
             }
             let t = Instant::now();
             let r = layout::quads(mesh, s, guides, seams, features, cut, quad, pull, reflex_area);
+            if let Err(why) = &r {
+                if why.starts_with("the model is too detailed") {
+                    hopeless.set(Some(why.clone()));
+                }
+            }
             // KLAY_ZR_TIME: each try's time and outcome (cheap, unlike the debug log).
             if std::env::var_os("KLAY_ZR_TIME").is_some() {
                 eprintln!("  try pull {pull} reflex {reflex_area}: {:.1} s, {}", t.elapsed().as_secs_f32(), r.as_ref().map_or_else(|e| e.clone(), |_| "planned".into()));
@@ -2220,6 +2242,19 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
     let out = SculptMesh::from_raw_full(out_p, indices, if grouped { tri_groups } else { Vec::new() }, Vec::new(), halves);
     stats.ms = start.elapsed().as_secs_f32() * 1000.0;
     Ok((out, stats))
+}
+
+/// The median length of `mesh`'s edges, from about 20,000 of its triangles' first edges.
+fn median_edge(mesh: &SculptMesh) -> f32 {
+    let nt = mesh.indices.len() / 3;
+    if nt == 0 {
+        return 0.0;
+    }
+    let step = (nt / 20_000).max(1);
+    let p = &mesh.positions;
+    let mut l: Vec<f32> = (0..nt).step_by(step).map(|t| p[mesh.indices[3 * t] as usize].distance(p[mesh.indices[3 * t + 1] as usize])).collect();
+    l.sort_by(|a, b| a.total_cmp(b));
+    l[l.len() / 2]
 }
 
 /// `mesh` wrapped for a remesh at `quad`: voxel remeshed at 1.1 quads (gaps and undercuts
