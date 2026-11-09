@@ -39,6 +39,7 @@
 use crate::{mesh::SculptMesh, symmetry::MirrorPlane};
 
 mod layout;
+mod onlines;
 use crate::fx::FxHashMap as HashMap;
 use glam::Vec3;
 use rayon::prelude::*;
@@ -306,6 +307,8 @@ pub struct Stats {
     pub holes: usize,
     /// Vertices put on a guide curve.
     pub on_guides: usize,
+    /// Vertices put on edge lines (loops along them).
+    pub on_lines: usize,
     /// Quads split as a fan round a middle point (both diagonals were taken).
     pub fans: usize,
     /// Badly shaped quads (an edge over three times another, or a corner outside 45–135
@@ -1877,14 +1880,43 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
         }
     }
     let near = (stats.planned && std::env::var_os("ZR_RAYPROJECT").is_none()).then(|| TriGrid::new(mesh, quad));
+    // The loops along edge lines go onto them and stay there, the rest evening out round
+    // them: a planned layout's at once (its edges were laid on the lines, and relaxing would
+    // slide them off), the plain remesher's halfway through the passes (its loops come out
+    // near the lines, not on them).
+    let mut on_line = vec![false; out_p.len()];
+    let old_snap = std::env::var_os("ZR_OLDSNAP").is_some();
     for pass in 0..passes {
+        if pass == if stats.planned { 0 } else { passes / 2 } && !old_snap && !features.lines.is_empty() {
+            let snapped = onlines::chains(&out_p, &adj, &features.lines, &features.corners, quad);
+            stats.on_lines = snapped.len();
+            for (v, q) in snapped {
+                if !pinned[v as usize] {
+                    out_p[v as usize] = q;
+                    on_line[v as usize] = true;
+                }
+            }
+            // The plain remesher's loops wander along a line, a short stretch on it and the next
+            // beside it: points within 0.3 quad of a line that are not beside one put on it go
+            // onto it too (where a stretch of loop is on the line and the next point is beside
+            // it, both on the line would collapse their quad).
+            if !stats.planned {
+                let lines = Guides::new(&features.lines, quad);
+                let extra: Vec<(usize, Vec3)> = (0..out_p.len()).filter(|&v| !pinned[v] && !on_line[v] && !adj[v].iter().any(|&u| on_line[u as usize])).filter_map(|v| lines.nearest(out_p[v], quad * 0.3).map(|(_, q, _)| (v, q))).collect();
+                stats.on_lines += extra.len();
+                for (v, q) in extra {
+                    out_p[v] = q;
+                    on_line[v] = true;
+                }
+            }
+        }
         normals(&out_p, &mut vnorm);
         if pass > 0 {
             let relaxed: Vec<Vec3> = (0..out_p.len())
                 .into_par_iter()
                 .map(|v| {
                     let a = &adj[v];
-                    if a.is_empty() || pinned[v] {
+                    if a.is_empty() || pinned[v] || on_line[v] {
                         return out_p[v];
                     }
                     let c = if by_faces && !vq[v].is_empty() && w_is_interior(&adj, &vq, v) {
@@ -1911,7 +1943,7 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
         };
         for (v, hit) in projected.into_iter().enumerate() {
             if let Some((p, _)) = hit {
-                if !pinned[v] {
+                if !pinned[v] && !on_line[v] {
                     out_p[v] = p;
                 }
             }
@@ -1964,7 +1996,7 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
                     }
                 }
             }
-            let mut order: Vec<u32> = moving.into_iter().filter(|&v| !pinned[v as usize] && !vq[v as usize].is_empty()).collect();
+            let mut order: Vec<u32> = moving.into_iter().filter(|&v| !pinned[v as usize] && !on_line[v as usize] && !vq[v as usize].is_empty()).collect();
             order.sort_unstable();
             for v in order {
                 let a = &adj[v as usize];
@@ -2033,8 +2065,8 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             out_p[v] = q;
         }
     }
-    // The loops on edge lines go exactly onto them, corners first.
-    if !features.lines.is_empty() {
+    // (A/B: ZR_OLDSNAP, every point within 0.4 quad of a line onto it at the end.)
+    if old_snap && !features.lines.is_empty() {
         let lines = Guides::new(&features.lines, quad);
         let cell = quad.max(1e-6);
         let mut corners: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::default();
