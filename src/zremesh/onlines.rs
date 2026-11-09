@@ -171,14 +171,17 @@ fn path(
 }
 
 /// The points of the new mesh (`p`, joined as `adj`) to put onto the edge `lines`, and where:
-/// on each line, the stretches of one path through the edges that run along it; a point
-/// within half a quad of one of the `corners` goes onto the corner.
+/// on each line, the stretches of one path through the edges that run along it (two edges or
+/// more, each within `angle` degrees of the line and both its ends within `near` quads of
+/// it); a point within half a quad of one of the `corners` goes onto the corner.
 pub(super) fn chains(
     p: &[Vec3],
     adj: &[Vec<u32>],
     lines: &[Vec<Vec3>],
     corners: &[Vec3],
     quad: f32,
+    near: f32,
+    angle: f32,
 ) -> Vec<(u32, Vec3)> {
     let cell = quad.max(1e-6);
     let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::default();
@@ -243,8 +246,7 @@ pub(super) fn chains(
                     })
                     .map(|(&v, _)| v)
             };
-            // Along: within 30° of the line, both ends within a third of a quad; two edges or more.
-            let (cos30, near, run) = (30f32.to_radians().cos(), 1.0 / 3.0, 2);
+            let (cos30, run) = (angle.to_radians().cos(), 2);
             let closed_walk = || -> Option<Vec<u32>> {
                 let (a, b) = (end_near(0.0)?, end_near(total * 0.5)?);
                 if a == b {
@@ -392,7 +394,7 @@ mod tests {
         let line: Vec<Vec3> = (0..=16)
             .map(|i| Vec3::new(1.0 + i as f32 * 0.5, 5.25, 0.0))
             .collect();
-        let got = chains(&p, &adj, &[line], &[], 1.0);
+        let got = chains(&p, &adj, &[line], &[], 1.0, 1.0 / 3.0, 30.0);
         let rows: Vec<(u32, u32)> = got.iter().map(|&(v, _)| (v % 11, v / 11)).collect();
         assert!(rows.iter().all(|&(_, y)| y == 5), "{rows:?}");
         assert_eq!(
@@ -410,7 +412,7 @@ mod tests {
         let line: Vec<Vec3> = (0..=16)
             .map(|i| Vec3::new(1.0 + i as f32 * 0.5, 1.0 + i as f32 * 0.5, 0.0))
             .collect();
-        assert!(chains(&p, &adj, &[line], &[], 1.0).is_empty());
+        assert!(chains(&p, &adj, &[line], &[], 1.0, 1.0 / 3.0, 30.0).is_empty());
     }
 
     #[test]
@@ -436,7 +438,7 @@ mod tests {
             Vec3::new(7.0, 7.0, 0.0),
             Vec3::new(3.0, 7.0, 0.0),
         ];
-        let got = chains(&p, &adj, &[line], &corners, 1.0);
+        let got = chains(&p, &adj, &[line], &corners, 1.0, 1.0 / 3.0, 30.0);
         assert_eq!(
             got.len(),
             16,

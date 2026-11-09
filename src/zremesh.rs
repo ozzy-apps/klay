@@ -1888,7 +1888,7 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
     let old_snap = std::env::var_os("ZR_OLDSNAP").is_some();
     for pass in 0..passes {
         if pass == if stats.planned { 0 } else { passes / 2 } && !old_snap && !features.lines.is_empty() {
-            let snapped = onlines::chains(&out_p, &adj, &features.lines, &features.corners, quad);
+            let snapped = onlines::chains(&out_p, &adj, &features.lines, &features.corners, quad, 1.0 / 3.0, 30.0);
             stats.on_lines = snapped.len();
             for (v, q) in snapped {
                 if !pinned[v as usize] {

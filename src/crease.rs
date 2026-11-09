@@ -461,6 +461,10 @@ pub fn region_edges(mesh: &SculptMesh, quad: f32) -> Vec<(u32, u32)> {
     }
     let turn_cos = turn.to_radians().cos();
     let mut out = Vec::new();
+    // Short stretches of crease between two lines kept (where a line passes between small
+    // regions: a ring round a turned part, its sides split into several facings), kept after
+    // if they join kept lines at their ends, so the line runs on unbroken.
+    let mut gaps: Vec<Vec<(u32, u32)>> = Vec::new();
     for ((x, y), es) in bnd {
         let len: f32 = es.iter().map(|e| p[e.0 as usize].distance(p[e.1 as usize])).sum();
         let local = es.iter().map(|e| e.2).sum::<f32>() / es.len() as f32;
@@ -468,7 +472,29 @@ pub fn region_edges(mesh: &SculptMesh, quad: f32) -> Vec<(u32, u32)> {
         // (Both sides big enough to keep at this quad size: `ZR_REGIONMIN` quads² each.)
         if across <= turn_cos && local >= 8.0 && len >= quad && size[x as usize].min(size[y as usize]) >= q2 * min_area {
             out.extend(es.iter().map(|e| (e.0, e.1)));
+        } else if local >= 25.0 && len < quad * 2.0 && std::env::var_os("ZR_NOREGIONGAPS").is_none() {
+            gaps.push(es.iter().map(|e| (e.0, e.1)).collect());
         }
+    }
+    // A gap's ends (its points on one of its edges only) must all be on kept lines; twice, as
+    // a gap can be two stretches.
+    for _ in 0..2 {
+        let on: std::collections::HashSet<u32> = out.iter().flat_map(|&(a, b)| [a, b]).collect();
+        let mut left = Vec::new();
+        for g in gaps {
+            let mut deg: std::collections::HashMap<u32, u32> = Default::default();
+            for &(a, b) in &g {
+                *deg.entry(a).or_default() += 1;
+                *deg.entry(b).or_default() += 1;
+            }
+            let ends: Vec<u32> = deg.iter().filter(|e| *e.1 == 1).map(|e| *e.0).collect();
+            if !ends.is_empty() && ends.iter().all(|v| on.contains(v)) {
+                out.extend(g);
+            } else {
+                left.push(g);
+            }
+        }
+        gaps = left;
     }
     sorted(out)
 }
@@ -531,6 +557,36 @@ mod tests {
         // And they cover the 12 edges: total length at least 80% of 12 × 2·half.
         let len: f32 = edges.iter().map(|&(a, b)| pos[a as usize].distance(pos[b as usize])).sum();
         assert!(len >= 0.8 * 12.0 * 2.0 * half, "{len} of {}", 12.0 * 2.0 * half);
+    }
+
+    #[test]
+    fn region_edges_ring_a_noisy_cylinder_whole() {
+        // A dense cylinder (a cube's surface, 96 segments a side, pulled round to radius 1,
+        // height 2) with the same normal noise: its side splits into several facings, so each
+        // rim is the border of the top with several regions, and the short stretches between
+        // them are kept too: each rim comes out one closed loop round the whole circle (without
+        // them: none).
+        let (mut p, i) = crate::primitive::box_surface([96; 3], |p| {
+            let r = p.x.abs().max(p.z.abs());
+            let l = Vec3::new(p.x, 0.0, p.z).length();
+            if l > 0.0 { Vec3::new(p.x * r / l, p.y, p.z * r / l) } else { p }
+        });
+        for (k, q) in p.iter_mut().enumerate() {
+            let side = Vec3::new(q.x, 0.0, q.z).length() > 0.999 && q.y.abs() < 0.999;
+            let n = if side { Vec3::new(q.x, 0.0, q.z).normalize() } else { Vec3::Y * q.y.signum() };
+            let h = ((k as f32 * 12.9898).sin() * 43758.547).fract() - 0.5;
+            *q += n * h * 0.002;
+        }
+        let m = SculptMesh::from_raw(p, i);
+        let quad = 2.0 / 96.0 * 8.0;
+        let edges = region_edges(&m, quad);
+        let (_, closed) = clean_lines(&m, &edges, quad);
+        let pos = &m.positions;
+        let lens: Vec<f32> = closed.iter().map(|c| (0..c.len()).map(|k| pos[c[k] as usize].distance(pos[c[(k + 1) % c.len()] as usize])).sum()).collect();
+        assert_eq!(closed.len(), 2, "closed loops of lengths {lens:?}");
+        for l in lens {
+            assert!((l - std::f32::consts::TAU).abs() < 0.6, "a rim loop {l} long");
+        }
     }
 
     #[test]
