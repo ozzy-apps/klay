@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.50.1 — 2026-11-10
 
 - **Remesh (Wedge) on open models**: a model with holes (open shells, parts not closed) no longer crashes the voxel remesh. A grid line through a hole never got back outside, so the inside ran on to the edge of the grid; such a line now ends at its last way out. Anything still inconsistent is refused with a message instead of a crash.
 - **ZRemesher no longer refuses thin hard-surface parts** with "edges shared by more than two polygons": two quads touching at two opposite corners, with both diagonals already used, are now split as a fan round a middle point. A tactical rifle and a dropship that failed now remesh.
@@ -9,6 +9,7 @@
 - **Plan Layout gives up in time**: planning gets 120 seconds in all, then the plain remesh is used (the notice says so), and a line caught on a fold of the surface (two faces back to back) stops instead of bouncing for minutes. A dropship went from over 15 minutes to about 4. A model too detailed to plan at the count asked (its working copy over 3 million triangles: a Meshy rifle at 40k quads) is refused at once with that reason, after the body builder has had its turn, instead of planning for minutes.
 - **ZRemesher: edge loops on hard edges** (Detect Edges, creases): each edge line now gets one chain of edges running along it, put exactly on it and held there while the rest evens out round it. Before, every point near a line was pulled onto it, so where a loop ran beside the line two rows met on it and their quads collapsed, and with Plan Layout the smoothing slid the loops it had laid on the lines off them again. Plan Layout on the test vase and rook: 59% and 63% of their rims had an edge loop on them, now 100% and 90% (the rims are crisp, a notch on the rook's top is gone); the plain remesher on a cube: 17% badly shaped quads → 8%.
 - **Plan Layout: face loops**: on a symmetric character the head is built finer than the body (0.6 of the quad) and the face is laid out as nested loops, as in a hand-made base mesh: a mask loop round both eyes from above the brows to the top of the nose, four rings round each eye (placed by the face's proportions), a loop round the nose and nostrils, and three rings round the mouth from under the nose to the chin; each a rectangle of the head's grid ringed in and capped, with poles only at its corners, exactly mirrored. If the eyes do not fit, the face is left as before. On a stylized T-pose base mesh at 10k quads: 0.8% badly shaped quads (0.5% before), no folded quads.
+- Verification: 474 release tests pass (15 ignored). Default results for the ball, cube, torus, blob, a bust with and without guide loops, and a stylized T-pose at 5k, 10k and 20k quads are unchanged by the edge-loop work; the T-pose stays an exact mirror image.
 
 ## 0.50.0 — 2026-11-08
 

@@ -3,9 +3,9 @@
 ## Project
 Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace (menu-bar palettes, four dockable trays, fixed shelves), ported from the interactive HTML reference `ui-mockup.html`. The Material 3 version described in steps 1–4 below was replaced in step 5. UI copy should only be functional.
 
-## Latest implementation — 0.50.0
+## Latest implementation — 0.50.1
 
-0.50.0 is published (Step 109); Step 110 adds an opt-in shoulder yoke, Step 111 opt-in face loops and a finer head. See Step 108 for the ZRemesher work in it (Plan Layout, the box-modeller body builder) and Step 107 for Transpose axis snapping, the floor grid and SubTool symmetry. See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
+0.50.1 is published (Step 116): the ZRemesher work of Steps 111–115 (face loops on by default, characters with gear, hard edges on noisy models opt-in, edge loops on edge lines, region edges ringing turned parts). 0.50.0 is published (Step 109); Step 110 adds an opt-in shoulder yoke, Step 111 opt-in face loops and a finer head. See Step 108 for the ZRemesher work in it (Plan Layout, the box-modeller body builder) and Step 107 for Transpose axis snapping, the floor grid and SubTool symmetry. See Step 104 for anti-aliasing and the pixol / HD-geometry analysis, Step 102 for the dense-mesh artifact fix and the polygon-count plan, Step 101 for Wrap, Step 100 for the deep test and its six fixes, Step 99 for manual retopology and Step 98 for the published 0.46.0 release. Step 97 covers ZRemesher guides, remesh symmetry and Clip brushes. Step 96 covers model import, Deformation mirrors, Fill Color and renaming.
 
 ## Historical implementation snapshot — 0.4.0
 - Native ZBrush-style Klay UI, preserving the readability touch-up. Current release has 33 tools, including six masking brushes, Clip Line, FormSoft/FormHard and Zipper/Stitch/Rake relief. Compact Sculpt/Mask working sets, original previews and a searchable/category-filtered B catalog keep them discoverable.
@@ -19,7 +19,7 @@ Klay is a native desktop sculpting prototype. The UI is a ZBrush-style workspace
 - Use semantic application versions in `Cargo.toml`: **minor** for new features, **patch** for fixes/polish, **major** for incompatible application changes. Update the root Klay package entry in `Cargo.lock` with every release.
 - Maintain `CHANGELOG.md` with the version, date, concrete changes and relevant verification. Record the current release and outstanding work in this handoff at each step.
 - About and packaging read the Cargo package version; do not hardcode a second application version in the UI. Project-file and workspace-format versions are independent and only change when their formats change; retain readers for old projects.
-- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.50.0**. Do not infer permission to commit, tag or push from version numbering alone.
+- Versioning started at **0.2.0** from the previous unversioned-work baseline **0.1.0**; the current feature version is **0.50.1** (ZRemesher releases go 0.50.1, 0.50.2, … while that work continues). Do not infer permission to commit, tag or push from version numbering alone.
 
 ## Stack
 - Rust 2024, winit 0.30, wgpu 30, egui/egui-wgpu/egui-winit 0.37.
@@ -1078,6 +1078,11 @@ The user shared four reference images of hand-made / Quad Remesher-quality chara
 - **Planning budget**: `layout::set_deadline` / `past_deadline` (thread-local; only the outermost plan sets and clears it): `ZR_BUDGET` (120) s over all four tries in `remesh()`, checked before each try, every round and in the line tracer's loop. Stall rule: a pass with no new low in faults for `ZR_STALL` (10) rounds is given up. The real hang was in `Trace::step`: a line caught on a zero-thickness fold (two faces back to back) bounced between them, moving just enough to escape the "still" guard; now `prev_face`/`bounce` stop it after 25 straight returns. `KLAY_ZR_TIME=1` prints each try's time and outcome (cheap; the debug log changes the timing). Dropship both paths: over 15 min → 408 s (one try still overran the budget by about 2 min before a check; worth finding).
 - Still open: the rifle and dropship remesh but poorly (rifle 27.8% bad, 706 folded; dropship 23.8%, 397): parts thinner than a quad at 10k; Detect Edges keeps only 4 of 17,020 sharp edges on the Meshy rifle (clean_lines drops nearly all of Meshy's broken edges), so hard surfaces get no edge loops. The brute's limbs are not tubes (length under 1.2 × girth: bulky arms, short legs); grey's face is too far from human proportions for the nest (falls back to the old eye and mouth insets) and its body overshoots the count (15.6k for 10k).
 - Verified: all 469 tests; six shapes, bust, bust loops, blob eyes identical; T-pose 5k/10k/20k byte-identical to the committed default.
+
+## Step 116 — Release 0.50.1 (2026-11-10)
+
+- Published as tag `v0.50.1` with a GitHub release (AppImage, Flatpak, .deb). Carries Steps 111–115: face loops and the finer head on by default, characters with gear and hard-surface parts (wrap retry, gear not a limb, planning time limit), hard edges on noisy models (opt-in), edge loops on edge lines, and region edges closing their rings. `zremesh-topology` was fast-forwarded into `main`.
+- Verification: see the CHANGELOG entry; `cargo test --release` before tagging.
 
 ## Step 115 — Lines onto the wrapped copy: tried, not kept; region edges close their rings (2026-11-09)
 
