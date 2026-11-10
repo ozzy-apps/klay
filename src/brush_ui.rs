@@ -490,6 +490,19 @@ impl Workspace {
         self.brush_ui.import = Some(rx);
         std::thread::spawn(move || {
             let result = (|| -> Result<Option<Pattern>, String> {
+                // Windows has no zenity: the system's own file picker.
+                #[cfg(windows)]
+                {
+                    let picked = rfd::FileDialog::new()
+                        .set_title(if texture { "Import Texture" } else { "Import Alpha" })
+                        .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                        .pick_file();
+                    return match picked {
+                        Some(p) => BrushImage::load(&p).map(|i| Some(Pattern::Image(i))),
+                        None => Ok(None),
+                    };
+                }
+                #[allow(unreachable_code)]
                 let output = std::process::Command::new("zenity")
                     .args([
                         "--file-selection",

@@ -4,59 +4,146 @@
 
 <h1 align="center">Klay</h1>
 
-<p align="center">Fast digital sculpting with a ZBrush-style workspace. Written in Rust.</p>
+<p align="center"><b>Sculpt millions of polygons in a ZBrush-style workspace. Free and open source.</b></p>
 
-![Klay's workspace with a sculpted sphere](docs/images/workspace.png)
+<p align="center">
+  <a href="https://github.com/ozzy-apps/klay/releases">Download</a> ·
+  <a href="docs/guide.md">Guide</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-## Highlights
+![Klay's workspace with a 1.5-million-triangle character bust](docs/images/workspace.png)
 
-- **Millions of polygons**, subdivision levels and layers, on any Vulkan GPU
-- **67 brushes**: Clay, Dam Standard, Move, Snake Hook, hPolish, Trim, Slash, Noise and more, picked ZBrush-style with **B** and two letters
-- **LightBox**: browse local projects, tools, brushes, materials, alphas, textures and QuickSaves with **,** (comma)
-- **Custom brush presets** save the live brush setup and embed imported alphas and textures. Load them after restarting from **LightBox › User › Brushes**.
-- **Model import** supports OBJ, STL, GLB, glTF, FBX and ZBrush GoZ. Multipart scenes open as editable SubTools.
-- **OBJ round trips** preserve faces, UVs and named groups. Update a SubTool’s cage from OBJ and carry its sculpted detail forward.
-- **Subdivision and layers** with Catmull–Clark on quad cages, geometry and UV smoothing controls, and layers that record shape, paint and masks.
-- **UV editing and map export** with manual seams, checker previews, island editing, vector displacement and batch baking across visible SubTools.
-- **Retopology**: place and extrude a hand-built cage with **Snap to Surface**, or use **ZRemesher** with undoable guide curves, polypaint density, X/Y/Z mirror planes, KeepCreases, Detect Edges and FreezeBorder; **ProjectAll** to bring the sculpt's detail onto the new mesh; **Reconstruct Subdiv** and **Freeze SubDiv Levels**
-- **Geometry**: **ZSpheres** (with cube nodes), **Dynamic Subdivision**, **Panel Loops**, **Sculptris Pro**, **Live Boolean**, **Decimation**, **UV Master**, **normal, displacement and colour map baking**, **ZModeler**, creases that Divide keeps sharp, Remesh, Insert Mesh and CurveTube
-- **Render** with shadows and ambient occlusion, **Turntable** videos, **Spotlight**, **FiberMesh** and cloth **Dynamics**
-- **Select, Clip, Trim, Slice and Knife** tools, masking, polygroups and **polypaint** with brush alphas and textures in RGB and Z+RGB, including live DragRect and DragDot stamp previews
-- **Your workspace**: dock any palette, drag any shelf item anywhere, themes, UI scale, stored configs
-- **Pen pressure** on Linux tablets, symmetry (mirror and radial), MatCaps
+## Why Klay
+
+Klay is a digital sculpting app for characters, creatures and hard-surface parts. It follows
+ZBrush's layout and key bindings, so ZBrush habits carry over: **B** and two letters pick a
+brush, **Ctrl** masks, **Alt** reverses, and palettes dock wherever you want them.
+
+It is written in Rust and draws on the GPU. Dense meshes stay responsive, and long
+operations run in the background while you keep turning the view. Klay is free, MIT
+licensed, and has no account or subscription.
+
+## Sculpting and brushes
+
+![The brush catalog with ZBrush two-letter codes on every tile](docs/images/brushes.png)
+
+- **67 brushes**: Clay, Clay Buildup, Dam Standard, Move, Snake Hook, hPolish, Trim, Slash, Noise, Inflate and more.
+- **ZBrush keys**: press **B**, then two letters (**B D S** for Dam Standard). Every tile shows its code.
+- **Alphas and textures** with Wrap, so stamps follow the surface around edges and curves. Built-in detail patterns include skin, scales, cracks, panels and wood grain.
+- **Pen pressure** on Linux tablets under X11 and Wayland, with curves per brush.
+- **Symmetry**: X, Y and Z mirrors and radial symmetry.
+- **Save brush presets** with their alphas and textures embedded, and load them again from LightBox.
+
+## Millions of polygons
+
+![A sphere divided to 15.4 million vertices, with the Geometry and Layers sections open](docs/images/subdivision.png)
+
+- **Subdivision levels** up to a 64-million-vertex budget. Step up and down with **D** and **Shift + D**.
+- **Catmull–Clark** on quad cages, with creases that Divide keeps sharp.
+- **Layers** record shape, polypaint and masks. Turn them up, down or off.
+- **Reconstruct Subdiv** and **Freeze SubDiv Levels** for imported or retopologized meshes.
+- **Sculptris Pro** adds triangles where the brush needs them.
+- **4× anti-aliasing** and GPU culling keep dense meshes sharp and fast.
+
+## ZRemesher and retopology
+
+![ZRemesher on a stylized T-pose base mesh, with the ZRemesher settings](docs/images/zremesher.png)
+
+![ZRemesher at 10k quads in Klay 0.50.1 and 0.50.2: a bust, a soldier and a rifle, with far fewer folded and badly shaped quads in 0.50.2](docs/images/zremesher-0.50.2.png)
+
+- **ZRemesher** turns any sculpt into clean quads, within a few percent of the count you ask for. Edge loops follow the form, even on noisy scanned or AI-generated models.
+- **Plan Layout** (experimental) builds characters the way a box modeller would: a head on a neck, limbs as cylinders, face loops around the eyes, nose and mouth, and an exact mirror image.
+- **Follow Shape** turns edge loops around limbs, ridges and hollows.
+- **Detect Edges** lays one edge loop exactly on each hard edge, so hard-surface parts stay crisp.
+- **Guides**: draw curves with the ZRemesherGuide brush (**B Z G**), and the loops follow them. Paint density with polypaint.
+- **Symmetry** on X, Y or Z, and a wrapped retry for models with straps, pouches and other small gear.
 
 | | |
 |---|---|
-| ![ZRemesher with polygroups](docs/images/zremesher.png) | ![The brush catalog in the Moss theme](docs/images/brushes.png) |
-| ZRemesher: clean quads that follow the form | The brush catalog, ZBrush key codes on every tile |
-| ![Preferences in the Studio Light theme](docs/images/themes.png) | ![Space menu with the rounded saturation and value picker](docs/images/color-picker.png) |
-| Themes, UI scale and Customize in Preferences | Space menu for polypaint color, brush settings and brush selection |
+| ![A ZRemesher result with ProjectAll detail and the Project and Retopology sections](docs/images/retopology.png) | ![A seven-quad retopology cage over a subdivided reference](docs/images/manual-retopology.png) |
+| **ProjectAll** carries a sculpt's detail onto the new quads, level by level | **Manual retopology**: place quads and extrude edges that snap to the surface |
 
-![LightBox QuickSave tab showing generated model thumbnails in Graphite Blue](docs/images/lightbox.png)
+## Polypaint, UVs and map baking
 
-![LightBox User Brushes tab showing a saved Skin Stamp brush preset](docs/images/brush-presets.png)
-
-![Klay's UV Map editor with seam controls, an island layout and the Multi Map Exporter](docs/images/uv-finishing.png)
-
-## Install
-
-Download the latest release from the [releases page](https://github.com/ozzy-apps/klay/releases):
-
-| Format | Install |
+| | |
 |---|---|
-| `.deb` (Ubuntu, Debian, Mint, Zorin) | `sudo apt install ./klay_<version>_amd64.deb` |
-| Flatpak | `flatpak install --user Klay-<version>-x86_64.flatpak` |
-| AppImage | `chmod +x Klay-<version>-x86_64.AppImage` and run it |
+| ![The Space menu with the color picker, brush sliders and quick brushes](docs/images/color-picker.png) | ![The UV Map editor with islands and the Multi Map Exporter](docs/images/uv-finishing.png) |
+| The **Space** menu: color, brush settings and quick brushes at the cursor | **UV Map**: unwrap, mark seams, pack islands, check with a checker |
 
-The 0.46.0 Debian package and AppImage require glibc 2.39 or later. Klay checks for new releases while it runs (Preferences › Updates).
+- **Polypaint** in RGB or Z+RGB, with alphas, textures and **Fill Color**.
+- **UV Master**-style unwrap with manual seams, island transforms and packing.
+- **Bake** normal, displacement, vector displacement and color maps from the highest level onto the lowest.
+- **Multi Map Exporter** bakes every visible SubTool in one background job.
+- **Export glTF** with the baked normal and color maps embedded, ready for Blender, Godot, Unity and Unreal.
 
-### Build from source
+## Modelling tools
 
-```bash
-cargo run --release
-```
+| | |
+|---|---|
+| ![A ZSphere armature with the ZSphere section](docs/images/zspheres.png) | ![Dynamic Subdivision on a cube with polygroups](docs/images/dynamic-subdiv.png) |
+| **ZSpheres**: sketch an armature, with cube nodes, and skin it | **Dynamic Subdivision**: a smooth preview while you model the cage |
 
-Needs Rust, a C compiler for the FBX parser, and a Vulkan driver. `scripts/` builds the .deb, Flatpak and AppImage.
+- **ZModeler**: QMesh, Extrude, Inset, Bevel, Bridge, edge loops, Crease, Slide, Stitch and more, on points, edges and polygons.
+- **Live Boolean**: add, subtract and intersect SubTools and see the result live. Make Boolean Mesh bakes it.
+- **Panel Loops**, **Decimation**, **Remesh**, **Insert Mesh**, **CurveTube**, **Close Holes** and **Mirror And Weld**.
+- **Transpose**, **Gizmo 3D** and **Transpose Master** to pose and place parts.
+- **Select, Clip, Trim, Slice and Knife** brushes, masking by cavity, smoothness and ambient occlusion, and polygroups.
+- **FiberMesh** and cloth **Dynamics**.
+
+![FiberMesh preview on a sphere](docs/images/fibermesh.png)
+
+## Rendering and materials
+
+| | |
+|---|---|
+| ![A BPR render of the bust with shadows and ambient occlusion](docs/images/render.png) | ![The same bust in Red Wax, Polished bronze, Cavity White and Toy Plastic](docs/images/materials.png) |
+| **Render (BPR)**: ray traced shadows and ambient occlusion, saved as PNG | **16 materials and MatCaps**, plus your own MatCap images |
+
+- **BPR** on the right shelf renders the view at once and saves it next to the project.
+- **Turntable** saves a full turn as an MP4 with ffmpeg, or as PNG frames.
+- **Light** palette for the key light, intensity and ambient.
+- **Reference images** on a plane behind the model, and **Spotlight** to paint and sculpt through a picture.
+- **Local**, **Transp** and **Ghost** views for working between SubTools.
+
+## Your workspace
+
+![Preferences in the Studio Light theme, with UI scale, themes and stored configs](docs/images/themes.png)
+
+- **Dock any palette** to the left, right, top or bottom tray, or keep it in the menu bar.
+- **Drag any shelf item** anywhere, and build your own shelf in Customize mode.
+- **Seven themes** and your own colors, UI scale from 80 to 200 %.
+- **Store Config** keeps your interface and, if you like, a startup model.
+- **LightBox** (**,**) browses projects, tools, brushes, materials, alphas, textures and QuickSaves.
+
+## Import and export
+
+![LightBox Tools with FBX, GoZ, GLB and glTF model previews](docs/images/model-import.png)
+
+- **Import** OBJ, STL, GLB, glTF, FBX and ZBrush GoZ. Multipart scenes open as separate SubTools.
+- **OBJ round trips** keep faces, UVs and named groups. **Update from OBJ** brings a revised cage back with its sculpted detail.
+- **Export** OBJ, STL and glTF (`.glb`).
+- **3D Print** palette: real-world size, Check Mesh, and Send to your slicer.
+- **Projects** (`.klay`) save every SubTool with its levels, layers, polypaint, UVs and reference images.
+
+## Download
+
+Get the latest release from the [releases page](https://github.com/ozzy-apps/klay/releases):
+
+| Platform | File | Install |
+|---|---|---|
+| Ubuntu, Debian, Mint, Zorin | `klay_<version>_amd64.deb` | `sudo apt install ./klay_<version>_amd64.deb` |
+| Any Linux (Flatpak) | `Klay-<version>-x86_64.flatpak` | `flatpak install --user Klay-<version>-x86_64.flatpak` |
+| Any Linux (AppImage) | `Klay-<version>-x86_64.AppImage` | `chmod +x Klay-<version>-x86_64.AppImage` and run it |
+| Windows 10 and 11 | `Klay-<version>-x86_64-windows.zip` | Unzip and run `klay.exe` |
+
+The Debian package and AppImage require glibc 2.39 or later. Klay checks for new releases while it runs (Preferences › Updates).
+
+### System requirements
+
+- 64-bit x86 Linux or Windows
+- A GPU with a Vulkan driver (OpenGL is used where Vulkan is missing)
+- RAM to match your meshes: each subdivision level costs about 140 bytes per vertex
 
 ## Getting around
 
@@ -75,37 +162,17 @@ Needs Rust, a C compiler for the FBX parser, and a Vulkan driver. `scripts/` bui
 | Shift + P | Toggle the floor grid at the lowest visible point |
 | F · Tab · F11 | frame the model · hide the interface · fullscreen |
 
+## Build from source
+
+```bash
+cargo run --release
+```
+
+Needs Rust, a C compiler for the FBX parser, and a Vulkan driver. `scripts/` builds the .deb, Flatpak and AppImage, and `scripts/package-windows.sh` cross-compiles the Windows zip (needs mingw-w64 and `rustup target add x86_64-pc-windows-gnu`).
+
+## Documentation
+
 The full manual is in [docs/guide.md](docs/guide.md), and what changed in each version is in [CHANGELOG.md](CHANGELOG.md).
-
-## Model import and SubTools
-
-- Use **Document › Import › Import Models…** or double-click a model in **LightBox › User › Tools**. **Fit** centers and scales each file as a whole. Keep external glTF geometry buffers with the model.
-- For a ZBrush ZTool (`.ztl`), open it in ZBrush and export FBX, OBJ or GoZ. Klay imports the sculptable mesh data.
-- In **Mesh › Deformation**, choose **X**, **Y** or **Z** under **Mirror Axis**. **Mirror Copy** reflects the mesh across the world axis and puts it below the source. **SubTool › Merge Down** joins them into one SubTool. **Mirror And Weld** mirrors around the active SubTool’s center and welds the seam.
-- Mirror and radial sculpting use the center of the active SubTool’s bounds. A merge uses the combined bounds, including disconnected pieces.
-- Double-click a SubTool row to rename it. Click **Fill Color** below the color picker or in the **Space** menu to apply the picked color to visible, unmasked areas of the active SubTool.
-
-![The Klay viewport with three visible SubTools and the floor grid aligned to the lowest sphere](docs/images/subtool-floor.png)
-
-![LightBox Tools with FBX, GoZ, GLB and glTF model previews](docs/images/model-import.png)
-
-## Manual retopology
-
-1. In **Mesh › Retopology › Reference**, choose the high-resolution SubTool.
-2. Click **Place Retopo Quad**, then click the sculpt. Klay creates a separate SubTool and selects ZModeler Edge Extrude.
-3. Drag an open cage edge to extend it. New vertices follow the reference while **Snap to Surface** is enabled. Use **Snap Active Mesh** to start from an existing low-poly plane.
-
-![A seven-quad retopology cage over a subdivided reference in Klay](docs/images/manual-retopology.png)
-
-## ZRemesher guides and symmetry
-
-- **Ctrl + Z** undoes a guide stroke. With **ZRemesherGuide** selected (**B Z G**), **Alt + click** a line to remove it. **Delete guides** clears the active SubTool's guides in one undo step.
-- In **Mesh › ZRemesher**, set **Symmetry** to **Force X**, **Force Y** or **Force Z**. ZRemesher mirrors the positive half across the active SubTool’s center and welds the seam where it meets the plane.
-
-## Clip brushes
-
-- Keep the mouse or pen down and hold **Space** to move a Clip Line, Clip Rect or Clip Circle guide. Release Space to resume drawing, then release the mouse or pen to apply.
-- Clip Rect uses the cut's cross-section on closed meshes so geometry pressed to the rectangle edge stays within the surface there.
 
 ## Contact
 
@@ -113,6 +180,7 @@ Found a bug, or have a request? [Open an issue](https://github.com/ozzy-apps/kla
 
 Made with love by Ozzy ♥ · [MIT License](LICENSE)
 
+## For developers
 
 ### Strata direct transfer (local source build)
 

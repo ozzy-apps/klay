@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.2 — 2026-11-10
+
+- **Windows**: Klay now ships for Windows 10 and 11 (x86-64) as a zip: unzip and run `klay.exe`. Settings and QuickSaves go to `%APPDATA%\klay`; importing an alpha or texture opens the Windows file picker.
+- **ZRemesher hits the count asked**: the quad size was set by the model's area, and a noisy or finely detailed surface (a scan, an AI model) has more area than the quads that smooth over it, while parts thinner than a quad lose theirs. Results came out 10–30% short (Meshy characters at 10k: 7–9k quads; a dropship of thin plates: 2k). When the count is more than 8% off, the remesh now runs again with a corrected target (up to twice) and keeps the nearest: all seven test models land within 5% of 10k.
+- **ZRemesher without spikes and folds**: while evening out the quads, each point was put back on the surface along its normal; where a quad had folded, that ray could reach another part of the model (the next pouch, the far side of a rail) and pull the point there, which drew long spikes and torn quads. Points now go to the nearest point of the surface (as Plan Layout already did), which is also 2–3× faster. At 10k quads, badly shaped quads and folded quads: a Meshy rifle 27.8% and 709 → 7.2% and 30, a bust 16.0% and 299 → 5.3% and 22, a tactical soldier 12.7% and 263 → 6.1% and 20, a brute 17% → 8%. The simple test shapes (ball, cube, torus, vase, rook, blob) are unchanged.
+- **README**: a new overview of Klay with current screenshots.
+- Verification: 475 release tests pass (15 ignored; new: a noisy sphere gets within 10% of the count asked). The Windows build was run under Wine: it draws the interface and a sculpt on the GPU.
+
 ## 0.50.1 — 2026-11-10
 
 - **Remesh (Wedge) on open models**: a model with holes (open shells, parts not closed) no longer crashes the voxel remesh. A grid line through a hole never got back outside, so the inside ran on to the edge of the grid; such a line now ends at its last way out. Anything still inconsistent is refused with a message instead of a crash.

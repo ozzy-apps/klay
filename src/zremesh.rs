@@ -1037,7 +1037,8 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
         std::fs::write(path, s).ok();
     }
     crate::jobs::check()?;
-    let run = |m: &SculptMesh| -> Result<(SculptMesh, Stats), String> {
+    let run_at = |m: &SculptMesh, target_k: f32| -> Result<(SculptMesh, Stats), String> {
+        let s = &Settings { target_k, ..*s };
         Ok(match s.mirror {
             // Plan Layout with Symmetry: a body is built whole and symmetric; anything else is
             // planned on its half and mirrored.
@@ -1047,6 +1048,41 @@ pub fn zremesh(mesh: &SculptMesh, s: &Settings, guides: &[Vec<Vec3>]) -> Result<
             },
             None => remesh(m, s, guides, &[], &features, None)?,
         })
+    };
+    // The plain remesher sizes its quads by the surface's area, and comes out short of the
+    // count asked: a noisy or finely detailed surface (an AI or scanned model) has more
+    // area than the quads that smooth over it, and parts thinner than a quad lose theirs
+    // (Meshy models at 10k: 7-9k quads; a dropship of thin plates 2k). When the count is
+    // over 8% off it is run again with the target scaled by how far off it was, up to
+    // twice, and the result nearest the count kept (`ZR_NOCOUNTFIX` off). A planned
+    // layout counts its own quads and is kept as it is.
+    let run = |m: &SculptMesh| -> Result<(SculptMesh, Stats), String> {
+        let want = (s.target_k * 1000.0).max(50.0);
+        let mut best = run_at(m, s.target_k)?;
+        if best.1.planned || std::env::var_os("ZR_NOCOUNTFIX").is_some() {
+            return Ok(best);
+        }
+        let off = |st: &Stats| (st.quads as f32 / want - 1.0).abs();
+        let (mut k, mut got) = (s.target_k, best.1.quads as f32);
+        for _ in 0..2 {
+            if got <= 0.0 || off(&best.1) <= 0.08 {
+                break;
+            }
+            crate::jobs::check()?;
+            k *= (want / got).clamp(0.5, 3.0);
+            // (Never far past what the model's own triangles can carry.)
+            let k_max = (m.triangle_count() as f32 / 1000.0 * 4.0).max(s.target_k);
+            k = k.min(k_max);
+            let Ok(r) = run_at(m, k) else { break };
+            got = r.1.quads as f32;
+            if debug {
+                eprintln!("count: asked {} quads at {:.2}k -> {}", want as usize, k, r.1.quads);
+            }
+            if off(&r.1) < off(&best.1) && r.0.subdivision_blocker().is_none() {
+                best = r;
+            }
+        }
+        Ok(best)
     };
     let (mut out, mut stats) = run(mesh)?;
     // Detail finer than a quad (pouches on a vest with gaps under them, thin rails and
@@ -1879,7 +1915,16 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             }
         }
     }
-    let near = (stats.planned && std::env::var_os("ZR_RAYPROJECT").is_none()).then(|| TriGrid::new(mesh, quad));
+    // Both remeshers put their points on the nearest point of the surface while relaxing:
+    // a ray along a folded quad's normal can land on another part of the model (spikes).
+    // For the plain remesher (`ZR_PLAINRAY`: along the normal, as before) at 10k quads: a
+    // Meshy rifle 27% -> 7% badly shaped quads and 815 -> 30 folded, a bust 13% -> 5%, a
+    // soldier 14% -> 6%, longest edges 10x the median -> 3x.
+    let ray = if stats.planned { std::env::var_os("ZR_RAYPROJECT").is_some() } else { std::env::var_os("ZR_PLAINRAY").is_some() };
+    let near = (!ray).then(|| TriGrid::new(mesh, quad));
+    // With rays, folded quads are still untangled with the nearest point afterwards
+    // (`ZR_NOPLAINUNTANGLE` off).
+    let untangle_grid = (near.is_none() && std::env::var_os("ZR_NOPLAINUNTANGLE").is_none()).then(|| TriGrid::new(mesh, quad));
     // The loops along edge lines go onto them and stay there, the rest evening out round
     // them: a planned layout's at once (its edges were laid on the lines, and relaxing would
     // slide them off), the plain remesher's halfway through the passes (its loops come out
@@ -1956,9 +2001,9 @@ fn finish(mesh: &SculptMesh, s: &Settings, mut out_p: Vec<Vec3>, mut quads: Vec<
             }
         }
     }
-    // Untangle (planned layout): quads still folded or collapsed get their points and the
-    // points round them smoothed a few more rounds, onto the nearest surface each time.
-    if let Some(g) = &near {
+    // Untangle: quads still folded or collapsed get their points and the points round them
+    // smoothed a few more rounds, onto the nearest surface each time.
+    if let Some(g) = near.as_ref().or(untangle_grid.as_ref()) {
         let rounds: usize = std::env::var("ZR_UNTANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
         let area = |q4: &[u32; 4], p: &[Vec3]| -> (f32, bool) {
             let pp: Vec<Vec3> = q4.iter().map(|&v| p[v as usize]).collect();
@@ -2609,6 +2654,24 @@ mod tests {
         assert!(creased.iter().all(|&(a, b)| out.positions[a as usize].y.abs() < 1e-4 && out.positions[b as usize].y.abs() < 1e-4));
         let (plain, _) = zremesh(&m, &Settings { keep_creases: false, ..s }, &[]).unwrap();
         assert!(plain.creases.is_empty());
+    }
+
+    #[test]
+    fn a_noisy_surface_still_gets_about_the_count_asked() {
+        // Bumps finer than a quad add area the quads smooth over: sized by area alone, the
+        // result comes out well short of the count.
+        let mut m = sphere(80);
+        for (k, p) in m.positions.iter_mut().enumerate() {
+            let h = ((k as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32;
+            *p *= 1.0 + 0.012 * (h - 0.5);
+        }
+        let m = SculptMesh::from_raw(m.positions.clone(), m.indices.clone());
+        for k in [1.0f32, 3.0] {
+            let (_, st) = zremesh(&m, &Settings { target_k: k, keep_groups: false, ..Settings::default() }, &[]).unwrap();
+            let off = st.quads as f32 / (k * 1000.0) - 1.0;
+            eprintln!("asked {}k: {} quads ({:+.1}%)", k, st.quads, off * 100.0);
+            assert!(off.abs() <= 0.1, "asked {k}k, got {}", st.quads);
+        }
     }
 
     #[test]

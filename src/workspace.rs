@@ -1468,8 +1468,10 @@ impl Workspace {
     }
 
     pub fn new() -> Self {
+        // Windows: %APPDATA% (there is no XDG or HOME there).
         let root = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
+            .or_else(|| if cfg!(windows) { std::env::var_os("APPDATA").map(PathBuf::from) } else { None })
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
             .unwrap_or_else(std::env::temp_dir);
         // Tests never read or write the user's own workspace, stored config or assets.

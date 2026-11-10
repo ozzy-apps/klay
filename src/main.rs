@@ -4261,6 +4261,7 @@ impl App {
         std::env::var_os("XDG_DATA_HOME")
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from)
+            .or_else(|| if cfg!(windows) { std::env::var_os("APPDATA").map(std::path::PathBuf::from) } else { None })
             .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("klay/quicksave")
